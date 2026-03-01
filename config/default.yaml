@@ -1,0 +1,37 @@
+# Context Sync 기본 설정
+# 이 파일은 기본값 템플릿입니다. 사용자 설정은 ~/.context-sync/config.yaml에 저장됩니다.
+
+app:
+  data_dir: "~/.context-sync/data"
+  log_level: "INFO"
+
+sync:
+  interval_minutes: 30
+  max_concurrent: 3
+
+sources:
+  confluence:
+    enabled: false
+    base_url: ""
+    email: ""
+    token_storage: "keyring"
+    spaces: []
+    exclude_labels:
+      - "draft"
+      - "archived"
+
+processor:
+  chunk_size: 512
+  chunk_overlap: 50
+  embedding_model: "text-embedding-3-small"
+  embedding_provider: "openai"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o"
+  api_key_storage: "keyring"
+  max_context_chunks: 10
+
+web:
+  host: "127.0.0.1"
+  port: 8501

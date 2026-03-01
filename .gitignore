@@ -17,6 +17,11 @@ venv/
 *.swp
 *.swo
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Environment
 .env
 .env.local
