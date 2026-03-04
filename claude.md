@@ -2,80 +2,343 @@
 
 ## 프로젝트 개요
 
-사내 업무 소스(Confluence 등)를 개인 로컬 PC에 LLM context로 변환·저장하고, 변경사항을 자동 동기화하는 시스템이다.
-CLI + 웹 UI 형태로 제공하며, `pip install`로 배포하고 사용자는 3개 명령어(`init`, `start`, `ask`)만으로 사용한다.
+사내 지식(Confluence 문서 등)을 LLM context로 변환·저장하고, 이를 시각적으로 관리할 수 있는 **웹 대시보드** 시스템이다.
+사용자는 대시보드를 통해 Confluence 문서를 임포트하거나, 파일을 업로드하거나, 직접 마크다운을 작성하여 사내 지식을 등록할 수 있다.
+등록된 문서는 LLM이 내용을 분석하여 **텍스트 청크** 또는 **그래프 DB** 중 최적의 저장 방식을 자동 결정한 뒤 저장한다.
+대시보드에서 원본 문서와 변환된 데이터를 시각적으로 확인·탐색할 수 있다.
+또한 **MCP(Model Context Protocol) Server**로 동작하여, 사내 LLM 애플리케이션이 질의하면 저장된 지식에서 적절한 컨텍스트를 검색·조립하여 응답한다.
 
 ## 시스템 아키텍처
 
 ```
-[Confluence / Jira / Slack / ...]
-        │ (REST API + API Token)
-        ▼
-┌─────────────────┐
-│  Connector Layer │  ← 소스별 어댑터 (플러그인 구조)
-└────────┬────────┘
-         ▼
-┌─────────────────┐
-│  Processor Layer │  ← 청킹, 임베딩, 요약
-└────────┬────────┘
-         ▼
-┌─────────────────┐
-│  Storage Layer   │  ← ChromaDB (벡터) + SQLite (메타데이터)
-└────────┬────────┘
-         ▼
-┌─────────────────┐
-│  Interface Layer │  ← CLI (click) + Web UI (Streamlit/Gradio)
-└─────────────────┘
+┌──────────────────────────────────────────────┐
+│              Input Layer (문서 입력)           │
+│                                              │
+│  ┌──────────┐  ┌──────────┐  ┌────────────┐ │
+│  │Confluence │  │파일 업로드│  │직접 MD 작성│ │
+│  │ API 임포트│  │(.md 등)  │  │(에디터)    │ │
+│  └─────┬────┘  └─────┬────┘  └─────┬──────┘ │
+└────────┼─────────────┼─────────────┼─────────┘
+         └─────────────┼─────────────┘
+                       ▼
+              ┌─────────────────┐
+              │  Processor Layer │  ← 문서 파싱, 정규화
+              └────────┬────────┘
+                       ▼
+              ┌─────────────────┐
+              │  LLM Classifier  │  ← 저장 방식 판단 (청크 vs 그래프)
+              └────────┬────────┘
+                       ▼
+              ┌─────────────────┐
+              │  Storage Layer   │  ← 벡터DB (청크) + 그래프DB + SQLite (메타)
+              └────────┬────────┘
+                       │
+              ┌────────┴────────┐
+              │                 │
+              ▼                 ▼
+┌─────────────────┐   ┌─────────────────────┐
+│  Dashboard (Web) │   │  MCP Server (stdio) │
+│  원본 뷰어 +     │   │  사내 LLM 앱 연동    │
+│  데이터 시각화    │   │  컨텍스트 검색/조립   │
+└─────────────────┘   └─────────────────────┘
+                              ▲
+                              │ MCP Protocol (JSON-RPC over stdio)
+                              │
+                      ┌───────┴───────┐
+                      │ 사내 LLM 앱    │
+                      │ (Claude Code,  │
+                      │  커스텀 에이전트│
+                      │  등)           │
+                      └───────────────┘
 ```
 
 ## 핵심 설계 원칙
 
-1. **로컬 퍼스트**: 모든 데이터는 사용자 PC에 저장. 외부 서버 의존 최소화.
-2. **증분 동기화**: 초기 full sync 이후에는 변경분(incremental)만 처리.
-3. **플러그인 구조**: 소스 커넥터는 공통 인터페이스를 구현하는 플러그인으로 확장 가능.
-4. **3단계 온보딩**: init → 소스 연결 → 초기 동기화. 사용자 설정은 3단계 이내로 완료.
-5. **보안 우선**: 인증 토큰은 OS 키체인(keyring)에 저장. 설정 파일에 시크릿 노출 금지.
+1. **대시보드 중심**: 모든 조작(입력, 조회, 탐색)은 웹 대시보드에서 수행.
+2. **다중 입력**: Confluence API 임포트, 파일 업로드, 직접 MD 작성 등 다양한 입력 경로 지원.
+3. **LLM 기반 저장 판단**: 문서 내용을 LLM이 분석하여 텍스트 청크 / 그래프 DB 중 최적 저장 방식을 자동 결정.
+4. **시각적 데이터 탐색**: 원본 문서와 변환된 데이터(청크, 그래프 노드/엣지)를 대시보드에서 시각적으로 확인 가능.
+5. **MCP Server 제공**: 사내 LLM 애플리케이션이 MCP 프로토콜로 질의하면 벡터 검색 + 그래프 탐색으로 적절한 컨텍스트를 조립하여 응답.
+6. **로컬 퍼스트**: 모든 데이터는 사용자 PC에 저장. 외부 서버 의존 최소화.
+7. **보안 우선**: 인증 토큰은 OS 키체인(keyring)에 저장. 설정 파일에 시크릿 노출 금지.
+
+## 문서 입력 방식
+
+### 1. Confluence API 임포트
+
+Confluence REST API를 통해 스페이스/페이지를 선택적으로 가져온다.
+
+- 대시보드에서 Confluence 연결 설정 (URL, 인증 정보)
+- 스페이스/페이지 트리를 탐색하여 임포트 대상 선택
+- HTML → 마크다운 변환 후 저장
+- 이후 변경분 증분 동기화 지원
+
+### 2. 파일 업로드
+
+마크다운(.md) 파일 등을 대시보드에서 직접 업로드한다.
+
+- 드래그 앤 드롭 또는 파일 선택으로 업로드
+- 지원 포맷: `.md`, `.txt`, `.html` (추후 `.pdf`, `.docx` 확장 가능)
+- 업로드된 파일은 원본 그대로 보관 + LLM 처리
+
+### 3. 직접 마크다운 작성
+
+대시보드 내장 에디터에서 직접 마크다운 문서를 작성한다.
+
+- 마크다운 에디터 (실시간 미리보기 지원)
+- 작성 완료 시 즉시 LLM 처리 파이프라인으로 전달
+- 기존 문서 수정/업데이트 가능
+
+## LLM 저장 방식 판단
+
+문서가 입력되면 LLM이 내용을 분석하여 최적 저장 방식을 결정한다.
+
+### 판단 기준
+
+| 저장 방식 | 적합한 문서 유형 | 예시 |
+|-----------|----------------|------|
+| **텍스트 청크** (벡터DB) | 서술형 문서, 가이드, 매뉴얼, 긴 설명 | 온보딩 가이드, API 문서, 회의록 |
+| **그래프 DB** | 엔티티 간 관계가 중요한 문서, 조직도, 시스템 구조 | 아키텍처 문서, 팀 구성, 의존성 맵 |
+| **혼합** | 서술 + 관계 정보가 공존하는 문서 | 프로젝트 기획서 (설명 + 마일스톤 관계) |
+
+### 처리 플로우
+
+```
+문서 입력
+   │
+   ▼
+LLM 분석 (문서 구조, 엔티티, 관계 존재 여부 판단)
+   │
+   ├─ "chunk" 판정 → 텍스트 청킹 → 임베딩 → 벡터DB 저장
+   │
+   ├─ "graph" 판정 → 엔티티/관계 추출 → 그래프DB 저장
+   │
+   └─ "hybrid" 판정 → 청크 + 그래프 모두 저장
+```
+
+## 문서 변경 감지 및 재처리
+
+문서는 지속적으로 변경될 수 있으므로, 저장된 컨텍스트 데이터(청크, 그래프)도 원본 변경에 맞춰 자동으로 갱신되어야 한다.
+
+### 변경 감지 방식
+
+| 입력 소스 | 감지 방법 |
+|-----------|----------|
+| **Confluence** | 증분 동기화 시 `version` 비교 + `content_hash` 대조 |
+| **파일 업로드** | 동일 파일 재업로드 시 `content_hash` 비교 |
+| **직접 작성** | 에디터에서 저장 시 `content_hash` 비교 |
+
+### 재처리 전략: Delete & Recreate
+
+문서 변경이 감지되면 해당 문서의 기존 파생 데이터를 모두 삭제한 뒤 새로 생성한다.
+
+```
+변경 감지 (content_hash 불일치)
+   │
+   ▼
+┌─────────────────────────────────┐
+│  1. 기존 데이터 정리             │
+│     - 벡터DB에서 해당 문서 청크 삭제 │
+│     - 그래프DB에서 해당 문서       │
+│       소유 노드/엣지 삭제         │
+│     - SQLite chunks, graph_nodes, │
+│       graph_edges 레코드 삭제     │
+└──────────┬──────────────────────┘
+           ▼
+┌─────────────────────────────────┐
+│  2. 원본 갱신                    │
+│     - documents.original_content │
+│       업데이트                    │
+│     - content_hash 갱신          │
+│     - status → "processing"      │
+└──────────┬──────────────────────┘
+           ▼
+┌─────────────────────────────────┐
+│  3. 재처리 파이프라인 실행        │
+│     - LLM Classifier 재판정      │
+│       (저장 방식이 바뀔 수 있음)  │
+│     - 청킹/임베딩 또는            │
+│       그래프 추출 재실행          │
+│     - 새 데이터 저장              │
+│     - status → "completed"       │
+└─────────────────────────────────┘
+```
+
+### 그래프 엔티티 관리
+
+여러 문서에서 동일 엔티티(예: "인증 서비스")를 참조할 수 있다. 이를 안전하게 관리하기 위해:
+
+- **문서 소유권 기반 삭제**: `graph_nodes`와 `graph_edges`에 `document_id`가 있으므로, 해당 문서 소유 레코드만 삭제한다.
+- **엔티티 병합 테이블**: 동일 엔티티가 여러 문서에서 등장하면 `entity_name` + `entity_type`으로 논리적 병합을 관리한다. 한 문서의 노드가 삭제되어도 다른 문서의 동일 엔티티는 유지된다.
+- **고아 엣지 정리**: 노드 삭제 후 연결된 엣지 중 양쪽 노드가 모두 없는 경우 자동 정리한다.
+
+### 재처리 이력 추적
+
+모든 재처리는 `processing_history` 테이블에 기록된다.
+
+- `action`: "created" / "updated" / "reprocessed"
+- 이전 `storage_method`와 새 `storage_method`가 다를 수 있음 (예: 문서 구조가 바뀌어 chunk → hybrid로 변경)
+- 대시보드 문서 상세 뷰의 **메타데이터 탭**에서 처리 이력 타임라인 확인 가능
+
+### Confluence 자동 동기화
+
+Confluence 소스 문서는 주기적 증분 동기화로 자동 갱신된다.
+
+- 설정된 주기(`sync_interval_minutes`)마다 변경된 페이지를 감지
+- 변경된 문서만 선별하여 재처리 파이프라인 실행
+- 대시보드에서 수동 동기화 트리거 가능 ("지금 동기화" 버튼)
+- Confluence에서 삭제된 페이지는 로컬 데이터도 함께 정리 (옵션)
+
+## 대시보드 화면 구성
+
+### 메인 대시보드
+
+- 등록된 문서 목록 (소스별 필터링: Confluence / 업로드 / 직접 작성)
+- 문서별 상태 표시 (원본, 처리 중, 처리 완료, 변경 감지됨)
+- 저장 방식 태그 (chunk / graph / hybrid)
+- 전체 통계 (문서 수, 청크 수, 그래프 노드/엣지 수)
+- Confluence 동기화 상태 및 "지금 동기화" 버튼
+
+### 문서 상세 뷰
+
+- **원본 탭**: 원본 마크다운/HTML 렌더링
+- **청크 탭**: 분할된 텍스트 청크 목록 (하이라이트로 원본 내 위치 표시)
+- **그래프 탭**: 추출된 엔티티/관계를 인터랙티브 그래프로 시각화
+- **메타데이터 탭**: 소스 정보, 처리 이력 타임라인, 버전 변경 내역
+
+### Confluence 임포트 화면
+
+- Confluence 연결 설정
+- 스페이스/페이지 트리 브라우저
+- 선택적 임포트 + 동기화 설정
+
+### 마크다운 에디터
+
+- 분할 뷰 (에디터 | 미리보기)
+- 새 문서 작성 / 기존 문서 수정
+
+## MCP Server
+
+### 개요
+
+이 시스템은 MCP(Model Context Protocol) Server로도 동작한다. 사내 LLM 애플리케이션(Claude Code, 커스텀 에이전트 등)이 MCP 클라이언트로서 이 서버에 질의하면, 저장된 사내 지식에서 관련 컨텍스트를 검색·조립하여 응답한다.
+
+### MCP 전송 방식
+
+- **stdio**: 기본 전송 방식. LLM 앱이 이 서버를 subprocess로 실행하여 stdin/stdout으로 JSON-RPC 통신.
+- **SSE (Server-Sent Events)**: 원격 접근이 필요한 경우 HTTP 기반 SSE 전송 지원 (선택적).
+
+### 제공 MCP Tools
+
+| Tool 이름 | 설명 | 파라미터 |
+|-----------|------|---------|
+| `search_context` | 질의 문자열로 관련 사내 지식 컨텍스트를 검색·조립하여 반환 | `query` (str), `max_chunks` (int, optional), `include_graph` (bool, optional) |
+| `list_documents` | 등록된 문서 목록 조회 | `source_type` (str, optional), `status` (str, optional) |
+| `get_document` | 특정 문서의 원본 또는 처리된 데이터 조회 | `document_id` (int), `format` ("original" \| "chunks" \| "graph") |
+| `get_graph_context` | 특정 엔티티 중심으로 그래프 관계를 탐색하여 컨텍스트 반환 | `entity_name` (str), `depth` (int, optional) |
+
+### 컨텍스트 조립 플로우
+
+```
+LLM 앱 질의 (MCP Tool Call)
+   │
+   ▼
+┌─────────────────────────────┐
+│  Query Processor             │
+│  - 질의 임베딩 생성          │
+│  - 벡터DB 유사도 검색        │
+│  - 그래프DB 관련 엔티티 탐색  │
+└──────────┬──────────────────┘
+           ▼
+┌─────────────────────────────┐
+│  Context Assembler           │
+│  - 청크 + 그래프 결과 병합   │
+│  - 중복 제거, 관련도 정렬    │
+│  - 출처 메타데이터 첨부      │
+└──────────┬──────────────────┘
+           ▼
+   MCP Tool Response
+   (컨텍스트 텍스트 + 출처 정보)
+```
+
+### MCP 서버 실행 방법
+
+```bash
+# stdio 모드 (기본)
+context-loop mcp serve
+
+# SSE 모드 (원격 접근)
+context-loop mcp serve --transport sse --port 3001
+```
+
+### 클라이언트 설정 예시 (Claude Code)
+
+```json
+{
+  "mcpServers": {
+    "context-loop": {
+      "command": "context-loop",
+      "args": ["mcp", "serve"],
+      "env": {}
+    }
+  }
+}
+```
 
 ## 프로젝트 구조
 
 ```
-context-sync/
+context-loop/
 ├── pyproject.toml
 ├── README.md
 ├── src/
-│   └── context_sync/
+│   └── context_loop/
 │       ├── __init__.py
-│       ├── cli.py                  # CLI 진입점 (click 기반)
 │       ├── config.py               # 설정 로드/저장
 │       ├── auth.py                 # 토큰 관리 (keyring 연동)
-│       ├── connectors/             # 소스 커넥터
+│       ├── ingestion/              # 문서 입력
 │       │   ├── __init__.py
-│       │   ├── base.py             # BaseConnector 추상 클래스
-│       │   └── confluence.py       # Confluence 커넥터
+│       │   ├── confluence.py       # Confluence API 임포트
+│       │   ├── uploader.py         # 파일 업로드 처리
+│       │   └── editor.py           # 직접 작성 문서 처리
 │       ├── processor/              # 문서 처리
 │       │   ├── __init__.py
+│       │   ├── parser.py           # HTML/MD 파싱, 정규화
+│       │   ├── classifier.py       # LLM 저장 방식 판단
 │       │   ├── chunker.py          # 텍스트 청킹
-│       │   ├── embedder.py         # 임베딩 생성
-│       │   └── summarizer.py       # LLM 요약
+│       │   ├── graph_extractor.py  # 엔티티/관계 추출
+│       │   └── embedder.py         # 임베딩 생성
 │       ├── storage/                # 저장소
 │       │   ├── __init__.py
-│       │   ├── vector_store.py     # ChromaDB 래퍼
+│       │   ├── vector_store.py     # ChromaDB 래퍼 (텍스트 청크)
+│       │   ├── graph_store.py      # 그래프DB 래퍼 (엔티티/관계)
 │       │   └── metadata_store.py   # SQLite 메타데이터
-│       ├── sync/                   # 동기화 엔진
+│       ├── sync/                   # Confluence 동기화
 │       │   ├── __init__.py
-│       │   ├── scheduler.py        # 주기적 동기화 스케줄러
-│       │   └── engine.py           # 동기화 로직 (변경 감지, 업데이트, 삭제)
-│       ├── query/                  # 질의 처리
+│       │   └── engine.py           # 증분 동기화 로직
+│       ├── mcp/                    # MCP Server
 │       │   ├── __init__.py
-│       │   └── rag.py              # RAG 파이프라인 (검색 → 컨텍스트 조립 → LLM 호출)
-│       └── web/                    # 웹 UI
+│       │   ├── server.py           # MCP 서버 메인 (FastMCP 기반)
+│       │   ├── tools.py            # MCP Tool 정의 (search_context 등)
+│       │   └── context_assembler.py # 컨텍스트 검색·조립 로직
+│       └── web/                    # 웹 대시보드
 │           ├── __init__.py
-│           └── app.py              # Streamlit/Gradio 앱
+│           ├── app.py              # FastAPI/Streamlit 앱
+│           ├── api/                # REST API 엔드포인트
+│           │   ├── __init__.py
+│           │   ├── documents.py    # 문서 CRUD
+│           │   ├── confluence.py   # Confluence 연동 API
+│           │   └── query.py        # 질의 API
+│           └── frontend/           # 프론트엔드 정적 파일
+│               ├── dashboard.html
+│               ├── editor.html
+│               └── viewer.html
 ├── tests/
-│   ├── test_connectors/
+│   ├── test_ingestion/
 │   ├── test_processor/
 │   ├── test_storage/
-│   └── test_sync/
+│   ├── test_mcp/
+│   └── test_web/
 └── config/
     └── default.yaml                # 기본 설정 템플릿
 ```
@@ -84,29 +347,28 @@ context-sync/
 
 | 영역 | 기술 | 선택 이유 |
 |------|------|-----------|
-| CLI | click | 서브커맨드 구조, 풍부한 옵션 처리 |
-| Web UI | Streamlit 또는 Gradio | Python만으로 UI 구현, 빠른 프로토타이핑 |
+| 웹 프레임워크 | FastAPI + Jinja2 또는 Streamlit | API + 대시보드 통합 |
+| 프론트엔드 | HTMX + Alpine.js 또는 Streamlit | 경량 인터랙티브 UI |
+| 그래프 시각화 | vis.js 또는 D3.js | 인터랙티브 그래프 렌더링 |
 | 벡터 DB | ChromaDB | 로컬 임베디드 모드, pip install만으로 사용 |
+| 그래프 DB | NetworkX + SQLite 또는 Neo4j Embedded | 엔티티/관계 저장, 로컬 실행 |
 | 메타데이터 DB | SQLite | 파일 기반, 별도 서버 불필요 |
 | 임베딩 | OpenAI text-embedding-3-small 또는 로컬 모델 | 비용/성능 균형 |
-| LLM | OpenAI GPT-4o 또는 Claude | RAG 응답 생성용 |
-| 인증 저장 | keyring | OS 네이티브 키체인 연동 (Windows/macOS/Linux) |
-| HTTP 클라이언트 | httpx | async 지원, 타임아웃 제어 용이 |
-| 스케줄링 | APScheduler | 백그라운드 주기 실행 |
+| LLM | OpenAI GPT-4o 또는 Claude | 저장 방식 판단 + RAG 응답 생성 |
+| MCP SDK | mcp (Python SDK) + FastMCP | MCP 프로토콜 서버 구현, stdio/SSE 전송 지원 |
+| 인증 저장 | keyring | OS 네이티브 키체인 연동 |
+| HTTP 클라이언트 | httpx | async 지원, Confluence API 호출용 |
+| 마크다운 에디터 | EasyMDE 또는 Toast UI Editor | 브라우저 기반 MD 편집 |
 | 패키징 | pyproject.toml + hatchling | 모던 Python 패키징 표준 |
 
 ## 설정 파일 구조
 
 ```yaml
-# ~/.context-sync/config.yaml
+# ~/.context-loop/config.yaml
 
 app:
-  data_dir: "~/.context-sync/data"       # 로컬 DB 저장 경로
+  data_dir: "~/.context-loop/data"        # 로컬 DB 저장 경로
   log_level: "INFO"
-
-sync:
-  interval_minutes: 30                    # 동기화 주기
-  max_concurrent: 3                       # 동시 처리 커넥터 수
 
 sources:
   confluence:
@@ -114,12 +376,7 @@ sources:
     base_url: "https://yourcompany.atlassian.net"
     email: "user@company.com"
     token_storage: "keyring"              # 토큰은 OS 키체인에 저장
-    spaces:                               # 구독할 스페이스 목록
-      - "DEV"
-      - "PROJECT-A"
-    exclude_labels:                       # 제외할 라벨
-      - "draft"
-      - "archived"
+    sync_interval_minutes: 30             # 증분 동기화 주기
 
 processor:
   chunk_size: 512                         # 청크 토큰 수
@@ -130,60 +387,23 @@ processor:
 llm:
   provider: "openai"                      # "openai" | "anthropic"
   model: "gpt-4o"
-  api_key_storage: "keyring"              # API 키도 키체인에 저장
-  max_context_chunks: 10                  # RAG 시 최대 참조 청크 수
+  api_key_storage: "keyring"
+  classifier_prompt: "default"            # 저장 방식 판단 프롬프트
+
+storage:
+  vector_db: "chromadb"
+  graph_db: "networkx"                    # "networkx" | "neo4j"
 
 web:
   host: "127.0.0.1"
-  port: 8501
-```
+  port: 8000
 
-## 커넥터 인터페이스
-
-모든 소스 커넥터는 `BaseConnector`를 상속하여 구현한다.
-
-```python
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import datetime
-from typing import AsyncIterator
-
-
-@dataclass
-class Document:
-    """커넥터가 반환하는 문서 단위"""
-    source_id: str              # 소스 시스템 내 고유 ID
-    source_type: str            # "confluence", "jira", "slack" 등
-    title: str
-    content: str                # 본문 텍스트 (마크다운 또는 플레인텍스트)
-    url: str                    # 원본 링크
-    author: str
-    updated_at: datetime
-    metadata: dict              # 소스별 추가 정보 (스페이스, 라벨 등)
-
-
-class BaseConnector(ABC):
-    """소스 커넥터 공통 인터페이스"""
-
-    @abstractmethod
-    async def authenticate(self) -> bool:
-        """인증 확인. 토큰 유효성 검증."""
-        ...
-
-    @abstractmethod
-    async def fetch_all(self) -> AsyncIterator[Document]:
-        """전체 문서 가져오기 (초기 동기화용)."""
-        ...
-
-    @abstractmethod
-    async def fetch_updated(self, since: datetime) -> AsyncIterator[Document]:
-        """특정 시점 이후 변경된 문서만 가져오기 (증분 동기화용)."""
-        ...
-
-    @abstractmethod
-    async def fetch_deleted(self, since: datetime) -> list[str]:
-        """특정 시점 이후 삭제된 문서 ID 목록."""
-        ...
+mcp:
+  transport: "stdio"                      # "stdio" | "sse"
+  sse_port: 3001                          # SSE 모드 시 포트
+  max_context_chunks: 10                  # 응답에 포함할 최대 청크 수
+  include_graph_by_default: true          # 그래프 컨텍스트 기본 포함 여부
+  context_max_tokens: 4096                # 조립된 컨텍스트 최대 토큰 수
 ```
 
 ## Confluence 커넥터 상세
@@ -209,88 +429,70 @@ headers = {
 
 | 용도 | 엔드포인트 | 비고 |
 |------|-----------|------|
-| 스페이스 목록 | `GET /wiki/api/v2/spaces` | 구독 대상 선택용 |
+| 스페이스 목록 | `GET /wiki/api/v2/spaces` | 대시보드에서 선택용 |
 | 페이지 목록 | `GET /wiki/api/v2/spaces/{id}/pages` | 페이지네이션 필수 |
 | 페이지 상세 | `GET /wiki/api/v2/pages/{id}?body-format=storage` | 본문 포함 |
-| 변경 감지 | `GET /wiki/rest/api/content?expand=version&orderby=lastmodified` | `lastModifiedDate` 기준 |
-
-### 변경 감지 전략
-
-1. 메타데이터 DB에 각 문서의 `(source_id, version_number, last_modified)` 저장
-2. 동기화 시 `orderby=lastmodified` + `modifiedDate >= last_sync_time`으로 변경분 조회
-3. version_number 비교로 실제 변경 여부 확인
-4. 로컬에 있지만 소스에서 삭제된 문서는 orphan cleanup 처리
-
-## 동기화 엔진 로직
-
-```
-┌─────────────────────────────────────────────┐
-│              Sync Cycle                      │
-│                                             │
-│  1. 마지막 동기화 시각 조회 (metadata DB)      │
-│            │                                │
-│  2. fetch_updated(since) 호출               │
-│            │                                │
-│  3. 변경 문서별:                              │
-│     ├─ 신규 → 청킹 → 임베딩 → 벡터DB 저장    │
-│     ├─ 수정 → 기존 청크 삭제 → 재생성         │
-│     └─ 삭제 → 벡터DB + 메타DB에서 제거        │
-│            │                                │
-│  4. 동기화 시각 갱신                          │
-│            │                                │
-│  5. 로그 기록                                │
-└─────────────────────────────────────────────┘
-```
-
-## CLI 명령어 체계
-
-```bash
-context-sync init             # 초기 설정 마법사 (웹 UI 실행)
-context-sync start            # 백그라운드 동기화 + 웹 UI 시작
-context-sync stop             # 백그라운드 동기화 중지
-context-sync status           # 동기화 상태 확인
-context-sync ask "<질문>"     # CLI에서 직접 질문
-context-sync sync             # 수동 즉시 동기화
-context-sync config           # 설정 웹 UI 열기
-context-sync autostart        # 시스템 시작 시 자동 실행 등록/해제
-```
+| 변경 감지 | `GET /wiki/rest/api/content?expand=version&orderby=lastmodified` | 증분 동기화용 |
 
 ## 메타데이터 DB 스키마 (SQLite)
 
 ```sql
--- 동기화된 문서 추적
+-- 등록된 문서
 CREATE TABLE documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id TEXT NOT NULL,          -- 소스 시스템 내 고유 ID
-    source_type TEXT NOT NULL,        -- "confluence", "jira" 등
-    title TEXT,
-    url TEXT,
+    source_type TEXT NOT NULL,            -- "confluence", "upload", "manual"
+    source_id TEXT,                       -- Confluence 페이지 ID (업로드/작성은 NULL)
+    title TEXT NOT NULL,
+    original_content TEXT,                -- 원본 텍스트 (마크다운)
+    content_hash TEXT,                    -- 변경 감지용 해시
+    storage_method TEXT,                  -- "chunk", "graph", "hybrid"
+    status TEXT DEFAULT 'pending',        -- "pending", "processing", "completed", "failed", "changed"
+    version INTEGER DEFAULT 1,            -- 처리 버전 (재처리 시 증가)
+    url TEXT,                             -- 원본 링크 (Confluence)
     author TEXT,
-    version INTEGER,                  -- 소스 시스템의 버전 번호
-    content_hash TEXT,                -- 본문 해시 (변경 감지용)
-    last_synced_at TIMESTAMP,
-    source_updated_at TIMESTAMP,
-    UNIQUE(source_id, source_type)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_type, source_id)
 );
 
--- 청크-문서 매핑
+-- 텍스트 청크 (벡터DB 매핑)
 CREATE TABLE chunks (
-    id TEXT PRIMARY KEY,              -- 벡터DB의 chunk ID와 동일
+    id TEXT PRIMARY KEY,                  -- 벡터DB의 chunk ID
     document_id INTEGER REFERENCES documents(id),
-    chunk_index INTEGER,              -- 문서 내 청크 순서
+    chunk_index INTEGER,
+    content TEXT,                         -- 청크 텍스트 (대시보드 표시용)
     token_count INTEGER
 );
 
--- 동기화 이력
-CREATE TABLE sync_history (
+-- 그래프 노드
+CREATE TABLE graph_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_type TEXT NOT NULL,
+    document_id INTEGER REFERENCES documents(id),
+    entity_name TEXT NOT NULL,
+    entity_type TEXT,                     -- "person", "system", "concept", "team" 등
+    properties TEXT                       -- JSON
+);
+
+-- 그래프 엣지
+CREATE TABLE graph_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER REFERENCES documents(id),
+    source_node_id INTEGER REFERENCES graph_nodes(id),
+    target_node_id INTEGER REFERENCES graph_nodes(id),
+    relation_type TEXT,                   -- "belongs_to", "depends_on", "manages" 등
+    properties TEXT                       -- JSON
+);
+
+-- 처리 이력
+CREATE TABLE processing_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER REFERENCES documents(id),
+    action TEXT,                           -- "created", "updated", "reprocessed"
+    prev_storage_method TEXT,              -- 이전 저장 방식 (재처리 시)
+    new_storage_method TEXT,               -- 새 저장 방식
     started_at TIMESTAMP,
     completed_at TIMESTAMP,
-    status TEXT,                       -- "success", "partial", "failed"
-    docs_added INTEGER DEFAULT 0,
-    docs_updated INTEGER DEFAULT 0,
-    docs_deleted INTEGER DEFAULT 0,
+    status TEXT,
     error_message TEXT
 );
 ```
@@ -303,33 +505,43 @@ CREATE TABLE sync_history (
 1. 프로젝트 스캐폴딩 (pyproject.toml, 디렉토리 구조)
 2. 설정 관리 (config.yaml 로드/저장, 기본값)
 3. 인증 모듈 (keyring 연동, 토큰 저장/조회)
+4. SQLite 메타데이터 저장소 세팅
 
-### Phase 2: Confluence 커넥터
-4. BaseConnector 추상 클래스 구현
-5. Confluence 커넥터 구현 (Cloud 우선)
-6. 페이지네이션 처리, HTML → 마크다운 변환
+### Phase 2: 문서 입력 파이프라인
+5. 파일 업로드 처리 (MD/TXT/HTML → 원본 저장)
+6. 마크다운 직접 작성 저장
+7. Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
+8. Confluence 증분 동기화
 
-### Phase 3: 문서 처리 파이프라인
-7. 청킹 모듈 (토큰 기반 분할)
-8. 임베딩 모듈 (OpenAI API 연동)
-9. ChromaDB 벡터 저장소 래퍼
-10. SQLite 메타데이터 저장소
+### Phase 3: LLM 저장 방식 판단 + 처리
+9. LLM Classifier 구현 (문서 분석 → chunk/graph/hybrid 판정)
+10. 텍스트 청킹 모듈 (토큰 기반 분할)
+11. 임베딩 + ChromaDB 벡터 저장
+12. 그래프 엔티티/관계 추출 모듈
+13. 그래프DB 저장 (NetworkX + SQLite)
 
-### Phase 4: 동기화 엔진
-11. 초기 전체 동기화 (full sync)
-12. 증분 동기화 (변경 감지 + 반영)
-13. 삭제 문서 정리 (orphan cleanup)
-14. APScheduler 기반 주기 실행
+### Phase 4: 웹 대시보드
+14. 기본 대시보드 레이아웃 (문서 목록, 통계)
+15. 문서 상세 뷰 (원본 탭, 청크 탭, 메타데이터 탭)
+16. 그래프 시각화 탭 (인터랙티브 그래프 렌더링)
+17. Confluence 임포트 UI (연결 설정, 스페이스 브라우저)
+18. 마크다운 에디터 통합
+19. 파일 업로드 UI
 
-### Phase 5: 질의 인터페이스
-15. RAG 파이프라인 (검색 → 컨텍스트 조립 → LLM 호출)
-16. CLI `ask` 명령어
-17. 출처 표시 (소스 URL 링크)
+### Phase 5: MCP Server
+20. MCP 서버 기본 구조 (FastMCP, stdio 전송)
+21. `search_context` Tool 구현 (벡터 검색 + 그래프 탐색 → 컨텍스트 조립)
+22. `list_documents`, `get_document`, `get_graph_context` Tool 구현
+23. SSE 전송 지원 (선택적 원격 접근)
+24. MCP 클라이언트 연동 테스트 (Claude Code 등)
 
-### Phase 6: UI 및 배포
-18. 웹 UI (대시보드, 채팅, 설정)
-19. 초기 설정 마법사 (init 플로우)
-20. 패키징 및 사내 배포
+### Phase 6: 질의 및 고도화
+25. 대시보드 내 채팅 인터페이스 (RAG 파이프라인 활용)
+26. 출처 표시 (원본 문서 링크)
+
+### Phase 7: 배포
+27. 패키징 및 사내 배포
+28. 초기 설정 마법사 (대시보드 내)
 
 ## 코딩 컨벤션
 
