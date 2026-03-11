@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+
+{% block title %}Confluence Import - Context Loop{% endblock %}
+
+{% block content %}
+<h2>Confluence Import</h2>
+
+<!-- 연결 설정 -->
+<article x-data="{ showForm: !{{ 'true' if connected else 'false' }} }">
+    <header>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong>Connection</strong>
+            {% if connected %}
+            <span class="badge badge-completed">Connected</span>
+            {% endif %}
+            <button class="outline" style="width: auto;" @click="showForm = !showForm">
+                <span x-text="showForm ? 'Hide' : '{% if connected %}Edit{% else %}Setup{% endif %}'"></span>
+            </button>
+        </div>
+    </header>
+    <div x-show="showForm" x-transition>
+        <form hx-post="/api/confluence/connect" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful) location.reload()">
+            <label>
+                Base URL
+                <input type="url" name="base_url" value="{{ base_url }}" required
+                       placeholder="https://yourcompany.atlassian.net">
+            </label>
+            <label>
+                Email
+                <input type="email" name="email" value="{{ email }}" required
+                       placeholder="user@company.com">
+            </label>
+            <label>
+                API Token
+                <input type="password" name="token" required
+                       placeholder="Enter your Confluence API token">
+            </label>
+            <button type="submit">Connect</button>
+        </form>
+    </div>
+</article>
+
+<!-- 스페이스 브라우저 -->
+{% if connected %}
+<article x-data="confluenceBrowser()">
+    <header><strong>Spaces & Pages</strong></header>
+
+    <div x-show="!spaces.length">
+        <button @click="loadSpaces()" class="outline">Load Spaces</button>
+    </div>
+
+    <div x-show="spaces.length">
+        <label>
+            Select Space
+            <select @change="loadPages($event.target.value)">
+                <option value="">-- Select a space --</option>
+                <template x-for="s in spaces" :key="s.id">
+                    <option :value="s.id" x-text="s.name + ' (' + s.key + ')'"></option>
+                </template>
+            </select>
+        </label>
+    </div>
+
+    <div x-show="pages.length" style="margin-top: 1rem;">
+        <table>
+            <thead>
+                <tr>
+                    <th><input type="checkbox" @change="toggleAll($event.target.checked)"></th>
+                    <th>Page Title</th>
+                </tr>
+            </thead>
+            <tbody>
+                <template x-for="p in pages" :key="p.id">
+                    <tr>
+                        <td><input type="checkbox" :value="p.id" x-model="selected"></td>
+                        <td x-text="p.title"></td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+        <button @click="importSelected()" :disabled="!selected.length">
+            Import Selected (<span x-text="selected.length"></span>)
+        </button>
+    </div>
+
+    <div x-show="importing" style="margin-top: 1rem;">
+        <p aria-busy="true">Importing...</p>
+    </div>
+</article>
+
+<script>
+function confluenceBrowser() {
+    return {
+        spaces: [],
+        pages: [],
+        selected: [],
+        importing: false,
+        async loadSpaces() {
+            const r = await fetch('/api/confluence/spaces');
+            const data = await r.json();
+            this.spaces = data.spaces || [];
+        },
+        async loadPages(spaceId) {
+            if (!spaceId) { this.pages = []; return; }
+            const r = await fetch('/api/confluence/spaces/' + spaceId + '/pages');
+            const data = await r.json();
+            this.pages = data.pages || [];
+            this.selected = [];
+        },
+        toggleAll(checked) {
+            this.selected = checked ? this.pages.map(p => String(p.id)) : [];
+        },
+        async importSelected() {
+            this.importing = true;
+            try {
+                await fetch('/api/confluence/import', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({page_ids: this.selected})
+                });
+                window.location = '/';
+            } finally {
+                this.importing = false;
+            }
+        }
+    };
+}
+</script>
+{% endif %}
+{% endblock %}

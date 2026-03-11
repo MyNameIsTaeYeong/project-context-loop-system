@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}{{ doc.title }} - Context Loop{% endblock %}
+
+{% block content %}
+<div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;">
+    <h2 style="margin: 0;">{{ doc.title }}</h2>
+    <span class="badge badge-{{ doc.status }}">{{ doc.status }}</span>
+    {% if doc.storage_method %}
+    <span class="badge badge-method">{{ doc.storage_method }}</span>
+    {% endif %}
+</div>
+
+<div style="display: flex; gap: 0.5rem; margin-bottom: 1.5rem;">
+    <a href="/editor/{{ doc.id }}" role="button" class="outline">Edit</a>
+    <button hx-post="/api/documents/{{ doc.id }}/process"
+            hx-swap="none"
+            onclick="this.setAttribute('aria-busy','true')"
+            class="outline">
+        Reprocess
+    </button>
+    <button hx-delete="/api/documents/{{ doc.id }}"
+            hx-confirm="Are you sure you want to delete this document?"
+            class="outline secondary">
+        Delete
+    </button>
+</div>
+
+<!-- 탭 -->
+<div x-data="{ tab: 'original' }">
+    <div role="group" style="margin-bottom: 1rem;">
+        <button :class="tab === 'original' ? '' : 'outline'"
+                @click="tab = 'original'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/original', {target: '#tab-content', swap: 'innerHTML'})">
+            Original
+        </button>
+        <button :class="tab === 'chunks' ? '' : 'outline'"
+                @click="tab = 'chunks'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/chunks', {target: '#tab-content', swap: 'innerHTML'})">
+            Chunks
+        </button>
+        <button :class="tab === 'graph' ? '' : 'outline'"
+                @click="tab = 'graph'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/graph', {target: '#tab-content', swap: 'innerHTML'})">
+            Graph
+        </button>
+        <button :class="tab === 'metadata' ? '' : 'outline'"
+                @click="tab = 'metadata'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/metadata', {target: '#tab-content', swap: 'innerHTML'})">
+            Metadata
+        </button>
+    </div>
+
+    <div id="tab-content"
+         hx-get="/partials/document/{{ doc.id }}/original"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+        <p aria-busy="true">Loading...</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script src="/static/js/graph.js"></script>
+{% endblock %}

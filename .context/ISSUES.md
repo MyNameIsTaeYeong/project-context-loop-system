@@ -4,14 +4,6 @@
 
 ## 미해결
 
-### I-001: 웹 프레임워크 최종 선택 미결정
-- FastAPI + Jinja2 vs Streamlit — 프로토타이핑 속도와 커스터마이징 유연성 간 트레이드오프
-- Phase 4 시작 전까지 결정 필요
-
-### I-002: 그래프 시각화 라이브러리 미결정
-- vis.js vs D3.js — vis.js는 쉽고 빠르나 커스터마이징 한계, D3.js는 유연하나 구현 공수 큼
-- Phase 4.3 시작 전까지 결정 필요
-
 ### I-003: 엔티티 병합 테이블 스키마 미정
 - 여러 문서에서 동일 엔티티가 등장할 때 병합 기준과 테이블 구조 상세 설계 필요
 - Phase 3.6 시작 전까지 결정 필요
@@ -28,6 +20,17 @@
 - 현재 매 요청마다 httpx.AsyncClient를 생성함 — 대량 임포트 시 성능 저하 가능
 - Phase 4 이상에서 AsyncClient를 재사용하도록 리팩터링 고려
 
+### I-007: save_document title 업데이트 미지원
+- `ingestion/editor.py`의 `save_document()`가 기존 문서 수정 시 title을 업데이트하지 않음
+- 현재 `web/api/documents.py`에서 직접 SQL UPDATE로 우회 중
+- editor.py 자체를 수정하여 title 업데이트를 지원하는 것이 바람직
+
 ## 해결됨
 
-(아직 없음)
+### I-001: 웹 프레임워크 최종 선택 → FastAPI + Jinja2 + HTMX
+- 2026-03-11 결정: FastAPI + Jinja2 + HTMX + Alpine.js + Pico CSS
+- 커스터마이징 자유도 높고 MCP 서버와 같은 프로세스 실행 가능
+
+### I-002: 그래프 시각화 라이브러리 → vis.js
+- 2026-03-11 결정: vis.js (CDN)
+- 네트워크 그래프에 특화, 구현 공수 적음, 기본 인터랙션(줌/드래그/클릭) 제공

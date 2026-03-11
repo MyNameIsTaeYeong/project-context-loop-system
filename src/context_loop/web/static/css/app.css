@@ -1,0 +1,85 @@
+/* Context Loop Dashboard — Custom Styles */
+
+/* 통계 카드 숫자 */
+.stat-number {
+    font-size: 2rem;
+    font-weight: bold;
+    text-align: center;
+    margin: 0;
+}
+
+/* 배지 공통 */
+.badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+/* 상태별 배지 */
+.badge-pending { background: #fef3cd; color: #856404; }
+.badge-processing { background: #cce5ff; color: #004085; }
+.badge-completed { background: #d4edda; color: #155724; }
+.badge-failed { background: #f8d7da; color: #721c24; }
+.badge-started { background: #cce5ff; color: #004085; }
+.badge-changed { background: #fff3cd; color: #856404; }
+
+/* 소스/메서드 배지 */
+.badge-source { background: #e2e3e5; color: #383d41; }
+.badge-method { background: #d1ecf1; color: #0c5460; }
+.badge-none { background: #e2e3e5; color: #999; }
+
+/* 청크 리스트 */
+.chunks-list article {
+    margin-bottom: 1rem;
+}
+.chunks-list article header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* 토스트 */
+#toast-area {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.toast {
+    padding: 0.75rem 1.25rem;
+    border-radius: 0.5rem;
+    color: white;
+    font-size: 0.875rem;
+    animation: toast-in 0.3s ease;
+}
+.toast-success { background: #28a745; }
+.toast-error { background: #dc3545; }
+.toast-info { background: #17a2b8; }
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateX(1rem); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+/* 그래프 컨테이너 */
+#graph-container {
+    background: var(--pico-background-color);
+}
+
+/* 탭 버튼 그룹 */
+[role="group"] button {
+    cursor: pointer;
+}
+
+/* 코드 블록 개선 */
+pre code {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
