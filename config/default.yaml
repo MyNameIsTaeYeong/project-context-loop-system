@@ -1,0 +1,38 @@
+app:
+  data_dir: "~/.context-loop/data"
+  log_level: "INFO"
+
+sources:
+  confluence:
+    enabled: true
+    base_url: ""
+    email: ""
+    token_storage: "keyring"
+    sync_interval_minutes: 30
+
+processor:
+  chunk_size: 512
+  chunk_overlap: 50
+  embedding_model: "text-embedding-3-small"
+  embedding_provider: "openai"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o"
+  api_key_storage: "keyring"
+  classifier_prompt: "default"
+
+storage:
+  vector_db: "chromadb"
+  graph_db: "networkx"
+
+web:
+  host: "127.0.0.1"
+  port: 8000
+
+mcp:
+  transport: "stdio"
+  sse_port: 3001
+  max_context_chunks: 10
+  include_graph_by_default: true
+  context_max_tokens: 4096
