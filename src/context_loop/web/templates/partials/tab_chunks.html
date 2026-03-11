@@ -1,0 +1,15 @@
+{% if chunks %}
+<div class="chunks-list">
+    {% for chunk in chunks %}
+    <article>
+        <header>
+            <strong>Chunk #{{ chunk.chunk_index }}</strong>
+            <small>{{ chunk.token_count }} tokens</small>
+        </header>
+        <pre><code>{{ chunk.content }}</code></pre>
+    </article>
+    {% endfor %}
+</div>
+{% else %}
+<p>No chunks. This document may use graph storage or hasn't been processed yet.</p>
+{% endif %}

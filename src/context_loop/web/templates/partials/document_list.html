@@ -1,0 +1,32 @@
+{% if documents %}
+<table>
+    <thead>
+        <tr>
+            <th>Title</th>
+            <th>Source</th>
+            <th>Status</th>
+            <th>Storage</th>
+            <th>Updated</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for doc in documents %}
+        <tr>
+            <td><a href="/documents/{{ doc.id }}">{{ doc.title }}</a></td>
+            <td><span class="badge badge-source">{{ doc.source_type }}</span></td>
+            <td><span class="badge badge-{{ doc.status }}">{{ doc.status }}</span></td>
+            <td>
+                {% if doc.storage_method %}
+                <span class="badge badge-method">{{ doc.storage_method }}</span>
+                {% else %}
+                <span class="badge badge-none">-</span>
+                {% endif %}
+            </td>
+            <td>{{ doc.updated_at[:16] if doc.updated_at else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>No documents found. <a href="/editor">Create one</a> or upload a file.</p>
+{% endif %}

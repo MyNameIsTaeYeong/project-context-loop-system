@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: 3 (LLM 저장 방식 판단 + 처리) → **완료**
-- **Step**: Phase 4 진입 준비
-- **상태**: Phase 3 전체 완료 (LLM Classifier, 청킹, ChromaDB, 그래프 추출, GraphStore, 파이프라인 통합)
+- **Phase**: 4 (웹 대시보드) → **완료**
+- **Step**: Phase 5 진입 준비
+- **상태**: Phase 4 전체 완료 (FastAPI + Jinja2 + HTMX + Alpine.js + vis.js 대시보드)
 
 ## Phase별 진행률
 
@@ -29,12 +29,12 @@
 - [x] 3.6 그래프 엔티티 병합 및 고아 엣지 정리 로직
 
 ### Phase 4: 웹 대시보드
-- [ ] 4.1 기본 대시보드 레이아웃 (문서 목록, 통계)
-- [ ] 4.2 문서 상세 뷰 (원본 탭, 청크 탭, 메타데이터 탭)
-- [ ] 4.3 그래프 시각화 탭 (인터랙티브 그래프 렌더링)
-- [ ] 4.4 Confluence 임포트 UI (연결 설정, 스페이스 브라우저)
-- [ ] 4.5 마크다운 에디터 통합
-- [ ] 4.6 파일 업로드 UI
+- [x] 4.1 기본 대시보드 레이아웃 (문서 목록, 통계)
+- [x] 4.2 문서 상세 뷰 (원본 탭, 청크 탭, 메타데이터 탭)
+- [x] 4.3 그래프 시각화 탭 (인터랙티브 그래프 렌더링)
+- [x] 4.4 Confluence 임포트 UI (연결 설정, 스페이스 브라우저)
+- [x] 4.5 마크다운 에디터 통합
+- [x] 4.6 파일 업로드 UI
 
 ### Phase 5: MCP Server
 - [ ] 5.1 MCP 서버 기본 구조 (FastMCP, stdio 전송)
@@ -53,4 +53,4 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-11
-- 내용: Phase 3 전체 구현 완료 — llm_client.py, classifier.py, chunker.py, embedder.py, graph_extractor.py, graph_store.py, vector_store.py, pipeline.py + 테스트 74개 통과
+- 내용: Phase 4 전체 구현 완료 — FastAPI 웹 대시보드 (6개 서브태스크) + 테스트 19개 추가, 전체 93개 통과

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Context Loop{% endblock %}
+
+{% block content %}
+<h2>Dashboard</h2>
+
+<!-- 통계 카드 -->
+<section id="stats-area" hx-get="/partials/stats" hx-trigger="load" hx-swap="innerHTML">
+    <p aria-busy="true">Loading stats...</p>
+</section>
+
+<!-- 필터 + 업로드 -->
+<section x-data="{ sourceType: '', status: '' }" style="margin-top: 1.5rem;">
+    <div class="grid" style="grid-template-columns: 1fr 1fr 1fr auto; align-items: end;">
+        <label>
+            Source
+            <select x-model="sourceType"
+                    @change="htmx.ajax('GET', '/partials/document-list?source_type=' + sourceType + '&status=' + status, {target: '#doc-list', swap: 'innerHTML'})">
+                <option value="">All</option>
+                <option value="confluence">Confluence</option>
+                <option value="upload">Upload</option>
+                <option value="manual">Manual</option>
+            </select>
+        </label>
+        <label>
+            Status
+            <select x-model="status"
+                    @change="htmx.ajax('GET', '/partials/document-list?source_type=' + sourceType + '&status=' + status, {target: '#doc-list', swap: 'innerHTML'})">
+                <option value="">All</option>
+                <option value="pending">Pending</option>
+                <option value="processing">Processing</option>
+                <option value="completed">Completed</option>
+                <option value="failed">Failed</option>
+            </select>
+        </label>
+        <div></div>
+        <label>
+            Upload File
+            <input type="file" accept=".md,.txt,.html"
+                   @change="
+                       const file = $event.target.files[0];
+                       if (!file) return;
+                       const fd = new FormData();
+                       fd.append('file', file);
+                       fetch('/api/upload', {method: 'POST', body: fd})
+                           .then(r => { if (r.ok && r.headers.get('HX-Redirect')) window.location = r.headers.get('HX-Redirect'); else htmx.ajax('GET', '/partials/document-list?source_type=' + sourceType + '&status=' + status, {target: '#doc-list', swap: 'innerHTML'}); })
+                           .catch(e => console.error(e));
+                       $event.target.value = '';
+                   ">
+        </label>
+    </div>
+</section>
+
+<!-- 문서 목록 -->
+<section id="doc-list" hx-get="/partials/document-list" hx-trigger="load" hx-swap="innerHTML">
+    <p aria-busy="true">Loading documents...</p>
+</section>
+{% endblock %}

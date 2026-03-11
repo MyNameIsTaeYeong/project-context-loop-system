@@ -1,0 +1,55 @@
+<article>
+    <header><strong>Document Info</strong></header>
+    <table>
+        <tbody>
+            <tr><td>ID</td><td>{{ doc.id }}</td></tr>
+            <tr><td>Title</td><td>{{ doc.title }}</td></tr>
+            <tr><td>Source Type</td><td>{{ doc.source_type }}</td></tr>
+            {% if doc.source_id %}<tr><td>Source ID</td><td>{{ doc.source_id }}</td></tr>{% endif %}
+            {% if doc.url %}<tr><td>URL</td><td><a href="{{ doc.url }}" target="_blank">{{ doc.url }}</a></td></tr>{% endif %}
+            {% if doc.author %}<tr><td>Author</td><td>{{ doc.author }}</td></tr>{% endif %}
+            <tr><td>Version</td><td>{{ doc.version }}</td></tr>
+            <tr><td>Storage Method</td><td>{{ doc.storage_method or '-' }}</td></tr>
+            <tr><td>Status</td><td>{{ doc.status }}</td></tr>
+            <tr><td>Created</td><td>{{ doc.created_at }}</td></tr>
+            <tr><td>Updated</td><td>{{ doc.updated_at }}</td></tr>
+        </tbody>
+    </table>
+</article>
+
+{% if history %}
+<article>
+    <header><strong>Processing History</strong></header>
+    <table>
+        <thead>
+            <tr>
+                <th>Action</th>
+                <th>Storage Method</th>
+                <th>Status</th>
+                <th>Started</th>
+                <th>Completed</th>
+                <th>Error</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for h in history %}
+            <tr>
+                <td>{{ h.action }}</td>
+                <td>
+                    {% if h.prev_storage_method and h.prev_storage_method != h.new_storage_method %}
+                    {{ h.prev_storage_method }} &rarr;
+                    {% endif %}
+                    {{ h.new_storage_method or '-' }}
+                </td>
+                <td><span class="badge badge-{{ h.status }}">{{ h.status }}</span></td>
+                <td>{{ h.started_at[:16] if h.started_at else '-' }}</td>
+                <td>{{ h.completed_at[:16] if h.completed_at else '-' }}</td>
+                <td>{{ h.error_message or '' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</article>
+{% else %}
+<p>No processing history yet.</p>
+{% endif %}

@@ -1,0 +1,13 @@
+{% if has_graph %}
+<div id="graph-container" style="height: 500px; border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius);"></div>
+<script>
+    (function() {
+        const data = {{ graph_data | safe }};
+        if (typeof initGraph === 'function') {
+            initGraph('graph-container', data);
+        }
+    })();
+</script>
+{% else %}
+<p>No graph data. This document may use chunk storage or hasn't been processed yet.</p>
+{% endif %}
