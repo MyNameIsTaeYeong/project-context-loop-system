@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: 1 (기반 구조) → **완료**
-- **Step**: Phase 2 진입 준비
-- **상태**: Phase 1 전체 완료 (스캐폴딩, 설정, 인증, 메타데이터 저장소)
+- **Phase**: 2 (문서 입력 파이프라인) → **완료**
+- **Step**: Phase 3 진입 준비
+- **상태**: Phase 2 전체 완료 (파일 업로드, 에디터, Confluence 임포트, 증분 동기화, 재처리 파이프라인)
 
 ## Phase별 진행률
 
@@ -14,11 +14,11 @@
 - [x] 1.4 SQLite 메타데이터 저장소 세팅
 
 ### Phase 2: 문서 입력 파이프라인
-- [ ] 2.1 파일 업로드 처리 (MD/TXT/HTML → 원본 저장)
-- [ ] 2.2 마크다운 직접 작성 저장
-- [ ] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
-- [ ] 2.4 Confluence 증분 동기화
-- [ ] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
+- [x] 2.1 파일 업로드 처리 (MD/TXT/HTML → 원본 저장)
+- [x] 2.2 마크다운 직접 작성 저장
+- [x] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
+- [x] 2.4 Confluence 증분 동기화
+- [x] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
 
 ### Phase 3: LLM 저장 방식 판단 + 처리
 - [ ] 3.1 LLM Classifier 구현 (문서 분석 → chunk/graph/hybrid 판정)
@@ -53,4 +53,4 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-11
-- 내용: Phase 1 전체 구현 완료 — pyproject.toml, config.py, auth.py, metadata_store.py + 테스트 15개 통과
+- 내용: Phase 2 전체 구현 완료 — uploader.py, editor.py, confluence.py, sync/engine.py, processor/reprocessor.py + 테스트 43개 통과

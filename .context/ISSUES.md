@@ -20,6 +20,14 @@
 - 문서를 chunk/graph/hybrid로 판정하는 프롬프트의 정확도와 비용 최적화 필요
 - Phase 3.1 시작 시 프로토타이핑 및 테스트 필요
 
+### I-005: Confluence HTML→MD 변환 품질
+- 현재 정규식 기반 경량 변환 사용 — 복잡한 Confluence 매크로(표, 패널, 코드 블록 확장 등) 미지원
+- Phase 3 또는 4 시작 전에 markdownify 라이브러리 도입 여부 결정 필요
+
+### I-006: ConfluenceClient HTTP 연결 풀링
+- 현재 매 요청마다 httpx.AsyncClient를 생성함 — 대량 임포트 시 성능 저하 가능
+- Phase 4 이상에서 AsyncClient를 재사용하도록 리팩터링 고려
+
 ## 해결됨
 
 (아직 없음)
