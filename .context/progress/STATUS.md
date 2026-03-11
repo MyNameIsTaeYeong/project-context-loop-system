@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: 1 (기반 구조) → **완료**
-- **Step**: Phase 2 진입 준비
-- **상태**: Phase 1 전체 완료 (스캐폴딩, 설정, 인증, 메타데이터 저장소)
+- **Phase**: 3 (LLM 저장 방식 판단 + 처리) → **완료**
+- **Step**: Phase 4 진입 준비
+- **상태**: Phase 3 전체 완료 (LLM Classifier, 청킹, ChromaDB, 그래프 추출, GraphStore, 파이프라인 통합)
 
 ## Phase별 진행률
 
@@ -14,19 +14,19 @@
 - [x] 1.4 SQLite 메타데이터 저장소 세팅
 
 ### Phase 2: 문서 입력 파이프라인
-- [ ] 2.1 파일 업로드 처리 (MD/TXT/HTML → 원본 저장)
-- [ ] 2.2 마크다운 직접 작성 저장
-- [ ] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
-- [ ] 2.4 Confluence 증분 동기화
-- [ ] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
+- [x] 2.1 파일 업로드 처리 (MD/TXT/HTML → 원본 저장)
+- [x] 2.2 마크다운 직접 작성 저장
+- [x] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
+- [x] 2.4 Confluence 증분 동기화
+- [x] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
 
 ### Phase 3: LLM 저장 방식 판단 + 처리
-- [ ] 3.1 LLM Classifier 구현 (문서 분석 → chunk/graph/hybrid 판정)
-- [ ] 3.2 텍스트 청킹 모듈 (토큰 기반 분할)
-- [ ] 3.3 임베딩 + ChromaDB 벡터 저장
-- [ ] 3.4 그래프 엔티티/관계 추출 모듈
-- [ ] 3.5 그래프DB 저장 (NetworkX + SQLite)
-- [ ] 3.6 그래프 엔티티 병합 및 고아 엣지 정리 로직
+- [x] 3.1 LLM Classifier 구현 (문서 분석 → chunk/graph/hybrid 판정)
+- [x] 3.2 텍스트 청킹 모듈 (토큰 기반 분할)
+- [x] 3.3 임베딩 + ChromaDB 벡터 저장
+- [x] 3.4 그래프 엔티티/관계 추출 모듈
+- [x] 3.5 그래프DB 저장 (NetworkX + SQLite)
+- [x] 3.6 그래프 엔티티 병합 및 고아 엣지 정리 로직
 
 ### Phase 4: 웹 대시보드
 - [ ] 4.1 기본 대시보드 레이아웃 (문서 목록, 통계)
@@ -53,4 +53,4 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-11
-- 내용: Phase 1 전체 구현 완료 — pyproject.toml, config.py, auth.py, metadata_store.py + 테스트 15개 통과
+- 내용: Phase 3 전체 구현 완료 — llm_client.py, classifier.py, chunker.py, embedder.py, graph_extractor.py, graph_store.py, vector_store.py, pipeline.py + 테스트 74개 통과
