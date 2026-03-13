@@ -288,20 +288,46 @@ async def _run_pipeline(
     """백그라운드에서 파이프라인을 실행한다."""
     try:
         from context_loop.auth import get_token
-        from context_loop.processor.embedder import OpenAIEmbeddingClient
-        from context_loop.processor.llm_client import AnthropicClient, OpenAIClient
+        from context_loop.processor.embedder import (
+            EndpointEmbeddingClient,
+            LocalEmbeddingClient,
+            OpenAIEmbeddingClient,
+        )
+        from context_loop.processor.llm_client import (
+            AnthropicClient,
+            EndpointLLMClient,
+            OpenAIClient,
+        )
         from context_loop.processor.pipeline import PipelineConfig, process_document
 
-        provider = config.get("llm.provider", "openai")
-        if provider == "anthropic":
+        provider = config.get("llm.provider", "endpoint")
+        if provider == "endpoint":
+            llm_client = EndpointLLMClient(
+                endpoint=config.get("llm.endpoint", ""),
+                model=config.get("llm.model", ""),
+                api_key=config.get("llm.api_key", "none"),
+            )
+        elif provider == "anthropic":
             api_key = get_token("anthropic", "api_key")
             llm_client = AnthropicClient(api_key=api_key or "")
         else:
             api_key = get_token("openai", "api_key")
             llm_client = OpenAIClient(api_key=api_key or "")
 
-        embed_key = get_token("openai", "api_key")
-        embedding_client = OpenAIEmbeddingClient(api_key=embed_key or "")
+        embed_provider = config.get("processor.embedding_provider", "endpoint")
+        if embed_provider == "endpoint":
+            embedding_client = EndpointEmbeddingClient(
+                endpoint=config.get("processor.embedding_endpoint", ""),
+                model=config.get("processor.embedding_model", ""),
+                api_key=config.get("processor.embedding_api_key", "none"),
+            )
+        elif embed_provider == "local":
+            embedding_client = LocalEmbeddingClient(
+                model=config.get("processor.embedding_model", "all-MiniLM-L6-v2"),
+            )
+        else:
+            embed_key = get_token("openai", "api_key")
+            embedding_client = OpenAIEmbeddingClient(api_key=embed_key or "")
 
         pipeline_config = PipelineConfig(
             chunk_size=config.get("processor.chunk_size", 512),
