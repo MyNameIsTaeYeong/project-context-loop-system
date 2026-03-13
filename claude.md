@@ -353,8 +353,8 @@ context-loop/
 | 벡터 DB | ChromaDB | 로컬 임베디드 모드, pip install만으로 사용 |
 | 그래프 DB | NetworkX + SQLite 또는 Neo4j Embedded | 엔티티/관계 저장, 로컬 실행 |
 | 메타데이터 DB | SQLite | 파일 기반, 별도 서버 불필요 |
-| 임베딩 | OpenAI text-embedding-3-small 또는 로컬 모델 | 비용/성능 균형 |
-| LLM | OpenAI GPT-4o 또는 Claude | 저장 방식 판단 + RAG 응답 생성 |
+| 임베딩 | 자체 엔드포인트(OpenAI 호환) / OpenAI / 로컬 모델 | 자체 모델 서버 우선, OpenAI 호환 API 지원 |
+| LLM | 자체 엔드포인트(OpenAI 호환) / OpenAI GPT-4o / Claude | 자체 모델 서버 우선, OpenAI 호환 API 지원 |
 | MCP SDK | mcp (Python SDK) + FastMCP | MCP 프로토콜 서버 구현, stdio/SSE 전송 지원 |
 | 인증 저장 | keyring | OS 네이티브 키체인 연동 |
 | HTTP 클라이언트 | httpx | async 지원, Confluence API 호출용 |
@@ -382,12 +382,16 @@ processor:
   chunk_size: 512                         # 청크 토큰 수
   chunk_overlap: 50                       # 청크 간 겹침
   embedding_model: "text-embedding-3-small"
-  embedding_provider: "openai"            # "openai" | "local"
+  embedding_provider: "endpoint"          # "openai" | "local" | "endpoint"
+  embedding_endpoint: ""                  # embedding_provider: "endpoint"일 때 사용 (예: "http://localhost:8080/v1")
+  embedding_api_key: ""                   # 엔드포인트 인증 키 (불필요한 경우 빈 문자열)
 
 llm:
-  provider: "openai"                      # "openai" | "anthropic"
-  model: "gpt-4o"
-  api_key_storage: "keyring"
+  provider: "endpoint"                    # "openai" | "anthropic" | "endpoint"
+  model: ""                               # 사용할 모델 ID
+  endpoint: ""                            # provider: "endpoint"일 때 사용 (예: "http://localhost:11434/v1")
+  api_key: ""                             # 엔드포인트 인증 키 (불필요한 경우 빈 문자열)
+  api_key_storage: "keyring"              # provider: "openai" | "anthropic"일 때 keyring 사용
   classifier_prompt: "default"            # 저장 방식 판단 프롬프트
 
 storage:

@@ -1,7 +1,10 @@
 """임베딩 생성 모듈.
 
-OpenAI 또는 Anthropic(via OpenAI 호환) API를 통해 텍스트 임베딩을 생성한다.
+OpenAI API, 로컬 모델, 또는 OpenAI 호환 자체 엔드포인트를 통해 텍스트 임베딩을 생성한다.
 config.yaml의 processor.embedding_provider 설정을 따른다.
+- "openai": OpenAI Embeddings API (api_key 방식)
+- "local": sentence-transformers 로컬 모델
+- "endpoint": OpenAI 호환 자체 임베딩 서버 (endpoint URL 방식)
 """
 
 from __future__ import annotations
@@ -50,6 +53,43 @@ class OpenAIEmbeddingClient(EmbeddingClient):
     ) -> None:
         from openai import AsyncOpenAI  # noqa: PLC0415
         self._client = AsyncOpenAI(api_key=api_key)
+        self._model = model
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """배치 단위로 임베딩을 생성한다."""
+        if not texts:
+            return []
+        results: list[list[float]] = []
+        for i in range(0, len(texts), _BATCH_SIZE):
+            batch = texts[i : i + _BATCH_SIZE]
+            response = await self._client.embeddings.create(
+                input=batch,
+                model=self._model,
+            )
+            results.extend([item.embedding for item in response.data])
+        return results
+
+
+class EndpointEmbeddingClient(EmbeddingClient):
+    """OpenAI 호환 자체 임베딩 서버(엔드포인트) 기반 임베딩 클라이언트.
+
+    자체 호스팅된 임베딩 서버(vLLM, TEI 등 OpenAI 호환 API)와 통신한다.
+    API 키가 필요 없는 경우 api_key를 빈 문자열로 설정한다.
+
+    Args:
+        endpoint: 임베딩 서버 엔드포인트 URL (예: "http://localhost:8080/v1").
+        model: 사용할 임베딩 모델 ID.
+        api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        api_key: str = "none",
+    ) -> None:
+        from openai import AsyncOpenAI  # noqa: PLC0415
+        self._client = AsyncOpenAI(api_key=api_key or "none", base_url=endpoint)
         self._model = model
 
     async def embed(self, texts: list[str]) -> list[list[float]]:

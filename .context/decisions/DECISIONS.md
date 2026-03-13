@@ -82,3 +82,17 @@
 - **맥락**: 인터랙티브 그래프 시각화 라이브러리로 vis.js vs D3.js 중 선택 (I-002)
 - **결정**: vis.js (CDN)
 - **이유**: 네트워크 그래프에 특화되어 노드/엣지 렌더링, 줌/드래그/클릭 이벤트가 기본 제공. D3.js 대비 구현 공수가 현저히 적음. 현재 요구사항(엔티티-관계 그래프 시각화)에 충분.
+
+---
+
+## D-010: LLM·임베딩 모델 연동 방식 — Endpoint 방식 전환 (자체 모델 서버)
+
+- **일시**: 2026-03-13
+- **맥락**: 기존 OpenAI/Anthropic API Key 방식으로 구현되어 있었으나, 자체 호스팅 모델 서버(vLLM, Ollama, TEI 등)를 사용할 예정으로 변경 필요
+- **결정**: LLM과 임베딩 모두 OpenAI 호환 엔드포인트 URL 방식(`"endpoint"` provider)을 기본으로 채택. 기존 OpenAI/Anthropic API Key 방식도 하위 호환으로 유지.
+- **구현 내용**:
+  - `llm_client.py`: `EndpointLLMClient` 추가 — OpenAI 호환 API의 `base_url` 파라미터로 자체 서버 URL 지정
+  - `embedder.py`: `EndpointEmbeddingClient` 추가 — 동일 방식
+  - `config/default.yaml`: `llm.provider: "endpoint"`, `llm.endpoint`, `llm.api_key` 필드 추가; `processor.embedding_provider: "endpoint"`, `processor.embedding_endpoint`, `processor.embedding_api_key` 필드 추가
+  - `web/api/documents.py`: `_run_pipeline`에서 `"endpoint"` provider 분기 처리
+- **이유**: OpenAI SDK의 `base_url` 파라미터를 활용하면 vLLM, Ollama, HuggingFace TGI, TEI 등 OpenAI 호환 인터페이스를 제공하는 모든 자체 모델 서버와 동일한 코드로 연동 가능. API Key 없이도 동작하므로 사내 배포 시 보안 관리 부담 경감.

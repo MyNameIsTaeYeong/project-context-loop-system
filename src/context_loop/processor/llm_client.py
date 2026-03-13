@@ -1,7 +1,10 @@
 """LLM 클라이언트 추상화 레이어.
 
-OpenAI와 Anthropic API를 동일한 인터페이스로 래핑한다.
+OpenAI, Anthropic API 및 OpenAI 호환 자체 엔드포인트를 동일한 인터페이스로 래핑한다.
 config.yaml의 llm.provider 설정에 따라 적절한 구현체를 반환한다.
+- "openai": OpenAI API (api_key 방식)
+- "anthropic": Anthropic Claude API (api_key 방식)
+- "endpoint": OpenAI 호환 자체 모델 서버 (endpoint URL 방식)
 """
 
 from __future__ import annotations
@@ -84,6 +87,44 @@ class OpenAIClient(LLMClient):
     def __init__(self, api_key: str, model: str = "gpt-4o-mini") -> None:
         from openai import AsyncOpenAI  # noqa: PLC0415
         self._client = AsyncOpenAI(api_key=api_key)
+        self._model = model
+
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+    ) -> str:
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content or ""
+
+
+class EndpointLLMClient(LLMClient):
+    """OpenAI 호환 자체 모델 서버(엔드포인트) 기반 LLM 클라이언트.
+
+    자체 호스팅된 LLM 서버(vLLM, Ollama 등 OpenAI 호환 API)와 통신한다.
+    API 키가 필요 없는 경우 api_key를 빈 문자열로 설정한다.
+
+    Args:
+        endpoint: 모델 서버 엔드포인트 URL (예: "http://localhost:8080/v1").
+        model: 사용할 모델 ID.
+        api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
+    """
+
+    def __init__(self, endpoint: str, model: str, api_key: str = "none") -> None:
+        from openai import AsyncOpenAI  # noqa: PLC0415
+        self._client = AsyncOpenAI(api_key=api_key or "none", base_url=endpoint)
         self._model = model
 
     async def complete(
