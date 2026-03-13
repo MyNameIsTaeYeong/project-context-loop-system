@@ -9,9 +9,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from langchain_core.embeddings import Embeddings
+
 from context_loop.processor.chunker import chunk_text
 from context_loop.processor.classifier import StorageMethod, classify_document
-from context_loop.processor.embedder import EmbeddingClient
 from context_loop.processor.graph_extractor import extract_graph
 from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.reprocessor import (
@@ -47,7 +48,7 @@ async def process_document(
     vector_store: VectorStore,
     graph_store: GraphStore,
     llm_client: LLMClient,
-    embedding_client: EmbeddingClient,
+    embedding_client: Embeddings,
     config: PipelineConfig | None = None,
 ) -> dict[str, Any]:
     """단일 문서를 전체 파이프라인으로 처리한다.
@@ -112,7 +113,7 @@ async def process_document(
             )
             if chunks:
                 texts = [c.content for c in chunks]
-                embeddings = await embedding_client.embed(texts)
+                embeddings = await embedding_client.aembed_documents(texts)
 
                 # 벡터DB 저장
                 chunk_ids = [c.id for c in chunks]

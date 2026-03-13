@@ -21,9 +21,54 @@ logger = logging.getLogger(__name__)
 _WEB_DIR = Path(__file__).resolve().parent
 
 
+def _build_llm_client(config: Config):
+    """설정에 따라 LLM 클라이언트를 생성한다."""
+    from context_loop.auth import get_token
+    from context_loop.processor.llm_client import AnthropicClient, EndpointLLMClient, OpenAIClient
+
+    provider = config.get("llm.provider", "endpoint")
+    if provider == "endpoint":
+        return EndpointLLMClient(
+            endpoint=config.get("llm.endpoint", ""),
+            model=config.get("llm.model", ""),
+            api_key=config.get("llm.api_key", ""),
+        )
+    if provider == "anthropic":
+        api_key = get_token("anthropic", "api_key")
+        return AnthropicClient(api_key=api_key or "")
+    # openai
+    api_key = get_token("openai", "api_key")
+    return OpenAIClient(api_key=api_key or "")
+
+
+def _build_embedding_client(config: Config):
+    """설정에 따라 임베딩 클라이언트를 생성한다."""
+    from context_loop.processor.embedder import EndpointEmbeddingClient, LocalEmbeddingClient
+
+    embed_provider = config.get("processor.embedding_provider", "endpoint")
+    if embed_provider == "endpoint":
+        return EndpointEmbeddingClient(
+            endpoint=config.get("processor.embedding_endpoint", ""),
+            model=config.get("processor.embedding_model", ""),
+            api_key=config.get("processor.embedding_api_key", ""),
+        )
+    if embed_provider == "local":
+        return LocalEmbeddingClient(
+            model=config.get("processor.embedding_model", "all-MiniLM-L6-v2"),
+        )
+    # openai (legacy): OpenAI 호환 엔드포인트로 라우팅
+    from context_loop.auth import get_token
+    api_key = get_token("openai", "api_key") or ""
+    return EndpointEmbeddingClient(
+        endpoint="https://api.openai.com/v1",
+        model=config.get("processor.embedding_model", "text-embedding-3-small"),
+        api_key=api_key,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """앱 시작/종료 시 스토어를 초기화/정리한다."""
+    """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
     config = Config()
     data_dir = config.data_dir
 
@@ -36,12 +81,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     graph_store = GraphStore(meta_store)
     await graph_store.load_from_db()
 
+    llm_client = _build_llm_client(config)
+    embedding_client = _build_embedding_client(config)
+
     app.state.config = config
     app.state.meta_store = meta_store
     app.state.vector_store = vector_store
     app.state.graph_store = graph_store
+    app.state.llm_client = llm_client
+    app.state.embedding_client = embedding_client
 
-    logger.info("웹 대시보드 스토어 초기화 완료.")
+    logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
 
     await meta_store.close()

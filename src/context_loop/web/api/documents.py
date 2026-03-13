@@ -6,15 +6,19 @@ import json
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request, Response
+from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.editor import save_document
+from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
 from context_loop.web.dependencies import (
     get_config,
+    get_embedding_client,
     get_graph_store,
+    get_llm_client,
     get_meta_store,
     get_templates,
     get_vector_store,
@@ -265,6 +269,8 @@ async def trigger_processing(
     vector_store: VectorStore = Depends(get_vector_store),
     graph_store: GraphStore = Depends(get_graph_store),
     config: Config = Depends(get_config),
+    llm_client: LLMClient = Depends(get_llm_client),
+    embedding_client: Embeddings = Depends(get_embedding_client),
 ):
     """문서 처리를 백그라운드로 실행한다."""
     doc = await meta_store.get_document(document_id)
@@ -273,7 +279,9 @@ async def trigger_processing(
 
     await meta_store.update_document_status(document_id, "processing")
     background_tasks.add_task(
-        _run_pipeline, document_id, meta_store, vector_store, graph_store, config,
+        _run_pipeline,
+        document_id, meta_store, vector_store, graph_store, config,
+        llm_client, embedding_client,
     )
     return {"status": "processing", "document_id": document_id}
 
@@ -284,50 +292,12 @@ async def _run_pipeline(
     vector_store: VectorStore,
     graph_store: GraphStore,
     config: Config,
+    llm_client: LLMClient,
+    embedding_client: Embeddings,
 ) -> None:
     """백그라운드에서 파이프라인을 실행한다."""
     try:
-        from context_loop.auth import get_token
-        from context_loop.processor.embedder import (
-            EndpointEmbeddingClient,
-            LocalEmbeddingClient,
-            OpenAIEmbeddingClient,
-        )
-        from context_loop.processor.llm_client import (
-            AnthropicClient,
-            EndpointLLMClient,
-            OpenAIClient,
-        )
         from context_loop.processor.pipeline import PipelineConfig, process_document
-
-        provider = config.get("llm.provider", "endpoint")
-        if provider == "endpoint":
-            llm_client = EndpointLLMClient(
-                endpoint=config.get("llm.endpoint", ""),
-                model=config.get("llm.model", ""),
-                api_key=config.get("llm.api_key", "none"),
-            )
-        elif provider == "anthropic":
-            api_key = get_token("anthropic", "api_key")
-            llm_client = AnthropicClient(api_key=api_key or "")
-        else:
-            api_key = get_token("openai", "api_key")
-            llm_client = OpenAIClient(api_key=api_key or "")
-
-        embed_provider = config.get("processor.embedding_provider", "endpoint")
-        if embed_provider == "endpoint":
-            embedding_client = EndpointEmbeddingClient(
-                endpoint=config.get("processor.embedding_endpoint", ""),
-                model=config.get("processor.embedding_model", ""),
-                api_key=config.get("processor.embedding_api_key", "none"),
-            )
-        elif embed_provider == "local":
-            embedding_client = LocalEmbeddingClient(
-                model=config.get("processor.embedding_model", "all-MiniLM-L6-v2"),
-            )
-        else:
-            embed_key = get_token("openai", "api_key")
-            embedding_client = OpenAIEmbeddingClient(api_key=embed_key or "")
 
         pipeline_config = PipelineConfig(
             chunk_size=config.get("processor.chunk_size", 512),

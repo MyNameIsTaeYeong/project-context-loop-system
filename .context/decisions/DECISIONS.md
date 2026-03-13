@@ -96,3 +96,21 @@
   - `config/default.yaml`: `llm.provider: "endpoint"`, `llm.endpoint`, `llm.api_key` 필드 추가; `processor.embedding_provider: "endpoint"`, `processor.embedding_endpoint`, `processor.embedding_api_key` 필드 추가
   - `web/api/documents.py`: `_run_pipeline`에서 `"endpoint"` provider 분기 처리
 - **이유**: OpenAI SDK의 `base_url` 파라미터를 활용하면 vLLM, Ollama, HuggingFace TGI, TEI 등 OpenAI 호환 인터페이스를 제공하는 모든 자체 모델 서버와 동일한 코드로 연동 가능. API Key 없이도 동작하므로 사내 배포 시 보안 관리 부담 경감.
+
+---
+
+## D-011: LLM·임베딩 클라이언트 의존성 주입(DI) 전환 + Embedding langchain_core 표준화
+
+- **일시**: 2026-03-13
+- **맥락**: 기존에는 `_run_pipeline` 내부에서 config를 읽어 LLM/임베딩 클라이언트를 직접 생성했음. 향후 LLM·임베딩을 Agent로 구성하여 교체할 예정이므로 외부 주입 방식이 필요. 임베딩은 langchain 생태계와 통합 가능하도록 표준 인터페이스 채택이 필요.
+- **결정**:
+  1. 앱 시작(lifespan)에서 LLM·임베딩 클라이언트를 한 번 생성하여 `app.state`에 저장, FastAPI DI로 주입
+  2. 임베딩 클라이언트를 `langchain_core.embeddings.Embeddings` 상속으로 재구현, httpx REST 직접 호출 방식 채택
+- **구현 내용**:
+  - `app.py`: lifespan에 `_build_llm_client`, `_build_embedding_client` 팩토리 함수 추가, `app.state.llm_client` / `app.state.embedding_client` 저장
+  - `dependencies.py`: `get_llm_client`, `get_embedding_client` DI 함수 추가
+  - `documents.py`: `trigger_processing`에서 클라이언트를 DI로 주입받아 `_run_pipeline`에 전달. 클라이언트 생성 로직 완전 제거
+  - `embedder.py`: `EmbeddingClient` ABC 제거. `EndpointEmbeddingClient(Embeddings)` — httpx로 OpenAI 호환 REST 직접 호출, 동기/비동기 모두 구현. `LocalEmbeddingClient(Embeddings)` 동일 인터페이스로 재구현
+  - `pipeline.py`: `EmbeddingClient` → `Embeddings` 타입으로 교체, `embed()` → `aembed_documents()` 호출
+  - `pyproject.toml`: `langchain-core>=0.3.0` 의존성 추가
+- **이유**: DI 방식으로 전환하면 클라이언트 구현체를 Agent 기반 등으로 자유롭게 교체 가능. `langchain_core.embeddings.Embeddings` 인터페이스를 따르면 langchain 생태계의 다양한 임베딩 구현체(OpenAIEmbeddings, HuggingFaceEmbeddings 등)와 바로 교환 가능. httpx 직접 호출은 OpenAI SDK 의존 없이 순수 REST로 동작해 서버 호환성이 더 넓음.
