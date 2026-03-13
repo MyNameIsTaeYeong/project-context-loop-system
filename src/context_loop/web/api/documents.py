@@ -229,12 +229,6 @@ async def update_document_api(
     result = await save_document(
         meta_store, title=title, content=content, document_id=document_id,
     )
-    # save_document은 title을 업데이트하지 않으므로 별도 갱신
-    await meta_store.db.execute(
-        "UPDATE documents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (title, document_id),
-    )
-    await meta_store.db.commit()
     response = Response(status_code=204)
     response.headers["HX-Redirect"] = f"/documents/{document_id}"
     return response

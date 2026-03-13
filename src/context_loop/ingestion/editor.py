@@ -67,14 +67,15 @@ async def save_document(
     if existing is None:
         raise ValueError(f"문서를 찾을 수 없습니다: document_id={document_id}")
 
-    if existing["content_hash"] == content_hash:
+    if existing["content_hash"] == content_hash and existing["title"] == title:
         return {**existing, "created": False, "changed": False}
 
-    # 내용 변경
+    # 내용 또는 제목 변경
     await store.update_document_content(
         document_id,
         original_content=content,
         content_hash=content_hash,
+        title=title,
     )
     await store.update_document_status(document_id, status="changed")
     await store.add_processing_history(

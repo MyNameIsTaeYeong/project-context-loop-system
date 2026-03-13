@@ -183,15 +183,25 @@ class MetadataStore:
         document_id: int,
         original_content: str,
         content_hash: str,
+        title: str | None = None,
     ) -> None:
         """문서 원본 내용과 해시를 갱신한다."""
-        await self.db.execute(
-            """UPDATE documents
-               SET original_content = ?, content_hash = ?, version = version + 1,
-                   status = 'processing', updated_at = CURRENT_TIMESTAMP
-               WHERE id = ?""",
-            (original_content, content_hash, document_id),
-        )
+        if title is not None:
+            await self.db.execute(
+                """UPDATE documents
+                   SET original_content = ?, content_hash = ?, title = ?,
+                       version = version + 1, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (original_content, content_hash, title, document_id),
+            )
+        else:
+            await self.db.execute(
+                """UPDATE documents
+                   SET original_content = ?, content_hash = ?, version = version + 1,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (original_content, content_hash, document_id),
+            )
         await self.db.commit()
 
     async def delete_document(self, document_id: int) -> None:

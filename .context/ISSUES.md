@@ -20,11 +20,6 @@
 - 현재 매 요청마다 httpx.AsyncClient를 생성함 — 대량 임포트 시 성능 저하 가능
 - Phase 4 이상에서 AsyncClient를 재사용하도록 리팩터링 고려
 
-### I-007: save_document title 업데이트 미지원
-- `ingestion/editor.py`의 `save_document()`가 기존 문서 수정 시 title을 업데이트하지 않음
-- 현재 `web/api/documents.py`에서 직접 SQL UPDATE로 우회 중
-- editor.py 자체를 수정하여 title 업데이트를 지원하는 것이 바람직
-
 ## 해결됨
 
 ### I-001: 웹 프레임워크 최종 선택 → FastAPI + Jinja2 + HTMX
@@ -34,3 +29,9 @@
 ### I-002: 그래프 시각화 라이브러리 → vis.js
 - 2026-03-11 결정: vis.js (CDN)
 - 네트워크 그래프에 특화, 구현 공수 적음, 기본 인터랙션(줌/드래그/클릭) 제공
+
+### I-007: save_document title 업데이트 미지원
+- `ingestion/editor.py`의 `save_document()`가 기존 문서 수정 시 title을 업데이트하지 않음
+- `web/api/documents.py`에서 직접 SQL UPDATE로 우회하던 것을 제거
+- `update_document_content()`에 `title` 파라미터 추가하여 editor.py에서 직접 처리하도록 수정
+- EasyMDE 내용이 HTMX 제출 시 textarea에 동기화되지 않는 버그도 함께 수정 (editor.js)
