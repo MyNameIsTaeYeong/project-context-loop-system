@@ -556,6 +556,28 @@ CREATE TABLE processing_history (
 
 ---
 
+## 로컬 환경 설정 및 실행
+
+자세한 설치·실행 방법은 **[docs/setup.md](docs/setup.md)** 를 참조한다.
+
+### 빠른 시작 요약
+
+```bash
+# 1. 가상환경 생성 및 패키지 설치
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+
+# 2. 설정 파일 초기화
+mkdir -p ~/.context-loop && cp config/default.yaml ~/.context-loop/config.yaml
+
+# 3. 웹 대시보드 실행 (--factory 플래그 필수)
+python3 -m uvicorn "context_loop.web.app:create_app" --factory --host 127.0.0.1 --port 8000 --reload
+```
+
+> `context_loop.web.app:app` 형태로 실행하면 에러가 발생한다. 반드시 `create_app` + `--factory` 사용.
+
+---
+
 ## 세션 간 Context 관리
 
 ### 목적
