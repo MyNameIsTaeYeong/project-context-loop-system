@@ -18,13 +18,10 @@ document.addEventListener("DOMContentLoaded", function() {
         ]
     });
 
-    // HTMX는 폼 데이터를 먼저 수집한 뒤 htmx:configRequest를 발생시킨다.
-    // codemirror.save()로는 이미 수집된 파라미터를 바꿀 수 없으므로,
-    // evt.detail.parameters를 직접 수정해 EasyMDE 내용을 주입한다.
-    var form = textarea.closest("form");
-    if (form) {
-        form.addEventListener("htmx:configRequest", function(evt) {
-            evt.detail.parameters["content"] = easyMDE.value();
-        });
-    }
+    // EasyMDE가 변경될 때마다 원본 textarea에 동기화한다.
+    // HTMX는 FormData(form)로 폼 데이터를 수집하므로,
+    // textarea 값이 최신 상태여야 PUT 요청에 내용이 포함된다.
+    easyMDE.codemirror.on("change", function() {
+        easyMDE.codemirror.save();
+    });
 });
