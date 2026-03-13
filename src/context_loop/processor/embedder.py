@@ -41,7 +41,7 @@ class EndpointEmbeddingClient(Embeddings):
         api_key: str = "",
         timeout: float = 60.0,
     ) -> None:
-        self._url = endpoint.rstrip("/") + "/embeddings"
+        self._url = endpoint
         self._model = model
         self._timeout = timeout
         self._headers: dict[str, str] = {"Content-Type": "application/json"}
