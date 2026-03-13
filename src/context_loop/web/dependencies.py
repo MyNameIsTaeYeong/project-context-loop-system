@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from fastapi import Request
 from fastapi.templating import Jinja2Templates
+from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
+from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -29,3 +31,13 @@ def get_graph_store(request: Request) -> GraphStore:
 
 def get_templates(request: Request) -> Jinja2Templates:
     return request.app.state.templates
+
+
+def get_llm_client(request: Request) -> LLMClient:
+    """앱 시작 시 생성된 LLM 클라이언트를 반환한다."""
+    return request.app.state.llm_client
+
+
+def get_embedding_client(request: Request) -> Embeddings:
+    """앱 시작 시 생성된 임베딩 클라이언트를 반환한다."""
+    return request.app.state.embedding_client
