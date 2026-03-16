@@ -4,7 +4,7 @@ document.addEventListener("DOMContentLoaded", function() {
     var textarea = document.getElementById("editor-content");
     if (!textarea) return;
 
-    new EasyMDE({
+    var easyMDE = new EasyMDE({
         element: textarea,
         spellChecker: false,
         autosave: { enabled: false },
@@ -16,5 +16,12 @@ document.addEventListener("DOMContentLoaded", function() {
             "preview", "side-by-side", "fullscreen", "|",
             "guide"
         ]
+    });
+
+    // HTMX 폼 제출 전에 EasyMDE 내용을 textarea에 동기화
+    document.body.addEventListener("htmx:configRequest", function(event) {
+        if (event.detail.parameters && "content" in event.detail.parameters) {
+            event.detail.parameters["content"] = easyMDE.value();
+        }
     });
 });
