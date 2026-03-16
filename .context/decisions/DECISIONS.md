@@ -114,3 +114,31 @@
   - `pipeline.py`: `EmbeddingClient` → `Embeddings` 타입으로 교체, `embed()` → `aembed_documents()` 호출
   - `pyproject.toml`: `langchain-core>=0.3.0` 의존성 추가
 - **이유**: DI 방식으로 전환하면 클라이언트 구현체를 Agent 기반 등으로 자유롭게 교체 가능. `langchain_core.embeddings.Embeddings` 인터페이스를 따르면 langchain 생태계의 다양한 임베딩 구현체(OpenAIEmbeddings, HuggingFaceEmbeddings 등)와 바로 교환 가능. httpx 직접 호출은 OpenAI SDK 의존 없이 순수 REST로 동작해 서버 호환성이 더 넓음.
+
+---
+
+## D-012: MCP Server — FastMCP + context_assembler 아키텍처
+
+- **일시**: 2026-03-16
+- **맥락**: Phase 5에서 MCP Server를 구현할 때, MCP SDK 활용 방식과 컨텍스트 검색 로직의 재사용성을 결정해야 함
+- **결정**: FastMCP 기반 서버 + context_assembler 모듈 분리. 벡터 검색과 그래프 탐색을 결합하는 로직을 `context_assembler.py`로 분리하여 MCP Tool과 웹 채팅 API 모두에서 재사용.
+- **구현 내용**:
+  - `mcp/server.py`: FastMCP 서버 메인 — stdio/SSE 전송, 저장소 초기화
+  - `mcp/tools.py`: 4개 MCP Tool 등록 (search_context, list_documents, get_document, get_graph_context)
+  - `mcp/context_assembler.py`: 벡터 검색 + 그래프 탐색 결과 병합·포맷팅, 출처 정보 추출
+  - `pyproject.toml`: `mcp>=1.0.0` 의존성 추가
+- **이유**: context_assembler를 독립 모듈로 분리하면 MCP Tool과 웹 API 양쪽에서 동일한 검색 로직을 호출할 수 있어 코드 중복 방지. FastMCP는 Python SDK에서 제공하는 고수준 API로 Tool 등록이 데코레이터 한 줄로 가능.
+
+---
+
+## D-013: 채팅 인터페이스 — Alpine.js + JSON API 방식
+
+- **일시**: 2026-03-16
+- **맥락**: Phase 6에서 대시보드 내 채팅 인터페이스 구현 시 프론트엔드 접근 방식 선택 필요. HTMX SSE 스트리밍 vs Alpine.js + JSON API fetch 중 선택.
+- **결정**: Alpine.js 기반 클라이언트 + POST /api/chat JSON API 방식 채택. 스트리밍 없이 전체 응답을 한 번에 반환.
+- **구현 내용**:
+  - `web/api/chat.py`: 채팅 API 엔드포인트 — RAG 파이프라인 (context_assembler 재사용 → LLM 호출 → 답변 + 출처 반환)
+  - `templates/chat.html`: Alpine.js x-data로 메시지 상태 관리, 출처 링크 표시
+  - `static/js/chat.js`: chatApp() Alpine 컴포넌트 — fetch API 호출, 메시지 렌더링
+  - `context_assembler.py`: `assemble_context_with_sources()` 함수 추가 — 출처 정보(document_id, title, similarity) 포함 반환
+- **이유**: 현재 LLM API가 스트리밍을 필수로 하지 않으므로 전체 응답 방식이 구현 단순. 출처 표시를 위해 JSON 구조가 필요하므로 HTMX 파셜보다 JSON API가 적합. Alpine.js는 이미 프로젝트에서 사용 중이라 추가 의존성 없음.

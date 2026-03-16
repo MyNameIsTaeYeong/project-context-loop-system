@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}Chat — Context Loop{% endblock %}
+
+{% block content %}
+<h2>Chat</h2>
+<p>등록된 사내 문서를 기반으로 질문에 답변합니다.</p>
+
+<div id="chat-app" x-data="chatApp()">
+    <!-- 메시지 영역 -->
+    <div id="chat-messages" style="min-height: 300px; max-height: 60vh; overflow-y: auto; border: 1px solid var(--pico-muted-border-color); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem;">
+        <template x-if="messages.length === 0">
+            <p style="color: var(--pico-muted-color); text-align: center; margin-top: 2rem;">
+                질문을 입력하면 등록된 문서에서 관련 정보를 찾아 답변합니다.
+            </p>
+        </template>
+        <template x-for="(msg, idx) in messages" :key="idx">
+            <div :class="'chat-message chat-' + msg.role" style="margin-bottom: 1rem;">
+                <div style="display: flex; align-items: flex-start; gap: 0.5rem;">
+                    <strong x-text="msg.role === 'user' ? 'Q' : 'A'" style="min-width: 1.5rem; text-align: center; padding: 0.15rem 0.4rem; border-radius: 0.25rem; font-size: 0.8rem;" :style="msg.role === 'user' ? 'background:#e2e3e5;color:#383d41' : 'background:#d4edda;color:#155724'"></strong>
+                    <div style="flex: 1;">
+                        <div x-html="renderMarkdown(msg.content)"></div>
+                        <!-- 출처 표시 -->
+                        <template x-if="msg.sources && msg.sources.length > 0">
+                            <div class="chat-sources" style="margin-top: 0.5rem; padding: 0.5rem; background: var(--pico-card-background-color); border-radius: 0.25rem; font-size: 0.85rem;">
+                                <strong>출처:</strong>
+                                <template x-for="(src, si) in msg.sources" :key="si">
+                                    <a :href="'/documents/' + src.document_id" style="margin-left: 0.5rem; text-decoration: underline;" x-text="src.title + ' (' + (src.similarity * 100).toFixed(0) + '%)'"></a>
+                                </template>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+        </template>
+        <!-- 로딩 표시 -->
+        <template x-if="loading">
+            <div style="text-align: center; color: var(--pico-muted-color);">
+                <span aria-busy="true">답변 생성 중...</span>
+            </div>
+        </template>
+    </div>
+
+    <!-- 입력 영역 -->
+    <form @submit.prevent="sendMessage" style="display: flex; gap: 0.5rem;">
+        <input type="text" x-model="input" placeholder="질문을 입력하세요..." :disabled="loading" style="flex: 1;" autofocus>
+        <button type="submit" :disabled="loading || !input.trim()" :aria-busy="loading">전송</button>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/chat.js"></script>
+{% endblock %}
