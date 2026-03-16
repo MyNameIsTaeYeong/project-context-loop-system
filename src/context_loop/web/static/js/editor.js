@@ -19,9 +19,10 @@ document.addEventListener("DOMContentLoaded", function() {
     });
 
     // HTMX 폼 제출 전에 EasyMDE 내용을 textarea에 동기화
+    // HTMX 2.x에서 parameters는 FormData 객체이므로 .set() 사용
     document.body.addEventListener("htmx:configRequest", function(event) {
-        if (event.detail.parameters && "content" in event.detail.parameters) {
-            event.detail.parameters["content"] = easyMDE.value();
+        if (event.detail.parameters instanceof FormData && event.detail.parameters.has("content")) {
+            event.detail.parameters.set("content", easyMDE.value());
         }
     });
 });
