@@ -3,12 +3,15 @@
 NetworkX로 인메모리 그래프를 관리하고,
 SQLite(MetadataStore)에 영속 저장한다.
 엔티티 병합 및 고아 엣지 정리 로직을 포함한다.
+LLM 기반 탐색을 위한 그래프 스키마 요약을 제공한다.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+from collections import Counter
 from typing import Any
 
 import networkx as nx
@@ -19,11 +22,22 @@ from context_loop.storage.metadata_store import MetadataStore
 logger = logging.getLogger(__name__)
 
 
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """두 벡터의 코사인 유사도를 계산한다."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 class GraphStore:
     """NetworkX + SQLite 기반 그래프 저장소.
 
     SQLite(MetadataStore)가 진실의 원천(source of truth)이다.
     NetworkX 그래프는 검색/탐색용 인메모리 인덱스 역할을 한다.
+    LLM 기반 그래프 탐색을 위한 스키마 요약을 제공한다.
 
     Args:
         store: 초기화된 MetadataStore 인스턴스.
@@ -32,6 +46,8 @@ class GraphStore:
     def __init__(self, store: MetadataStore) -> None:
         self._store = store
         self._graph: nx.DiGraph = nx.DiGraph()
+        # 엔티티 임베딩 캐시: node_id → (entity_name, embedding)
+        self._entity_embeddings: dict[int, tuple[str, list[float]]] = {}
 
     async def load_from_db(self) -> None:
         """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다."""
@@ -58,6 +74,7 @@ class GraphStore:
                     document_id=edge["document_id"],
                     properties=json.loads(edge["properties"] or "{}"),
                 )
+        self._entity_embeddings.clear()
         logger.debug(
             "그래프 로드 완료 — 노드: %d, 엣지: %d",
             self._graph.number_of_nodes(),
@@ -131,6 +148,10 @@ class GraphStore:
             )
             edge_count += 1
 
+        # 새 노드의 임베딩 캐시 무효화 (다음 build_entity_embeddings 호출 시 재생성)
+        for name, nid in name_to_node_id.items():
+            self._entity_embeddings.pop(nid, None)
+
         logger.info(
             "그래프 저장 완료 — document_id=%d, 노드: %d, 엣지: %d",
             document_id,
@@ -161,6 +182,10 @@ class GraphStore:
             if not self._graph.has_node(u) or not self._graph.has_node(v)
         ]
         self._graph.remove_edges_from(orphan_edges)
+
+        # 삭제된 노드의 임베딩 캐시도 제거
+        for nid in nodes_to_remove:
+            self._entity_embeddings.pop(nid, None)
 
         logger.debug("그래프 삭제 완료: document_id=%d", document_id)
 
@@ -233,3 +258,188 @@ class GraphStore:
             "nodes": self._graph.number_of_nodes(),
             "edges": self._graph.number_of_edges(),
         }
+
+    # --- LLM 기반 그래프 탐색 지원 ---
+
+    def get_schema_summary(self, max_entities_per_type: int = 10) -> dict[str, Any]:
+        """LLM에게 제공할 그래프 스키마 요약을 생성한다.
+
+        그래프의 구조(엔티티 유형, 관계 유형, 대표 엔티티 목록)를
+        LLM이 탐색 계획을 세울 수 있는 형태로 요약한다.
+
+        Args:
+            max_entities_per_type: 유형별 최대 엔티티 표시 수.
+
+        Returns:
+            {
+                "total_nodes": int,
+                "total_edges": int,
+                "entity_types": {"type": count, ...},
+                "relation_types": {"type": count, ...},
+                "entities_by_type": {"type": ["name1", "name2", ...], ...},
+                "sample_relations": [{"source", "target", "type"}, ...]
+            }
+        """
+        if self._graph.number_of_nodes() == 0:
+            return {
+                "total_nodes": 0,
+                "total_edges": 0,
+                "entity_types": {},
+                "relation_types": {},
+                "entities_by_type": {},
+                "sample_relations": [],
+            }
+
+        # 엔티티 유형별 집계
+        type_counter: Counter[str] = Counter()
+        entities_by_type: dict[str, list[str]] = {}
+        for _, data in self._graph.nodes(data=True):
+            etype = data.get("entity_type", "other")
+            ename = data.get("entity_name", "")
+            type_counter[etype] += 1
+            if etype not in entities_by_type:
+                entities_by_type[etype] = []
+            if len(entities_by_type[etype]) < max_entities_per_type:
+                entities_by_type[etype].append(ename)
+
+        # 관계 유형별 집계
+        rel_counter: Counter[str] = Counter()
+        sample_relations: list[dict[str, str]] = []
+        for u, v, data in self._graph.edges(data=True):
+            rtype = data.get("relation_type", "related_to")
+            rel_counter[rtype] += 1
+            if len(sample_relations) < 15:
+                src_name = self._graph.nodes[u].get("entity_name", str(u))
+                tgt_name = self._graph.nodes[v].get("entity_name", str(v))
+                sample_relations.append({
+                    "source": src_name,
+                    "target": tgt_name,
+                    "type": rtype,
+                })
+
+        return {
+            "total_nodes": self._graph.number_of_nodes(),
+            "total_edges": self._graph.number_of_edges(),
+            "entity_types": dict(type_counter.most_common()),
+            "relation_types": dict(rel_counter.most_common()),
+            "entities_by_type": entities_by_type,
+            "sample_relations": sample_relations,
+        }
+
+    def format_schema_for_llm(self, max_entities_per_type: int = 10) -> str:
+        """LLM 프롬프트에 삽입할 그래프 스키마 요약 텍스트를 생성한다.
+
+        Args:
+            max_entities_per_type: 유형별 최대 엔티티 표시 수.
+
+        Returns:
+            사람이 읽기 쉬운 스키마 요약 텍스트.
+        """
+        summary = self.get_schema_summary(max_entities_per_type)
+        if summary["total_nodes"] == 0:
+            return "그래프가 비어 있습니다."
+
+        lines = [
+            f"# 지식 그래프 구조 (노드: {summary['total_nodes']}개, 엣지: {summary['total_edges']}개)",
+            "",
+            "## 엔티티 유형별 목록",
+        ]
+        for etype, names in summary["entities_by_type"].items():
+            count = summary["entity_types"].get(etype, 0)
+            truncated = f" (외 {count - len(names)}개)" if count > len(names) else ""
+            lines.append(f"- **{etype}** ({count}개): {', '.join(names)}{truncated}")
+
+        if summary["relation_types"]:
+            lines.append("")
+            lines.append("## 관계 유형")
+            for rtype, count in summary["relation_types"].items():
+                lines.append(f"- {rtype}: {count}건")
+
+        if summary["sample_relations"]:
+            lines.append("")
+            lines.append("## 관계 예시")
+            for rel in summary["sample_relations"][:10]:
+                lines.append(f"- {rel['source']} --[{rel['type']}]--> {rel['target']}")
+
+        return "\n".join(lines)
+
+    # --- 엔티티 임베딩 기반 유사도 검색 ---
+
+    async def build_entity_embeddings(self, embedding_client: Any) -> int:
+        """모든 엔티티 이름의 임베딩을 생성하여 캐시한다.
+
+        이미 캐시된 노드는 건너뛴다.
+
+        Args:
+            embedding_client: Embeddings 인터페이스 구현체.
+
+        Returns:
+            새로 임베딩된 엔티티 수.
+        """
+        # 캐시에 없는 노드만 수집
+        missing: list[tuple[int, str]] = []
+        for node_id, data in self._graph.nodes(data=True):
+            if node_id not in self._entity_embeddings:
+                name = data.get("entity_name", "")
+                if name:
+                    missing.append((node_id, name))
+
+        if not missing:
+            return 0
+
+        names = [name for _, name in missing]
+        try:
+            embeddings = await embedding_client.aembed_documents(names)
+        except Exception:
+            logger.warning("엔티티 임베딩 생성 실패", exc_info=True)
+            return 0
+
+        for (node_id, name), emb in zip(missing, embeddings):
+            self._entity_embeddings[node_id] = (name, emb)
+
+        logger.debug("엔티티 임베딩 캐시 구축: %d개 추가 (총 %d개)", len(missing), len(self._entity_embeddings))
+        return len(missing)
+
+    def search_entities_by_embedding(
+        self,
+        query_embedding: list[float],
+        threshold: float = 0.7,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """질의 임베딩과 유사한 엔티티를 검색한다.
+
+        Args:
+            query_embedding: 질의 텍스트의 임베딩 벡터.
+            threshold: 최소 코사인 유사도 임계값.
+            top_k: 반환할 최대 엔티티 수.
+
+        Returns:
+            유사도 내림차순 정렬된 엔티티 목록.
+            각 항목: {"node_id", "entity_name", "entity_type", "similarity"}
+        """
+        if not self._entity_embeddings:
+            return []
+
+        scored: list[tuple[float, int, str]] = []
+        for node_id, (name, emb) in self._entity_embeddings.items():
+            sim = _cosine_similarity(query_embedding, emb)
+            if sim >= threshold:
+                scored.append((sim, node_id, name))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        results: list[dict[str, Any]] = []
+        for sim, node_id, name in scored[:top_k]:
+            data = dict(self._graph.nodes[node_id])
+            results.append({
+                "node_id": node_id,
+                "entity_name": name,
+                "entity_type": data.get("entity_type", ""),
+                "similarity": sim,
+            })
+        return results
+
+    @property
+    def entity_embedding_count(self) -> int:
+        """캐시된 엔티티 임베딩 수."""
+        return len(self._entity_embeddings)

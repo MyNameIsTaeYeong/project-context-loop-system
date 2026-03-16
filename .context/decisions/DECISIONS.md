@@ -114,3 +114,59 @@
   - `pipeline.py`: `EmbeddingClient` → `Embeddings` 타입으로 교체, `embed()` → `aembed_documents()` 호출
   - `pyproject.toml`: `langchain-core>=0.3.0` 의존성 추가
 - **이유**: DI 방식으로 전환하면 클라이언트 구현체를 Agent 기반 등으로 자유롭게 교체 가능. `langchain_core.embeddings.Embeddings` 인터페이스를 따르면 langchain 생태계의 다양한 임베딩 구현체(OpenAIEmbeddings, HuggingFaceEmbeddings 등)와 바로 교환 가능. httpx 직접 호출은 OpenAI SDK 의존 없이 순수 REST로 동작해 서버 호환성이 더 넓음.
+
+---
+
+## D-012: MCP Server — FastMCP + context_assembler 아키텍처
+
+- **일시**: 2026-03-16
+- **맥락**: Phase 5에서 MCP Server를 구현할 때, MCP SDK 활용 방식과 컨텍스트 검색 로직의 재사용성을 결정해야 함
+- **결정**: FastMCP 기반 서버 + context_assembler 모듈 분리. 벡터 검색과 그래프 탐색을 결합하는 로직을 `context_assembler.py`로 분리하여 MCP Tool과 웹 채팅 API 모두에서 재사용.
+- **구현 내용**:
+  - `mcp/server.py`: FastMCP 서버 메인 — stdio/SSE 전송, 저장소 초기화
+  - `mcp/tools.py`: 4개 MCP Tool 등록 (search_context, list_documents, get_document, get_graph_context)
+  - `mcp/context_assembler.py`: 벡터 검색 + 그래프 탐색 결과 병합·포맷팅, 출처 정보 추출
+  - `pyproject.toml`: `mcp>=1.0.0` 의존성 추가
+- **이유**: context_assembler를 독립 모듈로 분리하면 MCP Tool과 웹 API 양쪽에서 동일한 검색 로직을 호출할 수 있어 코드 중복 방지. FastMCP는 Python SDK에서 제공하는 고수준 API로 Tool 등록이 데코레이터 한 줄로 가능.
+
+---
+
+## D-013: 채팅 인터페이스 — Alpine.js + JSON API 방식
+
+- **일시**: 2026-03-16
+- **맥락**: Phase 6에서 대시보드 내 채팅 인터페이스 구현 시 프론트엔드 접근 방식 선택 필요. HTMX SSE 스트리밍 vs Alpine.js + JSON API fetch 중 선택.
+- **결정**: Alpine.js 기반 클라이언트 + POST /api/chat JSON API 방식 채택. 스트리밍 없이 전체 응답을 한 번에 반환.
+- **구현 내용**:
+  - `web/api/chat.py`: 채팅 API 엔드포인트 — RAG 파이프라인 (context_assembler 재사용 → LLM 호출 → 답변 + 출처 반환)
+  - `templates/chat.html`: Alpine.js x-data로 메시지 상태 관리, 출처 링크 표시
+  - `static/js/chat.js`: chatApp() Alpine 컴포넌트 — fetch API 호출, 메시지 렌더링
+  - `context_assembler.py`: `assemble_context_with_sources()` 함수 추가 — 출처 정보(document_id, title, similarity) 포함 반환
+- **이유**: 현재 LLM API가 스트리밍을 필수로 하지 않으므로 전체 응답 방식이 구현 단순. 출처 표시를 위해 JSON 구조가 필요하므로 HTMX 파셜보다 JSON API가 적합. Alpine.js는 이미 프로젝트에서 사용 중이라 추가 의존성 없음.
+
+---
+
+## D-014: 그래프 탐색 개선 — 임베딩 기반 엔티티 매칭 (C안)
+
+- **일시**: 2026-03-16
+- **맥락**: 기존 그래프 탐색은 `query.split()` → 엔티티 이름 완전 일치 방식으로, "게이트웨이"→"Gateway" 매칭 불가, 질의 의도와 무관하게 항상 실행, depth 고정 등의 한계가 있었음. LLM 분류(A안), 임베딩 매칭(B안), 하이브리드(C안) 중 선택.
+- **결정**: C안 (임베딩 기반 엔티티 매칭 + 매칭 유무로 그래프 탐색 자동 결정) 채택.
+- **구현 내용**:
+  - `graph_store.py`: `_entity_embeddings` 캐시 딕셔너리 추가 (node_id → (name, embedding)), `build_entity_embeddings()` — 전체 엔티티 이름 임베딩 생성 및 캐시, `search_entities_by_embedding()` — 코사인 유사도 기반 엔티티 검색 (threshold, top_k), `_cosine_similarity()` 유틸 함수
+  - `context_assembler.py`: `_search_graph_by_embedding()` — 질의 임베딩 → 엔티티 매칭 → 이웃 탐색 → 포맷팅. 매칭 엔티티 없으면 None 반환(탐색 스킵). 매칭 수에 따라 depth 동적 결정 (3개 이상: depth=1, 미만: depth=2). 질의 임베딩을 벡터 검색과 엔티티 매칭에 공용으로 재사용.
+  - `app.py`: lifespan에서 `build_entity_embeddings()` 사전 빌드. save/delete 시 캐시 자동 무효화.
+- **이유**: LLM 추가 호출 없이 기존 임베딩 인프라를 재활용. 다국어/유사어 매칭 가능 ("게이트웨이"↔"Gateway"). 매칭 엔티티가 없으면 그래프 탐색을 자연스럽게 스킵하여 불필요한 컨텍스트 노이즈 방지.
+- **후속**: D-015에서 LLM 기반 탐색 플래너로 교체됨.
+
+---
+
+## D-015: 그래프 탐색 개선 — LLM 기반 탐색 플래너
+
+- **일시**: 2026-03-16
+- **맥락**: D-014 임베딩 매칭은 다국어 매칭이 가능하지만 질의의 의미적 의도를 충분히 반영하지 못함. LLM이 그래프 구조를 이해하고 탐색 계획을 세우는 방식이 더 정확.
+- **결정**: LLM 기반 그래프 탐색 플래너 방식 채택.
+- **구현 내용**:
+  - `graph_store.py`: `get_schema_summary()` — 엔티티/관계 유형별 집계, 대표 엔티티 목록, 관계 예시 반환. `format_schema_for_llm()` — LLM 프롬프트용 마크다운 포맷.
+  - `graph_search_planner.py` (신규): `plan_graph_search()` — LLM에 스키마 + 질의 전달 → JSON 탐색 계획. `execute_graph_search()` — 계획의 step(entity_name, depth, focus_relations)에 따라 탐색. `_parse_plan()` — depth 1~2 제한, steps 최대 3개.
+  - `context_assembler.py`: `_search_graph_with_llm()` — plan → execute 파이프라인. `llm_client` 파라미터 추가 (None이면 그래프 탐색 스킵).
+  - `chat.py`, `tools.py`, `server.py`: llm_client 전달 연동.
+- **이유**: LLM이 질의 의도를 분석하여 탐색 여부/시작 엔티티/깊이/관계 유형을 결정. 임베딩 매칭보다 정밀한 그래프 컨텍스트 추출 가능. 그래프가 비어있으면 LLM 호출 없이 스킵.

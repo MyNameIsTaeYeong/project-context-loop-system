@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
-from context_loop.storage.graph_store import GraphStore
+from context_loop.storage.graph_store import GraphStore, _cosine_similarity
 from context_loop.storage.metadata_store import MetadataStore
 
 
@@ -138,3 +139,170 @@ async def test_load_from_db(meta_store: MetadataStore, tmp_path: Path) -> None:
     store2 = GraphStore(meta_store)
     await store2.load_from_db()
     assert store2.stats()["nodes"] == 2
+
+
+# --- 엔티티 임베딩 캐시 테스트 ---
+
+
+def test_cosine_similarity_identical() -> None:
+    """동일 벡터의 코사인 유사도는 1.0이다."""
+    v = [1.0, 0.0, 0.0]
+    assert abs(_cosine_similarity(v, v) - 1.0) < 1e-6
+
+
+def test_cosine_similarity_orthogonal() -> None:
+    """직교 벡터의 코사인 유사도는 0.0이다."""
+    a = [1.0, 0.0]
+    b = [0.0, 1.0]
+    assert abs(_cosine_similarity(a, b)) < 1e-6
+
+
+def test_cosine_similarity_zero_vector() -> None:
+    """영벡터와의 유사도는 0.0이다."""
+    assert _cosine_similarity([0.0, 0.0], [1.0, 1.0]) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_build_entity_embeddings(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """엔티티 임베딩을 빌드하면 캐시에 저장된다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[Entity(name="Gateway"), Entity(name="AuthService")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+
+    count = await graph_store.build_entity_embeddings(mock_embed)
+    assert count == 2
+    assert graph_store.entity_embedding_count == 2
+
+    # 이미 캐시됨 → 다시 빌드해도 0
+    count2 = await graph_store.build_entity_embeddings(mock_embed)
+    assert count2 == 0
+
+
+@pytest.mark.asyncio
+async def test_search_entities_by_embedding(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """임베딩 유사도로 엔티티를 검색한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+            Entity(name="Database", entity_type="system"),
+        ],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # Gateway와 유사한 벡터로 검색
+    results = graph_store.search_entities_by_embedding(
+        [0.9, 0.1, 0.0], threshold=0.7, top_k=2,
+    )
+    assert len(results) >= 1
+    assert results[0]["entity_name"] == "Gateway"
+
+    # 아무것도 매칭 안 되는 벡터
+    results_empty = graph_store.search_entities_by_embedding(
+        [0.0, 0.0, 0.0], threshold=0.7,
+    )
+    assert results_empty == []
+
+
+@pytest.mark.asyncio
+async def test_delete_clears_embedding_cache(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """문서 삭제 시 임베딩 캐시도 삭제된다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(entities=[Entity(name="NodeA")], relations=[])
+    await graph_store.save_graph_data(doc_id, data)
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+    assert graph_store.entity_embedding_count == 1
+
+    await graph_store.delete_document_graph(doc_id)
+    assert graph_store.entity_embedding_count == 0
+
+
+# --- 그래프 스키마 요약 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_get_schema_summary_empty(graph_store: GraphStore) -> None:
+    """빈 그래프의 스키마 요약은 모든 값이 0/빈 값이다."""
+    summary = graph_store.get_schema_summary()
+    assert summary["total_nodes"] == 0
+    assert summary["total_edges"] == 0
+    assert summary["entity_types"] == {}
+    assert summary["relation_types"] == {}
+
+
+@pytest.mark.asyncio
+async def test_get_schema_summary_with_data(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """그래프 데이터가 있으면 유형별 집계를 반환한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+            Entity(name="UserDB", entity_type="system"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
+            Relation(source="AuthService", target="UserDB", relation_type="uses"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    summary = graph_store.get_schema_summary()
+    assert summary["total_nodes"] == 3
+    assert summary["total_edges"] == 2
+    assert "component" in summary["entity_types"]
+    assert "service" in summary["entity_types"]
+    assert "depends_on" in summary["relation_types"]
+    assert "uses" in summary["relation_types"]
+    assert "Gateway" in summary["entities_by_type"]["component"]
+    assert len(summary["sample_relations"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_format_schema_for_llm_empty(graph_store: GraphStore) -> None:
+    """빈 그래프의 LLM 포맷은 비어있음을 알린다."""
+    text = graph_store.format_schema_for_llm()
+    assert "비어 있습니다" in text
+
+
+@pytest.mark.asyncio
+async def test_format_schema_for_llm_with_data(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """그래프 데이터가 있으면 LLM이 읽을 수 있는 텍스트를 생성한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    text = graph_store.format_schema_for_llm()
+    assert "지식 그래프 구조" in text
+    assert "Gateway" in text
+    assert "AuthService" in text
+    assert "depends_on" in text
+    assert "component" in text
+    assert "service" in text

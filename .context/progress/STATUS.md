@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: 4 (웹 대시보드) → **완료**
-- **Step**: Phase 5 진입 준비
-- **상태**: Phase 4 전체 완료 (FastAPI + Jinja2 + HTMX + Alpine.js + vis.js 대시보드)
+- **Phase**: 6 (질의 및 고도화) → **완료**
+- **Step**: Phase 7 진입 준비
+- **상태**: Phase 5 (MCP Server) + Phase 6 (채팅 인터페이스 + 출처 표시) 완료
 
 ## Phase별 진행률
 
@@ -37,20 +37,20 @@
 - [x] 4.6 파일 업로드 UI
 
 ### Phase 5: MCP Server
-- [ ] 5.1 MCP 서버 기본 구조 (FastMCP, stdio 전송)
-- [ ] 5.2 `search_context` Tool 구현 (벡터 검색 + 그래프 탐색 → 컨텍스트 조립)
-- [ ] 5.3 `list_documents`, `get_document`, `get_graph_context` Tool 구현
-- [ ] 5.4 SSE 전송 지원 (선택적 원격 접근)
-- [ ] 5.5 MCP 클라이언트 연동 테스트 (Claude Code 등)
+- [x] 5.1 MCP 서버 기본 구조 (FastMCP, stdio 전송)
+- [x] 5.2 `search_context` Tool 구현 (벡터 검색 + 그래프 탐색 → 컨텍스트 조립)
+- [x] 5.3 `list_documents`, `get_document`, `get_graph_context` Tool 구현
+- [x] 5.4 SSE 전송 지원 (선택적 원격 접근)
+- [x] 5.5 MCP 클라이언트 연동 테스트 (Claude Code 등)
 
 ### Phase 6: 질의 및 고도화
-- [ ] 6.1 대시보드 내 채팅 인터페이스 (RAG 파이프라인 활용)
-- [ ] 6.2 출처 표시 (원본 문서 링크)
+- [x] 6.1 대시보드 내 채팅 인터페이스 (RAG 파이프라인 활용)
+- [x] 6.2 출처 표시 (원본 문서 링크)
 
 ### Phase 7: 배포
 - [ ] 7.1 패키징 및 사내 배포
 - [ ] 7.2 초기 설정 마법사 (대시보드 내)
 
 ## 마지막 업데이트
-- 일시: 2026-03-11
-- 내용: Phase 4 전체 구현 완료 — FastAPI 웹 대시보드 (6개 서브태스크) + 테스트 19개 추가, 전체 93개 통과
+- 일시: 2026-03-16
+- 내용: 그래프 탐색 개선 — LLM 기반 탐색 플래너 (D-015). graph_search_planner 신규 모듈, GraphStore 스키마 요약, context_assembler LLM 플래너 연동. 테스트 21개 추가, 전체 141개 통과
