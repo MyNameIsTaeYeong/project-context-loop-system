@@ -174,5 +174,55 @@ def extract_json(text: str) -> Any:
         candidate = match2.group(1).strip()
     try:
         return json.loads(candidate)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"JSON 파싱 실패: {e}\n원본: {candidate[:200]}") from e
+    except json.JSONDecodeError:
+        pass
+
+    # max_tokens 제한으로 잘린 JSON 복구 시도
+    repaired = _repair_truncated_json(candidate)
+    if repaired is not None:
+        return repaired
+
+    raise ValueError(f"JSON 파싱 실패\n원본: {candidate[:200]}")
+
+
+def _repair_truncated_json(text: str) -> Any | None:
+    """잘린 JSON 문자열의 괄호를 닫아 복구를 시도한다.
+
+    마지막 완전한 항목까지만 유지하고, 닫히지 않은 괄호를 순서대로 닫는다.
+
+    Returns:
+        복구된 JSON 객체. 복구 실패 시 None.
+    """
+    # 마지막 불완전한 항목 제거: 마지막 완전한 }나 ] 이후를 자름
+    last_complete = max(text.rfind("}"), text.rfind("]"))
+    if last_complete == -1:
+        return None
+    text = text[: last_complete + 1]
+
+    # 닫히지 않은 괄호를 순서대로 닫기
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ("{", "["):
+            stack.append("}" if ch == "{" else "]")
+        elif ch in ("}", "]"):
+            if stack:
+                stack.pop()
+
+    text += "".join(reversed(stack))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None

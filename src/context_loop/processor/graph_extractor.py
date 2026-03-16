@@ -112,7 +112,7 @@ async def extract_graph(
     response = await client.complete(
         prompt,
         system=_SYSTEM_PROMPT,
-        max_tokens=2048,
+        max_tokens=4096,
         temperature=0.0,
     )
 
