@@ -19,9 +19,10 @@
         Title
         <input type="text" name="title" value="{{ doc.title if doc else '' }}" required placeholder="Document title">
     </label>
+    <input type="hidden" id="hidden-content" name="content" value="">
     <label>
         Content
-        <textarea id="editor-content" name="content">{{ doc.original_content if doc else '' }}</textarea>
+        <textarea id="editor-content">{{ doc.original_content if doc else '' }}</textarea>
     </label>
     <div style="display: flex; gap: 0.5rem;">
         <button type="submit">Save</button>
