@@ -188,7 +188,7 @@ class MetadataStore:
         await self.db.execute(
             """UPDATE documents
                SET original_content = ?, content_hash = ?, version = version + 1,
-                   status = 'processing', updated_at = CURRENT_TIMESTAMP
+                   updated_at = CURRENT_TIMESTAMP
                WHERE id = ?""",
             (original_content, content_hash, document_id),
         )

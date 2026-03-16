@@ -70,7 +70,7 @@ async def test_update_document_content(store: MetadataStore) -> None:
     assert doc["original_content"] == "new content"
     assert doc["content_hash"] == "h2"
     assert doc["version"] == 2
-    assert doc["status"] == "processing"
+    assert doc["status"] == "pending"  # status는 호출자가 별도로 설정
 
 
 async def test_delete_document_cascades(store: MetadataStore) -> None:
