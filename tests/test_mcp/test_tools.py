@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -132,7 +133,6 @@ async def test_assemble_context_no_results(
     """결과가 없으면 안내 메시지를 반환한다."""
     mock_embedding = AsyncMock()
     mock_embedding.aembed_query = AsyncMock(return_value=[0.0] * 384)
-    mock_embedding.aembed_documents = AsyncMock(return_value=[])
 
     result = await assemble_context(
         query="테스트 질의",
@@ -149,7 +149,7 @@ async def test_assemble_context_with_graph(
     vector_store: VectorStore,
     graph_store: GraphStore,
 ) -> None:
-    """그래프 컨텍스트가 포함된 결과를 반환한다."""
+    """LLM 기반 그래프 탐색으로 컨텍스트가 포함된 결과를 반환한다."""
     from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 
     doc_id = await meta_store.create_document(
@@ -166,9 +166,16 @@ async def test_assemble_context_with_graph(
     ))
 
     mock_embedding = AsyncMock()
-    # 질의 임베딩과 엔티티 임베딩 모두 설정 (임베딩 기반 그래프 탐색용)
     mock_embedding.aembed_query = AsyncMock(return_value=[1.0, 0.0])
-    mock_embedding.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.9, 0.1]])
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=json.dumps({
+        "should_search": True,
+        "reasoning": "Gateway 관련 구조 파악 필요",
+        "search_steps": [
+            {"entity_name": "Gateway", "depth": 1, "focus_relations": ["depends_on"]},
+        ],
+    }))
 
     result = await assemble_context(
         query="Gateway",
@@ -176,6 +183,7 @@ async def test_assemble_context_with_graph(
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=mock_embedding,
+        llm_client=mock_llm,
         include_graph=True,
     )
     assert "Gateway" in result

@@ -75,6 +75,7 @@ async def chat_api(
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=embedding_client,
+        llm_client=llm_client,
         max_chunks=body.max_chunks,
         include_graph=body.include_graph,
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -14,14 +15,6 @@ from context_loop.storage.vector_store import VectorStore
 from context_loop.web.app import create_app
 
 _DIM = 4  # 테스트용 임베딩 차원
-
-
-def _make_mock_embedding(query_emb: list[float], doc_embs: list[list[float]] | None = None):
-    """테스트용 임베딩 mock을 생성한다."""
-    mock = AsyncMock()
-    mock.aembed_query = AsyncMock(return_value=query_emb)
-    mock.aembed_documents = AsyncMock(return_value=doc_embs or [])
-    return mock
 
 
 @pytest.fixture
@@ -42,10 +35,8 @@ async def chat_client(chat_stores):
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="테스트 답변입니다.")
 
-    mock_embedding = _make_mock_embedding(
-        query_emb=[1.0, 0.0, 0.0, 0.0],
-        doc_embs=[],
-    )
+    mock_embedding = AsyncMock()
+    mock_embedding.aembed_query = AsyncMock(return_value=[1.0, 0.0, 0.0, 0.0])
 
     app = create_app()
     app.state.meta_store = meta_store
@@ -132,10 +123,15 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
         ],
     ))
 
-    # 임베딩 mock 갱신: 엔티티 2개의 임베딩도 설정
+    # LLM mock: 첫 호출은 그래프 탐색 계획, 두 번째는 최종 답변
     app = chat_client._transport.app  # type: ignore[attr-defined]
-    app.state.embedding_client.aembed_documents = AsyncMock(
-        return_value=[[1.0, 0.0, 0.0, 0.0], [0.9, 0.1, 0.0, 0.0]]
+    plan_response = json.dumps({
+        "should_search": True,
+        "reasoning": "Gateway 구조 파악 필요",
+        "search_steps": [{"entity_name": "Gateway", "depth": 1, "focus_relations": []}],
+    })
+    app.state.llm_client.complete = AsyncMock(
+        side_effect=[plan_response, "테스트 답변입니다."]
     )
 
     resp = await chat_client.post(

@@ -26,12 +26,13 @@ _meta_store: MetadataStore | None = None
 _vector_store: VectorStore | None = None
 _graph_store: GraphStore | None = None
 _embedding_client: object | None = None
+_llm_client: object | None = None
 _config: Config | None = None
 
 
 async def _initialize() -> None:
     """저장소와 설정을 초기화한다."""
-    global _meta_store, _vector_store, _graph_store, _embedding_client, _config  # noqa: PLW0603
+    global _meta_store, _vector_store, _graph_store, _embedding_client, _llm_client, _config  # noqa: PLW0603
 
     _config = Config()
     data_dir = Path(_config.get("app.data_dir", "~/.context-loop/data")).expanduser()
@@ -59,6 +60,15 @@ async def _initialize() -> None:
         _embedding_client = LocalEmbeddingClient(
             model=_config.get("processor.embedding_model", "all-MiniLM-L6-v2"),
         )
+
+    # LLM 클라이언트 초기화 (그래프 탐색 플래너용)
+    from context_loop.web.app import _build_llm_client
+
+    try:
+        _llm_client = _build_llm_client(_config)
+    except Exception:
+        logger.warning("LLM 클라이언트 초기화 실패 (그래프 탐색 비활성화)", exc_info=True)
+        _llm_client = None
 
     logger.info("MCP Server 저장소 초기화 완료")
 

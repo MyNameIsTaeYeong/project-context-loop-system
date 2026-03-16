@@ -155,3 +155,18 @@
   - `context_assembler.py`: `_search_graph_by_embedding()` — 질의 임베딩 → 엔티티 매칭 → 이웃 탐색 → 포맷팅. 매칭 엔티티 없으면 None 반환(탐색 스킵). 매칭 수에 따라 depth 동적 결정 (3개 이상: depth=1, 미만: depth=2). 질의 임베딩을 벡터 검색과 엔티티 매칭에 공용으로 재사용.
   - `app.py`: lifespan에서 `build_entity_embeddings()` 사전 빌드. save/delete 시 캐시 자동 무효화.
 - **이유**: LLM 추가 호출 없이 기존 임베딩 인프라를 재활용. 다국어/유사어 매칭 가능 ("게이트웨이"↔"Gateway"). 매칭 엔티티가 없으면 그래프 탐색을 자연스럽게 스킵하여 불필요한 컨텍스트 노이즈 방지.
+- **후속**: D-015에서 LLM 기반 탐색 플래너로 교체됨.
+
+---
+
+## D-015: 그래프 탐색 개선 — LLM 기반 탐색 플래너
+
+- **일시**: 2026-03-16
+- **맥락**: D-014 임베딩 매칭은 다국어 매칭이 가능하지만 질의의 의미적 의도를 충분히 반영하지 못함. LLM이 그래프 구조를 이해하고 탐색 계획을 세우는 방식이 더 정확.
+- **결정**: LLM 기반 그래프 탐색 플래너 방식 채택.
+- **구현 내용**:
+  - `graph_store.py`: `get_schema_summary()` — 엔티티/관계 유형별 집계, 대표 엔티티 목록, 관계 예시 반환. `format_schema_for_llm()` — LLM 프롬프트용 마크다운 포맷.
+  - `graph_search_planner.py` (신규): `plan_graph_search()` — LLM에 스키마 + 질의 전달 → JSON 탐색 계획. `execute_graph_search()` — 계획의 step(entity_name, depth, focus_relations)에 따라 탐색. `_parse_plan()` — depth 1~2 제한, steps 최대 3개.
+  - `context_assembler.py`: `_search_graph_with_llm()` — plan → execute 파이프라인. `llm_client` 파라미터 추가 (None이면 그래프 탐색 스킵).
+  - `chat.py`, `tools.py`, `server.py`: llm_client 전달 연동.
+- **이유**: LLM이 질의 의도를 분석하여 탐색 여부/시작 엔티티/깊이/관계 유형을 결정. 임베딩 매칭보다 정밀한 그래프 컨텍스트 추출 가능. 그래프가 비어있으면 LLM 호출 없이 스킵.

@@ -2,7 +2,7 @@
 
 벡터 유사도 검색과 그래프 탐색 결과를 병합하여
 LLM에 제공할 컨텍스트를 조립한다.
-임베딩 기반 엔티티 매칭으로 그래프 탐색 여부를 자동 결정한다.
+LLM 기반 그래프 탐색 플래너로 질의 의도에 맞는 그래프 영역을 탐색한다.
 """
 
 from __future__ import annotations
@@ -11,15 +11,15 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.processor.graph_search_planner import (
+    execute_graph_search,
+    plan_graph_search,
+)
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
-
-# 엔티티 임베딩 유사도 임계값
-_ENTITY_SIMILARITY_THRESHOLD = 0.7
-_ENTITY_TOP_K = 5
 
 
 @dataclass
@@ -46,12 +46,14 @@ async def assemble_context(
     vector_store: VectorStore,
     graph_store: GraphStore,
     embedding_client: Any,
+    llm_client: Any = None,
     max_chunks: int = 10,
     include_graph: bool = True,
 ) -> str:
-    """질의에 대해 벡터 검색 + 그래프 탐색으로 컨텍스트를 조립한다.
+    """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
-    그래프 탐색은 임베딩 기반으로 매칭되는 엔티티가 있을 때만 실행된다.
+    LLM에게 그래프 스키마를 보여주고 사용자 질의에 맞는 탐색 계획을
+    세운 뒤 해당 영역만 탐색한다. llm_client가 없으면 그래프 탐색을 스킵한다.
 
     Args:
         query: 검색 질의 문자열.
@@ -59,6 +61,7 @@ async def assemble_context(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트 (Embeddings 인터페이스).
+        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
 
@@ -67,21 +70,18 @@ async def assemble_context(
     """
     sections: list[str] = []
 
-    # 질의 임베딩 생성 (벡터 검색 + 엔티티 매칭 공용)
-    query_embedding = await _get_query_embedding(query, embedding_client)
-
     # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks_with_embedding(
-        query_embedding, vector_store, max_chunks,
+    chunk_results = await _search_chunks(
+        query, vector_store, embedding_client, max_chunks,
     )
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 2. 임베딩 기반 그래프 탐색 (매칭 엔티티가 있을 때만)
-    if include_graph and query_embedding:
-        graph_section = await _search_graph_by_embedding(
-            query_embedding, graph_store, embedding_client,
+    # 2. LLM 기반 그래프 탐색
+    if include_graph and llm_client:
+        graph_section = await _search_graph_with_llm(
+            query, graph_store, llm_client,
         )
         if graph_section:
             sections.append(graph_section)
@@ -92,41 +92,17 @@ async def assemble_context(
     return "\n\n---\n\n".join(sections)
 
 
-async def _get_query_embedding(query: str, embedding_client: Any) -> list[float]:
-    """질의 임베딩을 생성한다."""
-    try:
-        return await embedding_client.aembed_query(query)
-    except Exception:
-        logger.warning("질의 임베딩 생성 실패", exc_info=True)
-        return []
-
-
 async def _search_chunks(
     query: str,
     vector_store: VectorStore,
     embedding_client: Any,
     max_chunks: int,
 ) -> list[dict[str, Any]]:
-    """벡터 유사도 검색을 수행한다 (하위 호환용)."""
+    """벡터 유사도 검색을 수행한다."""
     try:
         if vector_store.count() == 0:
             return []
         query_embedding = await embedding_client.aembed_query(query)
-        return vector_store.search(query_embedding, n_results=max_chunks)
-    except Exception:
-        logger.warning("벡터 검색 실패", exc_info=True)
-        return []
-
-
-async def _search_chunks_with_embedding(
-    query_embedding: list[float],
-    vector_store: VectorStore,
-    max_chunks: int,
-) -> list[dict[str, Any]]:
-    """이미 생성된 질의 임베딩으로 벡터 검색을 수행한다."""
-    try:
-        if not query_embedding or vector_store.count() == 0:
-            return []
         return vector_store.search(query_embedding, n_results=max_chunks)
     except Exception:
         logger.warning("벡터 검색 실패", exc_info=True)
@@ -156,117 +132,26 @@ async def _format_chunk_results(
     return "\n".join(lines)
 
 
-async def _search_graph_by_embedding(
-    query_embedding: list[float],
+async def _search_graph_with_llm(
+    query: str,
     graph_store: GraphStore,
-    embedding_client: Any,
-    threshold: float = _ENTITY_SIMILARITY_THRESHOLD,
-    top_k: int = _ENTITY_TOP_K,
+    llm_client: Any,
 ) -> str | None:
-    """임베딩 유사도로 관련 엔티티를 찾고 그래프를 탐색한다.
+    """LLM 기반 플래너로 그래프를 탐색한다.
 
-    1. 엔티티 임베딩 캐시가 없으면 빌드한다.
-    2. 질의 임베딩과 유사한 엔티티를 검색한다.
-    3. 매칭된 엔티티를 중심으로 이웃 노드를 탐색한다.
-    4. 매칭 엔티티가 없으면 None을 반환 (그래프 탐색 스킵).
+    1. LLM에게 그래프 스키마 + 질의를 보여주고 탐색 계획을 받는다.
+    2. 계획에 따라 GraphStore에서 실제 탐색을 수행한다.
+    3. LLM이 탐색 불필요로 판단하면 None을 반환한다.
     """
-    if graph_store.stats()["nodes"] == 0:
+    try:
+        plan = await plan_graph_search(query, graph_store, llm_client)
+        if not plan.should_search:
+            logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
+            return None
+        return await execute_graph_search(plan, graph_store)
+    except Exception:
+        logger.warning("LLM 기반 그래프 탐색 실패", exc_info=True)
         return None
-
-    # 엔티티 임베딩 캐시 빌드 (없는 것만 추가)
-    if graph_store.entity_embedding_count < graph_store.stats()["nodes"]:
-        await graph_store.build_entity_embeddings(embedding_client)
-
-    # 임베딩 유사도로 엔티티 검색
-    matched_entities = graph_store.search_entities_by_embedding(
-        query_embedding, threshold=threshold, top_k=top_k,
-    )
-
-    if not matched_entities:
-        return None
-
-    # 매칭된 엔티티 수에 따라 depth 동적 결정
-    depth = 1 if len(matched_entities) >= 3 else 2
-
-    # 매칭된 엔티티 중심으로 이웃 탐색
-    all_nodes: list[dict[str, Any]] = []
-    all_node_ids: set[int] = set()
-
-    for entity in matched_entities:
-        entity_name = entity["entity_name"]
-        neighbors = graph_store.get_neighbors(entity_name, depth=depth)
-        for n in neighbors:
-            nid = n.get("id")
-            if nid and nid not in all_node_ids:
-                all_node_ids.add(nid)
-                all_nodes.append(n)
-
-    if not all_nodes:
-        return None
-
-    edges = graph_store.get_edges_between(list(all_node_ids))
-
-    # 포맷팅
-    matched_names = {e["entity_name"] for e in matched_entities}
-    lines = ["## 관련 그래프 컨텍스트"]
-    lines.append("\n**엔티티:**")
-    for node in all_nodes:
-        name = node.get("entity_name", "")
-        etype = node.get("entity_type", "")
-        marker = " *" if name in matched_names else ""
-        lines.append(f"- {name} ({etype}){marker}")
-
-    if edges:
-        lines.append("\n**관계:**")
-        id_to_name = {n["id"]: n.get("entity_name", "") for n in all_nodes}
-        for edge in edges:
-            src = id_to_name.get(edge.get("source"), "?")
-            tgt = id_to_name.get(edge.get("target"), "?")
-            rel = edge.get("relation_type", "관련")
-            lines.append(f"- {src} --[{rel}]--> {tgt}")
-
-    return "\n".join(lines)
-
-
-# 하위 호환: 키워드 기반 그래프 탐색 (MCP tools에서 사용 가능)
-def _search_graph(query: str, graph_store: GraphStore) -> str | None:
-    """질의에서 키워드를 추출하여 그래프를 탐색한다 (레거시)."""
-    keywords = query.split()
-    all_nodes: list[dict[str, Any]] = []
-    all_node_ids: set[int] = set()
-
-    for keyword in keywords:
-        if len(keyword) < 2:
-            continue
-        neighbors = graph_store.get_neighbors(keyword, depth=1)
-        for n in neighbors:
-            nid = n.get("id")
-            if nid and nid not in all_node_ids:
-                all_node_ids.add(nid)
-                all_nodes.append(n)
-
-    if not all_nodes:
-        return None
-
-    edges = graph_store.get_edges_between(list(all_node_ids))
-
-    lines = ["## 관련 그래프 컨텍스트"]
-    lines.append("\n**엔티티:**")
-    for node in all_nodes:
-        name = node.get("entity_name", "")
-        etype = node.get("entity_type", "")
-        lines.append(f"- {name} ({etype})")
-
-    if edges:
-        lines.append("\n**관계:**")
-        id_to_name = {n["id"]: n.get("entity_name", "") for n in all_nodes}
-        for edge in edges:
-            src = id_to_name.get(edge.get("source"), "?")
-            tgt = id_to_name.get(edge.get("target"), "?")
-            rel = edge.get("relation_type", "관련")
-            lines.append(f"- {src} --[{rel}]--> {tgt}")
-
-    return "\n".join(lines)
 
 
 async def assemble_context_with_sources(
@@ -276,12 +161,14 @@ async def assemble_context_with_sources(
     vector_store: VectorStore,
     graph_store: GraphStore,
     embedding_client: Any,
+    llm_client: Any = None,
     max_chunks: int = 10,
     include_graph: bool = True,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
-    그래프 탐색은 임베딩 기반으로 매칭되는 엔티티가 있을 때만 실행된다.
+    LLM에게 그래프 스키마를 보여주고 사용자 질의에 맞는 탐색 계획을
+    세운 뒤 해당 영역만 탐색한다.
 
     Args:
         query: 검색 질의 문자열.
@@ -289,6 +176,7 @@ async def assemble_context_with_sources(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트.
+        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
 
@@ -299,13 +187,8 @@ async def assemble_context_with_sources(
     sources: list[Source] = []
     doc_cache: dict[int, dict[str, Any]] = {}
 
-    # 질의 임베딩 생성 (벡터 검색 + 엔티티 매칭 공용)
-    query_embedding = await _get_query_embedding(query, embedding_client)
-
     # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks_with_embedding(
-        query_embedding, vector_store, max_chunks,
-    )
+    chunk_results = await _search_chunks(query, vector_store, embedding_client, max_chunks)
     if chunk_results:
         lines = []
         for r in chunk_results:
@@ -321,10 +204,10 @@ async def assemble_context_with_sources(
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 2. 임베딩 기반 그래프 탐색 (매칭 엔티티가 있을 때만)
-    if include_graph and query_embedding:
-        graph_section = await _search_graph_by_embedding(
-            query_embedding, graph_store, embedding_client,
+    # 2. LLM 기반 그래프 탐색
+    if include_graph and llm_client:
+        graph_section = await _search_graph_with_llm(
+            query, graph_store, llm_client,
         )
         if graph_section:
             sections.append(graph_section)

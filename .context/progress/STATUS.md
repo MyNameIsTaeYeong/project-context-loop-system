@@ -53,4 +53,4 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-16
-- 내용: 그래프 탐색 개선 — 임베딩 기반 엔티티 매칭 (C안) 구현. GraphStore 엔티티 임베딩 캐시, context_assembler 임베딩 기반 그래프 탐색, 동적 depth. 테스트 11개 추가, 전체 120개 통과
+- 내용: 그래프 탐색 개선 — LLM 기반 탐색 플래너 (D-015). graph_search_planner 신규 모듈, GraphStore 스키마 요약, context_assembler LLM 플래너 연동. 테스트 21개 추가, 전체 141개 통과

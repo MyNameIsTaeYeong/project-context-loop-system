@@ -234,3 +234,75 @@ async def test_delete_clears_embedding_cache(graph_store: GraphStore, meta_store
 
     await graph_store.delete_document_graph(doc_id)
     assert graph_store.entity_embedding_count == 0
+
+
+# --- 그래프 스키마 요약 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_get_schema_summary_empty(graph_store: GraphStore) -> None:
+    """빈 그래프의 스키마 요약은 모든 값이 0/빈 값이다."""
+    summary = graph_store.get_schema_summary()
+    assert summary["total_nodes"] == 0
+    assert summary["total_edges"] == 0
+    assert summary["entity_types"] == {}
+    assert summary["relation_types"] == {}
+
+
+@pytest.mark.asyncio
+async def test_get_schema_summary_with_data(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """그래프 데이터가 있으면 유형별 집계를 반환한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+            Entity(name="UserDB", entity_type="system"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
+            Relation(source="AuthService", target="UserDB", relation_type="uses"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    summary = graph_store.get_schema_summary()
+    assert summary["total_nodes"] == 3
+    assert summary["total_edges"] == 2
+    assert "component" in summary["entity_types"]
+    assert "service" in summary["entity_types"]
+    assert "depends_on" in summary["relation_types"]
+    assert "uses" in summary["relation_types"]
+    assert "Gateway" in summary["entities_by_type"]["component"]
+    assert len(summary["sample_relations"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_format_schema_for_llm_empty(graph_store: GraphStore) -> None:
+    """빈 그래프의 LLM 포맷은 비어있음을 알린다."""
+    text = graph_store.format_schema_for_llm()
+    assert "비어 있습니다" in text
+
+
+@pytest.mark.asyncio
+async def test_format_schema_for_llm_with_data(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """그래프 데이터가 있으면 LLM이 읽을 수 있는 텍스트를 생성한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    text = graph_store.format_schema_for_llm()
+    assert "지식 그래프 구조" in text
+    assert "Gateway" in text
+    assert "AuthService" in text
+    assert "depends_on" in text
+    assert "component" in text
+    assert "service" in text
