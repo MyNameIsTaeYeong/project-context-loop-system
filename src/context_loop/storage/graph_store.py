@@ -3,12 +3,14 @@
 NetworkX로 인메모리 그래프를 관리하고,
 SQLite(MetadataStore)에 영속 저장한다.
 엔티티 병합 및 고아 엣지 정리 로직을 포함한다.
+임베딩 기반 엔티티 유사도 검색을 지원한다.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any
 
 import networkx as nx
@@ -19,11 +21,22 @@ from context_loop.storage.metadata_store import MetadataStore
 logger = logging.getLogger(__name__)
 
 
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """두 벡터의 코사인 유사도를 계산한다."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 class GraphStore:
     """NetworkX + SQLite 기반 그래프 저장소.
 
     SQLite(MetadataStore)가 진실의 원천(source of truth)이다.
     NetworkX 그래프는 검색/탐색용 인메모리 인덱스 역할을 한다.
+    엔티티 이름의 임베딩을 캐시하여 유사도 기반 탐색을 지원한다.
 
     Args:
         store: 초기화된 MetadataStore 인스턴스.
@@ -32,6 +45,8 @@ class GraphStore:
     def __init__(self, store: MetadataStore) -> None:
         self._store = store
         self._graph: nx.DiGraph = nx.DiGraph()
+        # 엔티티 임베딩 캐시: node_id → (entity_name, embedding)
+        self._entity_embeddings: dict[int, tuple[str, list[float]]] = {}
 
     async def load_from_db(self) -> None:
         """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다."""
@@ -58,6 +73,7 @@ class GraphStore:
                     document_id=edge["document_id"],
                     properties=json.loads(edge["properties"] or "{}"),
                 )
+        self._entity_embeddings.clear()
         logger.debug(
             "그래프 로드 완료 — 노드: %d, 엣지: %d",
             self._graph.number_of_nodes(),
@@ -131,6 +147,10 @@ class GraphStore:
             )
             edge_count += 1
 
+        # 새 노드의 임베딩 캐시 무효화 (다음 build_entity_embeddings 호출 시 재생성)
+        for name, nid in name_to_node_id.items():
+            self._entity_embeddings.pop(nid, None)
+
         logger.info(
             "그래프 저장 완료 — document_id=%d, 노드: %d, 엣지: %d",
             document_id,
@@ -161,6 +181,10 @@ class GraphStore:
             if not self._graph.has_node(u) or not self._graph.has_node(v)
         ]
         self._graph.remove_edges_from(orphan_edges)
+
+        # 삭제된 노드의 임베딩 캐시도 제거
+        for nid in nodes_to_remove:
+            self._entity_embeddings.pop(nid, None)
 
         logger.debug("그래프 삭제 완료: document_id=%d", document_id)
 
@@ -233,3 +257,84 @@ class GraphStore:
             "nodes": self._graph.number_of_nodes(),
             "edges": self._graph.number_of_edges(),
         }
+
+    # --- 엔티티 임베딩 기반 유사도 검색 ---
+
+    async def build_entity_embeddings(self, embedding_client: Any) -> int:
+        """모든 엔티티 이름의 임베딩을 생성하여 캐시한다.
+
+        이미 캐시된 노드는 건너뛴다.
+
+        Args:
+            embedding_client: Embeddings 인터페이스 구현체.
+
+        Returns:
+            새로 임베딩된 엔티티 수.
+        """
+        # 캐시에 없는 노드만 수집
+        missing: list[tuple[int, str]] = []
+        for node_id, data in self._graph.nodes(data=True):
+            if node_id not in self._entity_embeddings:
+                name = data.get("entity_name", "")
+                if name:
+                    missing.append((node_id, name))
+
+        if not missing:
+            return 0
+
+        names = [name for _, name in missing]
+        try:
+            embeddings = await embedding_client.aembed_documents(names)
+        except Exception:
+            logger.warning("엔티티 임베딩 생성 실패", exc_info=True)
+            return 0
+
+        for (node_id, name), emb in zip(missing, embeddings):
+            self._entity_embeddings[node_id] = (name, emb)
+
+        logger.debug("엔티티 임베딩 캐시 구축: %d개 추가 (총 %d개)", len(missing), len(self._entity_embeddings))
+        return len(missing)
+
+    def search_entities_by_embedding(
+        self,
+        query_embedding: list[float],
+        threshold: float = 0.7,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """질의 임베딩과 유사한 엔티티를 검색한다.
+
+        Args:
+            query_embedding: 질의 텍스트의 임베딩 벡터.
+            threshold: 최소 코사인 유사도 임계값.
+            top_k: 반환할 최대 엔티티 수.
+
+        Returns:
+            유사도 내림차순 정렬된 엔티티 목록.
+            각 항목: {"node_id", "entity_name", "entity_type", "similarity"}
+        """
+        if not self._entity_embeddings:
+            return []
+
+        scored: list[tuple[float, int, str]] = []
+        for node_id, (name, emb) in self._entity_embeddings.items():
+            sim = _cosine_similarity(query_embedding, emb)
+            if sim >= threshold:
+                scored.append((sim, node_id, name))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        results: list[dict[str, Any]] = []
+        for sim, node_id, name in scored[:top_k]:
+            data = dict(self._graph.nodes[node_id])
+            results.append({
+                "node_id": node_id,
+                "entity_name": name,
+                "entity_type": data.get("entity_type", ""),
+                "similarity": sim,
+            })
+        return results
+
+    @property
+    def entity_embedding_count(self) -> int:
+        """캐시된 엔티티 임베딩 수."""
+        return len(self._entity_embeddings)

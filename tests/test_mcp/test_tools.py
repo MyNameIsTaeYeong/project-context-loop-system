@@ -132,6 +132,7 @@ async def test_assemble_context_no_results(
     """결과가 없으면 안내 메시지를 반환한다."""
     mock_embedding = AsyncMock()
     mock_embedding.aembed_query = AsyncMock(return_value=[0.0] * 384)
+    mock_embedding.aembed_documents = AsyncMock(return_value=[])
 
     result = await assemble_context(
         query="테스트 질의",
@@ -165,7 +166,9 @@ async def test_assemble_context_with_graph(
     ))
 
     mock_embedding = AsyncMock()
-    mock_embedding.aembed_query = AsyncMock(return_value=[0.0] * 384)
+    # 질의 임베딩과 엔티티 임베딩 모두 설정 (임베딩 기반 그래프 탐색용)
+    mock_embedding.aembed_query = AsyncMock(return_value=[1.0, 0.0])
+    mock_embedding.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.9, 0.1]])
 
     result = await assemble_context(
         query="Gateway",

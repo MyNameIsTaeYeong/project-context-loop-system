@@ -53,4 +53,4 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-16
-- 내용: Phase 5 + Phase 6 구현 완료 — MCP Server (4개 Tool + context_assembler), 대시보드 채팅 인터페이스 (RAG 파이프라인 + 출처 표시), 테스트 13개 추가, 전체 109개 통과
+- 내용: 그래프 탐색 개선 — 임베딩 기반 엔티티 매칭 (C안) 구현. GraphStore 엔티티 임베딩 캐시, context_assembler 임베딩 기반 그래프 탐색, 동적 depth. 테스트 11개 추가, 전체 120개 통과

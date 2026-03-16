@@ -142,3 +142,16 @@
   - `static/js/chat.js`: chatApp() Alpine 컴포넌트 — fetch API 호출, 메시지 렌더링
   - `context_assembler.py`: `assemble_context_with_sources()` 함수 추가 — 출처 정보(document_id, title, similarity) 포함 반환
 - **이유**: 현재 LLM API가 스트리밍을 필수로 하지 않으므로 전체 응답 방식이 구현 단순. 출처 표시를 위해 JSON 구조가 필요하므로 HTMX 파셜보다 JSON API가 적합. Alpine.js는 이미 프로젝트에서 사용 중이라 추가 의존성 없음.
+
+---
+
+## D-014: 그래프 탐색 개선 — 임베딩 기반 엔티티 매칭 (C안)
+
+- **일시**: 2026-03-16
+- **맥락**: 기존 그래프 탐색은 `query.split()` → 엔티티 이름 완전 일치 방식으로, "게이트웨이"→"Gateway" 매칭 불가, 질의 의도와 무관하게 항상 실행, depth 고정 등의 한계가 있었음. LLM 분류(A안), 임베딩 매칭(B안), 하이브리드(C안) 중 선택.
+- **결정**: C안 (임베딩 기반 엔티티 매칭 + 매칭 유무로 그래프 탐색 자동 결정) 채택.
+- **구현 내용**:
+  - `graph_store.py`: `_entity_embeddings` 캐시 딕셔너리 추가 (node_id → (name, embedding)), `build_entity_embeddings()` — 전체 엔티티 이름 임베딩 생성 및 캐시, `search_entities_by_embedding()` — 코사인 유사도 기반 엔티티 검색 (threshold, top_k), `_cosine_similarity()` 유틸 함수
+  - `context_assembler.py`: `_search_graph_by_embedding()` — 질의 임베딩 → 엔티티 매칭 → 이웃 탐색 → 포맷팅. 매칭 엔티티 없으면 None 반환(탐색 스킵). 매칭 수에 따라 depth 동적 결정 (3개 이상: depth=1, 미만: depth=2). 질의 임베딩을 벡터 검색과 엔티티 매칭에 공용으로 재사용.
+  - `app.py`: lifespan에서 `build_entity_embeddings()` 사전 빌드. save/delete 시 캐시 자동 무효화.
+- **이유**: LLM 추가 호출 없이 기존 임베딩 인프라를 재활용. 다국어/유사어 매칭 가능 ("게이트웨이"↔"Gateway"). 매칭 엔티티가 없으면 그래프 탐색을 자연스럽게 스킵하여 불필요한 컨텍스트 노이즈 방지.

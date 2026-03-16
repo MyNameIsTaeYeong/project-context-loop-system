@@ -13,6 +13,16 @@ from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
 from context_loop.web.app import create_app
 
+_DIM = 4  # 테스트용 임베딩 차원
+
+
+def _make_mock_embedding(query_emb: list[float], doc_embs: list[list[float]] | None = None):
+    """테스트용 임베딩 mock을 생성한다."""
+    mock = AsyncMock()
+    mock.aembed_query = AsyncMock(return_value=query_emb)
+    mock.aembed_documents = AsyncMock(return_value=doc_embs or [])
+    return mock
+
 
 @pytest.fixture
 async def chat_stores(tmp_path: Path):
@@ -32,8 +42,10 @@ async def chat_client(chat_stores):
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="테스트 답변입니다.")
 
-    mock_embedding = AsyncMock()
-    mock_embedding.aembed_query = AsyncMock(return_value=[0.0] * 384)
+    mock_embedding = _make_mock_embedding(
+        query_emb=[1.0, 0.0, 0.0, 0.0],
+        doc_embs=[],
+    )
 
     app = create_app()
     app.state.meta_store = meta_store
@@ -73,7 +85,6 @@ async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: Asy
     """문서가 있으면 답변과 출처를 반환한다."""
     meta_store, vector_store, _ = chat_stores
 
-    # 문서 생성 + 벡터 데이터 추가
     doc_id = await meta_store.create_document(
         source_type="manual",
         title="테스트 문서",
@@ -82,7 +93,7 @@ async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: Asy
     )
     vector_store.add_chunks(
         chunk_ids=[f"chunk_{doc_id}_0"],
-        embeddings=[[0.0] * 384],
+        embeddings=[[1.0, 0.0, 0.0, 0.0]],
         documents=["테스트 내용입니다."],
         metadatas=[{"document_id": doc_id, "chunk_index": 0}],
     )
@@ -120,6 +131,12 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
             Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
         ],
     ))
+
+    # 임베딩 mock 갱신: 엔티티 2개의 임베딩도 설정
+    app = chat_client._transport.app  # type: ignore[attr-defined]
+    app.state.embedding_client.aembed_documents = AsyncMock(
+        return_value=[[1.0, 0.0, 0.0, 0.0], [0.9, 0.1, 0.0, 0.0]]
+    )
 
     resp = await chat_client.post(
         "/api/chat",

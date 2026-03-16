@@ -2,6 +2,7 @@
 
 벡터 유사도 검색과 그래프 탐색 결과를 병합하여
 LLM에 제공할 컨텍스트를 조립한다.
+임베딩 기반 엔티티 매칭으로 그래프 탐색 여부를 자동 결정한다.
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
+
+# 엔티티 임베딩 유사도 임계값
+_ENTITY_SIMILARITY_THRESHOLD = 0.7
+_ENTITY_TOP_K = 5
 
 
 @dataclass
@@ -46,6 +51,8 @@ async def assemble_context(
 ) -> str:
     """질의에 대해 벡터 검색 + 그래프 탐색으로 컨텍스트를 조립한다.
 
+    그래프 탐색은 임베딩 기반으로 매칭되는 엔티티가 있을 때만 실행된다.
+
     Args:
         query: 검색 질의 문자열.
         meta_store: 메타데이터 저장소.
@@ -60,17 +67,22 @@ async def assemble_context(
     """
     sections: list[str] = []
 
+    # 질의 임베딩 생성 (벡터 검색 + 엔티티 매칭 공용)
+    query_embedding = await _get_query_embedding(query, embedding_client)
+
     # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(
-        query, vector_store, embedding_client, max_chunks,
+    chunk_results = await _search_chunks_with_embedding(
+        query_embedding, vector_store, max_chunks,
     )
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 2. 그래프 탐색 (선택적)
-    if include_graph:
-        graph_section = _search_graph(query, graph_store)
+    # 2. 임베딩 기반 그래프 탐색 (매칭 엔티티가 있을 때만)
+    if include_graph and query_embedding:
+        graph_section = await _search_graph_by_embedding(
+            query_embedding, graph_store, embedding_client,
+        )
         if graph_section:
             sections.append(graph_section)
 
@@ -80,17 +92,41 @@ async def assemble_context(
     return "\n\n---\n\n".join(sections)
 
 
+async def _get_query_embedding(query: str, embedding_client: Any) -> list[float]:
+    """질의 임베딩을 생성한다."""
+    try:
+        return await embedding_client.aembed_query(query)
+    except Exception:
+        logger.warning("질의 임베딩 생성 실패", exc_info=True)
+        return []
+
+
 async def _search_chunks(
     query: str,
     vector_store: VectorStore,
     embedding_client: Any,
     max_chunks: int,
 ) -> list[dict[str, Any]]:
-    """벡터 유사도 검색을 수행한다."""
+    """벡터 유사도 검색을 수행한다 (하위 호환용)."""
     try:
         if vector_store.count() == 0:
             return []
         query_embedding = await embedding_client.aembed_query(query)
+        return vector_store.search(query_embedding, n_results=max_chunks)
+    except Exception:
+        logger.warning("벡터 검색 실패", exc_info=True)
+        return []
+
+
+async def _search_chunks_with_embedding(
+    query_embedding: list[float],
+    vector_store: VectorStore,
+    max_chunks: int,
+) -> list[dict[str, Any]]:
+    """이미 생성된 질의 임베딩으로 벡터 검색을 수행한다."""
+    try:
+        if not query_embedding or vector_store.count() == 0:
+            return []
         return vector_store.search(query_embedding, n_results=max_chunks)
     except Exception:
         logger.warning("벡터 검색 실패", exc_info=True)
@@ -120,8 +156,81 @@ async def _format_chunk_results(
     return "\n".join(lines)
 
 
+async def _search_graph_by_embedding(
+    query_embedding: list[float],
+    graph_store: GraphStore,
+    embedding_client: Any,
+    threshold: float = _ENTITY_SIMILARITY_THRESHOLD,
+    top_k: int = _ENTITY_TOP_K,
+) -> str | None:
+    """임베딩 유사도로 관련 엔티티를 찾고 그래프를 탐색한다.
+
+    1. 엔티티 임베딩 캐시가 없으면 빌드한다.
+    2. 질의 임베딩과 유사한 엔티티를 검색한다.
+    3. 매칭된 엔티티를 중심으로 이웃 노드를 탐색한다.
+    4. 매칭 엔티티가 없으면 None을 반환 (그래프 탐색 스킵).
+    """
+    if graph_store.stats()["nodes"] == 0:
+        return None
+
+    # 엔티티 임베딩 캐시 빌드 (없는 것만 추가)
+    if graph_store.entity_embedding_count < graph_store.stats()["nodes"]:
+        await graph_store.build_entity_embeddings(embedding_client)
+
+    # 임베딩 유사도로 엔티티 검색
+    matched_entities = graph_store.search_entities_by_embedding(
+        query_embedding, threshold=threshold, top_k=top_k,
+    )
+
+    if not matched_entities:
+        return None
+
+    # 매칭된 엔티티 수에 따라 depth 동적 결정
+    depth = 1 if len(matched_entities) >= 3 else 2
+
+    # 매칭된 엔티티 중심으로 이웃 탐색
+    all_nodes: list[dict[str, Any]] = []
+    all_node_ids: set[int] = set()
+
+    for entity in matched_entities:
+        entity_name = entity["entity_name"]
+        neighbors = graph_store.get_neighbors(entity_name, depth=depth)
+        for n in neighbors:
+            nid = n.get("id")
+            if nid and nid not in all_node_ids:
+                all_node_ids.add(nid)
+                all_nodes.append(n)
+
+    if not all_nodes:
+        return None
+
+    edges = graph_store.get_edges_between(list(all_node_ids))
+
+    # 포맷팅
+    matched_names = {e["entity_name"] for e in matched_entities}
+    lines = ["## 관련 그래프 컨텍스트"]
+    lines.append("\n**엔티티:**")
+    for node in all_nodes:
+        name = node.get("entity_name", "")
+        etype = node.get("entity_type", "")
+        marker = " *" if name in matched_names else ""
+        lines.append(f"- {name} ({etype}){marker}")
+
+    if edges:
+        lines.append("\n**관계:**")
+        id_to_name = {n["id"]: n.get("entity_name", "") for n in all_nodes}
+        for edge in edges:
+            src = id_to_name.get(edge.get("source"), "?")
+            tgt = id_to_name.get(edge.get("target"), "?")
+            rel = edge.get("relation_type", "관련")
+            lines.append(f"- {src} --[{rel}]--> {tgt}")
+
+    return "\n".join(lines)
+
+
+# 하위 호환: 키워드 기반 그래프 탐색 (MCP tools에서 사용 가능)
 def _search_graph(query: str, graph_store: GraphStore) -> str | None:
-    """질의에서 키워드를 추출하여 그래프를 탐색한다."""
+    """질의에서 키워드를 추출하여 그래프를 탐색한다 (레거시)."""
     keywords = query.split()
     all_nodes: list[dict[str, Any]] = []
     all_node_ids: set[int] = set()
@@ -150,7 +259,6 @@ def _search_graph(query: str, graph_store: GraphStore) -> str | None:
 
     if edges:
         lines.append("\n**관계:**")
-        # 노드 ID → 이름 매핑
         id_to_name = {n["id"]: n.get("entity_name", "") for n in all_nodes}
         for edge in edges:
             src = id_to_name.get(edge.get("source"), "?")
@@ -173,6 +281,8 @@ async def assemble_context_with_sources(
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
+    그래프 탐색은 임베딩 기반으로 매칭되는 엔티티가 있을 때만 실행된다.
+
     Args:
         query: 검색 질의 문자열.
         meta_store: 메타데이터 저장소.
@@ -189,8 +299,13 @@ async def assemble_context_with_sources(
     sources: list[Source] = []
     doc_cache: dict[int, dict[str, Any]] = {}
 
+    # 질의 임베딩 생성 (벡터 검색 + 엔티티 매칭 공용)
+    query_embedding = await _get_query_embedding(query, embedding_client)
+
     # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(query, vector_store, embedding_client, max_chunks)
+    chunk_results = await _search_chunks_with_embedding(
+        query_embedding, vector_store, max_chunks,
+    )
     if chunk_results:
         lines = []
         for r in chunk_results:
@@ -206,9 +321,11 @@ async def assemble_context_with_sources(
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 2. 그래프 탐색
-    if include_graph:
-        graph_section = _search_graph(query, graph_store)
+    # 2. 임베딩 기반 그래프 탐색 (매칭 엔티티가 있을 때만)
+    if include_graph and query_embedding:
+        graph_section = await _search_graph_by_embedding(
+            query_embedding, graph_store, embedding_client,
+        )
         if graph_section:
             sections.append(graph_section)
 

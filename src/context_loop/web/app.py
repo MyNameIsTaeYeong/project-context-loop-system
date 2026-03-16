@@ -91,6 +91,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.llm_client = llm_client
     app.state.embedding_client = embedding_client
 
+    # 엔티티 임베딩 캐시 사전 빌드 (그래프 노드가 있는 경우)
+    if graph_store.stats()["nodes"] > 0:
+        try:
+            count = await graph_store.build_entity_embeddings(embedding_client)
+            logger.info("엔티티 임베딩 캐시 빌드 완료: %d개", count)
+        except Exception:
+            logger.warning("엔티티 임베딩 캐시 빌드 실패 (채팅 시 재시도됨)", exc_info=True)
+
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
 
