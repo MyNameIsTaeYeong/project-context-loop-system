@@ -7,7 +7,7 @@ import json
 import pytest
 
 from context_loop.processor.graph_extractor import GraphData, extract_graph
-from context_loop.processor.llm_client import LLMClient
+from context_loop.processor.llm_client import LLMClient, extract_json
 
 
 class MockLLMClient(LLMClient):
@@ -89,3 +89,37 @@ async def test_extract_graph_skips_missing_entities_in_relations() -> None:
     result = await extract_graph(client, "Title", "content")
     # 추출 자체는 그대로 반환 (저장 시 필터링됨)
     assert len(result.relations) == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_graph_truncated_json() -> None:
+    """max_tokens 제한으로 잘린 JSON 응답에서도 완전한 항목을 추출한다."""
+    truncated = (
+        '{"entities": ['
+        '{"name": "Auth Service", "type": "service", "description": "auth"},'
+        '{"name": "User DB", "type": "system", "description": "db"}'
+        '], "relations": ['
+        '{"source": "Auth Service", "target": "User DB", "type": "uses", "label": "queries"},'
+        '{"source": "Auth Service", "target": "Incom'  # 잘린 부분
+    )
+    client = MockLLMClient(truncated)
+    result = await extract_graph(client, "Title", "content")
+    assert len(result.entities) == 2
+    assert len(result.relations) == 1
+    assert result.relations[0].source == "Auth Service"
+
+
+def test_extract_json_truncated_repair() -> None:
+    """잘린 JSON 문자열을 복구하여 파싱한다."""
+    truncated = '{"entities": [{"name": "A"}, {"name": "B"}], "relations": [{"source": "A", "targ'
+    data = extract_json(truncated)
+    assert len(data["entities"]) == 2
+    # relations 키 자체가 잘려서 포함되지 않거나 빈 배열
+    assert len(data.get("relations", [])) <= 1
+
+
+def test_extract_json_truncated_code_block() -> None:
+    """코드 블록 안의 잘린 JSON도 복구한다."""
+    truncated = '```json\n{"entities": [{"name": "X"}], "relations": [{"sourc'
+    data = extract_json(truncated)
+    assert len(data["entities"]) == 1
