@@ -306,3 +306,83 @@ async def test_format_schema_for_llm_with_data(graph_store: GraphStore, meta_sto
     assert "depends_on" in text
     assert "component" in text
     assert "service" in text
+
+
+@pytest.mark.asyncio
+async def test_schema_cache_invalidation(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """그래프 변경 시 스키마 캐시가 무효화된다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[Entity(name="NodeA", entity_type="service")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    # 첫 호출: 캐시 생성
+    summary1 = graph_store.get_schema_summary()
+    assert summary1["total_nodes"] == 1
+
+    # 같은 호출: 캐시 반환 (동일 객체)
+    summary2 = graph_store.get_schema_summary()
+    assert summary1 is summary2
+
+    # 새 노드 추가 → 캐시 무효화
+    doc_id2 = await meta_store.create_document(
+        source_type="manual", title="T2", original_content="c", content_hash="h2",
+    )
+    await graph_store.save_graph_data(doc_id2, GraphData(
+        entities=[Entity(name="NodeB", entity_type="component")],
+        relations=[],
+    ))
+
+    summary3 = graph_store.get_schema_summary()
+    assert summary3["total_nodes"] == 2
+    assert summary3 is not summary1
+
+    # 삭제 → 캐시 무효화
+    await graph_store.delete_document_graph(doc_id)
+    summary4 = graph_store.get_schema_summary()
+    assert summary4["total_nodes"] == 1
+    assert summary4 is not summary3
+
+
+@pytest.mark.asyncio
+async def test_schema_total_entity_limit(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """max_total_entities로 LLM에 전달할 엔티티 총 수를 제한한다."""
+    doc_id = await _create_doc(meta_store)
+    # 유형 3개 × 각 5개 = 15개 엔티티
+    entities = []
+    for etype in ["service", "component", "system"]:
+        for i in range(5):
+            entities.append(Entity(name=f"{etype}_{i}", entity_type=etype))
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    # max_total_entities=6 → 유형 3개 × 쿼타 2개 = 최대 6개
+    summary = graph_store.get_schema_summary(max_entities_per_type=10, max_total_entities=6)
+    total_shown = sum(len(names) for names in summary["entities_by_type"].values())
+    assert total_shown <= 6
+    assert summary["total_nodes"] == 15  # 전체 수는 정확
+
+
+@pytest.mark.asyncio
+async def test_schema_relations_balanced_sampling(graph_store: GraphStore, meta_store: MetadataStore) -> None:
+    """관계 예시가 유형별로 균등하게 샘플링된다."""
+    doc_id = await _create_doc(meta_store)
+    entities = [Entity(name=f"E{i}", entity_type="service") for i in range(6)]
+    relations = [
+        # depends_on 3건
+        Relation(source="E0", target="E1", relation_type="depends_on"),
+        Relation(source="E1", target="E2", relation_type="depends_on"),
+        Relation(source="E2", target="E3", relation_type="depends_on"),
+        # uses 3건
+        Relation(source="E3", target="E4", relation_type="uses"),
+        Relation(source="E4", target="E5", relation_type="uses"),
+        Relation(source="E5", target="E0", relation_type="uses"),
+    ]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=relations))
+
+    summary = graph_store.get_schema_summary()
+    sample_types = [r["type"] for r in summary["sample_relations"]]
+    # 두 유형 모두 샘플에 포함되어야 함
+    assert "depends_on" in sample_types
+    assert "uses" in sample_types
