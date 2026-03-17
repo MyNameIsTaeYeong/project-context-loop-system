@@ -48,6 +48,8 @@ class GraphStore:
         self._graph: nx.DiGraph = nx.DiGraph()
         # 엔티티 임베딩 캐시: node_id → (entity_name, embedding)
         self._entity_embeddings: dict[int, tuple[str, list[float]]] = {}
+        # 스키마 요약 캐시: 그래프 변경 시 무효화
+        self._schema_cache: dict[str, Any] | None = None
 
     async def load_from_db(self) -> None:
         """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다."""
@@ -75,6 +77,7 @@ class GraphStore:
                     properties=json.loads(edge["properties"] or "{}"),
                 )
         self._entity_embeddings.clear()
+        self._schema_cache = None
         logger.debug(
             "그래프 로드 완료 — 노드: %d, 엣지: %d",
             self._graph.number_of_nodes(),
@@ -148,9 +151,10 @@ class GraphStore:
             )
             edge_count += 1
 
-        # 새 노드의 임베딩 캐시 무효화 (다음 build_entity_embeddings 호출 시 재생성)
+        # 캐시 무효화
         for name, nid in name_to_node_id.items():
             self._entity_embeddings.pop(nid, None)
+        self._schema_cache = None
 
         logger.info(
             "그래프 저장 완료 — document_id=%d, 노드: %d, 엣지: %d",
@@ -183,9 +187,10 @@ class GraphStore:
         ]
         self._graph.remove_edges_from(orphan_edges)
 
-        # 삭제된 노드의 임베딩 캐시도 제거
+        # 캐시 무효화
         for nid in nodes_to_remove:
             self._entity_embeddings.pop(nid, None)
+        self._schema_cache = None
 
         logger.debug("그래프 삭제 완료: document_id=%d", document_id)
 
@@ -261,14 +266,19 @@ class GraphStore:
 
     # --- LLM 기반 그래프 탐색 지원 ---
 
-    def get_schema_summary(self, max_entities_per_type: int = 10) -> dict[str, Any]:
+    def get_schema_summary(
+        self,
+        max_entities_per_type: int = 10,
+        max_total_entities: int = 50,
+    ) -> dict[str, Any]:
         """LLM에게 제공할 그래프 스키마 요약을 생성한다.
 
-        그래프의 구조(엔티티 유형, 관계 유형, 대표 엔티티 목록)를
-        LLM이 탐색 계획을 세울 수 있는 형태로 요약한다.
+        그래프 변경이 없으면 캐시된 결과를 반환한다.
+        전체 그래프를 순회하지만 결과는 요약되어 LLM 토큰을 절약한다.
 
         Args:
             max_entities_per_type: 유형별 최대 엔티티 표시 수.
+            max_total_entities: LLM에 전달할 엔티티 이름 총 상한.
 
         Returns:
             {
@@ -280,8 +290,11 @@ class GraphStore:
                 "sample_relations": [{"source", "target", "type"}, ...]
             }
         """
+        if self._schema_cache is not None:
+            return self._schema_cache
+
         if self._graph.number_of_nodes() == 0:
-            return {
+            result: dict[str, Any] = {
                 "total_nodes": 0,
                 "total_edges": 0,
                 "entity_types": {},
@@ -289,35 +302,66 @@ class GraphStore:
                 "entities_by_type": {},
                 "sample_relations": [],
             }
+            self._schema_cache = result
+            return result
 
         # 엔티티 유형별 집계
         type_counter: Counter[str] = Counter()
-        entities_by_type: dict[str, list[str]] = {}
+        all_entities_by_type: dict[str, list[str]] = {}
         for _, data in self._graph.nodes(data=True):
             etype = data.get("entity_type", "other")
             ename = data.get("entity_name", "")
             type_counter[etype] += 1
-            if etype not in entities_by_type:
-                entities_by_type[etype] = []
-            if len(entities_by_type[etype]) < max_entities_per_type:
-                entities_by_type[etype].append(ename)
+            if etype not in all_entities_by_type:
+                all_entities_by_type[etype] = []
+            all_entities_by_type[etype].append(ename)
 
-        # 관계 유형별 집계
+        # 유형별로 max_entities_per_type 이내로 자르되,
+        # 전체 합이 max_total_entities를 넘지 않도록 유형별 쿼타 분배
+        num_types = len(all_entities_by_type)
+        per_type_quota = max(1, max_total_entities // max(num_types, 1))
+        per_type_quota = min(per_type_quota, max_entities_per_type)
+
+        entities_by_type: dict[str, list[str]] = {}
+        total_shown = 0
+        for etype in type_counter:  # most_common 순서로 순회하기 위해 아래에서 정렬
+            pass
+        for etype, _ in type_counter.most_common():
+            remaining = max_total_entities - total_shown
+            if remaining <= 0:
+                break
+            quota = min(per_type_quota, remaining, len(all_entities_by_type[etype]))
+            entities_by_type[etype] = all_entities_by_type[etype][:quota]
+            total_shown += quota
+
+        # 관계 유형별 집계 + 유형별 균등 샘플링
         rel_counter: Counter[str] = Counter()
-        sample_relations: list[dict[str, str]] = []
+        relations_by_type: dict[str, list[dict[str, str]]] = {}
         for u, v, data in self._graph.edges(data=True):
             rtype = data.get("relation_type", "related_to")
             rel_counter[rtype] += 1
-            if len(sample_relations) < 15:
+            if rtype not in relations_by_type:
+                relations_by_type[rtype] = []
+            if len(relations_by_type[rtype]) < 3:  # 유형별 최대 3개
                 src_name = self._graph.nodes[u].get("entity_name", str(u))
                 tgt_name = self._graph.nodes[v].get("entity_name", str(v))
-                sample_relations.append({
+                relations_by_type[rtype].append({
                     "source": src_name,
                     "target": tgt_name,
                     "type": rtype,
                 })
 
-        return {
+        # 유형별 샘플을 합쳐서 최대 15개
+        sample_relations: list[dict[str, str]] = []
+        for rtype, _ in rel_counter.most_common():
+            for rel in relations_by_type.get(rtype, []):
+                if len(sample_relations) >= 15:
+                    break
+                sample_relations.append(rel)
+            if len(sample_relations) >= 15:
+                break
+
+        result = {
             "total_nodes": self._graph.number_of_nodes(),
             "total_edges": self._graph.number_of_edges(),
             "entity_types": dict(type_counter.most_common()),
@@ -325,17 +369,26 @@ class GraphStore:
             "entities_by_type": entities_by_type,
             "sample_relations": sample_relations,
         }
+        self._schema_cache = result
+        return result
 
-    def format_schema_for_llm(self, max_entities_per_type: int = 10) -> str:
+    def format_schema_for_llm(
+        self,
+        max_entities_per_type: int = 10,
+        max_total_entities: int = 50,
+    ) -> str:
         """LLM 프롬프트에 삽입할 그래프 스키마 요약 텍스트를 생성한다.
+
+        그래프 변경이 없으면 캐시된 요약을 사용한다.
 
         Args:
             max_entities_per_type: 유형별 최대 엔티티 표시 수.
+            max_total_entities: 전체 엔티티 이름 총 상한.
 
         Returns:
             사람이 읽기 쉬운 스키마 요약 텍스트.
         """
-        summary = self.get_schema_summary(max_entities_per_type)
+        summary = self.get_schema_summary(max_entities_per_type, max_total_entities)
         if summary["total_nodes"] == 0:
             return "그래프가 비어 있습니다."
 
