@@ -157,6 +157,47 @@ async def test_plan_graph_search_calls_llm(graph_store: GraphStore, meta_store: 
 
 
 @pytest.mark.asyncio
+async def test_plan_graph_search_with_query_embedding(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """query_embedding이 제공되면 쿼리 관련 스키마를 LLM에 전달한다."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="Auth", entity_type="service"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="Auth", relation_type="depends_on"),
+        ],
+    ))
+
+    # 엔티티 임베딩 구축
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    plan_json = json.dumps({
+        "should_search": True,
+        "reasoning": "Gateway 확인",
+        "search_steps": [{"entity_name": "Gateway", "depth": 1, "focus_relations": []}],
+    })
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=plan_json)
+
+    plan = await plan_graph_search(
+        "게이트웨이", graph_store, mock_llm,
+        query_embedding=[0.9, 0.1],
+    )
+    assert plan.should_search is True
+
+    # 프롬프트에 "쿼리 관련 핵심 엔티티" 섹션이 포함되어야 함
+    prompt = mock_llm.complete.call_args[0][0]
+    assert "쿼리 관련 핵심 엔티티" in prompt
+
+
+@pytest.mark.asyncio
 async def test_plan_graph_search_llm_failure(graph_store: GraphStore, meta_store: MetadataStore) -> None:
     """LLM 호출 실패 시 should_search=false를 반환한다."""
     doc_id = await _create_doc(meta_store)
