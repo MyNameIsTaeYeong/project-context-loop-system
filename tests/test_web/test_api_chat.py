@@ -141,3 +141,7 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
     assert resp.status_code == 200
     data = resp.json()
     assert data["answer"] == "테스트 답변입니다."
+    # 그래프 탐색에서 출처가 추출되어야 한다
+    assert len(data["sources"]) >= 1
+    assert data["sources"][0]["title"] == "아키텍처 문서"
+    assert data["sources"][0]["document_id"] == doc_id

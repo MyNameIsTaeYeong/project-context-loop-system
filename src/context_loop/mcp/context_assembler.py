@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from context_loop.processor.graph_search_planner import (
+    GraphSearchResult,
     execute_graph_search,
     plan_graph_search,
 )
@@ -81,13 +82,13 @@ async def assemble_context(
 
     # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
     if include_graph and llm_client:
-        graph_section = await _search_graph_with_llm(
+        graph_result = await _search_graph_with_llm(
             query, graph_store, llm_client,
             query_embedding=query_embedding,
             embedding_client=embedding_client,
         )
-        if graph_section:
-            sections.append(graph_section)
+        if graph_result:
+            sections.append(graph_result.text)
 
     if not sections:
         return "관련 컨텍스트를 찾을 수 없습니다."
@@ -152,7 +153,7 @@ async def _search_graph_with_llm(
     *,
     query_embedding: list[float] | None = None,
     embedding_client: Any = None,
-) -> str | None:
+) -> GraphSearchResult | None:
     """LLM 기반 플래너로 그래프를 탐색한다.
 
     1. 엔티티 임베딩이 없으면 자동으로 구축한다.
@@ -233,13 +234,22 @@ async def assemble_context_with_sources(
 
     # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
     if include_graph and llm_client:
-        graph_section = await _search_graph_with_llm(
+        graph_result = await _search_graph_with_llm(
             query, graph_store, llm_client,
             query_embedding=query_embedding,
             embedding_client=embedding_client,
         )
-        if graph_section:
-            sections.append(graph_section)
+        if graph_result:
+            sections.append(graph_result.text)
+            # 그래프 탐색 결과에서 출처 추출
+            existing_doc_ids = {s.document_id for s in sources}
+            for doc_id in graph_result.document_ids:
+                if doc_id not in existing_doc_ids:
+                    if doc_id not in doc_cache:
+                        doc = await meta_store.get_document(doc_id)
+                        doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
+                    title = doc_cache[doc_id]["title"]
+                    sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
 
     context_text = "\n\n---\n\n".join(sections) if sections else ""
     sources.sort(key=lambda s: s.similarity, reverse=True)

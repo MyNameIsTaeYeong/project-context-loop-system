@@ -78,6 +78,14 @@ class GraphSearchPlan:
     search_steps: list[SearchStep] = field(default_factory=list)
 
 
+@dataclass
+class GraphSearchResult:
+    """그래프 탐색 결과."""
+
+    text: str
+    document_ids: set[int] = field(default_factory=set)
+
+
 async def plan_graph_search(
     query: str,
     graph_store: GraphStore,
@@ -159,7 +167,7 @@ def _parse_plan(data: Any) -> GraphSearchPlan:
 async def execute_graph_search(
     plan: GraphSearchPlan,
     graph_store: GraphStore,
-) -> str | None:
+) -> GraphSearchResult | None:
     """탐색 계획에 따라 그래프를 탐색하고 결과를 포맷팅한다.
 
     Args:
@@ -167,7 +175,7 @@ async def execute_graph_search(
         graph_store: 그래프 저장소.
 
     Returns:
-        포맷팅된 그래프 컨텍스트 텍스트. 결과가 없으면 None.
+        그래프 탐색 결과(텍스트 + 관련 document_id). 결과가 없으면 None.
     """
     if not plan.should_search or not plan.search_steps:
         return None
@@ -204,6 +212,13 @@ async def execute_graph_search(
         if filtered_edges:
             edges = filtered_edges
 
+    # 관련 document_id 수집
+    document_ids: set[int] = set()
+    for node in all_nodes:
+        doc_id = node.get("document_id")
+        if doc_id is not None:
+            document_ids.add(doc_id)
+
     # 포맷팅
     searched_set = {name.lower() for name in searched_entities}
     lines = ["## 관련 그래프 컨텍스트"]
@@ -230,4 +245,4 @@ async def execute_graph_search(
             label_text = f" ({label})" if label else ""
             lines.append(f"- {src} --[{rel}]--> {tgt}{label_text}")
 
-    return "\n".join(lines)
+    return GraphSearchResult(text="\n".join(lines), document_ids=document_ids)
