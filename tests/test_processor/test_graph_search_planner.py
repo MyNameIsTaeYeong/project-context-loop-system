@@ -11,6 +11,7 @@ import pytest
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 from context_loop.processor.graph_search_planner import (
     GraphSearchPlan,
+    GraphSearchResult,
     SearchStep,
     _parse_plan,
     execute_graph_search,
@@ -255,10 +256,12 @@ async def test_execute_search_success(graph_store: GraphStore, meta_store: Metad
     )
     result = await execute_graph_search(plan, graph_store)
     assert result is not None
-    assert "Gateway" in result
-    assert "AuthService" in result
-    assert "depends_on" in result
-    assert "게이트웨이 구조 파악" in result
+    assert isinstance(result, GraphSearchResult)
+    assert "Gateway" in result.text
+    assert "AuthService" in result.text
+    assert "depends_on" in result.text
+    assert "게이트웨이 구조 파악" in result.text
+    assert doc_id in result.document_ids
 
 
 @pytest.mark.asyncio
@@ -284,6 +287,6 @@ async def test_execute_search_focus_relations_filter(graph_store: GraphStore, me
     )
     result = await execute_graph_search(plan, graph_store)
     assert result is not None
-    assert "calls" in result
+    assert "calls" in result.text
     # uses는 필터링되어 표시되지 않아야 함
-    assert "uses" not in result
+    assert "uses" not in result.text

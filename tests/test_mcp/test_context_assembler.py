@@ -95,9 +95,10 @@ async def test_graph_search_finds_entities_via_llm_plan(stores) -> None:
 
     result = await _search_graph_with_llm("게이트웨이 구조", graph_store, llm)
     assert result is not None
-    assert "Gateway" in result
-    assert "AuthService" in result
-    assert "depends_on" in result
+    assert "Gateway" in result.text
+    assert "AuthService" in result.text
+    assert "depends_on" in result.text
+    assert doc_id in result.document_ids
 
 
 @pytest.mark.asyncio
@@ -131,9 +132,9 @@ async def test_graph_search_with_multiple_steps(stores) -> None:
 
     result = await _search_graph_with_llm("서비스 구조", graph_store, llm)
     assert result is not None
-    assert "ServiceA" in result
-    assert "ServiceB" in result
-    assert "Database" in result
+    assert "ServiceA" in result.text
+    assert "ServiceB" in result.text
+    assert "Database" in result.text
 
 
 @pytest.mark.asyncio
@@ -298,4 +299,4 @@ async def test_graph_search_reasoning_in_output(stores) -> None:
 
     result = await _search_graph_with_llm("인증", graph_store, llm)
     assert result is not None
-    assert "인증 서비스 구조 파악 필요" in result
+    assert "인증 서비스 구조 파악 필요" in result.text
