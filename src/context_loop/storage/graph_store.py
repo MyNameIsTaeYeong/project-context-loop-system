@@ -363,6 +363,155 @@ class GraphStore:
 
         return "\n".join(lines)
 
+    # --- 쿼리 기반 스키마 생성 ---
+
+    def get_query_relevant_schema(
+        self,
+        query_embedding: list[float],
+        *,
+        similarity_threshold: float = 0.5,
+        top_k: int = 10,
+        neighbor_depth: int = 1,
+        max_sample_relations: int = 15,
+    ) -> dict[str, Any]:
+        """쿼리와 관련된 엔티티 중심으로 축소된 스키마를 생성한다.
+
+        1. 쿼리 임베딩과 유사한 엔티티를 찾는다.
+        2. 해당 엔티티의 이웃(neighbor_depth)을 포함하여 서브그래프를 구성한다.
+        3. 서브그래프의 스키마 요약을 반환한다.
+
+        임베딩 캐시가 비어 있으면 전체 스키마로 폴백한다.
+
+        Args:
+            query_embedding: 쿼리 텍스트의 임베딩 벡터.
+            similarity_threshold: 최소 코사인 유사도 임계값.
+            top_k: 유사 엔티티 최대 검색 수.
+            neighbor_depth: 유사 엔티티로부터의 이웃 탐색 깊이.
+            max_sample_relations: 샘플 관계 최대 수.
+
+        Returns:
+            전체 스키마와 동일한 형태의 딕셔너리 + "seed_entities" 키 추가.
+        """
+        if not self._entity_embeddings:
+            return self.get_schema_summary()
+
+        # 1. 쿼리와 유사한 엔티티 찾기
+        similar = self.search_entities_by_embedding(
+            query_embedding, threshold=similarity_threshold, top_k=top_k,
+        )
+        if not similar:
+            return self.get_schema_summary()
+
+        # 2. 유사 엔티티 + 이웃으로 서브그래프 노드 ID 수집
+        relevant_node_ids: set[int] = set()
+        seed_entities: list[dict[str, Any]] = []
+        for entity in similar:
+            nid = entity["node_id"]
+            relevant_node_ids.add(nid)
+            seed_entities.append({
+                "name": entity["entity_name"],
+                "type": entity["entity_type"],
+                "similarity": round(entity["similarity"], 3),
+            })
+            # 이웃 탐색
+            reachable = nx.single_source_shortest_path_length(
+                self._graph, nid, cutoff=neighbor_depth,
+            )
+            relevant_node_ids.update(reachable.keys())
+
+        if not relevant_node_ids:
+            return self.get_schema_summary()
+
+        # 3. 서브그래프 스키마 집계
+        type_counter: Counter[str] = Counter()
+        entities_by_type: dict[str, list[str]] = {}
+        for nid in relevant_node_ids:
+            if nid not in self._graph:
+                continue
+            data = self._graph.nodes[nid]
+            etype = data.get("entity_type", "other")
+            ename = data.get("entity_name", "")
+            type_counter[etype] += 1
+            entities_by_type.setdefault(etype, []).append(ename)
+
+        rel_counter: Counter[str] = Counter()
+        sample_relations: list[dict[str, str]] = []
+        for u, v, data in self._graph.edges(data=True):
+            if u in relevant_node_ids and v in relevant_node_ids:
+                rtype = data.get("relation_type", "related_to")
+                rel_counter[rtype] += 1
+                if len(sample_relations) < max_sample_relations:
+                    src_name = self._graph.nodes[u].get("entity_name", str(u))
+                    tgt_name = self._graph.nodes[v].get("entity_name", str(v))
+                    sample_relations.append({
+                        "source": src_name,
+                        "target": tgt_name,
+                        "type": rtype,
+                    })
+
+        return {
+            "total_nodes": len(relevant_node_ids),
+            "total_edges": sum(rel_counter.values()),
+            "entity_types": dict(type_counter.most_common()),
+            "relation_types": dict(rel_counter.most_common()),
+            "entities_by_type": entities_by_type,
+            "sample_relations": sample_relations,
+            "seed_entities": seed_entities,
+        }
+
+    def format_query_relevant_schema_for_llm(
+        self,
+        query_embedding: list[float],
+        **kwargs: Any,
+    ) -> str:
+        """쿼리 관련 스키마를 LLM 프롬프트용 텍스트로 변환한다.
+
+        Args:
+            query_embedding: 쿼리 텍스트의 임베딩 벡터.
+            **kwargs: get_query_relevant_schema에 전달할 추가 인자.
+
+        Returns:
+            사람이 읽기 쉬운 스키마 요약 텍스트.
+        """
+        summary = self.get_query_relevant_schema(query_embedding, **kwargs)
+        if summary["total_nodes"] == 0:
+            return "그래프가 비어 있습니다."
+
+        lines = [
+            f"# 지식 그래프 구조 (관련 노드: {summary['total_nodes']}개, "
+            f"관련 엣지: {summary['total_edges']}개)",
+        ]
+
+        # 쿼리와 직접 관련된 시드 엔티티 표시
+        seed = summary.get("seed_entities", [])
+        if seed:
+            lines.append("")
+            lines.append("## 쿼리 관련 핵심 엔티티")
+            for s in seed:
+                lines.append(
+                    f"- **{s['name']}** ({s['type']}, 유사도: {s['similarity']:.2f})"
+                )
+
+        lines.append("")
+        lines.append("## 엔티티 유형별 목록")
+        for etype, names in summary["entities_by_type"].items():
+            count = summary["entity_types"].get(etype, 0)
+            lines.append(f"- **{etype}** ({count}개): {', '.join(names)}")
+
+        if summary["relation_types"]:
+            lines.append("")
+            lines.append("## 관계 유형")
+            for rtype, count in summary["relation_types"].items():
+                lines.append(f"- {rtype}: {count}건")
+
+        if summary["sample_relations"]:
+            lines.append("")
+            lines.append("## 관계 예시")
+            for rel in summary["sample_relations"][:10]:
+                lines.append(f"- {rel['source']} --[{rel['type']}]--> {rel['target']}")
+
+        return "\n".join(lines)
+
     # --- 엔티티 임베딩 기반 유사도 검색 ---
 
     async def build_entity_embeddings(self, embedding_client: Any) -> int:

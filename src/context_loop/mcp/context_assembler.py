@@ -70,18 +70,21 @@ async def assemble_context(
     """
     sections: list[str] = []
 
+    # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
+    query_embedding = await _embed_query(query, embedding_client)
+
     # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(
-        query, vector_store, embedding_client, max_chunks,
-    )
+    chunk_results = await _search_chunks(query_embedding, vector_store, max_chunks)
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 2. LLM 기반 그래프 탐색
+    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
     if include_graph and llm_client:
         graph_section = await _search_graph_with_llm(
             query, graph_store, llm_client,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
         )
         if graph_section:
             sections.append(graph_section)
@@ -92,17 +95,27 @@ async def assemble_context(
     return "\n\n---\n\n".join(sections)
 
 
-async def _search_chunks(
+async def _embed_query(
     query: str,
-    vector_store: VectorStore,
     embedding_client: Any,
+) -> list[float] | None:
+    """쿼리 임베딩을 생성한다. 실패 시 None."""
+    try:
+        return await embedding_client.aembed_query(query)
+    except Exception:
+        logger.warning("쿼리 임베딩 생성 실패", exc_info=True)
+        return None
+
+
+async def _search_chunks(
+    query_embedding: list[float] | None,
+    vector_store: VectorStore,
     max_chunks: int,
 ) -> list[dict[str, Any]]:
     """벡터 유사도 검색을 수행한다."""
     try:
-        if vector_store.count() == 0:
+        if vector_store.count() == 0 or query_embedding is None:
             return []
-        query_embedding = await embedding_client.aembed_query(query)
         return vector_store.search(query_embedding, n_results=max_chunks)
     except Exception:
         logger.warning("벡터 검색 실패", exc_info=True)
@@ -136,15 +149,26 @@ async def _search_graph_with_llm(
     query: str,
     graph_store: GraphStore,
     llm_client: Any,
+    *,
+    query_embedding: list[float] | None = None,
+    embedding_client: Any = None,
 ) -> str | None:
     """LLM 기반 플래너로 그래프를 탐색한다.
 
-    1. LLM에게 그래프 스키마 + 질의를 보여주고 탐색 계획을 받는다.
-    2. 계획에 따라 GraphStore에서 실제 탐색을 수행한다.
-    3. LLM이 탐색 불필요로 판단하면 None을 반환한다.
+    1. 엔티티 임베딩이 없으면 자동으로 구축한다.
+    2. LLM에게 쿼리 관련 스키마 + 질의를 보여주고 탐색 계획을 받는다.
+    3. 계획에 따라 GraphStore에서 실제 탐색을 수행한다.
+    4. LLM이 탐색 불필요로 판단하면 None을 반환한다.
     """
     try:
-        plan = await plan_graph_search(query, graph_store, llm_client)
+        # 엔티티 임베딩 자동 구축 (최초 1회만 비용 발생)
+        if embedding_client and graph_store.entity_embedding_count == 0:
+            await graph_store.build_entity_embeddings(embedding_client)
+
+        plan = await plan_graph_search(
+            query, graph_store, llm_client,
+            query_embedding=query_embedding,
+        )
         if not plan.should_search:
             logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
             return None
@@ -187,8 +211,11 @@ async def assemble_context_with_sources(
     sources: list[Source] = []
     doc_cache: dict[int, dict[str, Any]] = {}
 
+    # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
+    query_embedding = await _embed_query(query, embedding_client)
+
     # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(query, vector_store, embedding_client, max_chunks)
+    chunk_results = await _search_chunks(query_embedding, vector_store, max_chunks)
     if chunk_results:
         lines = []
         for r in chunk_results:
@@ -204,10 +231,12 @@ async def assemble_context_with_sources(
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 2. LLM 기반 그래프 탐색
+    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
     if include_graph and llm_client:
         graph_section = await _search_graph_with_llm(
             query, graph_store, llm_client,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
         )
         if graph_section:
             sections.append(graph_section)

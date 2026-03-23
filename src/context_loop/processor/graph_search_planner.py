@@ -82,13 +82,19 @@ async def plan_graph_search(
     query: str,
     graph_store: GraphStore,
     llm_client: LLMClient,
+    *,
+    query_embedding: list[float] | None = None,
 ) -> GraphSearchPlan:
     """LLM을 사용하여 그래프 탐색 계획을 생성한다.
+
+    query_embedding이 제공되고 엔티티 임베딩이 구축되어 있으면
+    쿼리와 관련된 서브그래프 스키마만 LLM에게 제공한다.
 
     Args:
         query: 사용자 질의.
         graph_store: 그래프 저장소.
         llm_client: LLM 클라이언트.
+        query_embedding: 쿼리 텍스트의 임베딩 벡터. None이면 전체 스키마 사용.
 
     Returns:
         그래프 탐색 계획.
@@ -96,7 +102,10 @@ async def plan_graph_search(
     if graph_store.stats()["nodes"] == 0:
         return GraphSearchPlan(should_search=False, reasoning="그래프가 비어 있음")
 
-    schema_text = graph_store.format_schema_for_llm()
+    if query_embedding is not None and graph_store.entity_embedding_count > 0:
+        schema_text = graph_store.format_query_relevant_schema_for_llm(query_embedding)
+    else:
+        schema_text = graph_store.format_schema_for_llm()
 
     prompt = _PLAN_USER_TEMPLATE.format(query=query, schema=schema_text)
 

@@ -306,3 +306,130 @@ async def test_format_schema_for_llm_with_data(graph_store: GraphStore, meta_sto
     assert "depends_on" in text
     assert "component" in text
     assert "service" in text
+
+
+# --- 쿼리 기반 스키마 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_get_query_relevant_schema_no_embeddings(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """임베딩 캐시가 없으면 전체 스키마로 폴백한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[Entity(name="A", entity_type="service")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    # 임베딩 구축 없이 호출
+    summary = graph_store.get_query_relevant_schema([1.0, 0.0])
+    # 전체 스키마와 동일해야 함
+    assert summary["total_nodes"] == 1
+    assert "seed_entities" not in summary
+
+
+@pytest.mark.asyncio
+async def test_get_query_relevant_schema_filters_by_query(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """쿼리 임베딩과 유사한 엔티티 중심으로 축소된 스키마를 생성한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+            Entity(name="PaymentService", entity_type="service"),
+            Entity(name="Database", entity_type="system"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
+            Relation(source="Gateway", target="PaymentService", relation_type="depends_on"),
+            Relation(source="AuthService", target="Database", relation_type="uses"),
+            Relation(source="PaymentService", target="Database", relation_type="uses"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    # 임베딩 구축: Gateway=[1,0,0,0], Auth=[0,1,0,0], Payment=[0,0,1,0], DB=[0,0,0,1]
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # Gateway와 유사한 쿼리 → Gateway + 이웃(Auth, Payment)만 포함, DB는 depth=1이면 제외 안 됨
+    summary = graph_store.get_query_relevant_schema(
+        [0.9, 0.1, 0.0, 0.0],  # Gateway와 가장 유사
+        similarity_threshold=0.5,
+        top_k=1,
+        neighbor_depth=1,
+    )
+    assert "seed_entities" in summary
+    assert summary["seed_entities"][0]["name"] == "Gateway"
+    # Gateway(시드) + AuthService, PaymentService(이웃) = 3개
+    assert summary["total_nodes"] == 3
+    entity_names = []
+    for names in summary["entities_by_type"].values():
+        entity_names.extend(names)
+    assert "Gateway" in entity_names
+    assert "AuthService" in entity_names
+    assert "PaymentService" in entity_names
+
+
+@pytest.mark.asyncio
+async def test_get_query_relevant_schema_no_similar_entities(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """유사한 엔티티가 없으면 전체 스키마로 폴백한다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[Entity(name="X", entity_type="service")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # 완전히 반대 방향 벡터 → 유사도 낮음
+    summary = graph_store.get_query_relevant_schema(
+        [0.0, 1.0], similarity_threshold=0.9,
+    )
+    # 폴백: 전체 스키마
+    assert "seed_entities" not in summary
+    assert summary["total_nodes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_format_query_relevant_schema_for_llm(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """쿼리 관련 스키마의 LLM 포맷에 핵심 엔티티 섹션이 포함된다."""
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="Auth", entity_type="service"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="Auth", relation_type="depends_on"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    text = graph_store.format_query_relevant_schema_for_llm(
+        [0.9, 0.1], similarity_threshold=0.5,
+    )
+    assert "쿼리 관련 핵심 엔티티" in text
+    assert "Gateway" in text
+    assert "관련 노드" in text
