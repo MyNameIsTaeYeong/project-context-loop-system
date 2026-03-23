@@ -43,8 +43,8 @@
 
     <!-- 입력 영역 -->
     <form @submit.prevent="sendMessage" style="display: flex; gap: 0.5rem; align-items: flex-end;">
-        <textarea x-model="input" placeholder="질문을 입력하세요..." :disabled="loading" @keydown.enter.prevent="if (!$event.shiftKey) sendMessage()" style="flex: 1; min-height: 3.5rem; max-height: 10rem; resize: vertical; margin-bottom: 0;" rows="3" autofocus></textarea>
-        <button type="submit" :disabled="loading || !input.trim()" :aria-busy="loading" style="margin-bottom: 0;">전송</button>
+        <textarea x-model="input" placeholder="질문을 입력하세요..." :disabled="loading" @keydown.enter.prevent="if (!$event.shiftKey) sendMessage()" style="flex: 1; min-height: 6rem; max-height: 12rem; resize: vertical; margin-bottom: 0;" rows="4" autofocus></textarea>
+        <button type="submit" :disabled="loading || !input.trim()" :aria-busy="loading" style="margin-bottom: 0; padding: 0.5rem 1rem; height: auto; align-self: flex-end;">전송</button>
     </form>
 </div>
 {% endblock %}
