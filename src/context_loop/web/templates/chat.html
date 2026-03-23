@@ -25,7 +25,7 @@
                             <div class="chat-sources" style="margin-top: 0.5rem; padding: 0.5rem; background: var(--pico-card-background-color); border-radius: 0.25rem; font-size: 0.85rem;">
                                 <strong>출처:</strong>
                                 <template x-for="(src, si) in msg.sources" :key="si">
-                                    <a :href="'/documents/' + src.document_id" style="margin-left: 0.5rem; text-decoration: underline;" x-text="src.title + ' (' + (src.similarity * 100).toFixed(0) + '%)'"></a>
+                                    <a :href="'/documents/' + src.document_id" style="margin-left: 0.5rem; text-decoration: underline;" x-text="src.title"></a>
                                 </template>
                             </div>
                         </template>
@@ -42,9 +42,9 @@
     </div>
 
     <!-- 입력 영역 -->
-    <form @submit.prevent="sendMessage" style="display: flex; gap: 0.5rem;">
-        <input type="text" x-model="input" placeholder="질문을 입력하세요..." :disabled="loading" style="flex: 1;" autofocus>
-        <button type="submit" :disabled="loading || !input.trim()" :aria-busy="loading">전송</button>
+    <form @submit.prevent="sendMessage" style="display: flex; gap: 0.5rem; align-items: flex-end;">
+        <textarea x-model="input" placeholder="질문을 입력하세요..." :disabled="loading" @keydown.enter.prevent="if (!$event.shiftKey) sendMessage()" style="flex: 1; min-height: 3.5rem; max-height: 10rem; resize: vertical; margin-bottom: 0;" rows="3" autofocus></textarea>
+        <button type="submit" :disabled="loading || !input.trim()" :aria-busy="loading" style="margin-bottom: 0;">전송</button>
     </form>
 </div>
 {% endblock %}
