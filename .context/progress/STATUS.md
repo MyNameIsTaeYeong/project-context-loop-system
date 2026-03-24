@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: 6 (질의 및 고도화) → **완료**
-- **Step**: Phase 7 진입 준비
-- **상태**: Phase 5 (MCP Server) + Phase 6 (채팅 인터페이스 + 출처 표시) 완료
+- **Phase**: Phase 2 보강 — Confluence MCP Client 연동 검토 중
+- **Step**: 설계 검토 완료, 구현 대기
+- **상태**: Phase 6까지 완료. Confluence REST API 차단으로 MCP Client 방식 채택 (D-016)
 
 ## Phase별 진행률
 
@@ -19,6 +19,9 @@
 - [x] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
 - [x] 2.4 Confluence 증분 동기화
 - [x] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
+- [ ] 2.6 Confluence MCP Client 연동 — 검색 기반 임포트 (D-016, I-010)
+- [ ] 2.7 Confluence MCP Client 연동 — 트리 탐색 임포트
+- [ ] 2.8 Confluence MCP Client 연동 — 내 문서 임포트
 
 ### Phase 3: LLM 저장 방식 판단 + 처리
 - [x] 3.1 LLM Classifier 구현 (문서 분석 → chunk/graph/hybrid 판정)
@@ -52,5 +55,5 @@
 - [ ] 7.2 초기 설정 마법사 (대시보드 내)
 
 ## 마지막 업데이트
-- 일시: 2026-03-16
-- 내용: 그래프 탐색 개선 — LLM 기반 탐색 플래너 (D-015). graph_search_planner 신규 모듈, GraphStore 스키마 요약, context_assembler LLM 플래너 연동. 테스트 21개 추가, 전체 141개 통과
+- 일시: 2026-03-24
+- 내용: Confluence MCP Client 연동 방안 검토 (D-016). REST API 접근 차단으로 사내 Confluence MCP Server를 MCP Client로 활용하는 4번째 입력 경로 설계. 3가지 사용자 시나리오(검색, 트리 탐색, 내 문서) 및 탭 기반 통합 UI 기획 완료. Phase 2에 2.6~2.8 항목 추가.

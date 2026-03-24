@@ -170,3 +170,21 @@
   - `context_assembler.py`: `_search_graph_with_llm()` — plan → execute 파이프라인. `llm_client` 파라미터 추가 (None이면 그래프 탐색 스킵).
   - `chat.py`, `tools.py`, `server.py`: llm_client 전달 연동.
 - **이유**: LLM이 질의 의도를 분석하여 탐색 여부/시작 엔티티/깊이/관계 유형을 결정. 임베딩 매칭보다 정밀한 그래프 컨텍스트 추출 가능. 그래프가 비어있으면 LLM 호출 없이 스킵.
+
+---
+
+## D-016: Confluence 문서 입력 — MCP Client 방식 채택 (REST API 대체)
+
+- **일시**: 2026-03-24
+- **맥락**: Confluence REST API를 통한 사내 문서 임포트가 API 접근 제한으로 불가능한 상황. 사내에 Confluence MCP Server가 이미 운영 중이며, `searchContent`, `getPage`, `getChild`, `getSpaceInfoAll`, `getUserContributedPages` 등 9종의 도구를 제공. 현재 시스템은 `mcp>=1.0.0` 라이브러리를 MCP Server 역할로 이미 사용 중.
+- **결정**: 사내 Confluence MCP Server에 MCP Client로 연결하여 문서를 가져오는 4번째 입력 경로 추가.
+- **구현 계획**:
+  - `ingestion/mcp_confluence.py` (신규): MCP 클라이언트 모듈. `mcp.ClientSession` + SSE/stdio 전송으로 사내 MCP 서버에 연결. `searchContent` → `getPage` 흐름으로 문서 본문 수신 후 MetadataStore에 `source_type="confluence_mcp"`로 저장.
+  - `web/api/confluence_mcp.py` (신규): 웹 API 엔드포인트. 연결 테스트, 검색, 스페이스 탐색, 페이지 임포트 등.
+  - `config/default.yaml`: `sources.confluence_mcp` 섹션 추가 (transport, server_url, sync_interval).
+  - 탭 기반 통합 UI: 검색 탭 (searchContent), 탐색 탭 (getSpaceInfoAll + getChild), 내 문서 탭 (getUserContributedPages).
+- **사용자 시나리오**: 3가지 임포트 방법 제공.
+  - 1순위 — 검색 기반: `searchContent(query)` → 결과에서 선택 → `getPage(id)` × N
+  - 2순위 — 트리 탐색: `getSpaceInfoAll()` → `getChild(pageId)` 재귀 → `getPage(id)` × N
+  - 3순위 — 내 문서: `getUserContributedPages(userId)` → 선택 → `getPage(id)` × N
+- **이유**: 추가 라이브러리 설치 불필요 (`mcp` 이미 의존성에 포함). 인증/권한은 MCP 서버 측에서 처리하므로 클라이언트 구현 단순. 기존 ingestion 패턴(`async` 함수 → `dict` 반환)을 그대로 따르므로 ProcessingPipeline 변경 불필요. REST API 직접 접근이 차단된 환경에서 유일한 Confluence 연동 경로.
