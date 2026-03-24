@@ -10,6 +10,13 @@ sources:
     token_storage: "keyring"
     sync_interval_minutes: 30
 
+  confluence_mcp:
+    enabled: false
+    server_url: ""                          # MCP 서버 엔드포인트 URL (예: "http://mcp-server:3001/mcp")
+    transport: "http"                       # 전송 방식: "http" (Streamable HTTP) 또는 "sse"
+    token_storage: "keyring"                # 인증 토큰은 OS keyring에 저장 (x-auth 헤더로 전달)
+    sync_interval_minutes: 30
+
 processor:
   chunk_size: 512
   chunk_overlap: 50

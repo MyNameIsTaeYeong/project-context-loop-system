@@ -34,6 +34,18 @@
 - 현재 채팅 대화는 브라우저 세션에서만 유지되며 서버에 저장하지 않음
 - 대화 이력 DB 저장 및 이전 대화 재개 기능은 향후 고도화 항목
 
+### I-010: Confluence MCP Client 연동 구현
+- Confluence REST API 접근이 차단되어 사내 Confluence MCP Server를 통한 문서 임포트 방식 채택 (D-016)
+- `ingestion/mcp_confluence.py` 신규 모듈 구현 필요
+- 사내 MCP 서버 전송 방식(SSE/stdio) 및 각 도구의 입출력 형식 확인 필요
+- 3가지 임포트 시나리오(검색, 트리 탐색, 내 문서) 구현
+- 웹 UI (탭 기반) 및 API 엔드포인트 추가
+
+### I-011: Confluence REST API 접근 차단
+- 사내 보안 정책으로 Confluence REST API 직접 호출 불가
+- 기존 `ingestion/confluence.py` (ConfluenceClient) 사용 불가능
+- MCP Client 방식(I-010)으로 대체 예정
+
 ## 해결됨
 
 ### I-001: 웹 프레임워크 최종 선택 → FastAPI + Jinja2 + HTMX
