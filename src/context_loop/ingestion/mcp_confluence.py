@@ -189,12 +189,12 @@ async def _call_tool_safe(session: ClientSession, tool_name: str, arguments: dic
             request_data = raw_request.model_dump(
                 by_alias=True, mode="json", exclude_none=True,
             )
-            from mcp.types import JSONRPCRequest, JSONRPCResponse, JSONRPCError
-            from mcp.shared.message import JSONRPCMessage, SessionMessage
+            from mcp.shared.message import JSONRPCRequest, JSONRPCMessage, SessionMessage
             request_id = session._request_id
             session._request_id = request_id + 1
 
             import anyio
+            from mcp.shared.message import JSONRPCResponse, JSONRPCError
             response_stream, response_stream_reader = anyio.create_memory_object_stream[
                 JSONRPCResponse | JSONRPCError
             ](1)
