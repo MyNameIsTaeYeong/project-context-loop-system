@@ -25,7 +25,12 @@
                 <input type="url" name="server_url" value="{{ server_url }}" required
                        placeholder="http://confluence-mcp-server:3001/sse">
             </label>
-            <small>사내 Confluence MCP Server의 SSE 엔드포인트 URL을 입력하세요.</small>
+            <label>
+                Personal Access Token
+                <input type="password" name="token"
+                       placeholder="Enter your personal access token">
+            </label>
+            <small>MCP Server의 SSE 엔드포인트 URL과 인증 토큰을 입력하세요. 토큰은 OS keyring에 안전하게 저장됩니다.</small>
             <p x-show="error" style="color: var(--pico-del-color);" x-text="error"></p>
             <button type="submit" :aria-busy="connecting" :disabled="connecting">Connect</button>
         </form>

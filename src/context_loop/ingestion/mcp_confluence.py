@@ -61,36 +61,45 @@ def _parse_json_result(result: Any) -> Any:
         return text
 
 
-async def connect_mcp(server_url: str, timeout: float = 10.0):
+async def connect_mcp(
+    server_url: str,
+    token: str | None = None,
+    timeout: float = 10.0,
+):
     """SSE 전송으로 MCP 서버에 연결한다.
 
     컨텍스트 매니저로 사용한다::
 
-        async with connect_mcp("http://mcp-server:3001/sse") as session:
+        async with connect_mcp("http://mcp-server:3001/sse", token="pat_xxx") as session:
             tools = await session.list_tools()
 
     Args:
         server_url: MCP 서버 SSE 엔드포인트 URL.
+        token: 개인 액세스 토큰 (PAT). None이면 인증 없이 연결.
         timeout: 연결 타임아웃(초).
 
     Yields:
         초기화된 ClientSession.
     """
-    return _MCPConnection(server_url, timeout)
+    return _MCPConnection(server_url, token=token, timeout=timeout)
 
 
 class _MCPConnection:
     """MCP SSE 연결을 관리하는 비동기 컨텍스트 매니저."""
 
-    def __init__(self, server_url: str, timeout: float = 10.0) -> None:
+    def __init__(self, server_url: str, *, token: str | None = None, timeout: float = 10.0) -> None:
         self._server_url = server_url
+        self._token = token
         self._timeout = timeout
         self._sse_cm = None
         self._session_cm = None
 
     async def __aenter__(self) -> ClientSession:
         try:
-            self._sse_cm = sse_client(self._server_url, timeout=self._timeout)
+            headers: dict[str, Any] = {}
+            if self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            self._sse_cm = sse_client(self._server_url, headers=headers, timeout=self._timeout)
             read_stream, write_stream = await self._sse_cm.__aenter__()
 
             self._session_cm = ClientSession(read_stream, write_stream)
