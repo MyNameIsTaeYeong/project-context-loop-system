@@ -39,6 +39,11 @@ def _get_token() -> str | None:
     return get_token("confluence_mcp", "token")
 
 
+def _get_transport(config: Config) -> str:
+    """설정에서 MCP 전송 방식을 가져온다."""
+    return config.get("sources.confluence_mcp.transport", "http")
+
+
 @router.get("/confluence-mcp")
 async def confluence_mcp_page(
     request: Request,
@@ -58,12 +63,13 @@ async def confluence_mcp_page(
 async def connect_confluence_mcp(
     server_url: str = Form(...),
     token: str = Form(""),
+    transport: str = Form("http"),
     config: Config = Depends(get_config),
 ):
     """MCP 서버 연결을 테스트하고 설정을 저장한다."""
     pat = token.strip() or None
     try:
-        async with connect_mcp(server_url, token=pat) as session:
+        async with connect_mcp(server_url, token=pat, transport=transport) as session:
             tools = await list_available_tools(session)
     except MCPConnectionError as exc:
         raise HTTPException(400, str(exc))
@@ -71,6 +77,7 @@ async def connect_confluence_mcp(
         raise HTTPException(400, f"연결 실패: {exc}")
 
     config.set("sources.confluence_mcp.server_url", server_url)
+    config.set("sources.confluence_mcp.transport", transport)
     config.set("sources.confluence_mcp.enabled", True)
     config.save()
 
@@ -85,7 +92,7 @@ async def get_tools(config: Config = Depends(get_config)):
     """MCP 서버에서 사용 가능한 도구 목록을 반환한다."""
     server_url = _get_server_url(config)
     try:
-        async with connect_mcp(server_url, token=_get_token()) as session:
+        async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             tools = await list_available_tools(session)
     except MCPConnectionError as exc:
         raise HTTPException(502, str(exc))
@@ -105,7 +112,7 @@ async def search(
 
     server_url = _get_server_url(config)
     try:
-        async with connect_mcp(server_url, token=_get_token()) as session:
+        async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             results = await search_content(session, query)
     except MCPConnectionError as exc:
         raise HTTPException(502, str(exc))
@@ -117,7 +124,7 @@ async def list_spaces(config: Config = Depends(get_config)):
     """MCP 서버를 통해 Confluence 스페이스 목록을 반환한다."""
     server_url = _get_server_url(config)
     try:
-        async with connect_mcp(server_url, token=_get_token()) as session:
+        async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             spaces = await get_all_spaces(session)
     except MCPConnectionError as exc:
         raise HTTPException(502, str(exc))
@@ -132,7 +139,7 @@ async def list_children(
     """MCP 서버를 통해 하위 페이지 목록을 반환한다."""
     server_url = _get_server_url(config)
     try:
-        async with connect_mcp(server_url, token=_get_token()) as session:
+        async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             children = await get_child_pages(session, page_id)
     except MCPConnectionError as exc:
         raise HTTPException(502, str(exc))
@@ -147,7 +154,7 @@ async def user_pages(
     """MCP 서버를 통해 사용자 기여 페이지를 반환한다."""
     server_url = _get_server_url(config)
     try:
-        async with connect_mcp(server_url, token=_get_token()) as session:
+        async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             pages = await get_user_contributed_pages(session, user_id)
     except MCPConnectionError as exc:
         raise HTTPException(502, str(exc))
@@ -169,7 +176,7 @@ async def import_pages(
     server_url = _get_server_url(config)
     results = []
     try:
-        async with connect_mcp(server_url, token=_get_token()) as session:
+        async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             for pid in page_ids:
                 try:
                     result = await import_page_via_mcp(session, meta_store, str(pid))

@@ -12,8 +12,9 @@ sources:
 
   confluence_mcp:
     enabled: false
-    server_url: ""                          # MCP 서버 SSE 엔드포인트 URL (예: "http://mcp-server:3001/sse")
-    token_storage: "keyring"                # PAT는 OS keyring에 저장 (provider: "confluence_mcp", username: "token")
+    server_url: ""                          # MCP 서버 엔드포인트 URL (예: "http://mcp-server:3001/mcp")
+    transport: "http"                       # 전송 방식: "http" (Streamable HTTP) 또는 "sse"
+    token_storage: "keyring"                # 인증 토큰은 OS keyring에 저장 (x-auth 헤더로 전달)
     sync_interval_minutes: 30
 
 processor:

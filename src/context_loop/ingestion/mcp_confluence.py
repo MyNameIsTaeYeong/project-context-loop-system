@@ -20,6 +20,7 @@ from typing import Any
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 from context_loop.ingestion.uploader import compute_content_hash
 from context_loop.storage.metadata_store import MetadataStore
@@ -64,43 +65,71 @@ def _parse_json_result(result: Any) -> Any:
 def connect_mcp(
     server_url: str,
     token: str | None = None,
+    transport: str = "http",
+    headers: dict[str, str] | None = None,
     timeout: float = 10.0,
 ):
-    """SSE 전송으로 MCP 서버에 연결한다.
+    """MCP 서버에 연결한다.
 
     컨텍스트 매니저로 사용한다::
 
-        async with connect_mcp("http://mcp-server:3001/sse", token="pat_xxx") as session:
+        async with connect_mcp("http://mcp-server:3001/mcp", token="xxx") as session:
             tools = await session.list_tools()
 
     Args:
-        server_url: MCP 서버 SSE 엔드포인트 URL.
-        token: 개인 액세스 토큰 (PAT). None이면 인증 없이 연결.
+        server_url: MCP 서버 엔드포인트 URL.
+        token: 인증 토큰. ``x-auth`` 헤더로 전달된다.
+        transport: 전송 방식. ``"http"`` (Streamable HTTP) 또는 ``"sse"``.
+        headers: 추가 커스텀 헤더. token이 지정되면 ``x-auth`` 가 자동 추가된다.
         timeout: 연결 타임아웃(초).
 
     Yields:
         초기화된 ClientSession.
     """
-    return _MCPConnection(server_url, token=token, timeout=timeout)
+    return _MCPConnection(
+        server_url, token=token, transport=transport, headers=headers, timeout=timeout,
+    )
 
 
 class _MCPConnection:
-    """MCP SSE 연결을 관리하는 비동기 컨텍스트 매니저."""
+    """MCP 연결을 관리하는 비동기 컨텍스트 매니저."""
 
-    def __init__(self, server_url: str, *, token: str | None = None, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        server_url: str,
+        *,
+        token: str | None = None,
+        transport: str = "http",
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> None:
         self._server_url = server_url
         self._token = token
+        self._transport = transport
+        self._extra_headers = headers or {}
         self._timeout = timeout
-        self._sse_cm = None
+        self._transport_cm = None
         self._session_cm = None
+
+    def _build_headers(self) -> dict[str, str]:
+        h: dict[str, str] = {**self._extra_headers}
+        if self._token:
+            h["x-auth"] = self._token
+        return h
 
     async def __aenter__(self) -> ClientSession:
         try:
-            headers: dict[str, Any] = {}
-            if self._token:
-                headers["Authorization"] = f"Bearer {self._token}"
-            self._sse_cm = sse_client(self._server_url, headers=headers, timeout=self._timeout)
-            read_stream, write_stream = await self._sse_cm.__aenter__()
+            headers = self._build_headers()
+            if self._transport == "sse":
+                self._transport_cm = sse_client(
+                    self._server_url, headers=headers, timeout=self._timeout,
+                )
+            else:
+                self._transport_cm = streamablehttp_client(
+                    self._server_url, headers=headers, timeout=self._timeout,
+                )
+            transport_result = await self._transport_cm.__aenter__()
+            read_stream, write_stream = transport_result[0], transport_result[1]
 
             self._session_cm = ClientSession(read_stream, write_stream)
             session = await self._session_cm.__aenter__()
@@ -113,9 +142,9 @@ class _MCPConnection:
                     await self._session_cm.__aexit__(None, None, None)
                 except Exception:
                     pass
-            if self._sse_cm:
+            if self._transport_cm:
                 try:
-                    await self._sse_cm.__aexit__(None, None, None)
+                    await self._transport_cm.__aexit__(None, None, None)
                 except Exception:
                     pass
             raise MCPConnectionError(f"MCP 서버 연결 실패: {exc}") from exc
@@ -126,9 +155,9 @@ class _MCPConnection:
                 await self._session_cm.__aexit__(exc_type, exc_val, exc_tb)
             except Exception:
                 pass
-        if self._sse_cm:
+        if self._transport_cm:
             try:
-                await self._sse_cm.__aexit__(exc_type, exc_val, exc_tb)
+                await self._transport_cm.__aexit__(exc_type, exc_val, exc_tb)
             except Exception:
                 pass
 
