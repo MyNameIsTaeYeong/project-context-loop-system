@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 
@@ -85,6 +86,44 @@ async def connect_confluence_mcp(
         store_token("confluence_mcp", "token", pat)
 
     return {"status": "connected", "tools": tools}
+
+
+@router.get("/api/confluence-mcp/health")
+async def health_check(config: Config = Depends(get_config)):
+    """MCP 서버 연결 상태를 진단한다.
+
+    설정값, 토큰 존재 여부, 실제 연결 테스트 결과를 반환한다.
+    """
+    server_url = config.get("sources.confluence_mcp.server_url", "")
+    transport = _get_transport(config)
+    token = _get_token()
+
+    info: dict[str, Any] = {
+        "server_url": server_url,
+        "transport": transport,
+        "token_configured": token is not None,
+        "enabled": config.get("sources.confluence_mcp.enabled", False),
+    }
+
+    if not server_url:
+        info["status"] = "not_configured"
+        info["message"] = "server_url이 설정되지 않았습니다."
+        return info
+
+    try:
+        async with connect_mcp(server_url, token=token, transport=transport) as session:
+            tools = await list_available_tools(session)
+        info["status"] = "ok"
+        info["tools_count"] = len(tools)
+        info["tools"] = tools
+    except MCPConnectionError as exc:
+        info["status"] = "error"
+        info["message"] = str(exc)
+    except Exception as exc:
+        info["status"] = "error"
+        info["message"] = f"{type(exc).__name__}: {exc}"
+
+    return info
 
 
 @router.get("/api/confluence-mcp/tools")
