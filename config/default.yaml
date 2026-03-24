@@ -10,6 +10,11 @@ sources:
     token_storage: "keyring"
     sync_interval_minutes: 30
 
+  confluence_mcp:
+    enabled: false
+    server_url: ""                          # MCP 서버 SSE 엔드포인트 URL (예: "http://mcp-server:3001/sse")
+    sync_interval_minutes: 30
+
 processor:
   chunk_size: 512
   chunk_overlap: 50

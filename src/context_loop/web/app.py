@@ -109,6 +109,7 @@ def create_app() -> FastAPI:
 
     from context_loop.web.api.chat import router as chat_router
     from context_loop.web.api.confluence import router as confluence_router
+    from context_loop.web.api.confluence_mcp import router as confluence_mcp_router
     from context_loop.web.api.documents import router as documents_router
     from context_loop.web.api.stats import router as stats_router
     from context_loop.web.api.upload import router as upload_router
@@ -116,6 +117,7 @@ def create_app() -> FastAPI:
     app.include_router(stats_router)
     app.include_router(upload_router)
     app.include_router(confluence_router)
+    app.include_router(confluence_mcp_router)
     app.include_router(chat_router)
     app.include_router(documents_router)
 

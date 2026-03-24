@@ -1,0 +1,328 @@
+{% extends "base.html" %}
+
+{% block title %}Confluence MCP Import - Context Loop{% endblock %}
+
+{% block content %}
+<h2>Confluence MCP Import</h2>
+
+<!-- 연결 설정 -->
+<article x-data="{ showForm: !{{ 'true' if connected else 'false' }} }">
+    <header>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong>MCP Server Connection</strong>
+            {% if connected %}
+            <span class="badge badge-completed">Connected</span>
+            {% endif %}
+            <button class="outline" style="width: auto;" @click="showForm = !showForm">
+                <span x-text="showForm ? 'Hide' : '{% if connected %}Edit{% else %}Setup{% endif %}'"></span>
+            </button>
+        </div>
+    </header>
+    <div x-show="showForm" x-transition>
+        <form @submit.prevent="connectMCP($event)" x-data="{ connecting: false, error: '' }">
+            <label>
+                MCP Server URL (SSE)
+                <input type="url" name="server_url" value="{{ server_url }}" required
+                       placeholder="http://confluence-mcp-server:3001/sse">
+            </label>
+            <small>사내 Confluence MCP Server의 SSE 엔드포인트 URL을 입력하세요.</small>
+            <p x-show="error" style="color: var(--pico-del-color);" x-text="error"></p>
+            <button type="submit" :aria-busy="connecting" :disabled="connecting">Connect</button>
+        </form>
+    </div>
+</article>
+
+{% if connected %}
+<!-- 탭 기반 임포트 UI -->
+<article x-data="mcpBrowser()">
+    <header>
+        <nav>
+            <ul>
+                <li><a href="#" :class="tab === 'search' && 'active'" @click.prevent="tab = 'search'">Search</a></li>
+                <li><a href="#" :class="tab === 'browse' && 'active'" @click.prevent="tab = 'browse'">Browse Spaces</a></li>
+                <li><a href="#" :class="tab === 'my' && 'active'" @click.prevent="tab = 'my'">My Pages</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <!-- 검색 탭 -->
+    <div x-show="tab === 'search'">
+        <form @submit.prevent="doSearch()">
+            <div role="group">
+                <input type="search" x-model="searchQuery" placeholder="검색어를 입력하세요..." required>
+                <button type="submit" :aria-busy="searching" :disabled="searching" style="width: auto;">Search</button>
+            </div>
+        </form>
+        <div x-show="searchResults.length > 0" style="margin-top: 1rem;">
+            <table>
+                <thead>
+                    <tr>
+                        <th><input type="checkbox" @change="toggleAll($event.target.checked, searchResults)"></th>
+                        <th>Title</th>
+                        <th>Space</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="p in searchResults" :key="p.id">
+                        <tr>
+                            <td><input type="checkbox" :value="String(p.id)" x-model="selected"></td>
+                            <td x-text="p.title || p.name || '(no title)'"></td>
+                            <td x-text="p.space?.name || p.spaceKey || ''"></td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+        <p x-show="searchDone && searchResults.length === 0" style="color: var(--pico-muted-color);">검색 결과가 없습니다.</p>
+    </div>
+
+    <!-- 스페이스 탐색 탭 -->
+    <div x-show="tab === 'browse'">
+        <div x-show="!spaces.length">
+            <button @click="loadSpaces()" class="outline" :aria-busy="loadingSpaces" :disabled="loadingSpaces">
+                Load Spaces
+            </button>
+        </div>
+        <div x-show="spaces.length">
+            <label>
+                Select Space
+                <select @change="loadChildren($event.target.value)">
+                    <option value="">-- Select a space --</option>
+                    <template x-for="s in spaces" :key="s.id || s.key">
+                        <option :value="s.id || s.key" x-text="(s.name || s.key) + (s.key ? ' (' + s.key + ')' : '')"></option>
+                    </template>
+                </select>
+            </label>
+        </div>
+        <div x-show="browsePages.length > 0" style="margin-top: 1rem;">
+            <table>
+                <thead>
+                    <tr>
+                        <th><input type="checkbox" @change="toggleAll($event.target.checked, browsePages)"></th>
+                        <th>Title</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="p in browsePages" :key="p.id">
+                        <tr>
+                            <td><input type="checkbox" :value="String(p.id)" x-model="selected"></td>
+                            <td>
+                                <span x-text="p.title || p.name || '(no title)'"></span>
+                                <button class="outline" style="width: auto; padding: 0.1rem 0.4rem; margin-left: 0.5rem; font-size: 0.8rem;"
+                                        @click="expandChild(p)" x-show="p.hasChildren !== false">
+                                    ▶
+                                </button>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 내 문서 탭 -->
+    <div x-show="tab === 'my'">
+        <form @submit.prevent="loadMyPages()">
+            <div role="group">
+                <input type="text" x-model="userId" placeholder="사용자 ID를 입력하세요..." required>
+                <button type="submit" :aria-busy="loadingMyPages" :disabled="loadingMyPages" style="width: auto;">Load</button>
+            </div>
+        </form>
+        <div x-show="myPages.length > 0" style="margin-top: 1rem;">
+            <table>
+                <thead>
+                    <tr>
+                        <th><input type="checkbox" @change="toggleAll($event.target.checked, myPages)"></th>
+                        <th>Title</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="p in myPages" :key="p.id">
+                        <tr>
+                            <td><input type="checkbox" :value="String(p.id)" x-model="selected"></td>
+                            <td x-text="p.title || p.name || '(no title)'"></td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+        <p x-show="myPagesDone && myPages.length === 0" style="color: var(--pico-muted-color);">기여한 문서가 없습니다.</p>
+    </div>
+
+    <!-- 임포트 버튼 (공통) -->
+    <div x-show="selected.length > 0" style="margin-top: 1rem; display: flex; align-items: center; gap: 1rem;">
+        <label style="margin-bottom: 0;">
+            <input type="checkbox" x-model="includeChildren" style="margin-right: 0.3rem;">
+            하위 페이지 포함
+        </label>
+        <button @click="importSelected()" :disabled="importing" :aria-busy="importing">
+            Import Selected (<span x-text="selected.length"></span>)
+        </button>
+    </div>
+
+    <!-- 임포트 결과 -->
+    <div x-show="importResults.length > 0" style="margin-top: 1rem;">
+        <details open>
+            <summary>Import Results</summary>
+            <template x-for="r in importResults" :key="r.page_id">
+                <p>
+                    <span x-show="!r.error" style="color: var(--pico-ins-color);">✓</span>
+                    <span x-show="r.error" style="color: var(--pico-del-color);">✗</span>
+                    <span x-text="r.title || r.page_id"></span>
+                    <small x-show="r.created" style="color: var(--pico-ins-color);"> (new)</small>
+                    <small x-show="r.error" style="color: var(--pico-del-color);" x-text="' — ' + r.error"></small>
+                </p>
+            </template>
+        </details>
+    </div>
+</article>
+
+<script>
+function connectMCP(event) {
+    const form = event.target;
+    const data = new FormData(form);
+    this.connecting = true;
+    this.error = '';
+    fetch('/api/confluence-mcp/connect', { method: 'POST', body: data })
+        .then(r => { if (!r.ok) return r.json().then(d => { throw new Error(d.detail || 'Failed'); }); return r.json(); })
+        .then(() => location.reload())
+        .catch(e => { this.error = e.message; })
+        .finally(() => { this.connecting = false; });
+}
+
+function mcpBrowser() {
+    return {
+        tab: 'search',
+        selected: [],
+        includeChildren: false,
+        importing: false,
+        importResults: [],
+
+        // Search tab
+        searchQuery: '',
+        searchResults: [],
+        searching: false,
+        searchDone: false,
+
+        // Browse tab
+        spaces: [],
+        browsePages: [],
+        loadingSpaces: false,
+
+        // My pages tab
+        userId: '',
+        myPages: [],
+        loadingMyPages: false,
+        myPagesDone: false,
+
+        toggleAll(checked, list) {
+            if (checked) {
+                const ids = list.map(p => String(p.id));
+                this.selected = [...new Set([...this.selected, ...ids])];
+            } else {
+                const ids = new Set(list.map(p => String(p.id)));
+                this.selected = this.selected.filter(id => !ids.has(id));
+            }
+        },
+
+        async doSearch() {
+            this.searching = true;
+            this.searchDone = false;
+            try {
+                const r = await fetch('/api/confluence-mcp/search', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query: this.searchQuery})
+                });
+                const data = await r.json();
+                this.searchResults = data.results || [];
+            } finally {
+                this.searching = false;
+                this.searchDone = true;
+            }
+        },
+
+        async loadSpaces() {
+            this.loadingSpaces = true;
+            try {
+                const r = await fetch('/api/confluence-mcp/spaces');
+                const data = await r.json();
+                this.spaces = data.spaces || [];
+            } finally {
+                this.loadingSpaces = false;
+            }
+        },
+
+        async loadChildren(spaceOrPageId) {
+            if (!spaceOrPageId) { this.browsePages = []; return; }
+            const r = await fetch('/api/confluence-mcp/pages/' + spaceOrPageId + '/children');
+            const data = await r.json();
+            this.browsePages = data.pages || [];
+        },
+
+        async expandChild(page) {
+            const r = await fetch('/api/confluence-mcp/pages/' + page.id + '/children');
+            const data = await r.json();
+            const children = (data.pages || []).map(c => ({...c, _indent: (page._indent || 0) + 1}));
+            if (children.length > 0) {
+                const idx = this.browsePages.indexOf(page);
+                this.browsePages.splice(idx + 1, 0, ...children);
+            }
+        },
+
+        async loadMyPages() {
+            this.loadingMyPages = true;
+            this.myPagesDone = false;
+            try {
+                const r = await fetch('/api/confluence-mcp/user-pages?user_id=' + encodeURIComponent(this.userId));
+                const data = await r.json();
+                this.myPages = data.pages || [];
+            } finally {
+                this.loadingMyPages = false;
+                this.myPagesDone = true;
+            }
+        },
+
+        async importSelected() {
+            this.importing = true;
+            this.importResults = [];
+            let pageIds = [...this.selected];
+
+            // 하위 페이지 포함 시 하위 페이지 ID도 수집
+            if (this.includeChildren) {
+                for (const pid of [...pageIds]) {
+                    try {
+                        const r = await fetch('/api/confluence-mcp/pages/' + pid + '/children');
+                        const data = await r.json();
+                        const childIds = (data.pages || []).map(p => String(p.id));
+                        pageIds = [...new Set([...pageIds, ...childIds])];
+                    } catch (e) { /* skip */ }
+                }
+            }
+
+            try {
+                const r = await fetch('/api/confluence-mcp/import', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({page_ids: pageIds})
+                });
+                const data = await r.json();
+                this.importResults = data.results || [];
+            } finally {
+                this.importing = false;
+                this.selected = [];
+            }
+        }
+    };
+}
+</script>
+
+<style>
+nav ul li a.active {
+    font-weight: bold;
+    text-decoration: underline;
+    text-underline-offset: 0.3rem;
+}
+</style>
+{% endif %}
+{% endblock %}
