@@ -61,7 +61,7 @@ def _parse_json_result(result: Any) -> Any:
         return text
 
 
-async def connect_mcp(
+def connect_mcp(
     server_url: str,
     token: str | None = None,
     timeout: float = 10.0,
