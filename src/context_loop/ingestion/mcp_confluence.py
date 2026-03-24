@@ -162,71 +162,6 @@ class _MCPConnection:
                 pass
 
 
-async def _call_tool_safe(session: ClientSession, tool_name: str, arguments: dict[str, Any]) -> Any:
-    """MCP 도구를 호출하고, validation 에러 시 raw 응답을 로깅한다.
-
-    SDK의 call_tool()은 내부적으로 CallToolResult.model_validate()를 수행한다.
-    서버 응답이 스키마에 맞지 않으면 ValidationError가 발생하므로,
-    이 경우 send_request의 raw result를 직접 확인할 수 있도록 로깅한다.
-    """
-    try:
-        return await session.call_tool(tool_name, arguments)
-    except Exception as exc:
-        # raw 응답 확인을 위해 저수준 요청 재시도
-        logger.error(
-            "call_tool('%s') validation 실패: %s",
-            tool_name, exc,
-        )
-        try:
-            from mcp import types as mcp_types
-            raw_request = mcp_types.ClientRequest(
-                mcp_types.CallToolRequest(
-                    params=mcp_types.CallToolRequestParams(
-                        name=tool_name, arguments=arguments,
-                    ),
-                )
-            )
-            request_data = raw_request.model_dump(
-                by_alias=True, mode="json", exclude_none=True,
-            )
-            from mcp.shared.message import JSONRPCRequest, JSONRPCMessage, SessionMessage
-            request_id = session._request_id
-            session._request_id = request_id + 1
-
-            import anyio
-            from mcp.shared.message import JSONRPCResponse, JSONRPCError
-            response_stream, response_stream_reader = anyio.create_memory_object_stream[
-                JSONRPCResponse | JSONRPCError
-            ](1)
-            session._response_streams[request_id] = response_stream
-
-            jsonrpc_request = JSONRPCRequest(
-                jsonrpc="2.0", id=request_id, **request_data,
-            )
-            await session._write_stream.send(
-                SessionMessage(message=JSONRPCMessage(jsonrpc_request)),
-            )
-            response_or_error = await response_stream_reader.receive()
-
-            if isinstance(response_or_error, JSONRPCError):
-                logger.error("MCP 서버 에러 응답: %s", response_or_error.error)
-            else:
-                logger.error(
-                    "MCP 서버 raw 응답 (validation 전): %s",
-                    json.dumps(response_or_error.result, ensure_ascii=False, default=str),
-                )
-
-            session._response_streams.pop(request_id, None)
-            await response_stream.aclose()
-            await response_stream_reader.aclose()
-        except Exception as debug_exc:
-            logger.error("raw 응답 조회 실패: %s", debug_exc)
-
-        raise MCPToolError(
-            f"도구 '{tool_name}' 호출 결과 validation 실패: {exc}"
-        ) from exc
-
-
 async def list_available_tools(session: ClientSession) -> list[dict[str, Any]]:
     """MCP 서버에서 사용 가능한 도구 목록을 반환한다."""
     result = await session.list_tools()
@@ -249,7 +184,7 @@ async def search_content(session: ClientSession, query: str) -> list[dict[str, A
     Returns:
         검색 결과 목록. 각 항목에 id, title 등이 포함된다.
     """
-    result = await _call_tool_safe(session, "searchContent", {"query": query})
+    result = await session.call_tool("searchContent", {"query": query})
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
@@ -269,7 +204,7 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     Returns:
         페이지 정보 dict. title, content 등이 포함된다.
     """
-    result = await _call_tool_safe(session, "getPage", {"pageId": page_id})
+    result = await session.call_tool("getPage", {"pageId": page_id})
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
         return parsed
@@ -278,7 +213,7 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
 
 async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str, Any]]:
     """MCP 서버의 getChild 도구로 하위 페이지 목록을 가져온다."""
-    result = await _call_tool_safe(session, "getChild", {"pageId": page_id})
+    result = await session.call_tool("getChild", {"pageId": page_id})
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
@@ -289,7 +224,7 @@ async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str
 
 async def get_all_spaces(session: ClientSession) -> list[dict[str, Any]]:
     """MCP 서버의 getSpaceInfoAll 도구로 스페이스 목록을 가져온다."""
-    result = await _call_tool_safe(session, "getSpaceInfoAll", {})
+    result = await session.call_tool("getSpaceInfoAll", {})
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
@@ -302,7 +237,7 @@ async def get_user_contributed_pages(
     session: ClientSession, user_id: str,
 ) -> list[dict[str, Any]]:
     """MCP 서버의 getUserContributedPages 도구로 사용자 기여 페이지를 가져온다."""
-    result = await _call_tool_safe(session, "getUserContributedPages", {"userId": user_id})
+    result = await session.call_tool("getUserContributedPages", {"userId": user_id})
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
