@@ -149,7 +149,9 @@ async def test_search_content_list_result() -> None:
     session.call_tool.return_value = _make_result('[{"id": "1", "title": "Result"}]')
 
     results = await search_content(session, "test query")
-    session.call_tool.assert_called_once_with("searchContent", {"query": "test query"})
+    session.call_tool.assert_called_once_with(
+        "searchContent", {"cql": "test query", "limit": 25, "start": 0},
+    )
     assert len(results) == 1
     assert results[0]["id"] == "1"
 

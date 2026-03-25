@@ -174,17 +174,26 @@ async def list_available_tools(session: ClientSession) -> list[dict[str, Any]]:
     ]
 
 
-async def search_content(session: ClientSession, query: str) -> list[dict[str, Any]]:
+async def search_content(
+    session: ClientSession,
+    query: str,
+    limit: int = 25,
+    start: int = 0,
+) -> list[dict[str, Any]]:
     """MCP 서버의 searchContent 도구로 콘텐츠를 검색한다.
 
     Args:
         session: 초기화된 ClientSession.
-        query: 검색어.
+        query: CQL 검색 쿼리.
+        limit: 최대 결과 수.
+        start: 결과 시작 오프셋.
 
     Returns:
         검색 결과 목록. 각 항목에 id, title 등이 포함된다.
     """
-    result = await session.call_tool("searchContent", {"query": query})
+    result = await session.call_tool(
+        "searchContent", {"cql": query, "limit": limit, "start": start},
+    )
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
