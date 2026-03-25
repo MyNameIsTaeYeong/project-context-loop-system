@@ -5,7 +5,7 @@
 
 MCP Server가 제공하는 도구:
   - searchContent: 콘텐츠 키워드 검색
-  - getPage: 페이지 단건 조회 (본문 포함)
+  - getPageByID: 페이지 단건 조회 (본문 포함)
   - getChild: 하위 페이지 목록 조회
   - getSpaceInfoAll: 전체 스페이스 목록 조회
   - getSpaceInfo: 특정 스페이스 정보
@@ -238,7 +238,7 @@ async def search_content(
 
 
 async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
-    """MCP 서버의 getPage 도구로 페이지를 가져온다.
+    """MCP 서버의 getPageByID 도구로 페이지를 가져온다.
 
     Args:
         session: 초기화된 ClientSession.
@@ -247,7 +247,13 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     Returns:
         페이지 정보 dict. title, content 등이 포함된다.
     """
-    result = await session.call_tool("getPage", {"pageId": page_id})
+    result = await session.call_tool(
+        "getPageByID",
+        {
+            "pageId": page_id,
+            "expand": "history,space,version,body.storage",
+        },
+    )
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
         return parsed

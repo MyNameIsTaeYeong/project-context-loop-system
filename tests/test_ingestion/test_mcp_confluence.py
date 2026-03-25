@@ -227,7 +227,10 @@ async def test_get_page_dict_result() -> None:
     session.call_tool.return_value = _make_result('{"id": "123", "title": "Test Page", "content": "Hello"}')
 
     page = await get_page(session, "123")
-    session.call_tool.assert_called_once_with("getPage", {"pageId": "123"})
+    session.call_tool.assert_called_once_with(
+        "getPageByID",
+        {"pageId": "123", "expand": "history,space,version,body.storage"},
+    )
     assert page["title"] == "Test Page"
 
 
