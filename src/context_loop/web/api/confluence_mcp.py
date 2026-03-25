@@ -19,8 +19,9 @@ from context_loop.ingestion.mcp_confluence import (
     list_available_tools,
     search_content,
 )
+from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.metadata_store import MetadataStore
-from context_loop.web.dependencies import get_config, get_meta_store, get_templates
+from context_loop.web.dependencies import get_config, get_llm_client, get_meta_store, get_templates
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,7 @@ async def import_pages(
     request: Request,
     config: Config = Depends(get_config),
     meta_store: MetadataStore = Depends(get_meta_store),
+    llm_client: LLMClient = Depends(get_llm_client),
 ):
     """선택한 Confluence 페이지를 MCP를 통해 임포트한다."""
     body = await request.json()
@@ -218,7 +220,7 @@ async def import_pages(
         async with connect_mcp(server_url, token=_get_token(), transport=_get_transport(config)) as session:
             for pid in page_ids:
                 try:
-                    result = await import_page_via_mcp(session, meta_store, str(pid))
+                    result = await import_page_via_mcp(session, meta_store, str(pid), llm_client=llm_client)
                     results.append({
                         "page_id": pid,
                         "doc_id": result["id"],

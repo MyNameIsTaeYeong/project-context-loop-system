@@ -15,6 +15,7 @@ from context_loop.ingestion.mcp_confluence import (
     _is_cql,
     _parse_json_result,
     build_cql,
+    convert_html_to_markdown,
     get_all_spaces,
     get_child_pages,
     get_page,
@@ -343,3 +344,46 @@ async def test_import_page_via_mcp_changed(meta_store: MetadataStore) -> None:
     assert result2["created"] is False
     assert result2["changed"] is True
     assert result2["status"] == "changed"
+
+
+# --- convert_html_to_markdown 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_convert_html_to_markdown() -> None:
+    """LLM을 통해 HTML이 마크다운으로 변환된다."""
+    llm_client = AsyncMock()
+    llm_client.complete.return_value = "# Hello\n\nWorld"
+
+    result = await convert_html_to_markdown(llm_client, "<h1>Hello</h1><p>World</p>")
+    assert result == "# Hello\n\nWorld"
+    llm_client.complete.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_convert_html_to_markdown_empty() -> None:
+    """빈 HTML은 LLM 호출 없이 빈 문자열을 반환한다."""
+    llm_client = AsyncMock()
+
+    result = await convert_html_to_markdown(llm_client, "")
+    assert result == ""
+    llm_client.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_with_llm(meta_store: MetadataStore) -> None:
+    """llm_client가 주어지면 HTML 콘텐츠가 마크다운으로 변환되어 저장된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "p10", "title": "HTML Page", "content": "<h1>Title</h1><p>Body</p>"}'
+    )
+
+    llm_client = AsyncMock()
+    llm_client.complete.return_value = "# Title\n\nBody"
+
+    result = await import_page_via_mcp(session, meta_store, "p10", llm_client=llm_client)
+    assert result["created"] is True
+
+    doc = await meta_store.get_document(result["id"])
+    assert doc is not None
+    assert doc["original_content"] == "# Title\n\nBody"
