@@ -5,7 +5,7 @@
 
 MCP Server가 제공하는 도구:
   - searchContent: 콘텐츠 키워드 검색
-  - getPage: 페이지 단건 조회 (본문 포함)
+  - getPageByID: 페이지 단건 조회 (본문 포함)
   - getChild: 하위 페이지 목록 조회
   - getSpaceInfoAll: 전체 스페이스 목록 조회
   - getSpaceInfo: 특정 스페이스 정보
@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
+from markdownify import markdownify
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -174,17 +176,60 @@ async def list_available_tools(session: ClientSession) -> list[dict[str, Any]]:
     ]
 
 
-async def search_content(session: ClientSession, query: str) -> list[dict[str, Any]]:
+def _is_cql(query: str) -> bool:
+    """주어진 문자열이 이미 CQL 형식인지 판별한다.
+
+    CQL 연산자(=, ~, !=, >=, <=, >, <)나 키워드(AND, OR, NOT, IN, ORDER BY)가
+    포함되어 있으면 CQL로 간주한다.
+    """
+    import re
+
+    cql_operator_pattern = re.compile(r'[~=!<>]|!=|>=|<=')
+    cql_keyword_pattern = re.compile(
+        r'\b(AND|OR|NOT|IN|ORDER\s+BY)\b', re.IGNORECASE,
+    )
+    return bool(cql_operator_pattern.search(query) or cql_keyword_pattern.search(query))
+
+
+def build_cql(query: str) -> str:
+    """사용자 입력을 CQL 쿼리로 변환한다.
+
+    이미 CQL 형식이면 그대로 반환하고,
+    일반 키워드이면 ``type = "page" AND text ~ "검색어"`` 형식으로 감싼다.
+    """
+    query = query.strip()
+    if not query:
+        return query
+    if _is_cql(query):
+        return query
+    escaped = query.replace('\\', '\\\\').replace('"', '\\"')
+    return f'type = "page" AND text ~ "{escaped}"'
+
+
+async def search_content(
+    session: ClientSession,
+    query: str,
+    limit: int = 25,
+    start: int = 0,
+) -> list[dict[str, Any]]:
     """MCP 서버의 searchContent 도구로 콘텐츠를 검색한다.
+
+    사용자가 일반 키워드를 입력하면 자동으로 CQL로 변환한다.
+    이미 CQL 형식이면 그대로 사용한다.
 
     Args:
         session: 초기화된 ClientSession.
-        query: 검색어.
+        query: 검색 키워드 또는 CQL 쿼리.
+        limit: 최대 결과 수.
+        start: 결과 시작 오프셋.
 
     Returns:
         검색 결과 목록. 각 항목에 id, title 등이 포함된다.
     """
-    result = await session.call_tool("searchContent", {"query": query})
+    cql = build_cql(query)
+    result = await session.call_tool(
+        "searchContent", {"cql": cql, "limit": limit, "start": start},
+    )
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
@@ -195,7 +240,7 @@ async def search_content(session: ClientSession, query: str) -> list[dict[str, A
 
 
 async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
-    """MCP 서버의 getPage 도구로 페이지를 가져온다.
+    """MCP 서버의 getPageByID 도구로 페이지를 가져온다.
 
     Args:
         session: 초기화된 ClientSession.
@@ -204,7 +249,13 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     Returns:
         페이지 정보 dict. title, content 등이 포함된다.
     """
-    result = await session.call_tool("getPage", {"pageId": page_id})
+    result = await session.call_tool(
+        "getPageByID",
+        {
+            "pageId": page_id,
+            "expand": "history,space,version,body.storage",
+        },
+    )
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
         return parsed
@@ -273,6 +324,25 @@ def _extract_page_title(page_data: dict[str, Any], page_id: str) -> str:
     return page_data.get("title") or page_data.get("name") or f"Confluence Page {page_id}"
 
 
+def convert_html_to_markdown(html: str) -> str:
+    """HTML 콘텐츠를 마크다운으로 변환한다.
+
+    markdownify 라이브러리를 사용하여 Confluence HTML을 정리된 마크다운으로 변환한다.
+
+    Args:
+        html: 변환할 HTML 문자열.
+
+    Returns:
+        마크다운 형식의 문자열.
+    """
+    if not html or not html.strip():
+        return ""
+    md = markdownify(html, heading_style="ATX", strip=["script", "style"])
+    # 연속 빈 줄 정리
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
+
+
 async def import_page_via_mcp(
     session: ClientSession,
     store: MetadataStore,
@@ -294,8 +364,12 @@ async def import_page_via_mcp(
           - "changed" (bool): True면 내용이 변경됨.
     """
     page_data = await get_page(session, page_id)
-    content = _extract_page_content(page_data)
+    raw_content = _extract_page_content(page_data)
     title = _extract_page_title(page_data, page_id)
+
+    # HTML → 마크다운 변환
+    content = convert_html_to_markdown(raw_content) if raw_content else raw_content
+
     content_hash = compute_content_hash(content)
 
     # 기존 문서 확인

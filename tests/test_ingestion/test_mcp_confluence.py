@@ -12,7 +12,10 @@ from context_loop.ingestion.mcp_confluence import (
     _extract_page_content,
     _extract_page_title,
     _extract_text,
+    _is_cql,
     _parse_json_result,
+    build_cql,
+    convert_html_to_markdown,
     get_all_spaces,
     get_child_pages,
     get_page,
@@ -143,15 +146,71 @@ async def test_list_available_tools() -> None:
     assert tools[0]["name"] == "searchContent"
 
 
+# --- build_cql / _is_cql 테스트 ---
+
+
+def test_is_cql_with_operator() -> None:
+    assert _is_cql('text ~ "hello"') is True
+    assert _is_cql('title = "page"') is True
+    assert _is_cql('space != "DEV"') is True
+
+
+def test_is_cql_with_keyword() -> None:
+    assert _is_cql('text ~ "a" AND type = "page"') is True
+    assert _is_cql('text ~ "a" OR text ~ "b"') is True
+    assert _is_cql('type = "page" ORDER BY created') is True
+
+
+def test_is_cql_plain_keyword() -> None:
+    assert _is_cql("프로젝트 설계 문서") is False
+    assert _is_cql("hello world") is False
+
+
+def test_build_cql_plain_keyword() -> None:
+    assert build_cql("설계 문서") == 'type = "page" AND text ~ "설계 문서"'
+
+
+def test_build_cql_already_cql() -> None:
+    cql = 'text ~ "hello" AND type = "page"'
+    assert build_cql(cql) == cql
+
+
+def test_build_cql_empty() -> None:
+    assert build_cql("") == ""
+    assert build_cql("   ") == ""
+
+
+def test_build_cql_escapes_quotes() -> None:
+    assert build_cql('say "hello"') == 'type = "page" AND text ~ "say \\"hello\\""'
+
+
+# --- search_content 테스트 ---
+
+
 @pytest.mark.asyncio
 async def test_search_content_list_result() -> None:
     session = AsyncMock()
     session.call_tool.return_value = _make_result('[{"id": "1", "title": "Result"}]')
 
     results = await search_content(session, "test query")
-    session.call_tool.assert_called_once_with("searchContent", {"query": "test query"})
+    session.call_tool.assert_called_once_with(
+        "searchContent", {"cql": 'type = "page" AND text ~ "test query"', "limit": 25, "start": 0},
+    )
     assert len(results) == 1
     assert results[0]["id"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_search_content_with_cql() -> None:
+    """이미 CQL인 경우 변환 없이 그대로 전달한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result('[{"id": "1"}]')
+
+    cql = 'text ~ "hello" AND space = "DEV"'
+    await search_content(session, cql)
+    session.call_tool.assert_called_once_with(
+        "searchContent", {"cql": cql, "limit": 25, "start": 0},
+    )
 
 
 @pytest.mark.asyncio
@@ -159,7 +218,7 @@ async def test_search_content_dict_result() -> None:
     session = AsyncMock()
     session.call_tool.return_value = _make_result('{"results": [{"id": "2"}]}')
 
-    results = await search_content(session, "query")
+    results = await search_content(session, 'type = "page"')
     assert results[0]["id"] == "2"
 
 
@@ -169,7 +228,10 @@ async def test_get_page_dict_result() -> None:
     session.call_tool.return_value = _make_result('{"id": "123", "title": "Test Page", "content": "Hello"}')
 
     page = await get_page(session, "123")
-    session.call_tool.assert_called_once_with("getPage", {"pageId": "123"})
+    session.call_tool.assert_called_once_with(
+        "getPageByID",
+        {"pageId": "123", "expand": "history,space,version,body.storage"},
+    )
     assert page["title"] == "Test Page"
 
 
@@ -282,3 +344,53 @@ async def test_import_page_via_mcp_changed(meta_store: MetadataStore) -> None:
     assert result2["created"] is False
     assert result2["changed"] is True
     assert result2["status"] == "changed"
+
+
+# --- convert_html_to_markdown 테스트 ---
+
+
+def test_convert_html_to_markdown() -> None:
+    """HTML이 마크다운으로 변환된다."""
+    result = convert_html_to_markdown("<h1>Hello</h1><p>World</p>")
+    assert "# Hello" in result
+    assert "World" in result
+
+
+def test_convert_html_to_markdown_empty() -> None:
+    """빈 HTML은 빈 문자열을 반환한다."""
+    assert convert_html_to_markdown("") == ""
+    assert convert_html_to_markdown("   ") == ""
+
+
+def test_convert_html_to_markdown_table() -> None:
+    """HTML 테이블이 마크다운 테이블로 변환된다."""
+    html = "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+    result = convert_html_to_markdown(html)
+    assert "A" in result
+    assert "1" in result
+
+
+def test_convert_html_to_markdown_list() -> None:
+    """HTML 리스트가 마크다운 리스트로 변환된다."""
+    html = "<ul><li>one</li><li>two</li></ul>"
+    result = convert_html_to_markdown(html)
+    assert "one" in result
+    assert "two" in result
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_converts_html(meta_store: MetadataStore) -> None:
+    """임포트 시 HTML 콘텐츠가 마크다운으로 변환되어 저장된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "p10", "title": "HTML Page", "content": "<h1>Title</h1><p>Body</p>"}'
+    )
+
+    result = await import_page_via_mcp(session, meta_store, "p10")
+    assert result["created"] is True
+
+    doc = await meta_store.get_document(result["id"])
+    assert doc is not None
+    # HTML 태그가 아닌 마크다운 형식으로 저장됨
+    assert "<h1>" not in doc["original_content"]
+    assert "Title" in doc["original_content"]

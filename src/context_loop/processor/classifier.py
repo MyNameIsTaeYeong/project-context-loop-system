@@ -64,7 +64,7 @@ async def classify_document(
     response = await client.complete(
         prompt,
         system=_SYSTEM_PROMPT,
-        max_tokens=256,
+        max_tokens=1024,
         temperature=0.0,
     )
 
