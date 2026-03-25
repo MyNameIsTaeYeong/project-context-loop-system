@@ -12,7 +12,9 @@ from context_loop.ingestion.mcp_confluence import (
     _extract_page_content,
     _extract_page_title,
     _extract_text,
+    _is_cql,
     _parse_json_result,
+    build_cql,
     get_all_spaces,
     get_child_pages,
     get_page,
@@ -143,6 +145,47 @@ async def test_list_available_tools() -> None:
     assert tools[0]["name"] == "searchContent"
 
 
+# --- build_cql / _is_cql 테스트 ---
+
+
+def test_is_cql_with_operator() -> None:
+    assert _is_cql('text ~ "hello"') is True
+    assert _is_cql('title = "page"') is True
+    assert _is_cql('space != "DEV"') is True
+
+
+def test_is_cql_with_keyword() -> None:
+    assert _is_cql('text ~ "a" AND type = "page"') is True
+    assert _is_cql('text ~ "a" OR text ~ "b"') is True
+    assert _is_cql('type = "page" ORDER BY created') is True
+
+
+def test_is_cql_plain_keyword() -> None:
+    assert _is_cql("프로젝트 설계 문서") is False
+    assert _is_cql("hello world") is False
+
+
+def test_build_cql_plain_keyword() -> None:
+    assert build_cql("설계 문서") == 'type = "page" AND text ~ "설계 문서"'
+
+
+def test_build_cql_already_cql() -> None:
+    cql = 'text ~ "hello" AND type = "page"'
+    assert build_cql(cql) == cql
+
+
+def test_build_cql_empty() -> None:
+    assert build_cql("") == ""
+    assert build_cql("   ") == ""
+
+
+def test_build_cql_escapes_quotes() -> None:
+    assert build_cql('say "hello"') == 'type = "page" AND text ~ "say \\"hello\\""'
+
+
+# --- search_content 테스트 ---
+
+
 @pytest.mark.asyncio
 async def test_search_content_list_result() -> None:
     session = AsyncMock()
@@ -150,10 +193,23 @@ async def test_search_content_list_result() -> None:
 
     results = await search_content(session, "test query")
     session.call_tool.assert_called_once_with(
-        "searchContent", {"cql": "test query", "limit": 25, "start": 0},
+        "searchContent", {"cql": 'type = "page" AND text ~ "test query"', "limit": 25, "start": 0},
     )
     assert len(results) == 1
     assert results[0]["id"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_search_content_with_cql() -> None:
+    """이미 CQL인 경우 변환 없이 그대로 전달한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result('[{"id": "1"}]')
+
+    cql = 'text ~ "hello" AND space = "DEV"'
+    await search_content(session, cql)
+    session.call_tool.assert_called_once_with(
+        "searchContent", {"cql": cql, "limit": 25, "start": 0},
+    )
 
 
 @pytest.mark.asyncio
@@ -161,7 +217,7 @@ async def test_search_content_dict_result() -> None:
     session = AsyncMock()
     session.call_tool.return_value = _make_result('{"results": [{"id": "2"}]}')
 
-    results = await search_content(session, "query")
+    results = await search_content(session, 'type = "page"')
     assert results[0]["id"] == "2"
 
 

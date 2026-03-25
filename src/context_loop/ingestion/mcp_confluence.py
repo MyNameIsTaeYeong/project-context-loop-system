@@ -174,6 +174,36 @@ async def list_available_tools(session: ClientSession) -> list[dict[str, Any]]:
     ]
 
 
+def _is_cql(query: str) -> bool:
+    """주어진 문자열이 이미 CQL 형식인지 판별한다.
+
+    CQL 연산자(=, ~, !=, >=, <=, >, <)나 키워드(AND, OR, NOT, IN, ORDER BY)가
+    포함되어 있으면 CQL로 간주한다.
+    """
+    import re
+
+    cql_operator_pattern = re.compile(r'[~=!<>]|!=|>=|<=')
+    cql_keyword_pattern = re.compile(
+        r'\b(AND|OR|NOT|IN|ORDER\s+BY)\b', re.IGNORECASE,
+    )
+    return bool(cql_operator_pattern.search(query) or cql_keyword_pattern.search(query))
+
+
+def build_cql(query: str) -> str:
+    """사용자 입력을 CQL 쿼리로 변환한다.
+
+    이미 CQL 형식이면 그대로 반환하고,
+    일반 키워드이면 ``type = "page" AND text ~ "검색어"`` 형식으로 감싼다.
+    """
+    query = query.strip()
+    if not query:
+        return query
+    if _is_cql(query):
+        return query
+    escaped = query.replace('\\', '\\\\').replace('"', '\\"')
+    return f'type = "page" AND text ~ "{escaped}"'
+
+
 async def search_content(
     session: ClientSession,
     query: str,
@@ -182,17 +212,21 @@ async def search_content(
 ) -> list[dict[str, Any]]:
     """MCP 서버의 searchContent 도구로 콘텐츠를 검색한다.
 
+    사용자가 일반 키워드를 입력하면 자동으로 CQL로 변환한다.
+    이미 CQL 형식이면 그대로 사용한다.
+
     Args:
         session: 초기화된 ClientSession.
-        query: CQL 검색 쿼리.
+        query: 검색 키워드 또는 CQL 쿼리.
         limit: 최대 결과 수.
         start: 결과 시작 오프셋.
 
     Returns:
         검색 결과 목록. 각 항목에 id, title 등이 포함된다.
     """
+    cql = build_cql(query)
     result = await session.call_tool(
-        "searchContent", {"cql": query, "limit": limit, "start": start},
+        "searchContent", {"cql": cql, "limit": limit, "start": start},
     )
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
