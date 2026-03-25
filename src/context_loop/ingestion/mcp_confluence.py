@@ -16,14 +16,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
+from markdownify import markdownify
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from context_loop.ingestion.uploader import compute_content_hash
-from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.metadata_store import MetadataStore
 
 logger = logging.getLogger(__name__)
@@ -323,19 +324,12 @@ def _extract_page_title(page_data: dict[str, Any], page_id: str) -> str:
     return page_data.get("title") or page_data.get("name") or f"Confluence Page {page_id}"
 
 
-_HTML_TO_MD_SYSTEM = (
-    "You are an HTML-to-Markdown converter. "
-    "Convert the given Confluence HTML to clean Markdown. "
-    "Preserve the document structure (headings, lists, tables, code blocks, links, images). "
-    "Do NOT add any commentary — output ONLY the converted Markdown."
-)
+def convert_html_to_markdown(html: str) -> str:
+    """HTML 콘텐츠를 마크다운으로 변환한다.
 
-
-async def convert_html_to_markdown(llm_client: LLMClient, html: str) -> str:
-    """LLM을 사용하여 HTML 콘텐츠를 마크다운으로 변환한다.
+    markdownify 라이브러리를 사용하여 Confluence HTML을 정리된 마크다운으로 변환한다.
 
     Args:
-        llm_client: 초기화된 LLMClient 인스턴스.
         html: 변환할 HTML 문자열.
 
     Returns:
@@ -343,19 +337,16 @@ async def convert_html_to_markdown(llm_client: LLMClient, html: str) -> str:
     """
     if not html or not html.strip():
         return ""
-    return await llm_client.complete(
-        html,
-        system=_HTML_TO_MD_SYSTEM,
-        max_tokens=4096,
-        temperature=0.0,
-    )
+    md = markdownify(html, heading_style="ATX", strip=["script", "style"])
+    # 연속 빈 줄 정리
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
 
 
 async def import_page_via_mcp(
     session: ClientSession,
     store: MetadataStore,
     page_id: str,
-    llm_client: LLMClient | None = None,
 ) -> dict[str, Any]:
     """MCP를 통해 Confluence 페이지를 가져와 메타데이터 저장소에 등록한다.
 
@@ -376,11 +367,8 @@ async def import_page_via_mcp(
     raw_content = _extract_page_content(page_data)
     title = _extract_page_title(page_data, page_id)
 
-    # LLM을 통해 HTML → 마크다운 변환
-    if llm_client and raw_content:
-        content = await convert_html_to_markdown(llm_client, raw_content)
-    else:
-        content = raw_content
+    # HTML → 마크다운 변환
+    content = convert_html_to_markdown(raw_content) if raw_content else raw_content
 
     content_hash = compute_content_hash(content)
 

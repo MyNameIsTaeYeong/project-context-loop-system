@@ -349,41 +349,48 @@ async def test_import_page_via_mcp_changed(meta_store: MetadataStore) -> None:
 # --- convert_html_to_markdown 테스트 ---
 
 
+def test_convert_html_to_markdown() -> None:
+    """HTML이 마크다운으로 변환된다."""
+    result = convert_html_to_markdown("<h1>Hello</h1><p>World</p>")
+    assert "# Hello" in result
+    assert "World" in result
+
+
+def test_convert_html_to_markdown_empty() -> None:
+    """빈 HTML은 빈 문자열을 반환한다."""
+    assert convert_html_to_markdown("") == ""
+    assert convert_html_to_markdown("   ") == ""
+
+
+def test_convert_html_to_markdown_table() -> None:
+    """HTML 테이블이 마크다운 테이블로 변환된다."""
+    html = "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+    result = convert_html_to_markdown(html)
+    assert "A" in result
+    assert "1" in result
+
+
+def test_convert_html_to_markdown_list() -> None:
+    """HTML 리스트가 마크다운 리스트로 변환된다."""
+    html = "<ul><li>one</li><li>two</li></ul>"
+    result = convert_html_to_markdown(html)
+    assert "one" in result
+    assert "two" in result
+
+
 @pytest.mark.asyncio
-async def test_convert_html_to_markdown() -> None:
-    """LLM을 통해 HTML이 마크다운으로 변환된다."""
-    llm_client = AsyncMock()
-    llm_client.complete.return_value = "# Hello\n\nWorld"
-
-    result = await convert_html_to_markdown(llm_client, "<h1>Hello</h1><p>World</p>")
-    assert result == "# Hello\n\nWorld"
-    llm_client.complete.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_convert_html_to_markdown_empty() -> None:
-    """빈 HTML은 LLM 호출 없이 빈 문자열을 반환한다."""
-    llm_client = AsyncMock()
-
-    result = await convert_html_to_markdown(llm_client, "")
-    assert result == ""
-    llm_client.complete.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_import_page_via_mcp_with_llm(meta_store: MetadataStore) -> None:
-    """llm_client가 주어지면 HTML 콘텐츠가 마크다운으로 변환되어 저장된다."""
+async def test_import_page_via_mcp_converts_html(meta_store: MetadataStore) -> None:
+    """임포트 시 HTML 콘텐츠가 마크다운으로 변환되어 저장된다."""
     session = AsyncMock()
     session.call_tool.return_value = _make_result(
         '{"id": "p10", "title": "HTML Page", "content": "<h1>Title</h1><p>Body</p>"}'
     )
 
-    llm_client = AsyncMock()
-    llm_client.complete.return_value = "# Title\n\nBody"
-
-    result = await import_page_via_mcp(session, meta_store, "p10", llm_client=llm_client)
+    result = await import_page_via_mcp(session, meta_store, "p10")
     assert result["created"] is True
 
     doc = await meta_store.get_document(result["id"])
     assert doc is not None
-    assert doc["original_content"] == "# Title\n\nBody"
+    # HTML 태그가 아닌 마크다운 형식으로 저장됨
+    assert "<h1>" not in doc["original_content"]
+    assert "Title" in doc["original_content"]
