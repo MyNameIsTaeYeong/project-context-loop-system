@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 2 보강 — Confluence MCP Client 연동 검토 중
-- **Step**: 설계 검토 완료, 구현 대기
-- **상태**: Phase 6까지 완료. Confluence REST API 차단으로 MCP Client 방식 채택 (D-016)
+- **Phase**: Phase 2 보강 — Confluence MCP Client 연동 안정화
+- **Step**: 버그 수정 및 리팩토링 완료, 추가 기능 구현 대기
+- **상태**: Phase 6까지 완료. MCP Client HTML→MD 변환을 markdownify 라이브러리로 전환 (D-017). 문서 분류 파싱 에러 수정.
 
 ## Phase별 진행률
 
@@ -55,5 +55,5 @@
 - [ ] 7.2 초기 설정 마법사 (대시보드 내)
 
 ## 마지막 업데이트
-- 일시: 2026-03-24
-- 내용: Confluence MCP Client 연동 방안 검토 (D-016). REST API 접근 차단으로 사내 Confluence MCP Server를 MCP Client로 활용하는 4번째 입력 경로 설계. 3가지 사용자 시나리오(검색, 트리 탐색, 내 문서) 및 탭 기반 통합 UI 기획 완료. Phase 2에 2.6~2.8 항목 추가.
+- 일시: 2026-03-27
+- 내용: HTML→마크다운 변환을 LLM에서 markdownify 라이브러리로 전환 (D-017). classify_document max_tokens 256→1024 증가로 문서 분류 파싱 에러 수정.
