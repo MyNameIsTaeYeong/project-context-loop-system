@@ -140,7 +140,11 @@ async def _format_chunk_results(
         title = doc_cache.get(doc_id, "알 수 없음") if doc_id else "알 수 없음"
         content = r.get("document", "")
         distance = r.get("distance", 0)
-        lines.append(f"\n### [{title}] (유사도: {1 - distance:.2f})")
+        section_path = r.get("metadata", {}).get("section_path", "")
+        header = f"\n### [{title}] (유사도: {1 - distance:.2f})"
+        if section_path:
+            header += f"\n_섹션: {section_path}_"
+        lines.append(header)
         lines.append(content)
 
     return "\n".join(lines)
@@ -227,7 +231,11 @@ async def assemble_context_with_sources(
             title = doc_cache[doc_id]["title"] if doc_id and doc_id in doc_cache else "알 수 없음"
             distance = r.get("distance", 1.0)
             similarity = 1 - distance
-            lines.append(f"[출처: {title}]\n{r.get('document', '')}")
+            section_path = r.get("metadata", {}).get("section_path", "")
+            source_label = f"[출처: {title}]"
+            if section_path:
+                source_label += f" (섹션: {section_path})"
+            lines.append(f"{source_label}\n{r.get('document', '')}")
             if doc_id and doc_id not in {s.document_id for s in sources}:
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))

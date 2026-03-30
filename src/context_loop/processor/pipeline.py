@@ -122,6 +122,7 @@ async def process_document(
                         "document_id": document_id,
                         "chunk_index": c.index,
                         "title": title,
+                        "section_path": c.section_path,
                     }
                     for c in chunks
                 ]
