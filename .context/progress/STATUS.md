@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 2 보강 — Confluence MCP Client 연동 안정화
-- **Step**: 버그 수정 및 리팩토링 완료, 추가 기능 구현 대기
-- **상태**: Phase 6까지 완료. MCP Client HTML→MD 변환을 markdownify 라이브러리로 전환 (D-017). 문서 분류 파싱 에러 수정.
+- **Phase**: Phase 7 — 답변 품질 개선 (RAG 파이프라인 고도화)
+- **Step**: 7.1 HTML→Markdown 변환기 개선 완료
+- **상태**: Phase 6까지 완료. Phase 7.1 구현 — BeautifulSoup+markdownify 기반 공유 변환 모듈로 교체, Confluence 매크로/테이블/중첩목록 지원.
 
 ## Phase별 진행률
 
@@ -51,7 +51,7 @@
 - [x] 6.2 출처 표시 (원본 문서 링크)
 
 ### Phase 7: 답변 품질 개선 (RAG 파이프라인 고도화)
-- [ ] 7.1 HTML→Markdown 변환기 개선 — 테이블, 매크로, 중첩 목록 지원 (I-012)
+- [x] 7.1 HTML→Markdown 변환기 개선 — 테이블, 매크로, 중첩 목록 지원 (I-012)
 - [ ] 7.2 헤딩 기반 계층적 청킹 + 섹션 메타데이터 첨부 (I-013)
 - [ ] 7.3 Cross-encoder Reranker 추가 + 유사도 threshold 도입 (I-015)
 - [ ] 7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)
@@ -65,4 +65,4 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-30
-- 내용: RAG 파이프라인 답변 품질 분석 완료. 7개 개선 영역 식별 후 Phase 7(답변 품질 개선)으로 로드맵 추가. 기존 Phase 7(배포)은 Phase 8로 이동. 이슈 I-012~I-018 등록.
+- 내용: Phase 7.1 완료 — HTML→MD 변환기를 BeautifulSoup+markdownify 기반으로 개선. `ingestion/html_converter.py` 공유 모듈 신규 생성, confluence.py와 mcp_confluence.py에서 모두 사용. Confluence 매크로(info/warning/note/tip 패널, code/noformat, expand, toc), 테이블, 중첩 목록 지원. beautifulsoup4 의존성 추가. 28개 신규 테스트 통과.
