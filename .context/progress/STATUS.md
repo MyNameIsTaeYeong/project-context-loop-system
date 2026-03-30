@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 7 — 답변 품질 개선 (RAG 파이프라인 고도화)
-- **Step**: 7.1 HTML→Markdown 변환기 개선 완료
-- **상태**: Phase 6까지 완료. Phase 7.1 구현 — BeautifulSoup+markdownify 기반 공유 변환 모듈로 교체, Confluence 매크로/테이블/중첩목록 지원.
+- **Step**: 7.2 헤딩 기반 계층적 청킹 완료
+- **상태**: Phase 7.1~7.2 구현 완료. 7.1: BeautifulSoup+markdownify 기반 HTML→MD 변환. 7.2: 마크다운 헤딩 기반 섹션 분리 + section_path 메타데이터.
 
 ## Phase별 진행률
 
@@ -52,7 +52,7 @@
 
 ### Phase 7: 답변 품질 개선 (RAG 파이프라인 고도화)
 - [x] 7.1 HTML→Markdown 변환기 개선 — 테이블, 매크로, 중첩 목록 지원 (I-012)
-- [ ] 7.2 헤딩 기반 계층적 청킹 + 섹션 메타데이터 첨부 (I-013)
+- [x] 7.2 헤딩 기반 계층적 청킹 + 섹션 메타데이터 첨부 (I-013)
 - [ ] 7.3 Cross-encoder Reranker 추가 + 유사도 threshold 도입 (I-015)
 - [ ] 7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)
 - [ ] 7.5 쿼리 확장(Query Expansion) 또는 HyDE 적용 (I-016)
