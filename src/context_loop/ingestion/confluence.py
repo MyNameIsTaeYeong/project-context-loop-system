@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from context_loop.ingestion.html_converter import html_to_markdown
 from context_loop.ingestion.uploader import compute_content_hash
 from context_loop.storage.metadata_store import MetadataStore
 
@@ -40,10 +41,10 @@ def _bearer_auth_header(pat_token: str) -> str:
 
 
 def _html_to_markdown(html: str) -> str:
-    """HTML을 간단한 마크다운으로 변환한다.
+    """HTML을 마크다운으로 변환한다.
 
-    완전한 HTML 파서 대신 정규식 기반 경량 변환을 사용한다.
-    복잡한 HTML 구조는 일부 손실될 수 있다.
+    Confluence 매크로(패널, 코드, 테이블 등)를 전처리한 뒤
+    markdownify로 변환한다. 공유 모듈 ``html_converter``에 위임.
 
     Args:
         html: 변환할 HTML 문자열.
@@ -51,42 +52,7 @@ def _html_to_markdown(html: str) -> str:
     Returns:
         마크다운 문자열.
     """
-    # 헤딩 변환
-    for level in range(6, 0, -1):
-        html = re.sub(
-            rf"<h{level}[^>]*>(.*?)</h{level}>",
-            lambda m, lv=level: "#" * lv + " " + m.group(1).strip(),
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-    # 굵게
-    html = re.sub(r"<(strong|b)[^>]*>(.*?)</\1>", r"**\2**", html, flags=re.IGNORECASE | re.DOTALL)
-    # 이탤릭
-    html = re.sub(r"<(em|i)[^>]*>(.*?)</\1>", r"*\2*", html, flags=re.IGNORECASE | re.DOTALL)
-    # 코드 블록
-    html = re.sub(r"<pre[^>]*><code[^>]*>(.*?)</code></pre>", r"```\n\1\n```", html, flags=re.IGNORECASE | re.DOTALL)
-    # 인라인 코드
-    html = re.sub(r"<code[^>]*>(.*?)</code>", r"`\1`", html, flags=re.IGNORECASE | re.DOTALL)
-    # 링크
-    html = re.sub(r'<a[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>', r"[\2](\1)", html, flags=re.IGNORECASE | re.DOTALL)
-    # 이미지
-    html = re.sub(r'<img[^>]*alt=["\']([^"\']*)["\'][^>]*src=["\']([^"\']*)["\'][^>]*/?>',r"![\1](\2)", html, flags=re.IGNORECASE)
-    html = re.sub(r'<img[^>]*src=["\']([^"\']*)["\'][^>]*/?>',r"![](\1)", html, flags=re.IGNORECASE)
-    # 목록 항목
-    html = re.sub(r"<li[^>]*>(.*?)</li>", r"- \1", html, flags=re.IGNORECASE | re.DOTALL)
-    # 단락
-    html = re.sub(r"<p[^>]*>(.*?)</p>", r"\1\n", html, flags=re.IGNORECASE | re.DOTALL)
-    # 수평선
-    html = re.sub(r"<hr[^>]*/?>", "---", html, flags=re.IGNORECASE)
-    # 줄바꿈
-    html = re.sub(r"<br[^>]*/?>", "\n", html, flags=re.IGNORECASE)
-    # 나머지 태그 제거
-    html = re.sub(r"<[^>]+>", "", html)
-    # HTML 엔티티 디코딩
-    html = html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
-    # 과도한 공백/빈 줄 정리
-    html = re.sub(r"\n{3,}", "\n\n", html)
-    return html.strip()
+    return html_to_markdown(html)
 
 
 class ConfluenceClient:
