@@ -188,3 +188,31 @@
   - 2순위 — 트리 탐색: `getSpaceInfoAll()` → `getChild(pageId)` 재귀 → `getPage(id)` × N
   - 3순위 — 내 문서: `getUserContributedPages(userId)` → 선택 → `getPage(id)` × N
 - **이유**: 추가 라이브러리 설치 불필요 (`mcp` 이미 의존성에 포함). 인증/권한은 MCP 서버 측에서 처리하므로 클라이언트 구현 단순. 기존 ingestion 패턴(`async` 함수 → `dict` 반환)을 그대로 따르므로 ProcessingPipeline 변경 불필요. REST API 직접 접근이 차단된 환경에서 유일한 Confluence 연동 경로.
+
+---
+
+## D-018: HTML→Markdown 변환기 — BeautifulSoup 전처리 + markdownify 공유 모듈
+
+- **일시**: 2026-03-30
+- **맥락**: `confluence.py`의 `_html_to_markdown()`이 정규식 기반이라 테이블, Confluence 매크로, 중첩 목록이 모두 소실됨 (I-012, I-005). `mcp_confluence.py`는 D-017에서 markdownify로 전환했지만 매크로 전처리 없이 단순 변환만 수행. 두 모듈의 변환 로직이 분리되어 있어 품질 차이 발생.
+- **결정**: BeautifulSoup으로 Confluence 매크로를 표준 HTML로 전처리한 뒤 markdownify로 최종 변환하는 공유 모듈 `ingestion/html_converter.py`를 신규 생성. `confluence.py`와 `mcp_confluence.py` 양쪽에서 이 모듈에 위임.
+- **구현 내용**:
+  - `html_converter.py`: `html_to_markdown()` 함수 — `_preprocess_confluence_macros()` → `markdownify()` → `_postprocess()` 파이프라인
+  - Confluence 매크로 전처리: info/warning/note/tip 패널 → blockquote, code/noformat → 코드 블록, expand → 본문 펼침, toc/children → 제거, ac:image → img, ac:link → a
+  - `confluence.py`: `_html_to_markdown()` → `html_to_markdown()` 위임
+  - `mcp_confluence.py`: `convert_html_to_markdown()` → 동일 모듈 위임, `markdownify` 직접 import 제거
+  - `pyproject.toml`: `beautifulsoup4>=4.12.0` 의존성 추가
+- **이유**: 공유 모듈로 변환 품질을 일원화하고, BeautifulSoup 전처리로 Confluence 전용 매크로를 표준 HTML로 정규화한 뒤 markdownify에 넘기면 테이블·목록·서식 등 기본 HTML 변환은 라이브러리가 처리. 정규식 기반 대비 테이블 구조 보존, 매크로 내용 보존, 중첩 목록 정상 변환이 가능해져 원본 데이터 품질이 대폭 향상.
+
+---
+
+## D-019: 청킹 전략 — 마크다운 헤딩 기반 계층적 분할 + section_path 메타데이터
+
+- **일시**: 2026-03-30
+- **맥락**: 기존 청커(`chunker.py`)가 `\n\n` 기준으로만 단락을 분리하여 마크다운 헤딩 구조를 무시 (I-013). `# 섹션 제목`과 본문이 서로 다른 청크로 분리되어 검색 시 컨텍스트 소실. 메타데이터에 `chunk_index`와 `title`만 저장되어 해당 청크가 문서의 어느 위치에 속하는지 알 수 없음.
+- **결정**: 마크다운 헤딩(`#`~`######`)을 인식하여 섹션별로 분리한 뒤 각 섹션 내에서 토큰 기반 청킹 수행. 각 청크에 상위 헤딩 경로(`section_path`)를 자동 첨부.
+- **구현 내용**:
+  - `chunker.py`: `Chunk` dataclass에 `section_path: str` 필드 추가. `_split_into_sections()` — 헤딩 스택으로 계층 경로 계산. `_chunk_section()` — 기존 토큰 기반 분할 로직을 섹션 단위로 적용. 헤딩 텍스트를 청크 본문에 포함하여 임베딩 시 검색 정확도 향상. 헤딩 없는 문서는 기존과 동일하게 동작 (하위 호환).
+  - `pipeline.py`: 벡터스토어 메타데이터에 `section_path` 포함.
+  - `context_assembler.py`: `_format_chunk_results()`와 `assemble_context_with_sources()`에서 검색 결과에 섹션 경로 표시.
+- **이유**: 헤딩을 청크 본문에 포함하면 임베딩에 섹션 제목의 의미가 반영되어 "백엔드 기술 스택" 같은 쿼리와의 유사도가 높아짐. `section_path` 메타데이터를 통해 LLM이 답변 생성 시 문서 내 위치를 파악할 수 있고, 사용자에게 출처를 섹션 수준으로 안내 가능. 섹션 경계에서 분할하면 서로 다른 주제의 텍스트가 한 청크에 섞이는 문제도 방지.

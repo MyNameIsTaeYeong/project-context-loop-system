@@ -65,4 +65,6 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-30
-- 내용: Phase 7.1 완료 — HTML→MD 변환기를 BeautifulSoup+markdownify 기반으로 개선. `ingestion/html_converter.py` 공유 모듈 신규 생성, confluence.py와 mcp_confluence.py에서 모두 사용. Confluence 매크로(info/warning/note/tip 패널, code/noformat, expand, toc), 테이블, 중첩 목록 지원. beautifulsoup4 의존성 추가. 28개 신규 테스트 통과.
+- 내용: RAG 파이프라인 답변 품질 분석 → Phase 7 로드맵 수립 → 7.1~7.2 구현 완료.
+  - Phase 7.1 (D-018): HTML→MD 변환기를 BeautifulSoup+markdownify 기반으로 개선. `ingestion/html_converter.py` 공유 모듈 신규 생성. Confluence 매크로/테이블/중첩 목록 지원. 28개 신규 테스트.
+  - Phase 7.2 (D-019): 마크다운 헤딩 기반 계층적 청킹. `Chunk.section_path` 필드 추가, 벡터스토어 메타데이터 및 검색 결과 포맷에 섹션 경로 반영. 8개 신규 테스트. 전체 197개 통과.
