@@ -48,6 +48,7 @@ def register_tools(mcp: FastMCP) -> None:
             rerank_enabled=_config.get("search.reranker_enabled", False) if _config else False,
             rerank_top_k=_config.get("search.reranker_top_k", None) if _config else None,
             rerank_score_threshold=_config.get("search.reranker_score_threshold", 0.0) if _config else 0.0,
+            hyde_enabled=_config.get("search.hyde_enabled", False) if _config else False,
         )
 
     @mcp.tool()

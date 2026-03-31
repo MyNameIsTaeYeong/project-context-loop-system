@@ -248,3 +248,17 @@
   - `_USER_PROMPT_CHUNK_TEMPLATE` — 청크 프롬프트에 `(N/M)` 섹션 정보 포함하여 LLM이 문서 위치를 인식.
   - `pipeline.py` — 변경 없음 (함수 시그니처 동일, 내부에서 자동 분기).
 - **이유**: 기존 4000자 제한은 문서 후반부 정보를 완전히 무시함. Map-reduce로 전체 문서를 처리하면 10,000자+ 문서에서도 모든 엔티티/관계를 추출 가능. 부분 실패 허용으로 한 청크의 LLM 호출이 실패해도 나머지 결과를 살릴 수 있음. 중복 제거로 여러 청크에서 동일 엔티티가 추출되어도 그래프가 깨끗하게 유지됨. 짧은 문서는 기존과 동일하게 단일 호출(하위 호환).
+
+---
+
+## D-022: 쿼리 확장 — HyDE (Hypothetical Document Embedding)
+
+- **일시**: 2026-03-31
+- **맥락**: 사용자 쿼리가 그대로 임베딩되어 벡터 검색에 사용됨 (I-016). 짧은 질의("배포 절차")와 문서 청크("릴리즈 프로세스는 CI/CD 파이프라인을 통해…") 사이에 어휘적 갭(lexical gap)이 존재하여 의미적으로 관련된 문서를 놓침. 동의어, 약어, 기술 용어 차이로 인한 검색 재현율(recall) 저하.
+- **결정**: HyDE(Hypothetical Document Embedding) 방식 도입. LLM에게 질의에 대한 가상 답변 문서를 생성시킨 뒤, 원본 쿼리 임베딩과 가상 문서 임베딩을 평균하여 의미적으로 풍부한 검색 벡터를 생성.
+- **구현 내용**:
+  - `processor/query_expander.py` (신규): `generate_hypothetical_document()` — LLM에게 3~5문장의 가상 답변 단락 생성 요청 (temperature=0.7로 다양성 확보). `expand_query_embedding()` — 원본 쿼리 임베딩 + HyDE 임베딩 평균 벡터 반환. HyDE 실패 시 원본 임베딩 반환 (graceful degradation).
+  - `mcp/context_assembler.py`: `assemble_context()`, `assemble_context_with_sources()`에 `hyde_enabled` 파라미터 추가. 활성화 시 `_embed_query()` 대신 `expand_query_embedding()` 사용.
+  - `mcp/tools.py`, `web/api/chat.py`: config에서 `search.hyde_enabled` 읽어 전달.
+  - `config/default.yaml`: `search.hyde_enabled: false` 추가 (기본 비활성).
+- **이유**: HyDE는 질의를 문서 공간으로 변환하여 어휘적 갭을 해소. "배포 절차" 질의 → 가상 문서에 "릴리즈", "디플로이", "CI/CD", "파이프라인" 등 동의어가 자연스럽게 포함 → 이 용어들이 포함된 청크와의 유사도 상승. 원본 임베딩과 평균하여 원래 질의의 의도도 보존. LLM 1회 추가 호출(256토큰)로 구현되어 비용 낮음. 설정으로 비활성화 가능.

@@ -453,3 +453,75 @@ async def test_assemble_context_rerank_score_threshold(stores) -> None:
     # 점수 2인 "무관한 잡음"은 제외되어야 함
     assert "관련 내용" in assembled.context_text
     assert "무관한 잡음" not in assembled.context_text
+
+
+# --- HyDE 통합 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_with_hyde(stores) -> None:
+    """HyDE 활성화 시 LLM이 가상 문서를 생성하고 임베딩에 반영된다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="HydeDoc", original_content="c", content_hash="hhy",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["배포 자동화 CI/CD 파이프라인 설명"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = AsyncMock()
+    # HyDE 가상 문서 생성 호출
+    llm.complete = AsyncMock(return_value="배포 프로세스는 CI/CD를 통해 릴리즈됩니다.")
+
+    result = await assemble_context(
+        query="배포 절차",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=False,
+        hyde_enabled=True,
+    )
+    # HyDE가 활성화되었으므로 LLM이 호출됨
+    llm.complete.assert_called()
+    # 검색 결과가 포함되어야 함
+    assert "배포 자동화" in result
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_hyde_disabled_no_llm_call(stores) -> None:
+    """HyDE 비활성화 시 가상 문서 생성 LLM 호출이 없다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="NoHyde", original_content="c", content_hash="hnh",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["내용"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value="unused")
+
+    await assemble_context(
+        query="질의",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=False,
+        hyde_enabled=False,
+    )
+    # HyDE 비활성 → LLM 호출 없음 (그래프도 비활성)
+    llm.complete.assert_not_called()

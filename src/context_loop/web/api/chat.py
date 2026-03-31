@@ -85,6 +85,7 @@ async def chat_api(
         rerank_enabled=config.get("search.reranker_enabled", False),
         rerank_top_k=config.get("search.reranker_top_k", None),
         rerank_score_threshold=config.get("search.reranker_score_threshold", 0.0),
+        hyde_enabled=config.get("search.hyde_enabled", False),
     )
 
     # 2. LLM에 질의

@@ -18,6 +18,7 @@ from context_loop.processor.graph_search_planner import (
     execute_graph_search,
     plan_graph_search,
 )
+from context_loop.processor.query_expander import expand_query_embedding
 from context_loop.processor.reranker import rerank
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
@@ -57,6 +58,7 @@ async def assemble_context(
     rerank_enabled: bool = False,
     rerank_top_k: int | None = None,
     rerank_score_threshold: float = 0.0,
+    hyde_enabled: bool = False,
 ) -> str:
     """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
@@ -76,14 +78,18 @@ async def assemble_context(
         rerank_enabled: LLM 기반 리랭커 사용 여부.
         rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
         rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
+        hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
 
     Returns:
         조립된 컨텍스트 텍스트.
     """
     sections: list[str] = []
 
-    # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
-    query_embedding = await _embed_query(query, embedding_client)
+    # 쿼리 임베딩 생성 (HyDE 활성화 시 가상 문서 임베딩과 평균)
+    if hyde_enabled and llm_client:
+        query_embedding = await expand_query_embedding(query, llm_client, embedding_client)
+    else:
+        query_embedding = await _embed_query(query, embedding_client)
 
     # 1. 벡터 유사도 검색 + threshold 필터링
     chunk_results = await _search_chunks(
@@ -239,6 +245,7 @@ async def assemble_context_with_sources(
     rerank_enabled: bool = False,
     rerank_top_k: int | None = None,
     rerank_score_threshold: float = 0.0,
+    hyde_enabled: bool = False,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -258,6 +265,7 @@ async def assemble_context_with_sources(
         rerank_enabled: LLM 기반 리랭커 사용 여부.
         rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
         rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
+        hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -266,8 +274,11 @@ async def assemble_context_with_sources(
     sources: list[Source] = []
     doc_cache: dict[int, dict[str, Any]] = {}
 
-    # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
-    query_embedding = await _embed_query(query, embedding_client)
+    # 쿼리 임베딩 생성 (HyDE 활성화 시 가상 문서 임베딩과 평균)
+    if hyde_enabled and llm_client:
+        query_embedding = await expand_query_embedding(query, llm_client, embedding_client)
+    else:
+        query_embedding = await _embed_query(query, embedding_client)
 
     # 1. 벡터 유사도 검색 + threshold 필터링
     chunk_results = await _search_chunks(
