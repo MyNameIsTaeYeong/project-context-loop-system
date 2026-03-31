@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 7 — 답변 품질 개선 (RAG 파이프라인 고도화)
-- **Step**: 7.3 Cross-encoder Reranker + 유사도 threshold 완료
-- **상태**: Phase 7.1~7.3 구현 완료. 7.3: LLM 기반 리랭커 + 유사도 threshold 필터링.
+- **Step**: 7.4 그래프 추출 전체 문서 처리 완료
+- **상태**: Phase 7.1~7.4 구현 완료. 7.4: map-reduce 방식 그래프 추출 + 엔티티/관계 병합.
 
 ## Phase별 진행률
 
@@ -54,7 +54,7 @@
 - [x] 7.1 HTML→Markdown 변환기 개선 — 테이블, 매크로, 중첩 목록 지원 (I-012)
 - [x] 7.2 헤딩 기반 계층적 청킹 + 섹션 메타데이터 첨부 (I-013)
 - [x] 7.3 Cross-encoder Reranker 추가 + 유사도 threshold 도입 (I-015)
-- [ ] 7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)
+- [x] 7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)
 - [ ] 7.5 쿼리 확장(Query Expansion) 또는 HyDE 적용 (I-016)
 - [ ] 7.6 문서 분류기 입력 범위 확대 (I-017)
 - [ ] 7.7 크로스-문서 엔티티 병합 (I-018, I-003)
@@ -65,5 +65,5 @@
 
 ## 마지막 업데이트
 - 일시: 2026-03-31
-- 내용: Phase 7.3 구현 완료.
-  - Phase 7.3 (D-020): LLM 기반 Cross-encoder 리랭커 + 유사도 threshold. `processor/reranker.py` 신규 생성. `context_assembler.py`에 threshold 필터링 + 리랭킹 통합. `default.yaml`에 search 설정 추가. 16개 신규 테스트. 전체 213개 통과.
+- 내용: Phase 7.4 구현 완료.
+  - Phase 7.4 (D-021): 그래프 추출 map-reduce 방식 도입. 긴 문서를 자동 분할하여 각 청크에서 그래프 추출 후 엔티티/관계 병합. 단락/줄바꿈 경계 존중 분할. 대소문자 무시 중복 제거. 부분 실패 시 성공분만 병합. 14개 신규 테스트. 전체 229개 통과.

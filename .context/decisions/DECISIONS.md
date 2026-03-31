@@ -233,3 +233,18 @@
   - `web/api/chat.py`: 웹 채팅 API에서 config 기반 설정 전달.
   - `config/default.yaml`: `search` 섹션 추가 (`similarity_threshold: 0.3`, `reranker_enabled: false`, `reranker_top_k: 5`, `reranker_score_threshold: 4.0`).
 - **이유**: 유사도 threshold는 무관한 청크를 사전에 필터링하여 LLM 컨텍스트 창의 노이즈를 줄임. LLM 기반 리랭커는 cross-encoder 전용 모델을 추가 설치하지 않고 기존 LLM 인프라를 활용하여 bi-encoder의 precision 한계를 극복. 단일 호출로 모든 청크를 한꺼번에 평가하여 N번 호출 대비 비용/지연 최소화. 리랭커는 설정(`reranker_enabled`)으로 비활성화 가능하여 LLM 없는 환경에서도 문제 없음.
+
+---
+
+## D-021: 그래프 추출 — Map-reduce 방식 전체 문서 처리
+
+- **일시**: 2026-03-31
+- **맥락**: `graph_extractor.py`의 `extract_graph()`가 `content[:4000]`으로 앞 4000자만 LLM에 전달 (I-014). Confluence 문서는 도입부가 목차/배경이고 핵심 아키텍처 정보가 후반부에 있는 경우가 많아, 후반부 엔티티/관계가 모두 누락됨.
+- **결정**: Map-reduce 방식으로 전체 문서를 분할 추출 후 병합.
+  - **Map**: 문서를 `max_content_chars` 크기로 분할하여 각 청크에서 독립적으로 그래프 추출. 분할 시 단락 경계(`\n\n`) → 줄바꿈(`\n`) → 강제 분할 순서로 자연스러운 경계 존중.
+  - **Reduce**: 전체 결과를 병합. 엔티티는 `(name.lower(), entity_type)` 기준 중복 제거, 설명이 비어 있으면 나중 것으로 보충. 관계는 `(source.lower(), target.lower(), relation_type)` 기준 중복 제거.
+- **구현 내용**:
+  - `graph_extractor.py`: `extract_graph()` — 문서 길이에 따라 자동 분기 (짧으면 기존 단일 호출, 길면 map-reduce). `_extract_map_reduce()` — 청크별 LLM 호출 + 부분 실패 허용(graceful). `_split_content()` — 자연 경계 존중 분할. `_merge_graphs()` — 대소문자 무시 중복 제거. `_parse_graph_response()` — 공통 파싱 로직 추출.
+  - `_USER_PROMPT_CHUNK_TEMPLATE` — 청크 프롬프트에 `(N/M)` 섹션 정보 포함하여 LLM이 문서 위치를 인식.
+  - `pipeline.py` — 변경 없음 (함수 시그니처 동일, 내부에서 자동 분기).
+- **이유**: 기존 4000자 제한은 문서 후반부 정보를 완전히 무시함. Map-reduce로 전체 문서를 처리하면 10,000자+ 문서에서도 모든 엔티티/관계를 추출 가능. 부분 실패 허용으로 한 청크의 LLM 호출이 실패해도 나머지 결과를 살릴 수 있음. 중복 제거로 여러 청크에서 동일 엔티티가 추출되어도 그래프가 깨끗하게 유지됨. 짧은 문서는 기존과 동일하게 단일 호출(하위 호환).
