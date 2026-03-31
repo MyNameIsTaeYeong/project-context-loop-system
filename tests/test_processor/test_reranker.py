@@ -191,6 +191,30 @@ def test_parse_scores_ignores_out_of_range_index() -> None:
 
 
 def test_parse_scores_invalid_json() -> None:
-    """파싱 불가능한 응답은 빈 딕셔너리를 반환한다."""
+    """index/score 패턴이 전혀 없는 응답은 빈 딕셔너리를 반환한다."""
     scores = _parse_scores("이건 JSON이 아닙니다", 3)
     assert scores == {}
+
+
+def test_parse_scores_regex_fallback() -> None:
+    """JSON 파싱 실패 시 정규식으로 index/score 쌍을 추출한다."""
+    # LLM이 설명 텍스트와 함께 점수를 출력한 경우
+    response = (
+        '각 청크의 관련도를 평가했습니다.\n'
+        '- 청크 0: {"index": 0, "score": 7} — 직접 관련\n'
+        '- 청크 1: {"index": 1, "score": 3} — 간접 관련\n'
+        '- 청크 2: {"index": 2, "score": 9} — 매우 관련'
+    )
+    scores = _parse_scores(response, 3)
+    assert scores == {0: 7.0, 1: 3.0, 2: 9.0}
+
+
+def test_parse_scores_mixed_text_with_json() -> None:
+    """JSON이 텍스트 사이에 섞여 있어도 추출한다."""
+    response = (
+        '평가 결과:\n'
+        '{"index": 0, "score": 5}, {"index": 1, "score": 8}\n'
+        '이상입니다.'
+    )
+    scores = _parse_scores(response, 2)
+    assert scores == {0: 5.0, 1: 8.0}
