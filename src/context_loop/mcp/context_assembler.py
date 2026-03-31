@@ -3,6 +3,8 @@
 벡터 유사도 검색과 그래프 탐색 결과를 병합하여
 LLM에 제공할 컨텍스트를 조립한다.
 LLM 기반 그래프 탐색 플래너로 질의 의도에 맞는 그래프 영역을 탐색한다.
+유사도 threshold로 무관한 청크를 제외하고,
+LLM 기반 리랭커로 검색 결과의 정밀도를 높인다.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from context_loop.processor.graph_search_planner import (
     execute_graph_search,
     plan_graph_search,
 )
+from context_loop.processor.reranker import rerank
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -50,6 +53,10 @@ async def assemble_context(
     llm_client: Any = None,
     max_chunks: int = 10,
     include_graph: bool = True,
+    similarity_threshold: float = 0.0,
+    rerank_enabled: bool = False,
+    rerank_top_k: int | None = None,
+    rerank_score_threshold: float = 0.0,
 ) -> str:
     """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
@@ -62,9 +69,13 @@ async def assemble_context(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트 (Embeddings 인터페이스).
-        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        llm_client: LLM 클라이언트 (그래프 탐색 계획용 + 리랭킹용). None이면 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
+        similarity_threshold: 최소 코사인 유사도 (이 값 미만 제외, 0이면 필터링 없음).
+        rerank_enabled: LLM 기반 리랭커 사용 여부.
+        rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
+        rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
 
     Returns:
         조립된 컨텍스트 텍스트.
@@ -74,13 +85,28 @@ async def assemble_context(
     # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
     query_embedding = await _embed_query(query, embedding_client)
 
-    # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(query_embedding, vector_store, max_chunks)
+    # 1. 벡터 유사도 검색 + threshold 필터링
+    chunk_results = await _search_chunks(
+        query_embedding, vector_store, max_chunks,
+        similarity_threshold=similarity_threshold,
+    )
+
+    # 2. LLM 기반 리랭킹
+    if chunk_results and rerank_enabled and llm_client:
+        chunk_results = await rerank(
+            query, chunk_results, llm_client, top_k=rerank_top_k,
+        )
+        if rerank_score_threshold > 0:
+            chunk_results = [
+                c for c in chunk_results
+                if c.get("rerank_score", 0) >= rerank_score_threshold
+            ]
+
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
+    # 3. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
     if include_graph and llm_client:
         graph_result = await _search_graph_with_llm(
             query, graph_store, llm_client,
@@ -112,12 +138,28 @@ async def _search_chunks(
     query_embedding: list[float] | None,
     vector_store: VectorStore,
     max_chunks: int,
+    *,
+    similarity_threshold: float = 0.0,
 ) -> list[dict[str, Any]]:
-    """벡터 유사도 검색을 수행한다."""
+    """벡터 유사도 검색을 수행하고 threshold 이하 결과를 제외한다.
+
+    Args:
+        query_embedding: 쿼리 임베딩 벡터.
+        vector_store: 벡터 저장소.
+        max_chunks: 반환할 최대 청크 수.
+        similarity_threshold: 최소 코사인 유사도 (1 - distance).
+            이 값 미만인 청크는 제외된다. 0이면 필터링 없음.
+    """
     try:
         if vector_store.count() == 0 or query_embedding is None:
             return []
-        return vector_store.search(query_embedding, n_results=max_chunks)
+        results = vector_store.search(query_embedding, n_results=max_chunks)
+        if similarity_threshold > 0:
+            results = [
+                r for r in results
+                if (1 - r.get("distance", 1.0)) >= similarity_threshold
+            ]
+        return results
     except Exception:
         logger.warning("벡터 검색 실패", exc_info=True)
         return []
@@ -193,6 +235,10 @@ async def assemble_context_with_sources(
     llm_client: Any = None,
     max_chunks: int = 10,
     include_graph: bool = True,
+    similarity_threshold: float = 0.0,
+    rerank_enabled: bool = False,
+    rerank_top_k: int | None = None,
+    rerank_score_threshold: float = 0.0,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -205,9 +251,13 @@ async def assemble_context_with_sources(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트.
-        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        llm_client: LLM 클라이언트 (그래프 탐색 계획용 + 리랭킹용). None이면 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
+        similarity_threshold: 최소 코사인 유사도 (이 값 미만 제외, 0이면 필터링 없음).
+        rerank_enabled: LLM 기반 리랭커 사용 여부.
+        rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
+        rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -219,8 +269,23 @@ async def assemble_context_with_sources(
     # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
     query_embedding = await _embed_query(query, embedding_client)
 
-    # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(query_embedding, vector_store, max_chunks)
+    # 1. 벡터 유사도 검색 + threshold 필터링
+    chunk_results = await _search_chunks(
+        query_embedding, vector_store, max_chunks,
+        similarity_threshold=similarity_threshold,
+    )
+
+    # 2. LLM 기반 리랭킹
+    if chunk_results and rerank_enabled and llm_client:
+        chunk_results = await rerank(
+            query, chunk_results, llm_client, top_k=rerank_top_k,
+        )
+        if rerank_score_threshold > 0:
+            chunk_results = [
+                c for c in chunk_results
+                if c.get("rerank_score", 0) >= rerank_score_threshold
+            ]
+
     if chunk_results:
         lines = []
         for r in chunk_results:

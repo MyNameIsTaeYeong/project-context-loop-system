@@ -216,3 +216,20 @@
   - `pipeline.py`: 벡터스토어 메타데이터에 `section_path` 포함.
   - `context_assembler.py`: `_format_chunk_results()`와 `assemble_context_with_sources()`에서 검색 결과에 섹션 경로 표시.
 - **이유**: 헤딩을 청크 본문에 포함하면 임베딩에 섹션 제목의 의미가 반영되어 "백엔드 기술 스택" 같은 쿼리와의 유사도가 높아짐. `section_path` 메타데이터를 통해 LLM이 답변 생성 시 문서 내 위치를 파악할 수 있고, 사용자에게 출처를 섹션 수준으로 안내 가능. 섹션 경계에서 분할하면 서로 다른 주제의 텍스트가 한 청크에 섞이는 문제도 방지.
+
+---
+
+## D-020: Cross-encoder Reranker + 유사도 Threshold — LLM 기반 리랭킹
+
+- **일시**: 2026-03-31
+- **맥락**: 벡터 검색(bi-encoder)이 top-K 결과를 반환하지만 유사도 threshold가 없어 관련 없는 청크도 포함됨 (I-015). 벡터 검색 + 그래프 탐색 결과가 단순 concat으로 병합되어 중복/무관 정보의 우선순위 조정이 불가능. Cross-encoder 기반 정밀 재평가가 없어 bi-encoder의 recall은 높지만 precision이 낮음.
+- **결정**: 두 가지 메커니즘을 도입.
+  1. **유사도 threshold**: `_search_chunks()`에서 cosine similarity가 설정값(`search.similarity_threshold`, 기본 0.3) 미만인 청크를 제외.
+  2. **LLM 기반 리랭커**: `processor/reranker.py` 신규 생성. 벡터 검색 결과를 LLM에 한꺼번에 전달하여 0~10점으로 관련도를 평가받고, 점수순으로 재정렬. 점수 threshold(`search.reranker_score_threshold`) 미만 청크 추가 제외.
+- **구현 내용**:
+  - `processor/reranker.py`: `rerank()` 함수 — 단일 LLM 호출로 전체 청크 평가 (비용 최소화). LLM 실패 시 원본 순서 유지 (graceful degradation). `_parse_scores()` — JSON 응답 파싱 + 점수 클램핑(0~10).
+  - `mcp/context_assembler.py`: `assemble_context()`, `assemble_context_with_sources()` 에 `similarity_threshold`, `rerank_enabled`, `rerank_top_k`, `rerank_score_threshold` 파라미터 추가. 벡터 검색 → threshold 필터링 → 리랭킹 → 점수 threshold 필터링 → 포맷팅 파이프라인.
+  - `mcp/tools.py`: MCP search_context 도구에서 config 기반 설정 전달.
+  - `web/api/chat.py`: 웹 채팅 API에서 config 기반 설정 전달.
+  - `config/default.yaml`: `search` 섹션 추가 (`similarity_threshold: 0.3`, `reranker_enabled: false`, `reranker_top_k: 5`, `reranker_score_threshold: 4.0`).
+- **이유**: 유사도 threshold는 무관한 청크를 사전에 필터링하여 LLM 컨텍스트 창의 노이즈를 줄임. LLM 기반 리랭커는 cross-encoder 전용 모델을 추가 설치하지 않고 기존 LLM 인프라를 활용하여 bi-encoder의 precision 한계를 극복. 단일 호출로 모든 청크를 한꺼번에 평가하여 N번 호출 대비 비용/지연 최소화. 리랭커는 설정(`reranker_enabled`)으로 비활성화 가능하여 LLM 없는 환경에서도 문제 없음.

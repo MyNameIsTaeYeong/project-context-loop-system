@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 7 — 답변 품질 개선 (RAG 파이프라인 고도화)
-- **Step**: 7.2 헤딩 기반 계층적 청킹 완료
-- **상태**: Phase 7.1~7.2 구현 완료. 7.1: BeautifulSoup+markdownify 기반 HTML→MD 변환. 7.2: 마크다운 헤딩 기반 섹션 분리 + section_path 메타데이터.
+- **Step**: 7.3 Cross-encoder Reranker + 유사도 threshold 완료
+- **상태**: Phase 7.1~7.3 구현 완료. 7.3: LLM 기반 리랭커 + 유사도 threshold 필터링.
 
 ## Phase별 진행률
 
@@ -53,7 +53,7 @@
 ### Phase 7: 답변 품질 개선 (RAG 파이프라인 고도화)
 - [x] 7.1 HTML→Markdown 변환기 개선 — 테이블, 매크로, 중첩 목록 지원 (I-012)
 - [x] 7.2 헤딩 기반 계층적 청킹 + 섹션 메타데이터 첨부 (I-013)
-- [ ] 7.3 Cross-encoder Reranker 추가 + 유사도 threshold 도입 (I-015)
+- [x] 7.3 Cross-encoder Reranker 추가 + 유사도 threshold 도입 (I-015)
 - [ ] 7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)
 - [ ] 7.5 쿼리 확장(Query Expansion) 또는 HyDE 적용 (I-016)
 - [ ] 7.6 문서 분류기 입력 범위 확대 (I-017)
@@ -64,7 +64,6 @@
 - [ ] 8.2 초기 설정 마법사 (대시보드 내)
 
 ## 마지막 업데이트
-- 일시: 2026-03-30
-- 내용: RAG 파이프라인 답변 품질 분석 → Phase 7 로드맵 수립 → 7.1~7.2 구현 완료.
-  - Phase 7.1 (D-018): HTML→MD 변환기를 BeautifulSoup+markdownify 기반으로 개선. `ingestion/html_converter.py` 공유 모듈 신규 생성. Confluence 매크로/테이블/중첩 목록 지원. 28개 신규 테스트.
-  - Phase 7.2 (D-019): 마크다운 헤딩 기반 계층적 청킹. `Chunk.section_path` 필드 추가, 벡터스토어 메타데이터 및 검색 결과 포맷에 섹션 경로 반영. 8개 신규 테스트. 전체 197개 통과.
+- 일시: 2026-03-31
+- 내용: Phase 7.3 구현 완료.
+  - Phase 7.3 (D-020): LLM 기반 Cross-encoder 리랭커 + 유사도 threshold. `processor/reranker.py` 신규 생성. `context_assembler.py`에 threshold 필터링 + 리랭킹 통합. `default.yaml`에 search 설정 추가. 16개 신규 테스트. 전체 213개 통과.
