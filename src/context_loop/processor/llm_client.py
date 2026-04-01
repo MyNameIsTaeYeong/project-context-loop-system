@@ -122,10 +122,17 @@ class EndpointLLMClient(LLMClient):
         api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
     """
 
-    def __init__(self, endpoint: str, model: str, api_key: str = "none") -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        api_key: str = "none",
+        extra_body: dict[str, Any] | None = None,
+    ) -> None:
         from openai import AsyncOpenAI  # noqa: PLC0415
         self._client = AsyncOpenAI(api_key=api_key or "none", base_url=endpoint)
         self._model = model
+        self._extra_body = extra_body
 
     async def complete(
         self,
@@ -139,12 +146,15 @@ class EndpointLLMClient(LLMClient):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,  # type: ignore[arg-type]
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if self._extra_body:
+            kwargs["extra_body"] = self._extra_body
+        response = await self._client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
         return response.choices[0].message.content or ""
 
 
@@ -152,6 +162,7 @@ def extract_json(text: str) -> Any:
     """LLM 응답에서 JSON을 추출한다.
 
     마크다운 코드 블록 또는 순수 JSON 형태를 모두 처리한다.
+    Qwen3 등 추론 모델의 <think>...</think> 블록도 자동 제거한다.
 
     Args:
         text: LLM 응답 텍스트.
@@ -162,6 +173,9 @@ def extract_json(text: str) -> Any:
     Raises:
         ValueError: JSON을 찾을 수 없거나 파싱 실패 시.
     """
+    # 추론 모델(Qwen3 등)의 <think>...</think> 블록 제거
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+
     # ```json ... ``` 블록 우선 추출
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
