@@ -32,7 +32,7 @@ def register_tools(mcp: FastMCP) -> None:
             include_graph: 그래프 컨텍스트 포함 여부.
         """
         from context_loop.mcp.context_assembler import assemble_context
-        from context_loop.mcp.server import _embedding_client, _get_stores, _llm_client
+        from context_loop.mcp.server import _config, _embedding_client, _get_stores, _llm_client
 
         meta_store, vector_store, graph_store = _get_stores()
         return await assemble_context(
@@ -44,6 +44,11 @@ def register_tools(mcp: FastMCP) -> None:
             llm_client=_llm_client,
             max_chunks=max_chunks,
             include_graph=include_graph,
+            similarity_threshold=_config.get("search.similarity_threshold", 0.0) if _config else 0.0,
+            rerank_enabled=_config.get("search.reranker_enabled", False) if _config else False,
+            rerank_top_k=_config.get("search.reranker_top_k", None) if _config else None,
+            rerank_score_threshold=_config.get("search.reranker_score_threshold", 0.0) if _config else 0.0,
+            hyde_enabled=_config.get("search.hyde_enabled", False) if _config else False,
         )
 
     @mcp.tool()

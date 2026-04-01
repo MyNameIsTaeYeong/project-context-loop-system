@@ -1,4 +1,4 @@
-"""context_assembler LLM 기반 그래프 탐색 테스트."""
+"""context_assembler LLM 기반 그래프 탐색 + 리랭킹/threshold 테스트."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from context_loop.mcp.context_assembler import (
+    _search_chunks,
     _search_graph_with_llm,
     assemble_context,
     assemble_context_with_sources,
@@ -300,3 +301,227 @@ async def test_graph_search_reasoning_in_output(stores) -> None:
     result = await _search_graph_with_llm("인증", graph_store, llm)
     assert result is not None
     assert "인증 서비스 구조 파악 필요" in result.text
+
+
+# --- 유사도 threshold 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_search_chunks_threshold_filters_low_similarity(stores) -> None:
+    """similarity_threshold가 유사도 낮은 청크를 제외한다."""
+    meta_store, vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="Doc", original_content="c", content_hash="ht",
+    )
+    # distance=0.2 → similarity=0.8, distance=0.8 → similarity=0.2
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0", f"chunk_{doc_id}_1"],
+        embeddings=[[0.9, 0.1], [0.1, 0.9]],
+        documents=["관련 내용", "무관한 내용"],
+        metadatas=[
+            {"document_id": doc_id, "chunk_index": 0},
+            {"document_id": doc_id, "chunk_index": 1},
+        ],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    query_embedding = await embed_client.aembed_query("test")
+
+    # threshold=0.5 → distance > 0.5인 청크 제외
+    results = await _search_chunks(
+        query_embedding, vector_store, max_chunks=10,
+        similarity_threshold=0.5,
+    )
+
+    # 유사도 0.8인 청크만 남아야 함 (distance=0.2)
+    assert len(results) >= 1
+    for r in results:
+        similarity = 1 - r["distance"]
+        assert similarity >= 0.5
+
+
+@pytest.mark.asyncio
+async def test_search_chunks_no_threshold_returns_all(stores) -> None:
+    """threshold=0이면 모든 결과를 반환한다."""
+    meta_store, vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="Doc", original_content="c", content_hash="hnt",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0", f"chunk_{doc_id}_1"],
+        embeddings=[[0.9, 0.1], [0.1, 0.9]],
+        documents=["내용 A", "내용 B"],
+        metadatas=[
+            {"document_id": doc_id, "chunk_index": 0},
+            {"document_id": doc_id, "chunk_index": 1},
+        ],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    query_embedding = await embed_client.aembed_query("test")
+
+    results = await _search_chunks(
+        query_embedding, vector_store, max_chunks=10,
+        similarity_threshold=0.0,
+    )
+    assert len(results) == 2
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_with_reranking(stores) -> None:
+    """리랭킹이 활성화되면 LLM 기반으로 결과가 재정렬된다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="RerankDoc", original_content="c", content_hash="hrr",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0", f"chunk_{doc_id}_1"],
+        embeddings=[[0.9, 0.1], [0.85, 0.15]],
+        documents=["일반 내용", "핵심 답변"],
+        metadatas=[
+            {"document_id": doc_id, "chunk_index": 0},
+            {"document_id": doc_id, "chunk_index": 1},
+        ],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    # LLM이 chunk_1(핵심 답변)에 높은 점수를 부여
+    rerank_response = json.dumps([
+        {"index": 0, "score": 3},
+        {"index": 1, "score": 9},
+    ])
+    llm = AsyncMock()
+    # LLM은 리랭킹 호출과 그래프 탐색 호출 모두 처리
+    llm.complete = AsyncMock(return_value=rerank_response)
+
+    result = await assemble_context(
+        query="핵심 정보",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=False,
+        rerank_enabled=True,
+        rerank_top_k=2,
+    )
+    # 리랭킹 후 "핵심 답변"이 먼저 나와야 함
+    assert "핵심 답변" in result
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_rerank_score_threshold(stores) -> None:
+    """리랭크 점수 threshold가 낮은 점수의 청크를 제외한다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="ThDoc", original_content="c", content_hash="hth",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0", f"chunk_{doc_id}_1"],
+        embeddings=[[0.9, 0.1], [0.85, 0.15]],
+        documents=["관련 내용", "무관한 잡음"],
+        metadatas=[
+            {"document_id": doc_id, "chunk_index": 0},
+            {"document_id": doc_id, "chunk_index": 1},
+        ],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    rerank_response = json.dumps([
+        {"index": 0, "score": 8},
+        {"index": 1, "score": 2},  # threshold(4.0) 미만
+    ])
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=rerank_response)
+
+    assembled = await assemble_context_with_sources(
+        query="관련 질의",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=False,
+        rerank_enabled=True,
+        rerank_score_threshold=4.0,
+    )
+    # 점수 2인 "무관한 잡음"은 제외되어야 함
+    assert "관련 내용" in assembled.context_text
+    assert "무관한 잡음" not in assembled.context_text
+
+
+# --- HyDE 통합 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_with_hyde(stores) -> None:
+    """HyDE 활성화 시 LLM이 가상 문서를 생성하고 임베딩에 반영된다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="HydeDoc", original_content="c", content_hash="hhy",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["배포 자동화 CI/CD 파이프라인 설명"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = AsyncMock()
+    # HyDE 가상 문서 생성 호출
+    llm.complete = AsyncMock(return_value="배포 프로세스는 CI/CD를 통해 릴리즈됩니다.")
+
+    result = await assemble_context(
+        query="배포 절차",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=False,
+        hyde_enabled=True,
+    )
+    # HyDE가 활성화되었으므로 LLM이 호출됨
+    llm.complete.assert_called()
+    # 검색 결과가 포함되어야 함
+    assert "배포 자동화" in result
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_hyde_disabled_no_llm_call(stores) -> None:
+    """HyDE 비활성화 시 가상 문서 생성 LLM 호출이 없다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="NoHyde", original_content="c", content_hash="hnh",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["내용"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value="unused")
+
+    await assemble_context(
+        query="질의",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=False,
+        hyde_enabled=False,
+    )
+    # HyDE 비활성 → LLM 호출 없음 (그래프도 비활성)
+    llm.complete.assert_not_called()

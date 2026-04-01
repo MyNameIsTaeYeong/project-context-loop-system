@@ -19,7 +19,6 @@ import logging
 import re
 from typing import Any
 
-from markdownify import markdownify
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -327,7 +326,8 @@ def _extract_page_title(page_data: dict[str, Any], page_id: str) -> str:
 def convert_html_to_markdown(html: str) -> str:
     """HTML 콘텐츠를 마크다운으로 변환한다.
 
-    markdownify 라이브러리를 사용하여 Confluence HTML을 정리된 마크다운으로 변환한다.
+    Confluence 매크로(패널, 코드, 테이블 등)를 전처리한 뒤
+    markdownify로 변환한다. 공유 모듈 ``html_converter``에 위임.
 
     Args:
         html: 변환할 HTML 문자열.
@@ -335,12 +335,9 @@ def convert_html_to_markdown(html: str) -> str:
     Returns:
         마크다운 형식의 문자열.
     """
-    if not html or not html.strip():
-        return ""
-    md = markdownify(html, heading_style="ATX", strip=["script", "style"])
-    # 연속 빈 줄 정리
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
+    from context_loop.ingestion.html_converter import html_to_markdown  # noqa: PLC0415
+
+    return html_to_markdown(html)
 
 
 async def import_page_via_mcp(

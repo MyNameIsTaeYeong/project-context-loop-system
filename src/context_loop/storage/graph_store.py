@@ -2,7 +2,7 @@
 
 NetworkX로 인메모리 그래프를 관리하고,
 SQLite(MetadataStore)에 영속 저장한다.
-엔티티 병합 및 고아 엣지 정리 로직을 포함한다.
+크로스-문서 엔티티 병합(정규 노드)을 지원한다.
 LLM 기반 탐색을 위한 그래프 스키마 요약을 제공한다.
 """
 
@@ -37,7 +37,11 @@ class GraphStore:
 
     SQLite(MetadataStore)가 진실의 원천(source of truth)이다.
     NetworkX 그래프는 검색/탐색용 인메모리 인덱스 역할을 한다.
-    LLM 기반 그래프 탐색을 위한 스키마 요약을 제공한다.
+
+    크로스-문서 엔티티 병합:
+    - 동일 엔티티(entity_name + entity_type, 대소문자 무시)는 하나의 정규 노드로 병합
+    - graph_node_documents 테이블로 노드-문서 다대다 관계 관리
+    - NetworkX 노드의 document_ids 속성에 연결된 문서 ID 집합 저장
 
     Args:
         store: 초기화된 MetadataStore 인스턴스.
@@ -50,32 +54,49 @@ class GraphStore:
         self._entity_embeddings: dict[int, tuple[str, list[float]]] = {}
 
     async def load_from_db(self) -> None:
-        """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다."""
+        """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다.
+
+        graph_node_documents 테이블에서 노드-문서 연결 정보를 로드하여
+        각 노드의 document_ids 속성을 설정한다.
+        """
         self._graph = nx.DiGraph()
-        # 모든 문서의 노드/엣지 로드
+
+        # 모든 노드 로드
+        nodes = await self._store.get_all_graph_nodes()
+        # 노드-문서 연결 정보 로드
+        node_doc_links = await self._store.get_all_node_document_links()
+
+        for node in nodes:
+            doc_ids = set(node_doc_links.get(node["id"], []))
+            # 레거시: graph_node_documents에 데이터가 없으면 document_id 사용
+            if not doc_ids and node.get("document_id"):
+                doc_ids = {node["document_id"]}
+            self._graph.add_node(
+                node["id"],
+                entity_name=node["entity_name"],
+                entity_type=node.get("entity_type", "other"),
+                document_ids=doc_ids,
+                properties=json.loads(node["properties"] or "{}"),
+            )
+
+        # 모든 엣지 로드
         docs = await self._store.list_documents()
         for doc in docs:
-            nodes = await self._store.get_graph_nodes_by_document(doc["id"])
-            for node in nodes:
-                self._graph.add_node(
-                    node["id"],
-                    entity_name=node["entity_name"],
-                    entity_type=node.get("entity_type", "other"),
-                    document_id=node["document_id"],
-                    properties=json.loads(node["properties"] or "{}"),
-                )
             edges = await self._store.get_graph_edges_by_document(doc["id"])
             for edge in edges:
-                self._graph.add_edge(
-                    edge["source_node_id"],
-                    edge["target_node_id"],
-                    id=edge["id"],
-                    relation_type=edge.get("relation_type", "related_to"),
-                    document_id=edge["document_id"],
-                    properties=json.loads(edge["properties"] or "{}"),
-                )
+                if (self._graph.has_node(edge["source_node_id"])
+                        and self._graph.has_node(edge["target_node_id"])):
+                    self._graph.add_edge(
+                        edge["source_node_id"],
+                        edge["target_node_id"],
+                        id=edge["id"],
+                        relation_type=edge.get("relation_type", "related_to"),
+                        document_id=edge["document_id"],
+                        properties=json.loads(edge["properties"] or "{}"),
+                    )
+
         self._entity_embeddings.clear()
-        logger.debug(
+        logger.info(
             "그래프 로드 완료 — 노드: %d, 엣지: %d",
             self._graph.number_of_nodes(),
             self._graph.number_of_edges(),
@@ -88,36 +109,74 @@ class GraphStore:
     ) -> dict[str, int]:
         """GraphData를 SQLite에 저장하고 NetworkX 그래프에 추가한다.
 
-        동일 엔티티 병합(entity_name + entity_type 기준)을 처리한다.
-        이미 다른 문서에 같은 이름의 엔티티가 있으면 별도 노드로 생성하되
-        entity_merges 테이블 없이 NetworkX 상에서 논리적으로 병합한다.
+        정규 엔티티 병합: entity_name(대소문자 무시) + entity_type 기준으로
+        기존 노드가 있으면 재사용하고, 없으면 새로 생성한다.
+        재사용 시 description이 비어 있으면 보강한다.
 
         Args:
             document_id: 저장할 문서 ID.
             graph_data: 추출된 그래프 데이터.
 
         Returns:
-            {"nodes": 생성된 노드 수, "edges": 생성된 엣지 수} 딕셔너리.
+            {"nodes": 생성된 노드 수, "edges": 생성된 엣지 수,
+             "merged": 기존 노드에 병합된 수} 딕셔너리.
         """
-        # 엔티티 이름 → 노드 DB ID 매핑 (이 문서에서 생성된 노드)
         name_to_node_id: dict[str, int] = {}
+        new_count = 0
+        merged_count = 0
 
         for entity in graph_data.entities:
             props = {"description": entity.description} if entity.description else {}
-            node_id = await self._store.create_graph_node(
-                document_id=document_id,
-                entity_name=entity.name,
-                entity_type=entity.entity_type,
-                properties=json.dumps(props, ensure_ascii=False),
+
+            # 기존 정규 노드 검색
+            existing = await self._store.find_graph_node_by_entity(
+                entity.name, entity.entity_type,
             )
+
+            if existing:
+                node_id = existing["id"]
+                merged_count += 1
+                # description 보강 (기존에 없으면 채움)
+                existing_props = json.loads(existing["properties"] or "{}")
+                if entity.description and not existing_props.get("description"):
+                    existing_props["description"] = entity.description
+                    await self._store.update_graph_node_properties(
+                        node_id, json.dumps(existing_props, ensure_ascii=False),
+                    )
+                # 문서 연결 추가
+                await self._store.add_node_document_link(node_id, document_id)
+                # NetworkX 업데이트
+                if self._graph.has_node(node_id):
+                    self._graph.nodes[node_id]["document_ids"].add(document_id)
+                    if entity.description and not self._graph.nodes[node_id].get("properties", {}).get("description"):
+                        self._graph.nodes[node_id]["properties"]["description"] = entity.description
+                else:
+                    self._graph.add_node(
+                        node_id,
+                        entity_name=entity.name,
+                        entity_type=entity.entity_type,
+                        document_ids={document_id},
+                        properties=existing_props,
+                    )
+            else:
+                # 새 노드 생성
+                node_id = await self._store.create_graph_node(
+                    document_id=document_id,
+                    entity_name=entity.name,
+                    entity_type=entity.entity_type,
+                    properties=json.dumps(props, ensure_ascii=False),
+                )
+                await self._store.add_node_document_link(node_id, document_id)
+                new_count += 1
+                self._graph.add_node(
+                    node_id,
+                    entity_name=entity.name,
+                    entity_type=entity.entity_type,
+                    document_ids={document_id},
+                    properties=props,
+                )
+
             name_to_node_id[entity.name] = node_id
-            self._graph.add_node(
-                node_id,
-                entity_name=entity.name,
-                entity_type=entity.entity_type,
-                document_id=document_id,
-                properties=props,
-            )
 
         edge_count = 0
         for relation in graph_data.relations:
@@ -130,6 +189,16 @@ class GraphStore:
                     relation.target,
                 )
                 continue
+            # 동일 엣지 중복 방지 (같은 src, tgt, relation_type, document_id)
+            existing_edge = False
+            if self._graph.has_edge(src_id, tgt_id):
+                edge_data = self._graph.edges[src_id, tgt_id]
+                if (edge_data.get("relation_type") == relation.relation_type
+                        and edge_data.get("document_id") == document_id):
+                    existing_edge = True
+            if existing_edge:
+                continue
+
             props = {"label": relation.label} if relation.label else {}
             edge_id = await self._store.create_graph_edge(
                 document_id=document_id,
@@ -148,42 +217,53 @@ class GraphStore:
             )
             edge_count += 1
 
-        # 새 노드의 임베딩 캐시 무효화 (다음 build_entity_embeddings 호출 시 재생성)
+        # 새 노드의 임베딩 캐시 무효화
         for name, nid in name_to_node_id.items():
             self._entity_embeddings.pop(nid, None)
 
         logger.info(
-            "그래프 저장 완료 — document_id=%d, 노드: %d, 엣지: %d",
+            "그래프 저장 완료 — document_id=%d, 신규: %d, 병합: %d, 엣지: %d",
             document_id,
-            len(name_to_node_id),
+            new_count,
+            merged_count,
             edge_count,
         )
-        return {"nodes": len(name_to_node_id), "edges": edge_count}
+        return {"nodes": new_count, "edges": edge_count, "merged": merged_count}
 
     async def delete_document_graph(self, document_id: int) -> None:
-        """문서의 그래프 데이터를 삭제하고 고아 엣지를 정리한다.
+        """문서의 그래프 데이터를 삭제한다.
+
+        1. 해당 문서의 엣지를 삭제한다.
+        2. 노드-문서 연결을 해제한다.
+        3. 고아 노드(어떤 문서에도 연결되지 않은 노드)를 삭제한다.
+        4. NetworkX 그래프를 동기화한다.
 
         Args:
             document_id: 삭제할 문서 ID.
         """
-        # SQLite에서 삭제 (CASCADE로 엣지도 삭제됨)
+        # SQLite에서 삭제 (엣지, 연결 해제, 고아 노드 정리)
         await self._store.delete_graph_data_by_document(document_id)
 
-        # NetworkX에서 해당 문서 노드/엣지 제거
-        nodes_to_remove = [
-            n for n, d in self._graph.nodes(data=True)
+        # NetworkX 동기화: 해당 문서의 엣지 제거
+        edges_to_remove = [
+            (u, v) for u, v, d in self._graph.edges(data=True)
             if d.get("document_id") == document_id
         ]
+        self._graph.remove_edges_from(edges_to_remove)
+
+        # NetworkX 동기화: 노드의 document_ids에서 해당 문서 제거
+        nodes_to_remove = []
+        for n, d in self._graph.nodes(data=True):
+            doc_ids = d.get("document_ids", set())
+            if document_id in doc_ids:
+                doc_ids.discard(document_id)
+                if not doc_ids:
+                    nodes_to_remove.append(n)
+
+        # 고아 노드 제거
         self._graph.remove_nodes_from(nodes_to_remove)
 
-        # 고아 엣지 정리 (양쪽 노드가 없는 엣지)
-        orphan_edges = [
-            (u, v) for u, v in self._graph.edges()
-            if not self._graph.has_node(u) or not self._graph.has_node(v)
-        ]
-        self._graph.remove_edges_from(orphan_edges)
-
-        # 삭제된 노드의 임베딩 캐시도 제거
+        # 삭제된 노드의 임베딩 캐시 제거
         for nid in nodes_to_remove:
             self._entity_embeddings.pop(nid, None)
 
@@ -196,6 +276,9 @@ class GraphStore:
     ) -> list[dict[str, Any]]:
         """엔티티 이름을 중심으로 주변 관계를 탐색한다.
 
+        정규 노드 병합 덕분에 동명 엔티티는 하나의 노드이므로
+        크로스-문서 관계가 자연스럽게 탐색된다.
+
         Args:
             entity_name: 탐색 중심 엔티티 이름.
             depth: 탐색 깊이 (1 = 직접 연결만).
@@ -203,7 +286,6 @@ class GraphStore:
         Returns:
             관련 노드 정보 목록.
         """
-        # entity_name으로 노드 ID 찾기
         center_nodes = [
             n for n, d in self._graph.nodes(data=True)
             if d.get("entity_name", "").lower() == entity_name.lower()
@@ -228,14 +310,7 @@ class GraphStore:
         self,
         node_ids: list[int],
     ) -> list[dict[str, Any]]:
-        """주어진 노드 집합 사이의 엣지를 반환한다.
-
-        Args:
-            node_ids: 노드 ID 목록.
-
-        Returns:
-            엣지 정보 목록.
-        """
+        """주어진 노드 집합 사이의 엣지를 반환한다."""
         node_set = set(node_ids)
         result = []
         for u, v, data in self._graph.edges(data=True):
@@ -262,24 +337,7 @@ class GraphStore:
     # --- LLM 기반 그래프 탐색 지원 ---
 
     def get_schema_summary(self, max_entities_per_type: int = 10) -> dict[str, Any]:
-        """LLM에게 제공할 그래프 스키마 요약을 생성한다.
-
-        그래프의 구조(엔티티 유형, 관계 유형, 대표 엔티티 목록)를
-        LLM이 탐색 계획을 세울 수 있는 형태로 요약한다.
-
-        Args:
-            max_entities_per_type: 유형별 최대 엔티티 표시 수.
-
-        Returns:
-            {
-                "total_nodes": int,
-                "total_edges": int,
-                "entity_types": {"type": count, ...},
-                "relation_types": {"type": count, ...},
-                "entities_by_type": {"type": ["name1", "name2", ...], ...},
-                "sample_relations": [{"source", "target", "type"}, ...]
-            }
-        """
+        """LLM에게 제공할 그래프 스키마 요약을 생성한다."""
         if self._graph.number_of_nodes() == 0:
             return {
                 "total_nodes": 0,
@@ -290,7 +348,6 @@ class GraphStore:
                 "sample_relations": [],
             }
 
-        # 엔티티 유형별 집계
         type_counter: Counter[str] = Counter()
         entities_by_type: dict[str, list[str]] = {}
         for _, data in self._graph.nodes(data=True):
@@ -302,7 +359,6 @@ class GraphStore:
             if len(entities_by_type[etype]) < max_entities_per_type:
                 entities_by_type[etype].append(ename)
 
-        # 관계 유형별 집계
         rel_counter: Counter[str] = Counter()
         sample_relations: list[dict[str, str]] = []
         for u, v, data in self._graph.edges(data=True):
@@ -327,14 +383,7 @@ class GraphStore:
         }
 
     def format_schema_for_llm(self, max_entities_per_type: int = 10) -> str:
-        """LLM 프롬프트에 삽입할 그래프 스키마 요약 텍스트를 생성한다.
-
-        Args:
-            max_entities_per_type: 유형별 최대 엔티티 표시 수.
-
-        Returns:
-            사람이 읽기 쉬운 스키마 요약 텍스트.
-        """
+        """LLM 프롬프트에 삽입할 그래프 스키마 요약 텍스트를 생성한다."""
         summary = self.get_schema_summary(max_entities_per_type)
         if summary["total_nodes"] == 0:
             return "그래프가 비어 있습니다."
@@ -374,35 +423,16 @@ class GraphStore:
         neighbor_depth: int = 1,
         max_sample_relations: int = 15,
     ) -> dict[str, Any]:
-        """쿼리와 관련된 엔티티 중심으로 축소된 스키마를 생성한다.
-
-        1. 쿼리 임베딩과 유사한 엔티티를 찾는다.
-        2. 해당 엔티티의 이웃(neighbor_depth)을 포함하여 서브그래프를 구성한다.
-        3. 서브그래프의 스키마 요약을 반환한다.
-
-        임베딩 캐시가 비어 있으면 전체 스키마로 폴백한다.
-
-        Args:
-            query_embedding: 쿼리 텍스트의 임베딩 벡터.
-            similarity_threshold: 최소 코사인 유사도 임계값.
-            top_k: 유사 엔티티 최대 검색 수.
-            neighbor_depth: 유사 엔티티로부터의 이웃 탐색 깊이.
-            max_sample_relations: 샘플 관계 최대 수.
-
-        Returns:
-            전체 스키마와 동일한 형태의 딕셔너리 + "seed_entities" 키 추가.
-        """
+        """쿼리와 관련된 엔티티 중심으로 축소된 스키마를 생성한다."""
         if not self._entity_embeddings:
             return self.get_schema_summary()
 
-        # 1. 쿼리와 유사한 엔티티 찾기
         similar = self.search_entities_by_embedding(
             query_embedding, threshold=similarity_threshold, top_k=top_k,
         )
         if not similar:
             return self.get_schema_summary()
 
-        # 2. 유사 엔티티 + 이웃으로 서브그래프 노드 ID 수집
         relevant_node_ids: set[int] = set()
         seed_entities: list[dict[str, Any]] = []
         for entity in similar:
@@ -413,7 +443,6 @@ class GraphStore:
                 "type": entity["entity_type"],
                 "similarity": round(entity["similarity"], 3),
             })
-            # 이웃 탐색
             reachable = nx.single_source_shortest_path_length(
                 self._graph, nid, cutoff=neighbor_depth,
             )
@@ -422,7 +451,6 @@ class GraphStore:
         if not relevant_node_ids:
             return self.get_schema_summary()
 
-        # 3. 서브그래프 스키마 집계
         type_counter: Counter[str] = Counter()
         entities_by_type: dict[str, list[str]] = {}
         for nid in relevant_node_ids:
@@ -464,15 +492,7 @@ class GraphStore:
         query_embedding: list[float],
         **kwargs: Any,
     ) -> str:
-        """쿼리 관련 스키마를 LLM 프롬프트용 텍스트로 변환한다.
-
-        Args:
-            query_embedding: 쿼리 텍스트의 임베딩 벡터.
-            **kwargs: get_query_relevant_schema에 전달할 추가 인자.
-
-        Returns:
-            사람이 읽기 쉬운 스키마 요약 텍스트.
-        """
+        """쿼리 관련 스키마를 LLM 프롬프트용 텍스트로 변환한다."""
         summary = self.get_query_relevant_schema(query_embedding, **kwargs)
         if summary["total_nodes"] == 0:
             return "그래프가 비어 있습니다."
@@ -482,7 +502,6 @@ class GraphStore:
             f"관련 엣지: {summary['total_edges']}개)",
         ]
 
-        # 쿼리와 직접 관련된 시드 엔티티 표시
         seed = summary.get("seed_entities", [])
         if seed:
             lines.append("")
@@ -515,17 +534,7 @@ class GraphStore:
     # --- 엔티티 임베딩 기반 유사도 검색 ---
 
     async def build_entity_embeddings(self, embedding_client: Any) -> int:
-        """모든 엔티티 이름의 임베딩을 생성하여 캐시한다.
-
-        이미 캐시된 노드는 건너뛴다.
-
-        Args:
-            embedding_client: Embeddings 인터페이스 구현체.
-
-        Returns:
-            새로 임베딩된 엔티티 수.
-        """
-        # 캐시에 없는 노드만 수집
+        """모든 엔티티 이름의 임베딩을 생성하여 캐시한다."""
         missing: list[tuple[int, str]] = []
         for node_id, data in self._graph.nodes(data=True):
             if node_id not in self._entity_embeddings:
@@ -555,17 +564,7 @@ class GraphStore:
         threshold: float = 0.7,
         top_k: int = 5,
     ) -> list[dict[str, Any]]:
-        """질의 임베딩과 유사한 엔티티를 검색한다.
-
-        Args:
-            query_embedding: 질의 텍스트의 임베딩 벡터.
-            threshold: 최소 코사인 유사도 임계값.
-            top_k: 반환할 최대 엔티티 수.
-
-        Returns:
-            유사도 내림차순 정렬된 엔티티 목록.
-            각 항목: {"node_id", "entity_name", "entity_type", "similarity"}
-        """
+        """질의 임베딩과 유사한 엔티티를 검색한다."""
         if not self._entity_embeddings:
             return []
 

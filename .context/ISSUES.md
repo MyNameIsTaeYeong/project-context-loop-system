@@ -4,10 +4,6 @@
 
 ## 미해결
 
-### I-003: 엔티티 병합 테이블 스키마 미정
-- 여러 문서에서 동일 엔티티가 등장할 때 병합 기준과 테이블 구조 상세 설계 필요
-- Phase 3.6 시작 전까지 결정 필요
-
 ### I-004: LLM Classifier 프롬프트 설계
 - 문서를 chunk/graph/hybrid로 판정하는 프롬프트의 정확도와 비용 최적화 필요
 - Phase 3.1 시작 시 프로토타이핑 및 테스트 필요
@@ -47,6 +43,32 @@
 - MCP Client 방식(I-010)으로 대체 예정
 
 ## 해결됨
+
+### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
+- `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리
+- `entity_name(대소문자 무시) + entity_type` 기준 정규 노드 병합
+
+### I-012: HTML→Markdown 변환 시 테이블·매크로 손실 → 해결 (Phase 7.1, D-018)
+- BeautifulSoup + markdownify 기반 변환으로 교체
+- Confluence 매크로 전처리 지원 (info/warning/note/code/expand 등)
+
+### I-013: 청킹 시 문서 구조(헤딩) 미활용 → 해결 (Phase 7.2, D-019)
+- 마크다운 헤딩 기반 계층적 청킹 + `section_path` 메타데이터 첨부
+
+### I-014: 그래프 추출 시 콘텐츠 절삭 → 해결 (Phase 7.4, D-021)
+- map-reduce 방식으로 전체 문서 처리, 엔티티/관계 중복 제거 병합
+
+### I-015: 컨텍스트 조립 시 재랭킹·필터링 부재 → 해결 (Phase 7.3, D-020)
+- cosine similarity threshold + LLM 리랭커 2단계 필터링
+
+### I-016: 쿼리 전처리 및 확장 부재 → 해결 (Phase 7.5, D-022)
+- HyDE 적용 — LLM 가상 문서 임베딩과 원본 쿼리 임베딩 평균
+
+### I-017: 문서 분류기가 처음 2000자만 사용 → 해결 (Phase 7.6, D-023)
+- 시작/중간/끝 구간 샘플링 (~4000자)
+
+### I-018: 크로스-문서 엔티티 병합 로직 미구현 → 해결 (Phase 7.7, D-024)
+- 정규 노드 방식 — entity_name + entity_type 기준 병합, graph_node_documents 조인 테이블
 
 ### I-001: 웹 프레임워크 최종 선택 → FastAPI + Jinja2 + HTMX
 - 2026-03-11 결정: FastAPI + Jinja2 + HTMX + Alpine.js + Pico CSS

@@ -188,3 +188,103 @@
   - 2순위 — 트리 탐색: `getSpaceInfoAll()` → `getChild(pageId)` 재귀 → `getPage(id)` × N
   - 3순위 — 내 문서: `getUserContributedPages(userId)` → 선택 → `getPage(id)` × N
 - **이유**: 추가 라이브러리 설치 불필요 (`mcp` 이미 의존성에 포함). 인증/권한은 MCP 서버 측에서 처리하므로 클라이언트 구현 단순. 기존 ingestion 패턴(`async` 함수 → `dict` 반환)을 그대로 따르므로 ProcessingPipeline 변경 불필요. REST API 직접 접근이 차단된 환경에서 유일한 Confluence 연동 경로.
+
+---
+
+## D-018: HTML→Markdown 변환기 — BeautifulSoup 전처리 + markdownify 공유 모듈
+
+- **일시**: 2026-03-30
+- **맥락**: `confluence.py`의 `_html_to_markdown()`이 정규식 기반이라 테이블, Confluence 매크로, 중첩 목록이 모두 소실됨 (I-012, I-005). `mcp_confluence.py`는 D-017에서 markdownify로 전환했지만 매크로 전처리 없이 단순 변환만 수행. 두 모듈의 변환 로직이 분리되어 있어 품질 차이 발생.
+- **결정**: BeautifulSoup으로 Confluence 매크로를 표준 HTML로 전처리한 뒤 markdownify로 최종 변환하는 공유 모듈 `ingestion/html_converter.py`를 신규 생성. `confluence.py`와 `mcp_confluence.py` 양쪽에서 이 모듈에 위임.
+- **구현 내용**:
+  - `html_converter.py`: `html_to_markdown()` 함수 — `_preprocess_confluence_macros()` → `markdownify()` → `_postprocess()` 파이프라인
+  - Confluence 매크로 전처리: info/warning/note/tip 패널 → blockquote, code/noformat → 코드 블록, expand → 본문 펼침, toc/children → 제거, ac:image → img, ac:link → a
+  - `confluence.py`: `_html_to_markdown()` → `html_to_markdown()` 위임
+  - `mcp_confluence.py`: `convert_html_to_markdown()` → 동일 모듈 위임, `markdownify` 직접 import 제거
+  - `pyproject.toml`: `beautifulsoup4>=4.12.0` 의존성 추가
+- **이유**: 공유 모듈로 변환 품질을 일원화하고, BeautifulSoup 전처리로 Confluence 전용 매크로를 표준 HTML로 정규화한 뒤 markdownify에 넘기면 테이블·목록·서식 등 기본 HTML 변환은 라이브러리가 처리. 정규식 기반 대비 테이블 구조 보존, 매크로 내용 보존, 중첩 목록 정상 변환이 가능해져 원본 데이터 품질이 대폭 향상.
+
+---
+
+## D-019: 청킹 전략 — 마크다운 헤딩 기반 계층적 분할 + section_path 메타데이터
+
+- **일시**: 2026-03-30
+- **맥락**: 기존 청커(`chunker.py`)가 `\n\n` 기준으로만 단락을 분리하여 마크다운 헤딩 구조를 무시 (I-013). `# 섹션 제목`과 본문이 서로 다른 청크로 분리되어 검색 시 컨텍스트 소실. 메타데이터에 `chunk_index`와 `title`만 저장되어 해당 청크가 문서의 어느 위치에 속하는지 알 수 없음.
+- **결정**: 마크다운 헤딩(`#`~`######`)을 인식하여 섹션별로 분리한 뒤 각 섹션 내에서 토큰 기반 청킹 수행. 각 청크에 상위 헤딩 경로(`section_path`)를 자동 첨부.
+- **구현 내용**:
+  - `chunker.py`: `Chunk` dataclass에 `section_path: str` 필드 추가. `_split_into_sections()` — 헤딩 스택으로 계층 경로 계산. `_chunk_section()` — 기존 토큰 기반 분할 로직을 섹션 단위로 적용. 헤딩 텍스트를 청크 본문에 포함하여 임베딩 시 검색 정확도 향상. 헤딩 없는 문서는 기존과 동일하게 동작 (하위 호환).
+  - `pipeline.py`: 벡터스토어 메타데이터에 `section_path` 포함.
+  - `context_assembler.py`: `_format_chunk_results()`와 `assemble_context_with_sources()`에서 검색 결과에 섹션 경로 표시.
+- **이유**: 헤딩을 청크 본문에 포함하면 임베딩에 섹션 제목의 의미가 반영되어 "백엔드 기술 스택" 같은 쿼리와의 유사도가 높아짐. `section_path` 메타데이터를 통해 LLM이 답변 생성 시 문서 내 위치를 파악할 수 있고, 사용자에게 출처를 섹션 수준으로 안내 가능. 섹션 경계에서 분할하면 서로 다른 주제의 텍스트가 한 청크에 섞이는 문제도 방지.
+
+---
+
+## D-020: Cross-encoder Reranker + 유사도 Threshold — LLM 기반 리랭킹
+
+- **일시**: 2026-03-31
+- **맥락**: 벡터 검색(bi-encoder)이 top-K 결과를 반환하지만 유사도 threshold가 없어 관련 없는 청크도 포함됨 (I-015). 벡터 검색 + 그래프 탐색 결과가 단순 concat으로 병합되어 중복/무관 정보의 우선순위 조정이 불가능. Cross-encoder 기반 정밀 재평가가 없어 bi-encoder의 recall은 높지만 precision이 낮음.
+- **결정**: 두 가지 메커니즘을 도입.
+  1. **유사도 threshold**: `_search_chunks()`에서 cosine similarity가 설정값(`search.similarity_threshold`, 기본 0.3) 미만인 청크를 제외.
+  2. **LLM 기반 리랭커**: `processor/reranker.py` 신규 생성. 벡터 검색 결과를 LLM에 한꺼번에 전달하여 0~10점으로 관련도를 평가받고, 점수순으로 재정렬. 점수 threshold(`search.reranker_score_threshold`) 미만 청크 추가 제외.
+- **구현 내용**:
+  - `processor/reranker.py`: `rerank()` 함수 — 단일 LLM 호출로 전체 청크 평가 (비용 최소화). LLM 실패 시 원본 순서 유지 (graceful degradation). `_parse_scores()` — JSON 응답 파싱 + 점수 클램핑(0~10).
+  - `mcp/context_assembler.py`: `assemble_context()`, `assemble_context_with_sources()` 에 `similarity_threshold`, `rerank_enabled`, `rerank_top_k`, `rerank_score_threshold` 파라미터 추가. 벡터 검색 → threshold 필터링 → 리랭킹 → 점수 threshold 필터링 → 포맷팅 파이프라인.
+  - `mcp/tools.py`: MCP search_context 도구에서 config 기반 설정 전달.
+  - `web/api/chat.py`: 웹 채팅 API에서 config 기반 설정 전달.
+  - `config/default.yaml`: `search` 섹션 추가 (`similarity_threshold: 0.3`, `reranker_enabled: false`, `reranker_top_k: 5`, `reranker_score_threshold: 4.0`).
+- **이유**: 유사도 threshold는 무관한 청크를 사전에 필터링하여 LLM 컨텍스트 창의 노이즈를 줄임. LLM 기반 리랭커는 cross-encoder 전용 모델을 추가 설치하지 않고 기존 LLM 인프라를 활용하여 bi-encoder의 precision 한계를 극복. 단일 호출로 모든 청크를 한꺼번에 평가하여 N번 호출 대비 비용/지연 최소화. 리랭커는 설정(`reranker_enabled`)으로 비활성화 가능하여 LLM 없는 환경에서도 문제 없음.
+
+---
+
+## D-021: 그래프 추출 — Map-reduce 방식 전체 문서 처리
+
+- **일시**: 2026-03-31
+- **맥락**: `graph_extractor.py`의 `extract_graph()`가 `content[:4000]`으로 앞 4000자만 LLM에 전달 (I-014). Confluence 문서는 도입부가 목차/배경이고 핵심 아키텍처 정보가 후반부에 있는 경우가 많아, 후반부 엔티티/관계가 모두 누락됨.
+- **결정**: Map-reduce 방식으로 전체 문서를 분할 추출 후 병합.
+  - **Map**: 문서를 `max_content_chars` 크기로 분할하여 각 청크에서 독립적으로 그래프 추출. 분할 시 단락 경계(`\n\n`) → 줄바꿈(`\n`) → 강제 분할 순서로 자연스러운 경계 존중.
+  - **Reduce**: 전체 결과를 병합. 엔티티는 `(name.lower(), entity_type)` 기준 중복 제거, 설명이 비어 있으면 나중 것으로 보충. 관계는 `(source.lower(), target.lower(), relation_type)` 기준 중복 제거.
+- **구현 내용**:
+  - `graph_extractor.py`: `extract_graph()` — 문서 길이에 따라 자동 분기 (짧으면 기존 단일 호출, 길면 map-reduce). `_extract_map_reduce()` — 청크별 LLM 호출 + 부분 실패 허용(graceful). `_split_content()` — 자연 경계 존중 분할. `_merge_graphs()` — 대소문자 무시 중복 제거. `_parse_graph_response()` — 공통 파싱 로직 추출.
+  - `_USER_PROMPT_CHUNK_TEMPLATE` — 청크 프롬프트에 `(N/M)` 섹션 정보 포함하여 LLM이 문서 위치를 인식.
+  - `pipeline.py` — 변경 없음 (함수 시그니처 동일, 내부에서 자동 분기).
+- **이유**: 기존 4000자 제한은 문서 후반부 정보를 완전히 무시함. Map-reduce로 전체 문서를 처리하면 10,000자+ 문서에서도 모든 엔티티/관계를 추출 가능. 부분 실패 허용으로 한 청크의 LLM 호출이 실패해도 나머지 결과를 살릴 수 있음. 중복 제거로 여러 청크에서 동일 엔티티가 추출되어도 그래프가 깨끗하게 유지됨. 짧은 문서는 기존과 동일하게 단일 호출(하위 호환).
+
+---
+
+## D-022: 쿼리 확장 — HyDE (Hypothetical Document Embedding)
+
+- **일시**: 2026-03-31
+- **맥락**: 사용자 쿼리가 그대로 임베딩되어 벡터 검색에 사용됨 (I-016). 짧은 질의("배포 절차")와 문서 청크("릴리즈 프로세스는 CI/CD 파이프라인을 통해…") 사이에 어휘적 갭(lexical gap)이 존재하여 의미적으로 관련된 문서를 놓침. 동의어, 약어, 기술 용어 차이로 인한 검색 재현율(recall) 저하.
+- **결정**: HyDE(Hypothetical Document Embedding) 방식 도입. LLM에게 질의에 대한 가상 답변 문서를 생성시킨 뒤, 원본 쿼리 임베딩과 가상 문서 임베딩을 평균하여 의미적으로 풍부한 검색 벡터를 생성.
+- **구현 내용**:
+  - `processor/query_expander.py` (신규): `generate_hypothetical_document()` — LLM에게 3~5문장의 가상 답변 단락 생성 요청 (temperature=0.7로 다양성 확보). `expand_query_embedding()` — 원본 쿼리 임베딩 + HyDE 임베딩 평균 벡터 반환. HyDE 실패 시 원본 임베딩 반환 (graceful degradation).
+  - `mcp/context_assembler.py`: `assemble_context()`, `assemble_context_with_sources()`에 `hyde_enabled` 파라미터 추가. 활성화 시 `_embed_query()` 대신 `expand_query_embedding()` 사용.
+  - `mcp/tools.py`, `web/api/chat.py`: config에서 `search.hyde_enabled` 읽어 전달.
+  - `config/default.yaml`: `search.hyde_enabled: false` 추가 (기본 비활성).
+- **이유**: HyDE는 질의를 문서 공간으로 변환하여 어휘적 갭을 해소. "배포 절차" 질의 → 가상 문서에 "릴리즈", "디플로이", "CI/CD", "파이프라인" 등 동의어가 자연스럽게 포함 → 이 용어들이 포함된 청크와의 유사도 상승. 원본 임베딩과 평균하여 원래 질의의 의도도 보존. LLM 1회 추가 호출(512토큰)로 구현되어 비용 낮음. 설정으로 비활성화 가능.
+
+---
+
+## D-023: 문서 분류기 입력 범위 확대 — 시작/중간/끝 구간 샘플링
+
+- **일시**: 2026-04-01
+- **맥락**: `classifier.py`가 `content[:2000]`으로 앞 2000자만 LLM에 전달 (I-017). 문서 전체 구조를 파악하지 못해 잘못된 분류 발생 가능. 예: 앞부분은 서술형 배경 설명이지만 후반부에 아키텍처 다이어그램과 엔티티 관계가 있는 경우 `chunk`로 잘못 분류될 수 있음.
+- **결정**: 짧은 문서(4000자 이하)는 전문을 전달하고, 긴 문서는 시작/중간/끝 세 구간에서 균등 샘플링하여 총 ~4000자를 LLM에 전달.
+- **구현 내용**:
+  - `classifier.py`: `_sample_content()` 함수 추가 — 4000자 이하 전문 반환, 초과 시 시작(1300자) + 중간(1300자) + 끝(1300자) 샘플링. 프롬프트에 `[Beginning]/[Middle]/[End]` 레이블과 총 문자 수 포함.
+  - `_USER_PROMPT_TEMPLATE` 변경 — 고정 `Content (first 2000 chars)` → 동적 `content_label` (전문/샘플링 여부 표시).
+  - 기존 테스트 호환 유지 (짧은 content는 기존과 동일하게 동작).
+- **이유**: 시작/중간/끝 샘플링은 단순하면서도 문서의 구조적 다양성을 포착. 도입부(배경/목차) + 본문 핵심(중간) + 결론/참고(끝)를 모두 볼 수 있어 chunk vs graph vs hybrid 판정 정확도 향상. LLM 호출 수 증가 없이 입력 품질만 개선.
+
+---
+
+## D-024: 크로스-문서 엔티티 병합 — 정규 노드 + 조인 테이블
+
+- **일시**: 2026-04-01
+- **맥락**: `graph_store.py`에서 동일 엔티티가 문서마다 별도 노드로 생성됨 (I-018, I-003). 문서 A의 "쿠버네티스"와 문서 B의 "쿠버네티스"가 별도 노드로 존재하여 크로스-문서 관계 탐색이 불완전하고, 스키마 요약/임베딩 검색에서 중복 발생.
+- **결정**: 정규 노드(canonical node) 방식 — `entity_name(대소문자 무시) + entity_type` 기준으로 동일 엔티티는 하나의 노드로 병합. `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리.
+- **구현 내용**:
+  - `metadata_store.py`: `graph_node_documents` 테이블 추가 (node_id, document_id). `find_graph_node_by_entity()`, `add_node_document_link()`, `get_all_node_document_links()` 등 메서드 추가. `delete_graph_data_by_document()` 수정 — 연결 해제 + 고아 노드 정리.
+  - `graph_store.py`: `save_graph_data()` — 기존 정규 노드 검색 후 재사용/신규 생성 분기. description 보강. `load_from_db()` — `graph_node_documents`에서 document_ids 로드. `delete_document_graph()` — 부분 해제, 고아 노드만 삭제. NetworkX 노드에 `document_ids` (set) 속성 저장.
+  - `graph_search_planner.py`: `execute_graph_search()`에서 `document_ids` set 대응.
+- **이유**: 정규 노드 방식은 그래프가 깔끔하고 중복이 없어 LLM 스키마 요약 품질 향상. 임베딩 검색 시 top_k 자리 낭비 방지. 문서 삭제 시 `graph_node_documents` 연결만 해제하고 고아 노드만 정리하여 안전. "same_as" 엣지 방식 대비 그래프 복잡도 낮음.

@@ -33,6 +33,13 @@ llm:
   api_key_storage: "keyring"       # provider: "openai" | "anthropic"일 때 keyring 사용
   classifier_prompt: "default"
 
+search:
+  similarity_threshold: 0.3       # 코사인 유사도 최소값 (이 값 미만 청크 제외)
+  reranker_enabled: false          # LLM 기반 리랭커 사용 여부
+  reranker_top_k: 5                # 리랭킹 후 반환할 최대 청크 수
+  reranker_score_threshold: 4.0    # 리랭크 점수 최소값 (0~10, 이 값 미만 제외)
+  hyde_enabled: false              # HyDE (Hypothetical Document Embedding) 사용 여부
+
 storage:
   vector_db: "chromadb"
   graph_db: "networkx"
