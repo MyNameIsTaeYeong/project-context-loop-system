@@ -96,7 +96,7 @@ class GraphStore:
                     )
 
         self._entity_embeddings.clear()
-        logger.debug(
+        logger.info(
             "그래프 로드 완료 — 노드: %d, 엣지: %d",
             self._graph.number_of_nodes(),
             self._graph.number_of_edges(),
