@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     properties TEXT
 );
 
+CREATE TABLE IF NOT EXISTS graph_node_documents (
+    node_id INTEGER REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+    PRIMARY KEY (node_id, document_id)
+);
+
 CREATE TABLE IF NOT EXISTS processing_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
@@ -72,6 +78,8 @@ CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_document ON graph_nodes(document_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_document ON graph_edges(document_id);
+CREATE INDEX IF NOT EXISTS idx_graph_node_documents_node ON graph_node_documents(node_id);
+CREATE INDEX IF NOT EXISTS idx_graph_node_documents_document ON graph_node_documents(document_id);
 CREATE INDEX IF NOT EXISTS idx_processing_history_document ON processing_history(document_id);
 """
 
@@ -257,10 +265,123 @@ class MetadataStore:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_all_graph_nodes(self) -> list[dict[str, Any]]:
+        """전체 그래프 노드 목록을 조회한다."""
+        cursor = await self.db.execute("SELECT * FROM graph_nodes")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def find_graph_node_by_entity(
+        self,
+        entity_name: str,
+        entity_type: str,
+    ) -> dict[str, Any] | None:
+        """엔티티 이름+타입으로 기존 정규 노드를 검색한다 (대소문자 무시)."""
+        cursor = await self.db.execute(
+            """SELECT * FROM graph_nodes
+               WHERE LOWER(entity_name) = LOWER(?) AND entity_type = ?
+               LIMIT 1""",
+            (entity_name, entity_type),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_graph_node_properties(
+        self,
+        node_id: int,
+        properties: str,
+    ) -> None:
+        """그래프 노드의 속성을 업데이트한다."""
+        await self.db.execute(
+            "UPDATE graph_nodes SET properties = ? WHERE id = ?",
+            (properties, node_id),
+        )
+        await self.db.commit()
+
+    async def add_node_document_link(
+        self,
+        node_id: int,
+        document_id: int,
+    ) -> None:
+        """노드-문서 연결을 추가한다 (이미 존재하면 무시)."""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO graph_node_documents (node_id, document_id) VALUES (?, ?)",
+            (node_id, document_id),
+        )
+        await self.db.commit()
+
+    async def get_node_document_ids(self, node_id: int) -> list[int]:
+        """노드에 연결된 문서 ID 목록을 반환한다."""
+        cursor = await self.db.execute(
+            "SELECT document_id FROM graph_node_documents WHERE node_id = ?",
+            (node_id,),
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def get_all_node_document_links(self) -> dict[int, list[int]]:
+        """전체 노드-문서 연결을 반환한다. {node_id: [doc_id, ...]}"""
+        cursor = await self.db.execute(
+            "SELECT node_id, document_id FROM graph_node_documents"
+        )
+        rows = await cursor.fetchall()
+        links: dict[int, list[int]] = {}
+        for row in rows:
+            links.setdefault(row[0], []).append(row[1])
+        return links
+
+    async def unlink_node_from_document(
+        self,
+        node_id: int,
+        document_id: int,
+    ) -> None:
+        """노드에서 특정 문서 연결을 제거한다."""
+        await self.db.execute(
+            "DELETE FROM graph_node_documents WHERE node_id = ? AND document_id = ?",
+            (node_id, document_id),
+        )
+        await self.db.commit()
+
+    async def get_orphan_node_ids(self) -> list[int]:
+        """어떤 문서에도 연결되지 않은 고아 노드 ID를 반환한다."""
+        cursor = await self.db.execute(
+            """SELECT gn.id FROM graph_nodes gn
+               LEFT JOIN graph_node_documents gnd ON gn.id = gnd.node_id
+               WHERE gnd.node_id IS NULL"""
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def delete_graph_nodes_by_ids(self, node_ids: list[int]) -> None:
+        """노드 ID 목록으로 노드를 삭제한다 (CASCADE로 엣지도 삭제)."""
+        if not node_ids:
+            return
+        placeholders = ",".join("?" for _ in node_ids)
+        await self.db.execute(
+            f"DELETE FROM graph_nodes WHERE id IN ({placeholders})",  # noqa: S608
+            node_ids,
+        )
+        await self.db.commit()
+
     async def delete_graph_data_by_document(self, document_id: int) -> None:
-        """문서의 그래프 노드와 엣지를 모두 삭제한다."""
-        await self.db.execute("DELETE FROM graph_edges WHERE document_id = ?", (document_id,))
-        await self.db.execute("DELETE FROM graph_nodes WHERE document_id = ?", (document_id,))
+        """문서의 그래프 엣지를 삭제하고, 노드-문서 연결을 해제한다.
+
+        고아 노드(어떤 문서에도 연결되지 않은 노드)도 정리한다.
+        """
+        # 1. 이 문서에서 생성된 엣지 삭제
+        await self.db.execute(
+            "DELETE FROM graph_edges WHERE document_id = ?", (document_id,)
+        )
+        # 2. 노드-문서 연결 해제
+        await self.db.execute(
+            "DELETE FROM graph_node_documents WHERE document_id = ?", (document_id,)
+        )
+        # 3. 고아 노드 삭제 (어떤 문서에도 연결되지 않은 노드)
+        await self.db.execute(
+            """DELETE FROM graph_nodes WHERE id NOT IN (
+                SELECT DISTINCT node_id FROM graph_node_documents
+            )"""
+        )
         await self.db.commit()
 
     # --- Graph Edges ---

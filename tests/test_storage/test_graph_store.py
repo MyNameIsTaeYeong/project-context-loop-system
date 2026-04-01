@@ -433,3 +433,299 @@ async def test_format_query_relevant_schema_for_llm(
     assert "쿼리 관련 핵심 엔티티" in text
     assert "Gateway" in text
     assert "관련 노드" in text
+
+
+# --- 크로스-문서 엔티티 병합 테스트 ---
+
+
+async def _create_doc_with_title(store: MetadataStore, title: str) -> int:
+    return await store.create_document(
+        source_type="manual",
+        title=title,
+        original_content="content",
+        content_hash=f"hash_{title}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_entity_merge_same_entity(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """동일 엔티티(이름+타입)가 다른 문서에서 등장하면 같은 노드로 병합된다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    data1 = GraphData(
+        entities=[
+            Entity(name="쿠버네티스", entity_type="technology"),
+            Entity(name="도커", entity_type="technology"),
+        ],
+        relations=[
+            Relation(source="쿠버네티스", target="도커", relation_type="uses"),
+        ],
+    )
+    result1 = await graph_store.save_graph_data(doc1, data1)
+    assert result1["nodes"] == 2
+    assert result1["merged"] == 0
+
+    data2 = GraphData(
+        entities=[
+            Entity(name="쿠버네티스", entity_type="technology"),
+            Entity(name="AWS", entity_type="platform"),
+        ],
+        relations=[
+            Relation(source="쿠버네티스", target="AWS", relation_type="runs_on"),
+        ],
+    )
+    result2 = await graph_store.save_graph_data(doc2, data2)
+    assert result2["nodes"] == 1  # AWS만 신규
+    assert result2["merged"] == 1  # 쿠버네티스 병합
+
+    # 전체 노드 수: 쿠버네티스(1) + 도커(1) + AWS(1) = 3
+    assert graph_store.stats()["nodes"] == 3
+    assert graph_store.stats()["edges"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_entity_merge_preserves_document_ids(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """병합된 노드는 양쪽 문서의 document_ids를 가진다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    for doc_id in [doc1, doc2]:
+        data = GraphData(
+            entities=[Entity(name="Kubernetes", entity_type="technology")],
+            relations=[],
+        )
+        await graph_store.save_graph_data(doc_id, data)
+
+    # NetworkX에서 document_ids 확인
+    k8s_nodes = [
+        (n, d) for n, d in graph_store.graph.nodes(data=True)
+        if d.get("entity_name") == "Kubernetes"
+    ]
+    assert len(k8s_nodes) == 1  # 하나의 정규 노드
+    _, node_data = k8s_nodes[0]
+    assert node_data["document_ids"] == {doc1, doc2}
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_traversal_via_merged_node(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """병합된 노드를 통해 크로스-문서 관계 탐색이 가능하다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    # 문서 A: 쿠버네티스 → 도커
+    data1 = GraphData(
+        entities=[
+            Entity(name="쿠버네티스", entity_type="technology"),
+            Entity(name="도커", entity_type="technology"),
+        ],
+        relations=[
+            Relation(source="쿠버네티스", target="도커", relation_type="uses"),
+        ],
+    )
+    await graph_store.save_graph_data(doc1, data1)
+
+    # 문서 B: 쿠버네티스 → AWS
+    data2 = GraphData(
+        entities=[
+            Entity(name="쿠버네티스", entity_type="technology"),
+            Entity(name="AWS", entity_type="platform"),
+        ],
+        relations=[
+            Relation(source="쿠버네티스", target="AWS", relation_type="runs_on"),
+        ],
+    )
+    await graph_store.save_graph_data(doc2, data2)
+
+    # 쿠버네티스(병합 노드)에서 depth=1로 탐색 → 도커(doc1) + AWS(doc2) 모두 도달
+    neighbors = graph_store.get_neighbors("쿠버네티스", depth=1)
+    names = {n["entity_name"] for n in neighbors}
+    assert "쿠버네티스" in names
+    assert "도커" in names  # doc1의 관계
+    assert "AWS" in names  # doc2의 관계 → 크로스-문서 탐색 성공
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_delete_partial_keeps_shared_node(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """공유 노드가 있는 문서를 삭제해도 다른 문서가 참조하면 노드가 유지된다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    # 양쪽 문서에 쿠버네티스 등장
+    for doc_id in [doc1, doc2]:
+        data = GraphData(
+            entities=[Entity(name="쿠버네티스", entity_type="technology")],
+            relations=[],
+        )
+        await graph_store.save_graph_data(doc_id, data)
+
+    assert graph_store.stats()["nodes"] == 1  # 병합된 1개 노드
+
+    # 문서 A 삭제
+    await graph_store.delete_document_graph(doc1)
+
+    # 쿠버네티스 노드는 문서 B가 참조하므로 살아있음
+    assert graph_store.stats()["nodes"] == 1
+    k8s = [
+        d for _, d in graph_store.graph.nodes(data=True)
+        if d.get("entity_name") == "쿠버네티스"
+    ]
+    assert len(k8s) == 1
+    assert k8s[0]["document_ids"] == {doc2}
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_delete_all_removes_node(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """모든 문서가 삭제되면 고아 노드도 정리된다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    for doc_id in [doc1, doc2]:
+        data = GraphData(
+            entities=[Entity(name="쿠버네티스", entity_type="technology")],
+            relations=[],
+        )
+        await graph_store.save_graph_data(doc_id, data)
+
+    await graph_store.delete_document_graph(doc1)
+    await graph_store.delete_document_graph(doc2)
+
+    assert graph_store.stats()["nodes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_description_enrichment(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """기존 노드에 description이 없으면 새 문서에서 보강한다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    # 문서 A: description 없이 저장
+    data1 = GraphData(
+        entities=[Entity(name="K8s", entity_type="technology", description="")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc1, data1)
+
+    # 문서 B: description 포함
+    data2 = GraphData(
+        entities=[
+            Entity(name="K8s", entity_type="technology", description="컨테이너 오케스트레이션 플랫폼"),
+        ],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc2, data2)
+
+    k8s = [
+        d for _, d in graph_store.graph.nodes(data=True)
+        if d.get("entity_name") == "K8s"
+    ]
+    assert len(k8s) == 1
+    assert k8s[0]["properties"]["description"] == "컨테이너 오케스트레이션 플랫폼"
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_case_insensitive_merge(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """엔티티 이름 대소문자가 달라도 병합된다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    data1 = GraphData(
+        entities=[Entity(name="Kubernetes", entity_type="technology")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc1, data1)
+
+    data2 = GraphData(
+        entities=[Entity(name="kubernetes", entity_type="technology")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc2, data2)
+
+    assert graph_store.stats()["nodes"] == 1  # 대소문자 무시 병합
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_different_type_not_merged(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """같은 이름이지만 entity_type이 다르면 병합하지 않는다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    data1 = GraphData(
+        entities=[Entity(name="Gateway", entity_type="component")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc1, data1)
+
+    data2 = GraphData(
+        entities=[Entity(name="Gateway", entity_type="service")],
+        relations=[],
+    )
+    await graph_store.save_graph_data(doc2, data2)
+
+    assert graph_store.stats()["nodes"] == 2  # 타입 다르면 별도 노드
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_load_from_db_preserves_document_ids(
+    meta_store: MetadataStore,
+) -> None:
+    """DB에서 로드 시 document_ids가 올바르게 복원된다."""
+    store1 = GraphStore(meta_store)
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    for doc_id in [doc1, doc2]:
+        data = GraphData(
+            entities=[Entity(name="SharedEntity", entity_type="system")],
+            relations=[],
+        )
+        await store1.save_graph_data(doc_id, data)
+
+    # 새 GraphStore로 DB에서 로드
+    store2 = GraphStore(meta_store)
+    await store2.load_from_db()
+
+    assert store2.stats()["nodes"] == 1
+    node_data = list(store2.graph.nodes(data=True))
+    assert len(node_data) == 1
+    _, data = node_data[0]
+    assert data["document_ids"] == {doc1, doc2}
+
+
+@pytest.mark.asyncio
+async def test_cross_doc_embedding_no_duplicates(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """병합된 노드는 임베딩이 1개만 생성된다."""
+    doc1 = await _create_doc_with_title(meta_store, "Doc A")
+    doc2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    for doc_id in [doc1, doc2]:
+        data = GraphData(
+            entities=[Entity(name="Kubernetes", entity_type="technology")],
+            relations=[],
+        )
+        await graph_store.save_graph_data(doc_id, data)
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0]])
+    count = await graph_store.build_entity_embeddings(mock_embed)
+
+    assert count == 1  # 1개 노드 → 1개 임베딩
+    assert graph_store.entity_embedding_count == 1

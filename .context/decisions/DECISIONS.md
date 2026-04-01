@@ -275,3 +275,16 @@
   - `_USER_PROMPT_TEMPLATE` 변경 — 고정 `Content (first 2000 chars)` → 동적 `content_label` (전문/샘플링 여부 표시).
   - 기존 테스트 호환 유지 (짧은 content는 기존과 동일하게 동작).
 - **이유**: 시작/중간/끝 샘플링은 단순하면서도 문서의 구조적 다양성을 포착. 도입부(배경/목차) + 본문 핵심(중간) + 결론/참고(끝)를 모두 볼 수 있어 chunk vs graph vs hybrid 판정 정확도 향상. LLM 호출 수 증가 없이 입력 품질만 개선.
+
+---
+
+## D-024: 크로스-문서 엔티티 병합 — 정규 노드 + 조인 테이블
+
+- **일시**: 2026-04-01
+- **맥락**: `graph_store.py`에서 동일 엔티티가 문서마다 별도 노드로 생성됨 (I-018, I-003). 문서 A의 "쿠버네티스"와 문서 B의 "쿠버네티스"가 별도 노드로 존재하여 크로스-문서 관계 탐색이 불완전하고, 스키마 요약/임베딩 검색에서 중복 발생.
+- **결정**: 정규 노드(canonical node) 방식 — `entity_name(대소문자 무시) + entity_type` 기준으로 동일 엔티티는 하나의 노드로 병합. `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리.
+- **구현 내용**:
+  - `metadata_store.py`: `graph_node_documents` 테이블 추가 (node_id, document_id). `find_graph_node_by_entity()`, `add_node_document_link()`, `get_all_node_document_links()` 등 메서드 추가. `delete_graph_data_by_document()` 수정 — 연결 해제 + 고아 노드 정리.
+  - `graph_store.py`: `save_graph_data()` — 기존 정규 노드 검색 후 재사용/신규 생성 분기. description 보강. `load_from_db()` — `graph_node_documents`에서 document_ids 로드. `delete_document_graph()` — 부분 해제, 고아 노드만 삭제. NetworkX 노드에 `document_ids` (set) 속성 저장.
+  - `graph_search_planner.py`: `execute_graph_search()`에서 `document_ids` set 대응.
+- **이유**: 정규 노드 방식은 그래프가 깔끔하고 중복이 없어 LLM 스키마 요약 품질 향상. 임베딩 검색 시 top_k 자리 낭비 방지. 문서 삭제 시 `graph_node_documents` 연결만 해제하고 고아 노드만 정리하여 안전. "same_as" 엣지 방식 대비 그래프 복잡도 낮음.

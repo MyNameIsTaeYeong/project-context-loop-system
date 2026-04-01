@@ -212,12 +212,17 @@ async def execute_graph_search(
         if filtered_edges:
             edges = filtered_edges
 
-    # 관련 document_id 수집
+    # 관련 document_id 수집 (정규 노드는 document_ids set을 가짐)
     document_ids: set[int] = set()
     for node in all_nodes:
-        doc_id = node.get("document_id")
-        if doc_id is not None:
-            document_ids.add(doc_id)
+        node_doc_ids = node.get("document_ids")
+        if isinstance(node_doc_ids, set):
+            document_ids.update(node_doc_ids)
+        else:
+            # 레거시 호환: 단일 document_id
+            doc_id = node.get("document_id")
+            if doc_id is not None:
+                document_ids.add(doc_id)
 
     # 포맷팅
     searched_set = {name.lower() for name in searched_entities}
