@@ -75,11 +75,14 @@ async def rerank(
         f'[{{"index": 0, "score": ?}}, ..., {{"index": {len(chunks) - 1}, "score": ?}}]'
     )
 
+    # 청크 수에 비례하여 max_tokens 조절 (청크당 ~40토큰: {"index": N, "score": M} + 여유)
+    rerank_max_tokens = max(256, len(chunks) * 40)
+
     try:
         response = await llm_client.complete(
             prompt,
             system=_RERANK_SYSTEM_PROMPT,
-            max_tokens=512,
+            max_tokens=rerank_max_tokens,
             temperature=0.0,
         )
         scores = _parse_scores(response, len(chunks))

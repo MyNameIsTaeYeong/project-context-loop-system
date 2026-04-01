@@ -49,7 +49,7 @@ async def generate_hypothetical_document(
         return await llm_client.complete(
             prompt,
             system=_HYDE_SYSTEM_PROMPT,
-            max_tokens=256,
+            max_tokens=512,
             temperature=0.7,
         )
     except Exception:
