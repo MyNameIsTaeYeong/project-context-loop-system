@@ -26,6 +26,7 @@ class LLMClient(ABC):
         system: str | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.0,
+        **kwargs: Any,
     ) -> str:
         """텍스트 완성 요청을 보내고 응답 문자열을 반환한다.
 
@@ -34,6 +35,7 @@ class LLMClient(ABC):
             system: 시스템 프롬프트. None이면 사용하지 않는다.
             max_tokens: 최대 출력 토큰 수.
             temperature: 샘플링 온도 (0.0 = 결정적).
+            **kwargs: 구현체별 추가 파라미터 (예: extra_body).
 
         Returns:
             LLM 응답 문자열.
@@ -60,6 +62,7 @@ class AnthropicClient(LLMClient):
         system: str | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.0,
+        **kwargs: Any,
     ) -> str:
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -96,6 +99,7 @@ class OpenAIClient(LLMClient):
         system: str | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.0,
+        **kwargs: Any,
     ) -> str:
         messages: list[dict[str, str]] = []
         if system:
@@ -134,17 +138,21 @@ class EndpointLLMClient(LLMClient):
         system: str | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.0,
+        **kwargs: Any,
     ) -> str:
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,  # type: ignore[arg-type]
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        api_kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if "extra_body" in kwargs:
+            api_kwargs["extra_body"] = kwargs["extra_body"]
+        response = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
         return response.choices[0].message.content or ""
 
 

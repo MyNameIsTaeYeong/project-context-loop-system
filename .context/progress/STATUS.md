@@ -65,5 +65,7 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-01
-- 내용: Phase 7.7 구현 완료. Phase 7 전체 완료.
-  - Phase 7.7 (D-024): 크로스-문서 엔티티 병합. graph_node_documents 조인 테이블로 다대다 관계 관리. 동일 엔티티(name+type, 대소문자 무시) 정규 노드 1개로 병합. 문서 삭제 시 부분 해제 + 고아 노드 정리. 10개 신규 테스트. 전체 258개 통과.
+- 내용: Qwen3 추론 모델의 `<think>` 태그로 인한 JSON 추출 실패 수정
+  - `LLMClient.complete()`에 `**kwargs` 추가하여 `extra_body` 전달 지원
+  - `graph_search_planner.py`에서 `enable_thinking: False`로 thinking 비활성화
+  - 세션 문서: `.context/sessions/2026-04-01_fix-llm-json-extraction.md`
