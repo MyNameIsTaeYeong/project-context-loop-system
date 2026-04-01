@@ -32,7 +32,6 @@ def _build_llm_client(config: Config):
             endpoint=config.get("llm.endpoint", ""),
             model=config.get("llm.model", ""),
             api_key=config.get("llm.api_key", ""),
-            extra_body=config.get("llm.extra_body", None),
         )
     if provider == "anthropic":
         api_key = get_token("anthropic", "api_key")
