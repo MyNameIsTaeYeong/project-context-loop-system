@@ -4,10 +4,6 @@
 
 ## 미해결
 
-### I-003: 엔티티 병합 테이블 스키마 미정
-- 여러 문서에서 동일 엔티티가 등장할 때 병합 기준과 테이블 구조 상세 설계 필요
-- Phase 3.6 시작 전까지 결정 필요
-
 ### I-004: LLM Classifier 프롬프트 설계
 - 문서를 chunk/graph/hybrid로 판정하는 프롬프트의 정확도와 비용 최적화 필요
 - Phase 3.1 시작 시 프로토타이핑 및 테스트 필요
@@ -46,53 +42,33 @@
 - 기존 `ingestion/confluence.py` (ConfluenceClient) 사용 불가능
 - MCP Client 방식(I-010)으로 대체 예정
 
-### I-012: HTML→Markdown 변환 시 테이블·매크로 손실
-- `confluence.py:42-89`의 정규식 기반 변환기에서 `<table>`, `<tr>`, `<td>` 태그가 모두 strip되어 텍스트만 남음
-- Confluence 매크로(`<ac:structured-macro>` 등 info/warning/code 패널)가 완전 무시됨
-- 중첩 목록(`<ul>` 안의 `<ul>`)이 flat하게 변환됨
-- MCP 쪽은 markdownify(D-017)로 전환했으나, REST API 쪽은 미전환
-- **영향**: 원본 데이터 품질이 전체 파이프라인 퀄리티의 상한선을 결정하므로, 가장 우선적으로 개선 필요
-- **개선 방향**: `markdownify` 또는 `beautifulsoup4` 기반 파서로 교체 + Confluence 전용 매크로 전처리 로직 추가
-
-### I-013: 청킹 시 문서 구조(헤딩) 미활용
-- `chunker.py`에서 `\n\n`(빈 줄) 기준으로만 단락을 분리함
-- `# 섹션 제목`과 본문이 서로 다른 청크로 분리되어 청크가 맥락을 잃음
-- 메타데이터에 `chunk_index`와 `title`만 저장 — 해당 청크가 속한 **섹션 헤딩 경로**가 없음
-- chunk_size=512, overlap=50이 모든 문서에 고정 적용
-- **개선 방향**: 마크다운 헤딩 기반 계층적 청킹, 각 청크에 상위 헤딩 경로(예: "프로젝트 개요 > 아키텍처 > 백엔드") 메타데이터 첨부
-
-### I-014: 그래프 추출 시 콘텐츠 절삭 (앞 4000자만 사용)
-- `graph_extractor.py:109`에서 `content[:max_content_chars]`로 앞 4000자만 LLM에 전달
-- 긴 문서의 후반부 엔티티/관계가 모두 누락됨
-- Confluence 문서는 도입부가 목차/배경이고 핵심 정보가 후반에 있는 경우가 많음
-- **개선 방향**: 청크 단위 그래프 추출 후 병합(map-reduce), 또는 문서 요약 후 추출
-
-### I-015: 컨텍스트 조립 시 재랭킹·필터링 부재
-- 벡터 검색 결과에 유사도 threshold가 없어 관련 없는 청크도 top-K에 포함됨
-- 벡터 검색 + 그래프 탐색 결과가 단순 concat으로 병합 — 중복/모순 정보의 우선순위 조정 없음
-- Cross-encoder reranker가 없어 bi-encoder의 정밀도 한계를 극복하지 못함
-- **개선 방향**: 유사도 threshold 도입(cosine sim < 0.3 제외), cross-encoder reranker 추가, 벡터+그래프 결과 가중 병합
-
-### I-016: 쿼리 전처리 및 확장 부재
-- 사용자 쿼리가 그대로 임베딩되어 검색에 사용됨
-- 쿼리 확장(Query Expansion)이 없어 동의어 문서를 놓침 (예: "배포 절차" ↔ "릴리즈 프로세스")
-- HyDE(Hypothetical Document Embedding) 등 검색 품질 향상 기법 미적용
-- 대화 히스토리 유지 없이 매 쿼리가 독립적으로 처리됨
-- **개선 방향**: LLM 기반 쿼리 확장 또는 HyDE, 대화 이력 기반 컨텍스트 유지
-
-### I-017: 문서 분류기가 처음 2000자만 사용
-- `classifier.py:60`에서 `content[:2000]`만 보고 chunk/graph/hybrid를 결정
-- 문서 전체 구조를 파악하지 못해 잘못된 분류 발생 가능 (앞부분은 서술형이지만 뒤에 아키텍처 다이어그램이 있는 경우 등)
-- **개선 방향**: 문서 전체의 구조적 특성을 요약 후 분류, 또는 여러 구간 샘플링
-
-### I-018: 크로스-문서 엔티티 병합 로직 미구현
-- `graph_store.py:104-120`에서 동일 엔티티가 문서마다 별도 노드로 생성됨
-- 주석에 "논리적 병합"이라 되어 있지만 실제 병합 로직 없음
-- 문서 간 관계 연결이 끊겨 그래프 탐색 범위가 단일 문서로 제한됨
-- I-003과 관련됨
-- **개선 방향**: entity_name + entity_type 기준 병합 테이블, 또는 임베딩 기반 유사 엔티티 자동 병합
-
 ## 해결됨
+
+### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
+- `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리
+- `entity_name(대소문자 무시) + entity_type` 기준 정규 노드 병합
+
+### I-012: HTML→Markdown 변환 시 테이블·매크로 손실 → 해결 (Phase 7.1, D-018)
+- BeautifulSoup + markdownify 기반 변환으로 교체
+- Confluence 매크로 전처리 지원 (info/warning/note/code/expand 등)
+
+### I-013: 청킹 시 문서 구조(헤딩) 미활용 → 해결 (Phase 7.2, D-019)
+- 마크다운 헤딩 기반 계층적 청킹 + `section_path` 메타데이터 첨부
+
+### I-014: 그래프 추출 시 콘텐츠 절삭 → 해결 (Phase 7.4, D-021)
+- map-reduce 방식으로 전체 문서 처리, 엔티티/관계 중복 제거 병합
+
+### I-015: 컨텍스트 조립 시 재랭킹·필터링 부재 → 해결 (Phase 7.3, D-020)
+- cosine similarity threshold + LLM 리랭커 2단계 필터링
+
+### I-016: 쿼리 전처리 및 확장 부재 → 해결 (Phase 7.5, D-022)
+- HyDE 적용 — LLM 가상 문서 임베딩과 원본 쿼리 임베딩 평균
+
+### I-017: 문서 분류기가 처음 2000자만 사용 → 해결 (Phase 7.6, D-023)
+- 시작/중간/끝 구간 샘플링 (~4000자)
+
+### I-018: 크로스-문서 엔티티 병합 로직 미구현 → 해결 (Phase 7.7, D-024)
+- 정규 노드 방식 — entity_name + entity_type 기준 병합, graph_node_documents 조인 테이블
 
 ### I-001: 웹 프레임워크 최종 선택 → FastAPI + Jinja2 + HTMX
 - 2026-03-11 결정: FastAPI + Jinja2 + HTMX + Alpine.js + Pico CSS
