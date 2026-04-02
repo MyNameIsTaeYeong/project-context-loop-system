@@ -288,3 +288,104 @@
   - `graph_store.py`: `save_graph_data()` — 기존 정규 노드 검색 후 재사용/신규 생성 분기. description 보강. `load_from_db()` — `graph_node_documents`에서 document_ids 로드. `delete_document_graph()` — 부분 해제, 고아 노드만 삭제. NetworkX 노드에 `document_ids` (set) 속성 저장.
   - `graph_search_planner.py`: `execute_graph_search()`에서 `document_ids` set 대응.
 - **이유**: 정규 노드 방식은 그래프가 깔끔하고 중복이 없어 LLM 스키마 요약 품질 향상. 임베딩 검색 시 top_k 자리 낭비 방지. 문서 삭제 시 `graph_node_documents` 연결만 해제하고 고아 노드만 정리하여 안전. "same_as" 엣지 방식 대비 그래프 복잡도 낮음.
+
+---
+
+## D-025: 코드 기반 컨텍스트 구축 — LLM 문서 생성 + 원본 코드 하이브리드
+
+- **일시**: 2026-04-02
+- **맥락**: Confluence 문서만으로는 사내 기술 컨텍스트가 부족. 실제 개발 코드, 커밋 히스토리, PR 리뷰 등 기술적 맥락이 시스템에 없음. 코드를 컨텍스트로 변환하는 방식으로 (A) 코드→LLM 문서 생성→기존 파이프라인과 (B) 코드→AST 파싱→직접 Chunking 두 가지를 비교 검토.
+- **결정**: A + B 하이브리드 방식 채택.
+  - **접근 A (code_doc)**: 코드를 LLM에 전달하여 자연어 문서를 생성. `source_type = "code_doc"`. 기존 chunker + graph_extractor 그대로 재사용. "왜 이렇게 구현했는가" 등 설계 의도 포함.
+  - **접근 B (git_code)**: 원본 코드를 파일 단위로 저장. `source_type = "git_code"`. 환각 검증 및 정확한 코드 참조용.
+- **접근 A 선택 이유**:
+  - LLM이 소비하는 컨텍스트는 자연어가 토큰 대비 정보 밀도가 높음
+  - "왜"가 포함된 컨텍스트가 없으면 LLM이 매번 추론해야 함. 수집 시점에 한 번만 추론
+  - 기존 파이프라인(마크다운 헤딩 chunking, LLM 그래프 추출) 100% 재사용 가능
+  - 비개발자(PM, 기획자)도 자연어 문서로 기술 컨텍스트에 접근 가능
+- **접근 B 병행 이유**:
+  - LLM 문서 생성의 환각 위험을 원본 코드로 검증
+  - 정확한 코드 라인을 참조해야 하는 개발자 유스케이스 지원
+- **검색 시 동작**: code_doc chunk 반환(이해용) → document_sources 테이블로 원본 git_code 조회(검증용) → LLM에 둘 다 제공
+- **추가 컨텍스트 소스 우선순위** (ROI 기준):
+  1. Git Repository (코드 + 커밋 + PR) — 사내 기술 컨텍스트의 60-70% 커버
+  2. Jira/이슈 트래커 — 요구사항-코드 연결
+  3. API 명세 (OpenAPI) — Git에 포함 시 1순위와 동시 해결
+  4. DB 스키마 — 도메인 모델의 실체
+  5. Slack/Teams — 가치 높지만 노이즈 필터링 복잡
+- **결론**: Git 먼저 구현 → Jira 두 번째 → 이 둘로 사내 컨텍스트의 80-90% 자동 유지 가능
+
+---
+
+## D-026: 코드 문서 ↔ 원본 코드 연결 — document_sources 테이블
+
+- **일시**: 2026-04-02
+- **맥락**: D-025 하이브리드 방식에서 `code_doc`(LLM 생성 문서)이 반환되었을 때 대응하는 원본 코드(`git_code`)를 찾아 검증하는 연결 메커니즘이 필요. 기존 스키마의 `UNIQUE(source_type, source_id)`로는 `source_id` 매칭만 가능하나, 실제 사내 코드에서 LLM 문서 1개가 여러 파일을 참조하는 경우가 일반적 (예: VPC 관련 코드 = vpc.tf + subnets.tf + nat.tf).
+- **검토한 방법**:
+  1. `source_id` 직접 매칭: 스키마 변경 없이 같은 source_id 공유. 단, 1파일=1문서일 때만 동작하여 다중 파일 참조 시 깨짐.
+  2. `document_sources` 연결 테이블: doc_id → source_doc_id N:M 관계. 정확한 추적.
+  3. 벡터 재검색: code_doc과 같은 쿼리로 git_code를 한 번 더 검색. 연결 관리 불필요하나, 정확한 코드를 못 찾을 수 있음.
+- **결정**: 방법 2 — `document_sources` 연결 테이블 도입.
+  ```sql
+  CREATE TABLE document_sources (
+      doc_id        INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+      source_doc_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+      file_path     TEXT,
+      PRIMARY KEY (doc_id, source_doc_id)
+  );
+  ```
+- **구현 계획**:
+  - `metadata_store.py`: `document_sources` 테이블 추가. `add_document_source()`, `get_document_sources()`, `get_documents_by_source()` 메서드 추가.
+  - `ingestion/git_repository.py` (신규): Git repo clone/pull → 파일별 git_code 문서 저장 → 관련 파일 그룹핑 → LLM 문서 생성 → code_doc 저장 + document_sources 연결 기록.
+  - `context_assembler.py`: code_doc chunk 반환 시 document_sources 조회하여 원본 코드 첨부 옵션.
+- **이유**: N:M 관계 지원으로 LLM이 여러 파일을 종합하여 하나의 문서를 생성하는 자연스러운 흐름을 정확히 추적 가능. 검색 시 code_doc → 원본 코드 역추적이 확실하여 환각 검증에 필수적.
+
+---
+
+## D-027: 멀티에이전트 기반 계층적 문서 생성
+
+- **일시**: 2026-04-02
+- **맥락**: 모노레포에 여러 상품의 코드가 혼재하며 코드량이 매우 많음. 단일 LLM으로 순차 처리 시 시간이 과다(파일 500개 × ~5초 = ~42분). 계층적 문서 생성(Level 1 파일 요약 → Level 2 디렉토리 문서 → Level 3 상품 문서)을 병렬화하여 처리 시간 단축 필요.
+- **결정**: 3계층 멀티에이전트 아키텍처 채택.
+  - **Coordinator Agent** (최상위): config 로드, 상품별 Product Agent 할당, 전체 진행 관리.
+  - **Product Agent** (상품별): 파일 수집, 디렉토리 그룹핑, Worker 할당, Category Agent 할당.
+  - **Worker Agent** (디렉토리별): Level 1 파일별 요약 + Level 2 디렉토리별 관점 중립 문서 생성. 모든 Category Agent가 이 결과를 공유.
+  - **Category Agent** (카테고리별): Level 2 결과를 받아 특정 관점(아키텍처, 개발, 인프라 등)으로 Level 3 종합 문서 생성.
+- **핵심 설계**: Worker는 관점 중립 사실 요약(1회 실행), Category Agent가 관점 부여(카테고리 수만큼 병렬 실행). 코드 분석 비용 중복 없음.
+- **상품 스코프 결정**: config에 상품별 paths/exclude를 정의. 최초에 LLM이 레포 디렉토리 트리를 분석하여 스코프를 제안하고, 사람이 검토 후 확정. 이후 완전 자동.
+- **Worker 단위**: 디렉토리 기반. 파일 30개 초과 시 서브디렉토리 분할, 3개 미만 시 상위와 병합.
+- **증분 처리**: `git diff`로 변경 파일 감지 → 해당 상품의 영향받는 디렉토리만 Worker 재실행 → Category Agent 재실행. 미변경 상품/디렉토리는 건드리지 않음.
+- **이유**: 병렬 처리로 ~42분 → ~2분 (속도 20배 향상, 비용 동일). 관점 중립 요약을 공유하여 Worker 비용 중복 방지. Coordinator → Product → Worker/Category 계층 구조로 확장성 확보.
+
+---
+
+## D-028: 상품 × 카테고리 매트릭스 문서 체계
+
+- **일시**: 2026-04-02
+- **맥락**: 같은 코드를 봐도 독자(아키텍트, 개발자, 인프라, 프라이싱, 사업)에 따라 필요한 문서가 다름. 상품 1개당 문서 1개가 아닌 상품 × 카테고리 매트릭스로 문서를 생성해야 함. 또한 팀마다 카테고리가 추가될 가능성이 있어 확장성 필요.
+- **결정**: 카테고리를 config의 프롬프트로만 정의하여 코드 변경 없이 자유롭게 추가/수정 가능하도록 설계.
+- **카테고리 정의 방식**: 각 카테고리는 `display_name`, `prompt` (LLM 지시), `target_audience`, `model` (엔드포인트 지정)로 구성. 카테고리 추가 시 config에 항목 1개 추가 + 프롬프트 작성만으로 전체 상품에 해당 관점 문서 자동 생성.
+- **기본 카테고리**: architecture(아키텍처), development(개발 가이드), infrastructure(인프라 운영), pricing(과금 체계), business(사업 요약).
+- **문서 저장 규칙**:
+  - `source_type = "git_code"`: 원본 코드 파일 (파일 단위)
+  - `source_type = "code_summary"`: Worker가 생성한 관점 중립 디렉토리 요약
+  - `source_type = "code_doc"`: Category Agent가 생성한 관점별 문서
+  - `source_id` 규칙: `"{product}:{category}"` (예: `"vpc:architecture"`, `"vpc:pricing"`)
+  - `document_sources` (D-026)로 code_doc ↔ git_code 연결 추적
+- **이유**: 카테고리를 프롬프트 기반으로 정의하면 새 팀이 추가되어도 코드 수정 없이 config만으로 대응 가능. 상품 × 카테고리 매트릭스는 조직의 다양한 역할을 커버하면서도 코드 분석(Worker)은 한 번만 수행하여 비용 효율적.
+
+---
+
+## D-029: 에이전트별 모델 계층화 — 엔드포인트 방식 통일
+
+- **일시**: 2026-04-02
+- **맥락**: D-027 멀티에이전트에서 각 에이전트의 역할별로 필요한 모델 성능이 다름. 파일 요약(Worker)은 경량 모델, 종합 문서(Category Agent)는 고성능 모델이 적합. 기존 시스템은 D-010에서 OpenAI 호환 엔드포인트 방식을 채택하여 자체 모델 서버를 사용 중. 모든 에이전트의 LLM 호출도 동일하게 엔드포인트 방식으로 통일해야 함.
+- **결정**: 에이전트별로 다른 엔드포인트/모델을 지정할 수 있는 모델 계층화 구조. 모든 LLM 호출은 OpenAI 호환 엔드포인트 방식(D-010)으로 통일.
+- **모델 배치**:
+  - Worker Agent (Level 1 파일 요약): 경량 모델 (Haiku급) — `worker_endpoint`
+  - Worker Agent (Level 2 디렉토리 문서): 중간 모델 (Sonnet급) — `synthesizer_endpoint`
+  - Category Agent (Level 3 카테고리 문서): 고성능 모델 (Opus급) — `orchestrator_endpoint`
+  - Coordinator (품질 검증): 중간 모델 (Sonnet급) — `synthesizer_endpoint`
+- **config 구조**: `sources.git.processing` 하위에 에이전트별 `endpoint`, `model`, `api_key` 지정. 미지정 시 기존 `llm.endpoint` 폴백.
+- **비용 예시** (파일 500개, 디렉토리 50개, 카테고리 5개, 상품 1개): Worker 500회(Haiku) + Synthesizer 50회(Sonnet) + Category 5회(Opus) + 검증 50회(Sonnet) → 모두 Opus 대비 80%+ 비용 절감.
+- **이유**: 작업 복잡도에 맞는 모델을 배치하여 비용 최적화. 엔드포인트 방식 통일로 기존 `llm_client.py`의 `EndpointLLMClient`를 그대로 재사용. 에이전트별 엔드포인트를 분리하면 Worker는 빠르고 저렴한 자체 서버, Category Agent는 고성능 서버로 분배 가능.

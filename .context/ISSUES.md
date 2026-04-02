@@ -42,6 +42,53 @@
 - 기존 `ingestion/confluence.py` (ConfluenceClient) 사용 불가능
 - MCP Client 방식(I-010)으로 대체 예정
 
+### I-019: Git Repository 기반 코드 수집기 구현
+- Git repo를 clone/pull하여 소스 코드 파일을 수집하고, 변경 감지(commit hash 비교)로 증분 동기화하는 `ingestion/git_repository.py` 모듈 필요
+- GitPython 또는 subprocess 기반 구현 검토 필요
+- 파일 필터링 규칙 (`.gitignore` 존중, 바이너리 제외, 언어별 확장자 필터) 설계 필요
+- D-025 관련, Phase 9.2
+
+### I-020: 코드 → LLM 문서 자동 생성 파이프라인
+- 수집된 코드 파일을 LLM에 전달하여 자연어 문서(code_doc)를 자동 생성하는 파이프라인 필요
+- 관련 파일 그룹핑 전략 (디렉토리 기반? 모듈 기반? LLM 판단?) 결정 필요
+- LLM 프롬프트 설계: 코드의 목적, 구조, 설계 의도, 의존성을 포함하는 문서 생성
+- 생성된 문서는 기존 chunker + graph_extractor로 처리 (기존 파이프라인 재사용)
+- D-025 관련, Phase 9.3
+
+### I-021: document_sources 테이블 및 검색 시 원본 코드 첨부
+- `document_sources` 테이블 추가하여 code_doc ↔ git_code N:M 관계 관리
+- context_assembler에서 code_doc chunk 반환 시 원본 코드를 함께 제공하는 옵션 구현
+- D-026 관련, Phase 9.1, 9.5
+
+### I-022: LLM 생성 문서의 환각 검증 메커니즘
+- code_doc이 원본 코드와 불일치하는 경우를 감지하는 방법 검토 필요
+- 생성 시점 검증 (LLM에게 코드와 문서 비교 요청) vs 검색 시점 검증 (원본 코드 첨부) 결정 필요
+- D-025, D-026 관련
+
+### I-023: 멀티에이전트 Coordinator/Product/Worker/Category 구현
+- D-027 아키텍처에 따른 4종 에이전트 구현 필요
+- `asyncio.gather` 기반 병렬 실행, 부분 실패 허용 (graceful degradation)
+- Worker 단위: 디렉토리 기반 + 크기 제한 (30개 초과 시 분할, 3개 미만 시 병합)
+- Phase 9.4, 9.5, 9.6
+
+### I-024: 카테고리 프롬프트 시스템 설계
+- D-028에 따라 카테고리를 config 프롬프트로만 정의하여 코드 변경 없이 확장 가능하게
+- 기본 카테고리 5종 프롬프트 작성 필요: architecture, development, infrastructure, pricing, business
+- 팀별 추가 카테고리(보안, QA 등) 대응 구조 검증 필요
+- Phase 9.3, 9.6
+
+### I-025: 에이전트별 엔드포인트/모델 설정 구조
+- D-029에 따라 Worker(Haiku급), Synthesizer(Sonnet급), Category(Opus급) 각각 다른 엔드포인트 지정 가능해야 함
+- 기존 `llm_client.py`의 `EndpointLLMClient`를 에이전트별로 인스턴스화
+- 미지정 시 기존 `llm.endpoint` 폴백
+- Phase 9.3
+
+### I-026: 모노레포 상품 스코프 자동 제안 기능
+- LLM이 레포 디렉토리 트리를 분석하여 상품별 스코프를 제안하는 기능
+- 최초 1회 사람 검토 후 config에 확정, 이후 자동 동기화
+- 대시보드 UI에서 제안 검토/수정 인터페이스 필요
+- Phase 9.2
+
 ## 해결됨
 
 ### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
