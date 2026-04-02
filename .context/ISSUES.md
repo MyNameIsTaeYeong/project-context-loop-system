@@ -42,6 +42,29 @@
 - 기존 `ingestion/confluence.py` (ConfluenceClient) 사용 불가능
 - MCP Client 방식(I-010)으로 대체 예정
 
+### I-019: Git Repository 기반 코드 수집기 구현
+- Git repo를 clone/pull하여 소스 코드 파일을 수집하고, 변경 감지(commit hash 비교)로 증분 동기화하는 `ingestion/git_repository.py` 모듈 필요
+- GitPython 또는 subprocess 기반 구현 검토 필요
+- 파일 필터링 규칙 (`.gitignore` 존중, 바이너리 제외, 언어별 확장자 필터) 설계 필요
+- D-025 관련, Phase 9.2
+
+### I-020: 코드 → LLM 문서 자동 생성 파이프라인
+- 수집된 코드 파일을 LLM에 전달하여 자연어 문서(code_doc)를 자동 생성하는 파이프라인 필요
+- 관련 파일 그룹핑 전략 (디렉토리 기반? 모듈 기반? LLM 판단?) 결정 필요
+- LLM 프롬프트 설계: 코드의 목적, 구조, 설계 의도, 의존성을 포함하는 문서 생성
+- 생성된 문서는 기존 chunker + graph_extractor로 처리 (기존 파이프라인 재사용)
+- D-025 관련, Phase 9.3
+
+### I-021: document_sources 테이블 및 검색 시 원본 코드 첨부
+- `document_sources` 테이블 추가하여 code_doc ↔ git_code N:M 관계 관리
+- context_assembler에서 code_doc chunk 반환 시 원본 코드를 함께 제공하는 옵션 구현
+- D-026 관련, Phase 9.1, 9.5
+
+### I-022: LLM 생성 문서의 환각 검증 메커니즘
+- code_doc이 원본 코드와 불일치하는 경우를 감지하는 방법 검토 필요
+- 생성 시점 검증 (LLM에게 코드와 문서 비교 요청) vs 검색 시점 검증 (원본 코드 첨부) 결정 필요
+- D-025, D-026 관련
+
 ## 해결됨
 
 ### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)

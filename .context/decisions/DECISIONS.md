@@ -288,3 +288,54 @@
   - `graph_store.py`: `save_graph_data()` — 기존 정규 노드 검색 후 재사용/신규 생성 분기. description 보강. `load_from_db()` — `graph_node_documents`에서 document_ids 로드. `delete_document_graph()` — 부분 해제, 고아 노드만 삭제. NetworkX 노드에 `document_ids` (set) 속성 저장.
   - `graph_search_planner.py`: `execute_graph_search()`에서 `document_ids` set 대응.
 - **이유**: 정규 노드 방식은 그래프가 깔끔하고 중복이 없어 LLM 스키마 요약 품질 향상. 임베딩 검색 시 top_k 자리 낭비 방지. 문서 삭제 시 `graph_node_documents` 연결만 해제하고 고아 노드만 정리하여 안전. "same_as" 엣지 방식 대비 그래프 복잡도 낮음.
+
+---
+
+## D-025: 코드 기반 컨텍스트 구축 — LLM 문서 생성 + 원본 코드 하이브리드
+
+- **일시**: 2026-04-02
+- **맥락**: Confluence 문서만으로는 사내 기술 컨텍스트가 부족. 실제 개발 코드, 커밋 히스토리, PR 리뷰 등 기술적 맥락이 시스템에 없음. 코드를 컨텍스트로 변환하는 방식으로 (A) 코드→LLM 문서 생성→기존 파이프라인과 (B) 코드→AST 파싱→직접 Chunking 두 가지를 비교 검토.
+- **결정**: A + B 하이브리드 방식 채택.
+  - **접근 A (code_doc)**: 코드를 LLM에 전달하여 자연어 문서를 생성. `source_type = "code_doc"`. 기존 chunker + graph_extractor 그대로 재사용. "왜 이렇게 구현했는가" 등 설계 의도 포함.
+  - **접근 B (git_code)**: 원본 코드를 파일 단위로 저장. `source_type = "git_code"`. 환각 검증 및 정확한 코드 참조용.
+- **접근 A 선택 이유**:
+  - LLM이 소비하는 컨텍스트는 자연어가 토큰 대비 정보 밀도가 높음
+  - "왜"가 포함된 컨텍스트가 없으면 LLM이 매번 추론해야 함. 수집 시점에 한 번만 추론
+  - 기존 파이프라인(마크다운 헤딩 chunking, LLM 그래프 추출) 100% 재사용 가능
+  - 비개발자(PM, 기획자)도 자연어 문서로 기술 컨텍스트에 접근 가능
+- **접근 B 병행 이유**:
+  - LLM 문서 생성의 환각 위험을 원본 코드로 검증
+  - 정확한 코드 라인을 참조해야 하는 개발자 유스케이스 지원
+- **검색 시 동작**: code_doc chunk 반환(이해용) → document_sources 테이블로 원본 git_code 조회(검증용) → LLM에 둘 다 제공
+- **추가 컨텍스트 소스 우선순위** (ROI 기준):
+  1. Git Repository (코드 + 커밋 + PR) — 사내 기술 컨텍스트의 60-70% 커버
+  2. Jira/이슈 트래커 — 요구사항-코드 연결
+  3. API 명세 (OpenAPI) — Git에 포함 시 1순위와 동시 해결
+  4. DB 스키마 — 도메인 모델의 실체
+  5. Slack/Teams — 가치 높지만 노이즈 필터링 복잡
+- **결론**: Git 먼저 구현 → Jira 두 번째 → 이 둘로 사내 컨텍스트의 80-90% 자동 유지 가능
+
+---
+
+## D-026: 코드 문서 ↔ 원본 코드 연결 — document_sources 테이블
+
+- **일시**: 2026-04-02
+- **맥락**: D-025 하이브리드 방식에서 `code_doc`(LLM 생성 문서)이 반환되었을 때 대응하는 원본 코드(`git_code`)를 찾아 검증하는 연결 메커니즘이 필요. 기존 스키마의 `UNIQUE(source_type, source_id)`로는 `source_id` 매칭만 가능하나, 실제 사내 코드에서 LLM 문서 1개가 여러 파일을 참조하는 경우가 일반적 (예: VPC 관련 코드 = vpc.tf + subnets.tf + nat.tf).
+- **검토한 방법**:
+  1. `source_id` 직접 매칭: 스키마 변경 없이 같은 source_id 공유. 단, 1파일=1문서일 때만 동작하여 다중 파일 참조 시 깨짐.
+  2. `document_sources` 연결 테이블: doc_id → source_doc_id N:M 관계. 정확한 추적.
+  3. 벡터 재검색: code_doc과 같은 쿼리로 git_code를 한 번 더 검색. 연결 관리 불필요하나, 정확한 코드를 못 찾을 수 있음.
+- **결정**: 방법 2 — `document_sources` 연결 테이블 도입.
+  ```sql
+  CREATE TABLE document_sources (
+      doc_id        INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+      source_doc_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+      file_path     TEXT,
+      PRIMARY KEY (doc_id, source_doc_id)
+  );
+  ```
+- **구현 계획**:
+  - `metadata_store.py`: `document_sources` 테이블 추가. `add_document_source()`, `get_document_sources()`, `get_documents_by_source()` 메서드 추가.
+  - `ingestion/git_repository.py` (신규): Git repo clone/pull → 파일별 git_code 문서 저장 → 관련 파일 그룹핑 → LLM 문서 생성 → code_doc 저장 + document_sources 연결 기록.
+  - `context_assembler.py`: code_doc chunk 반환 시 document_sources 조회하여 원본 코드 첨부 옵션.
+- **이유**: N:M 관계 지원으로 LLM이 여러 파일을 종합하여 하나의 문서를 생성하는 자연스러운 흐름을 정확히 추적 가능. 검색 시 code_doc → 원본 코드 역추적이 확실하여 환각 검증에 필수적.
