@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.1 document_sources 테이블 추가 완료
-- **상태**: D-026 구현 완료. document_sources 테이블 + CRUD 메서드 + 테스트 12/12 통과.
+- **Step**: 9.2 Git 레포지토리 수집 모듈 완료
+- **상태**: git_repository.py 구현 완료. clone/pull, 상품 스코핑, 변경 감지, git_code 저장 + 테스트 31/31 통과.
 
 ## Phase별 진행률
 
@@ -65,7 +65,7 @@
 
 ### Phase 9: 추가 컨텍스트 소스 — Git 코드 기반 멀티에이전트 문서 생성
 - [x] 9.1 `document_sources` 테이블 추가 (code_doc ↔ git_code 연결, D-026)
-- [ ] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
+- [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [ ] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [ ] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
 - [ ] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
@@ -83,7 +83,10 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-02
-- 내용: Phase 9.1 — `document_sources` 테이블 구현 완료 (D-026).
-  - `_SCHEMA_SQL`에 `document_sources` 테이블 + 인덱스 추가
-  - `MetadataStore`에 4개 메서드: `add_document_source()`, `get_document_sources()`, `get_documents_by_source()`, `delete_document_sources()`
-  - 테스트 3개 추가 (CRUD, CASCADE 양방향) — 전체 12/12 통과
+- 내용: Phase 9.2 — `ingestion/git_repository.py` 구현 완료.
+  - Git repo clone/pull (asyncio subprocess)
+  - 상품별 스코핑 (config paths/exclude glob 패턴)
+  - git diff 기반 증분 변경 감지
+  - git_code 문서 저장 (content_hash 기반 생성/갱신/무변경 판별)
+  - 삭제 파일 처리, 디렉토리별 그룹핑 (Worker Agent 배정 단위)
+  - 테스트 31개 (단위 16 + 통합 15) — 전체 통과
