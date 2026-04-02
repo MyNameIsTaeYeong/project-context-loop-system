@@ -17,6 +17,96 @@ sources:
     token_storage: "keyring"                # 인증 토큰은 OS keyring에 저장 (x-auth 헤더로 전달)
     sync_interval_minutes: 30
 
+  git:
+    enabled: false
+    sync_interval_minutes: 60
+    file_size_limit_kb: 500                 # 이 크기 초과 파일 제외
+    supported_extensions:                   # 처리할 파일 확장자
+      - ".py"
+      - ".go"
+      - ".java"
+      - ".ts"
+      - ".js"
+      - ".tf"
+      - ".yaml"
+      - ".yml"
+      - ".proto"
+      - ".sql"
+
+    repositories: []
+    # repositories:                         # 수집 대상 레포지토리 목록
+    #   - url: ""                           # Git URL (예: "git@github.com:company/monorepo.git")
+    #     branch: "main"                    # 대상 브랜치
+    #     products:                         # 상품별 스코프 정의
+    #       product-name:
+    #         display_name: "상품 이름"
+    #         paths:                        # 포함할 경로 (glob 패턴)
+    #           - "services/product/**"
+    #         exclude:                      # 제외할 경로
+    #           - "**/*_test.go"
+    #           - "**/vendor/**"
+
+    categories:                             # 문서 카테고리 (상품별로 각 카테고리의 문서 생성)
+      architecture:
+        display_name: "아키텍처"
+        target_audience: "아키텍트, 시니어 개발자"
+        prompt: |
+          당신은 소프트웨어 아키텍트입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 아키텍처 문서를 작성하세요.
+          포함할 내용: 전체 구조, 핵심 컴포넌트, 데이터 흐름,
+          설계 패턴, 확장성 고려사항, 의존성 관계
+      development:
+        display_name: "개발 가이드"
+        target_audience: "개발자"
+        prompt: |
+          당신은 시니어 개발자입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 개발 가이드를 작성하세요.
+          포함할 내용: API 명세, 코드 구조, 핵심 함수/클래스 설명,
+          에러 처리 패턴, 로컬 개발 환경 설정, 테스트 방법
+      infrastructure:
+        display_name: "인프라 운영"
+        target_audience: "인프라 엔지니어, SRE"
+        prompt: |
+          당신은 DevOps/SRE 엔지니어입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 인프라 운영 문서를 작성하세요.
+          포함할 내용: 배포 구성, 리소스 명세, 모니터링 포인트,
+          스케일링 전략, 장애 대응 절차, 환경 변수/시크릿
+      pricing:
+        display_name: "과금 체계"
+        target_audience: "프라이싱팀, 사업팀"
+        prompt: |
+          당신은 프라이싱 전문가입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 과금 관련 정보를 정리하세요.
+          포함할 내용: 과금 단위, 비용 계산 로직, 리소스 사용량 측정,
+          할인/무료 구간, 빌링 주기
+      business:
+        display_name: "사업 요약"
+        target_audience: "사업팀, 영업팀, 경영진"
+        prompt: |
+          당신은 프로덕트 매니저입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 비기술적 요약을 작성하세요.
+          포함할 내용: 핵심 기능, 고객 가치, 사용 시나리오,
+          제약 사항, 경쟁사 대비 차별점 (코드에서 유추 가능한 부분)
+
+    processing:                             # 멀티에이전트 처리 설정 (D-027, D-029)
+      max_concurrent_workers: 10            # 동시 Worker Agent 수
+      max_files_per_worker: 30              # Worker당 최대 파일 수 (초과 시 분할)
+      min_files_per_worker: 3               # Worker당 최소 파일 수 (미만 시 상위와 병합)
+      # 에이전트별 모델 설정 (엔드포인트 방식, D-010/D-029)
+      # 미지정 시 상위 llm.endpoint/llm.model로 폴백
+      worker:                               # Level 1 파일 요약 (경량 모델)
+        endpoint: ""                        # 예: "http://haiku-server:8080/v1"
+        model: ""
+        api_key: ""
+      synthesizer:                          # Level 2 디렉토리 문서 (중간 모델)
+        endpoint: ""                        # 예: "http://sonnet-server:8080/v1"
+        model: ""
+        api_key: ""
+      orchestrator:                         # Level 3 카테고리 문서 (고성능 모델)
+        endpoint: ""                        # 예: "http://opus-server:8080/v1"
+        model: ""
+        api_key: ""
+
 processor:
   chunk_size: 512
   chunk_overlap: 50

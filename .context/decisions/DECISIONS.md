@@ -339,3 +339,53 @@
   - `ingestion/git_repository.py` (신규): Git repo clone/pull → 파일별 git_code 문서 저장 → 관련 파일 그룹핑 → LLM 문서 생성 → code_doc 저장 + document_sources 연결 기록.
   - `context_assembler.py`: code_doc chunk 반환 시 document_sources 조회하여 원본 코드 첨부 옵션.
 - **이유**: N:M 관계 지원으로 LLM이 여러 파일을 종합하여 하나의 문서를 생성하는 자연스러운 흐름을 정확히 추적 가능. 검색 시 code_doc → 원본 코드 역추적이 확실하여 환각 검증에 필수적.
+
+---
+
+## D-027: 멀티에이전트 기반 계층적 문서 생성
+
+- **일시**: 2026-04-02
+- **맥락**: 모노레포에 여러 상품의 코드가 혼재하며 코드량이 매우 많음. 단일 LLM으로 순차 처리 시 시간이 과다(파일 500개 × ~5초 = ~42분). 계층적 문서 생성(Level 1 파일 요약 → Level 2 디렉토리 문서 → Level 3 상품 문서)을 병렬화하여 처리 시간 단축 필요.
+- **결정**: 3계층 멀티에이전트 아키텍처 채택.
+  - **Coordinator Agent** (최상위): config 로드, 상품별 Product Agent 할당, 전체 진행 관리.
+  - **Product Agent** (상품별): 파일 수집, 디렉토리 그룹핑, Worker 할당, Category Agent 할당.
+  - **Worker Agent** (디렉토리별): Level 1 파일별 요약 + Level 2 디렉토리별 관점 중립 문서 생성. 모든 Category Agent가 이 결과를 공유.
+  - **Category Agent** (카테고리별): Level 2 결과를 받아 특정 관점(아키텍처, 개발, 인프라 등)으로 Level 3 종합 문서 생성.
+- **핵심 설계**: Worker는 관점 중립 사실 요약(1회 실행), Category Agent가 관점 부여(카테고리 수만큼 병렬 실행). 코드 분석 비용 중복 없음.
+- **상품 스코프 결정**: config에 상품별 paths/exclude를 정의. 최초에 LLM이 레포 디렉토리 트리를 분석하여 스코프를 제안하고, 사람이 검토 후 확정. 이후 완전 자동.
+- **Worker 단위**: 디렉토리 기반. 파일 30개 초과 시 서브디렉토리 분할, 3개 미만 시 상위와 병합.
+- **증분 처리**: `git diff`로 변경 파일 감지 → 해당 상품의 영향받는 디렉토리만 Worker 재실행 → Category Agent 재실행. 미변경 상품/디렉토리는 건드리지 않음.
+- **이유**: 병렬 처리로 ~42분 → ~2분 (속도 20배 향상, 비용 동일). 관점 중립 요약을 공유하여 Worker 비용 중복 방지. Coordinator → Product → Worker/Category 계층 구조로 확장성 확보.
+
+---
+
+## D-028: 상품 × 카테고리 매트릭스 문서 체계
+
+- **일시**: 2026-04-02
+- **맥락**: 같은 코드를 봐도 독자(아키텍트, 개발자, 인프라, 프라이싱, 사업)에 따라 필요한 문서가 다름. 상품 1개당 문서 1개가 아닌 상품 × 카테고리 매트릭스로 문서를 생성해야 함. 또한 팀마다 카테고리가 추가될 가능성이 있어 확장성 필요.
+- **결정**: 카테고리를 config의 프롬프트로만 정의하여 코드 변경 없이 자유롭게 추가/수정 가능하도록 설계.
+- **카테고리 정의 방식**: 각 카테고리는 `display_name`, `prompt` (LLM 지시), `target_audience`, `model` (엔드포인트 지정)로 구성. 카테고리 추가 시 config에 항목 1개 추가 + 프롬프트 작성만으로 전체 상품에 해당 관점 문서 자동 생성.
+- **기본 카테고리**: architecture(아키텍처), development(개발 가이드), infrastructure(인프라 운영), pricing(과금 체계), business(사업 요약).
+- **문서 저장 규칙**:
+  - `source_type = "git_code"`: 원본 코드 파일 (파일 단위)
+  - `source_type = "code_summary"`: Worker가 생성한 관점 중립 디렉토리 요약
+  - `source_type = "code_doc"`: Category Agent가 생성한 관점별 문서
+  - `source_id` 규칙: `"{product}:{category}"` (예: `"vpc:architecture"`, `"vpc:pricing"`)
+  - `document_sources` (D-026)로 code_doc ↔ git_code 연결 추적
+- **이유**: 카테고리를 프롬프트 기반으로 정의하면 새 팀이 추가되어도 코드 수정 없이 config만으로 대응 가능. 상품 × 카테고리 매트릭스는 조직의 다양한 역할을 커버하면서도 코드 분석(Worker)은 한 번만 수행하여 비용 효율적.
+
+---
+
+## D-029: 에이전트별 모델 계층화 — 엔드포인트 방식 통일
+
+- **일시**: 2026-04-02
+- **맥락**: D-027 멀티에이전트에서 각 에이전트의 역할별로 필요한 모델 성능이 다름. 파일 요약(Worker)은 경량 모델, 종합 문서(Category Agent)는 고성능 모델이 적합. 기존 시스템은 D-010에서 OpenAI 호환 엔드포인트 방식을 채택하여 자체 모델 서버를 사용 중. 모든 에이전트의 LLM 호출도 동일하게 엔드포인트 방식으로 통일해야 함.
+- **결정**: 에이전트별로 다른 엔드포인트/모델을 지정할 수 있는 모델 계층화 구조. 모든 LLM 호출은 OpenAI 호환 엔드포인트 방식(D-010)으로 통일.
+- **모델 배치**:
+  - Worker Agent (Level 1 파일 요약): 경량 모델 (Haiku급) — `worker_endpoint`
+  - Worker Agent (Level 2 디렉토리 문서): 중간 모델 (Sonnet급) — `synthesizer_endpoint`
+  - Category Agent (Level 3 카테고리 문서): 고성능 모델 (Opus급) — `orchestrator_endpoint`
+  - Coordinator (품질 검증): 중간 모델 (Sonnet급) — `synthesizer_endpoint`
+- **config 구조**: `sources.git.processing` 하위에 에이전트별 `endpoint`, `model`, `api_key` 지정. 미지정 시 기존 `llm.endpoint` 폴백.
+- **비용 예시** (파일 500개, 디렉토리 50개, 카테고리 5개, 상품 1개): Worker 500회(Haiku) + Synthesizer 50회(Sonnet) + Category 5회(Opus) + 검증 50회(Sonnet) → 모두 Opus 대비 80%+ 비용 절감.
+- **이유**: 작업 복잡도에 맞는 모델을 배치하여 비용 최적화. 엔드포인트 방식 통일로 기존 `llm_client.py`의 `EndpointLLMClient`를 그대로 재사용. 에이전트별 엔드포인트를 분리하면 Worker는 빠르고 저렴한 자체 서버, Category Agent는 고성능 서버로 분배 가능.

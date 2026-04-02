@@ -63,14 +63,18 @@
 - [ ] 8.1 패키징 및 사내 배포
 - [ ] 8.2 초기 설정 마법사 (대시보드 내)
 
-### Phase 9: 추가 컨텍스트 소스 — Git 코드 기반 컨텍스트 구축
+### Phase 9: 추가 컨텍스트 소스 — Git 코드 기반 멀티에이전트 문서 생성
 - [ ] 9.1 `document_sources` 테이블 추가 (code_doc ↔ git_code 연결, D-026)
-- [ ] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 파일 수집, 변경 감지
-- [ ] 9.3 코드 → LLM 문서 생성 파이프라인 (code_doc, D-025)
-- [ ] 9.4 원본 코드 파일 단위 저장 (git_code, D-025)
-- [ ] 9.5 code_doc ↔ git_code 연결 기록 및 검색 시 원본 코드 첨부
-- [ ] 9.6 GitHub webhook 기반 자동 동기화
-- [ ] 9.7 커밋 히스토리 / PR 리뷰 수집 및 컨텍스트화
+- [ ] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
+- [ ] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
+- [ ] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
+- [ ] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
+- [ ] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
+- [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
+- [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
+- [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
+- [ ] 9.10 GitHub webhook 기반 자동 동기화
+- [ ] 9.11 커밋 히스토리 / PR 리뷰 수집 및 컨텍스트화
 
 ### Phase 10 (후속): 추가 소스 확장
 - [ ] 10.1 Jira API 연동 — 티켓, 요구사항-코드 연결
@@ -79,8 +83,11 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-02
-- 내용: 추가 컨텍스트 소스 검토 완료. Git 코드 기반 컨텍스트 구축 방향 결정.
+- 내용: 멀티에이전트 기반 코드 컨텍스트 구축 설계 완료.
   - D-025: 코드→LLM 문서 생성 + 원본 코드 하이브리드 방식 채택
   - D-026: `document_sources` 연결 테이블로 code_doc ↔ git_code 추적
-  - Phase 9, 10 로드맵 수립
+  - D-027: 멀티에이전트 3계층 (Coordinator → Product/Worker → Category)
+  - D-028: 상품 × 카테고리 매트릭스 문서 체계 (config 프롬프트 기반 확장)
+  - D-029: 에이전트별 모델 계층화, 전체 엔드포인트 방식 통일
+  - Phase 9 상세 로드맵 수립
   - 세션 문서: `.context/sessions/2026-04-02_추가-컨텍스트-소스-검토.md`
