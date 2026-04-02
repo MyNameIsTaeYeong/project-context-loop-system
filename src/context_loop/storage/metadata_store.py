@@ -1,7 +1,7 @@
 """SQLite 메타데이터 저장소.
 
-documents, chunks, graph_nodes, graph_edges, processing_history
-테이블을 관리한다.
+documents, chunks, graph_nodes, graph_edges, processing_history,
+document_sources 테이블을 관리한다.
 """
 
 from __future__ import annotations
@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS processing_history (
     error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS document_sources (
+    doc_id        INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+    source_doc_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+    file_path     TEXT,
+    PRIMARY KEY (doc_id, source_doc_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type, source_id);
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
@@ -81,6 +88,8 @@ CREATE INDEX IF NOT EXISTS idx_graph_edges_document ON graph_edges(document_id);
 CREATE INDEX IF NOT EXISTS idx_graph_node_documents_node ON graph_node_documents(node_id);
 CREATE INDEX IF NOT EXISTS idx_graph_node_documents_document ON graph_node_documents(document_id);
 CREATE INDEX IF NOT EXISTS idx_processing_history_document ON processing_history(document_id);
+CREATE INDEX IF NOT EXISTS idx_document_sources_doc ON document_sources(doc_id);
+CREATE INDEX IF NOT EXISTS idx_document_sources_source ON document_sources(source_doc_id);
 """
 
 
@@ -457,6 +466,68 @@ class MetadataStore:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    # --- Document Sources ---
+
+    async def add_document_source(
+        self,
+        doc_id: int,
+        source_doc_id: int,
+        file_path: str | None = None,
+    ) -> None:
+        """문서 간 소스 연결을 추가한다 (code_doc ↔ git_code).
+
+        Args:
+            doc_id: LLM 생성 문서(code_doc) ID.
+            source_doc_id: 원본 코드 문서(git_code) ID.
+            file_path: 원본 코드의 파일 경로 (선택).
+        """
+        await self.db.execute(
+            "INSERT OR IGNORE INTO document_sources (doc_id, source_doc_id, file_path) VALUES (?, ?, ?)",
+            (doc_id, source_doc_id, file_path),
+        )
+        await self.db.commit()
+
+    async def get_document_sources(self, doc_id: int) -> list[dict[str, Any]]:
+        """문서의 소스 문서 목록을 조회한다 (code_doc → git_code 방향).
+
+        Returns:
+            소스 문서 정보 리스트. 각 항목은 source_doc_id, file_path,
+            그리고 소스 문서의 전체 컬럼을 포함한다.
+        """
+        cursor = await self.db.execute(
+            """SELECT ds.source_doc_id, ds.file_path, d.*
+               FROM document_sources ds
+               JOIN documents d ON ds.source_doc_id = d.id
+               WHERE ds.doc_id = ?""",
+            (doc_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_documents_by_source(self, source_doc_id: int) -> list[dict[str, Any]]:
+        """원본 코드를 참조하는 문서 목록을 조회한다 (git_code → code_doc 역방향).
+
+        Returns:
+            참조 문서 정보 리스트. 각 항목은 doc_id, file_path,
+            그리고 참조 문서의 전체 컬럼을 포함한다.
+        """
+        cursor = await self.db.execute(
+            """SELECT ds.doc_id, ds.file_path, d.*
+               FROM document_sources ds
+               JOIN documents d ON ds.doc_id = d.id
+               WHERE ds.source_doc_id = ?""",
+            (source_doc_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def delete_document_sources(self, doc_id: int) -> None:
+        """문서의 모든 소스 연결을 삭제한다."""
+        await self.db.execute(
+            "DELETE FROM document_sources WHERE doc_id = ?", (doc_id,)
+        )
+        await self.db.commit()
 
     # --- Statistics ---
 

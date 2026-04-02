@@ -156,6 +156,94 @@ async def test_processing_history(store: MetadataStore) -> None:
     assert history[0]["completed_at"] is not None
 
 
+async def test_document_sources_crud(store: MetadataStore) -> None:
+    """document_sources 테이블 CRUD 테스트."""
+    # code_doc 문서 생성
+    code_doc_id = await store.create_document(
+        source_type="code_doc",
+        title="VPC 아키텍처 문서",
+        original_content="# VPC\nVPC 관련 설명",
+        content_hash="cd1",
+        source_id="vpc:architecture",
+    )
+    # git_code 원본 코드 문서 생성
+    git1_id = await store.create_document(
+        source_type="git_code",
+        title="vpc.tf",
+        original_content='resource "aws_vpc" ...',
+        content_hash="g1",
+        source_id="vpc.tf",
+    )
+    git2_id = await store.create_document(
+        source_type="git_code",
+        title="subnets.tf",
+        original_content='resource "aws_subnet" ...',
+        content_hash="g2",
+        source_id="subnets.tf",
+    )
+
+    # 소스 연결 추가 (code_doc → git_code N:M)
+    await store.add_document_source(code_doc_id, git1_id, file_path="infra/vpc.tf")
+    await store.add_document_source(code_doc_id, git2_id, file_path="infra/subnets.tf")
+
+    # code_doc → git_code 조회
+    sources = await store.get_document_sources(code_doc_id)
+    assert len(sources) == 2
+    source_paths = {s["file_path"] for s in sources}
+    assert source_paths == {"infra/vpc.tf", "infra/subnets.tf"}
+
+    # git_code → code_doc 역방향 조회
+    referencing = await store.get_documents_by_source(git1_id)
+    assert len(referencing) == 1
+    assert referencing[0]["doc_id"] == code_doc_id
+
+    # 중복 INSERT 무시 (INSERT OR IGNORE)
+    await store.add_document_source(code_doc_id, git1_id, file_path="infra/vpc.tf")
+    sources = await store.get_document_sources(code_doc_id)
+    assert len(sources) == 2  # 여전히 2개
+
+    # 소스 연결 삭제
+    await store.delete_document_sources(code_doc_id)
+    sources = await store.get_document_sources(code_doc_id)
+    assert len(sources) == 0
+
+
+async def test_document_sources_cascade_on_delete(store: MetadataStore) -> None:
+    """문서 삭제 시 document_sources도 CASCADE 삭제되는지 확인."""
+    doc_id = await store.create_document(
+        source_type="code_doc", title="doc", original_content="x", content_hash="h1",
+    )
+    src_id = await store.create_document(
+        source_type="git_code", title="src", original_content="y", content_hash="h2",
+    )
+    await store.add_document_source(doc_id, src_id, file_path="main.py")
+
+    # doc_id 삭제 → document_sources에서 doc_id 행 CASCADE 삭제
+    await store.delete_document(doc_id)
+    sources = await store.get_document_sources(doc_id)
+    assert len(sources) == 0
+
+    # src_id 측에서도 역방향 조회 시 결과 없음
+    referencing = await store.get_documents_by_source(src_id)
+    assert len(referencing) == 0
+
+
+async def test_document_sources_cascade_on_source_delete(store: MetadataStore) -> None:
+    """소스 문서(git_code) 삭제 시 document_sources도 CASCADE 삭제되는지 확인."""
+    doc_id = await store.create_document(
+        source_type="code_doc", title="doc", original_content="x", content_hash="h1",
+    )
+    src_id = await store.create_document(
+        source_type="git_code", title="src", original_content="y", content_hash="h2",
+    )
+    await store.add_document_source(doc_id, src_id, file_path="main.py")
+
+    # source_doc_id 삭제 → CASCADE로 연결 제거
+    await store.delete_document(src_id)
+    sources = await store.get_document_sources(doc_id)
+    assert len(sources) == 0
+
+
 async def test_get_stats(store: MetadataStore) -> None:
     doc_id = await store.create_document(
         source_type="manual", title="문서", original_content="x", content_hash="h"
