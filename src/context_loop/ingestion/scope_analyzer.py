@@ -36,7 +36,12 @@ _SINGLE_PASS_THRESHOLD = 300
 _SYSTEM_PROMPT = """\
 당신은 소프트웨어 아키텍트입니다.
 Git 레포지토리의 디렉토리 트리를 분석하여 독립적인 상품(서비스/모듈) 단위를 식별하세요.
-각 상품에 대해 config에 넣을 수 있는 스코프 정보를 제안하세요."""
+각 상품에 대해 config에 넣을 수 있는 스코프 정보를 제안하세요.
+
+중요: "상품"은 비즈니스 기능 단위입니다. 아키텍처 레이어(controller, service, repository,
+model, domain, handler, route 등)는 상품이 아닙니다.
+레이어형 구조에서는 여러 레이어에 걸쳐 동일 이름으로 존재하는 하위 디렉토리가 하나의 상품입니다.
+예시: controller/vpc/, service/vpc/, repository/vpc/ → "vpc" 상품 (paths: controller/vpc/**, service/vpc/**, repository/vpc/**)"""
 
 _PASS1_PROMPT_TEMPLATE = """\
 다음은 Git 레포지토리의 상위 디렉토리 구조입니다:
@@ -65,7 +70,10 @@ _PASS1_PROMPT_TEMPLATE = """\
 - 공통 라이브러리(lib/, pkg/, common/)는 별도 영역으로 식별
 - 인프라 코드(terraform/, deploy/, infra/)는 별도 영역으로 식별
 - 최상위 디렉토리가 이미 상품 단위면 그대로 사용
-- 모노레포에서 services/ 하위 각 디렉토리가 상품이면 개별로 식별"""
+- 모노레포에서 services/ 하위 각 디렉토리가 상품이면 개별로 식별
+- **레이어형 구조 주의**: controller/, service/, repository/, handler/, route/, model/, domain/ 등은 아키텍처 레이어이지 상품이 아닙니다.
+  여러 레이어 디렉토리 하위에 동일 이름(예: vpc, billing)이 반복되면 그것이 상품입니다.
+  이 경우 root_path는 상품 이름(예: "vpc")으로 하고, 실제 경로는 여러 레이어에 걸칩니다."""
 
 _PASS2_PROMPT_TEMPLATE = """\
 다음은 "{area_name}" ({area_description}) 영역의 상세 디렉토리 구조입니다:
@@ -89,7 +97,8 @@ _PASS2_PROMPT_TEMPLATE = """\
 규칙:
 - paths는 이 영역의 코드만 포함하도록 구체적으로 지정
 - 테스트 파일(*_test.*, *_spec.*, test_*), vendor/node_modules 등은 exclude에 추가
-- 빌드 산출물, 설정 파일 등 코드가 아닌 것은 exclude에 추가"""
+- 빌드 산출물, 설정 파일 등 코드가 아닌 것은 exclude에 추가
+- 레이어형 구조(controller/, service/, repository/ 등)에 상품 코드가 분산되어 있으면 paths에 모든 레이어 경로를 포함 (예: ["controller/vpc/**", "service/vpc/**", "repository/vpc/**"])"""
 
 _SINGLE_PASS_PROMPT_TEMPLATE = """\
 다음은 Git 레포지토리의 디렉토리 트리입니다:
@@ -120,7 +129,11 @@ _SINGLE_PASS_PROMPT_TEMPLATE = """\
 - paths는 해당 상품의 코드만 포함하도록 최대한 구체적으로 지정하세요.
 - 공통 라이브러리(lib/, pkg/, common/ 등)는 별도 상품으로 분리하세요.
 - 인프라 코드(terraform/, deploy/, infra/ 등)가 있으면 별도 상품으로 분리하세요.
-- 상품 이름은 디렉토리 구조에서 자연스럽게 유추하세요."""
+- 상품 이름은 디렉토리 구조에서 자연스럽게 유추하세요.
+- **레이어형 구조 주의**: controller/, service/, repository/, handler/, route/, model/, domain/ 등 아키텍처 레이어는 상품이 아닙니다.
+  여러 레이어 하위에 동일 이름이 반복되면(예: controller/vpc/, service/vpc/) 그것이 상품입니다.
+  상품의 paths에는 관련된 모든 레이어 경로를 포함하세요.
+  예: "vpc" 상품 → paths: ["controller/vpc/**", "service/vpc/**", "repository/vpc/**"]"""
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +400,63 @@ async def _pass1_identify_areas(
     return _parse_areas(parsed)
 
 
+def _collect_subtrees(
+    clone_dir: Path,
+    area: _AreaInfo,
+    supported_extensions: list[str] | None,
+) -> tuple[str, str]:
+    """영역의 서브트리를 수집한다.
+
+    root_path가 직접 존재하면 해당 디렉토리의 서브트리를 반환하고,
+    존재하지 않으면 레이어형 구조로 판단하여 여러 레이어에서 상품명으로
+    매칭되는 서브디렉토리를 모아 반환한다.
+
+    Returns:
+        (subtree_text, effective_root_path) 튜플.
+        subtree_text가 빈 문자열이면 매칭 디렉토리를 찾지 못한 것.
+    """
+    subtree_root = clone_dir / area.root_path
+    if subtree_root.is_dir():
+        tree = build_directory_tree(
+            subtree_root,
+            supported_extensions=supported_extensions,
+            max_depth=4,
+            max_entries=300,
+        )
+        return tree, area.root_path
+
+    # 레이어형 구조: 최상위 디렉토리들에서 area.root_path(상품명)과
+    # 일치하는 하위 디렉토리를 찾는다.
+    product_name = Path(area.root_path).name
+    parts: list[str] = []
+    found_paths: list[str] = []
+    try:
+        top_dirs = sorted(
+            [d for d in clone_dir.iterdir() if d.is_dir() and not d.name.startswith(".")],
+            key=lambda p: p.name,
+        )
+    except PermissionError:
+        return "", area.root_path
+
+    for top_dir in top_dirs:
+        candidate = top_dir / product_name
+        if candidate.is_dir():
+            rel = f"{top_dir.name}/{product_name}"
+            tree = build_directory_tree(
+                candidate,
+                supported_extensions=supported_extensions,
+                max_depth=3,
+                max_entries=100,
+            )
+            parts.append(f"[{rel}]\n{tree}")
+            found_paths.append(rel)
+
+    if not parts:
+        return "", area.root_path
+
+    return "\n\n".join(parts), ", ".join(found_paths)
+
+
 async def _pass2_refine_area(
     clone_dir: Path,
     area: _AreaInfo,
@@ -394,28 +464,22 @@ async def _pass2_refine_area(
     supported_extensions: list[str] | None,
 ) -> ProductScopeProposal:
     """Pass 2: 단일 영역의 상세 서브트리를 분석하여 스코프를 확정한다."""
-    subtree_root = clone_dir / area.root_path
-    if not subtree_root.is_dir():
-        # 경로가 유효하지 않으면 기본 glob 패턴으로 폴백
-        logger.warning("영역 경로가 존재하지 않음: %s, 기본 패턴 사용", area.root_path)
+    subtree, effective_root = _collect_subtrees(
+        clone_dir, area, supported_extensions,
+    )
+    if not subtree:
+        logger.warning("영역 경로를 찾지 못함: %s, 기본 패턴 사용", area.root_path)
         return ProductScopeProposal(
             name=area.name,
             display_name=area.display_name,
             description=area.description,
             paths=[f"{area.root_path}/**"],
         )
-
-    subtree = build_directory_tree(
-        subtree_root,
-        supported_extensions=supported_extensions,
-        max_depth=4,
-        max_entries=300,
-    )
     prompt = _PASS2_PROMPT_TEMPLATE.format(
         area_name=area.name,
         area_display_name=area.display_name,
         area_description=area.description,
-        root_path=area.root_path,
+        root_path=effective_root,
         subtree=subtree,
     )
     raw_response = await llm_client.complete(

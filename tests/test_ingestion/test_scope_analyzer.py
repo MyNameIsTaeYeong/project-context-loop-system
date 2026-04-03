@@ -12,6 +12,7 @@ from context_loop.ingestion.scope_analyzer import (
     ProductScopeProposal,
     ScopeAnalysisResult,
     _AreaInfo,
+    _collect_subtrees,
     _parse_areas,
     _parse_proposals,
     _parse_single_proposal,
@@ -566,3 +567,140 @@ class TestAnalyzeTwoPass:
         assert len(result.products) == 1
         assert result.products[0].name == "svc"
         assert result.products[0].paths == ["services/**"]
+
+
+# --- Tests: _collect_subtrees (레이어형 구조) ---
+
+
+class TestCollectSubtrees:
+    def test_direct_path_exists(self, tmp_path: Path) -> None:
+        """root_path가 직접 존재하면 해당 디렉토리 서브트리 반환."""
+        (tmp_path / "services" / "vpc").mkdir(parents=True)
+        (tmp_path / "services" / "vpc" / "main.go").write_text("package main")
+
+        area = _AreaInfo("vpc", "VPC", "VPC 관리", "services/vpc")
+        subtree, root = _collect_subtrees(tmp_path, area, None)
+
+        assert "main.go" in subtree
+        assert root == "services/vpc"
+
+    def test_layered_structure(self, tmp_path: Path) -> None:
+        """레이어형 구조에서 여러 레이어의 상품 서브트리를 수집."""
+        for layer in ("controller", "service", "repository"):
+            d = tmp_path / layer / "vpc"
+            d.mkdir(parents=True)
+            (d / f"{layer}_vpc.go").write_text("package vpc")
+
+        # root_path="vpc" → 직접 경로 없음 → 레이어 탐색
+        area = _AreaInfo("vpc", "VPC", "VPC 관리", "vpc")
+        subtree, root = _collect_subtrees(tmp_path, area, None)
+
+        # 3개 레이어 모두 포함
+        assert "[controller/vpc]" in subtree
+        assert "[service/vpc]" in subtree
+        assert "[repository/vpc]" in subtree
+        assert "controller_vpc.go" in subtree
+        assert "service_vpc.go" in subtree
+        assert "repository_vpc.go" in subtree
+        # effective_root에 모든 레이어 경로 포함
+        assert "controller/vpc" in root
+        assert "service/vpc" in root
+        assert "repository/vpc" in root
+
+    def test_layered_partial_match(self, tmp_path: Path) -> None:
+        """일부 레이어에만 상품이 존재하는 경우."""
+        (tmp_path / "controller" / "billing").mkdir(parents=True)
+        (tmp_path / "controller" / "billing" / "api.go").write_text("package billing")
+        (tmp_path / "service" / "billing").mkdir(parents=True)
+        (tmp_path / "service" / "billing" / "logic.go").write_text("package billing")
+        # repository/billing은 없음
+
+        area = _AreaInfo("billing", "과금", "과금 서비스", "billing")
+        subtree, root = _collect_subtrees(tmp_path, area, None)
+
+        assert "[controller/billing]" in subtree
+        assert "[service/billing]" in subtree
+        assert "repository/billing" not in subtree
+
+    def test_no_match_returns_empty(self, tmp_path: Path) -> None:
+        """어떤 레이어에서도 상품을 찾지 못하면 빈 문자열 반환."""
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+
+        area = _AreaInfo("nonexistent", "없는 상품", "없음", "nonexistent")
+        subtree, root = _collect_subtrees(tmp_path, area, None)
+
+        assert subtree == ""
+
+
+class TestLayeredTwoPass:
+    """레이어형 구조에서 2-pass 전체 흐름 테스트."""
+
+    def _make_layered_repo(self, tmp_path: Path) -> Path:
+        """레이어형 대규모 레포 생성 (>300줄)."""
+        layers = ("controller", "service", "repository", "model")
+        products = [f"product{i:02d}" for i in range(20)]
+        for layer in layers:
+            for product in products:
+                d = tmp_path / layer / product
+                d.mkdir(parents=True)
+                for j in range(4):
+                    (d / f"file{j}.go").write_text(f"package {product}")
+        return tmp_path
+
+    async def test_layered_two_pass(self, tmp_path: Path) -> None:
+        """레이어형 구조에서 상품 단위로 올바르게 식별."""
+        repo = self._make_layered_repo(tmp_path)
+
+        # Pass 1: LLM이 상품 영역을 식별 (레이어가 아닌 상품 이름)
+        pass1_response = json.dumps({
+            "areas": [
+                {
+                    "name": "product00",
+                    "display_name": "상품 00",
+                    "description": "상품 00 설명",
+                    "root_path": "product00",
+                },
+                {
+                    "name": "product01",
+                    "display_name": "상품 01",
+                    "description": "상품 01 설명",
+                    "root_path": "product01",
+                },
+            ]
+        })
+
+        # Pass 2: 각 상품의 스코프
+        pass2_p00 = json.dumps({
+            "name": "product00",
+            "display_name": "상품 00",
+            "description": "상품 00",
+            "paths": [
+                "controller/product00/**",
+                "service/product00/**",
+                "repository/product00/**",
+                "model/product00/**",
+            ],
+            "exclude": ["**/*_test.go"],
+        })
+        pass2_p01 = json.dumps({
+            "name": "product01",
+            "display_name": "상품 01",
+            "description": "상품 01",
+            "paths": [
+                "controller/product01/**",
+                "service/product01/**",
+                "repository/product01/**",
+                "model/product01/**",
+            ],
+        })
+
+        mock_llm = MockLLMClient([pass1_response, pass2_p00, pass2_p01])
+        result = await analyze_repository_scope(repo, mock_llm)
+
+        assert mock_llm.call_count == 3
+        assert len(result.products) == 2
+
+        p00 = next(p for p in result.products if p.name == "product00")
+        assert "controller/product00/**" in p00.paths
+        assert "service/product00/**" in p00.paths
+        assert len(p00.paths) == 4
