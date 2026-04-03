@@ -13,6 +13,7 @@ from context_loop.ingestion.scope_analyzer import (
     ScopeAnalysisResult,
     _AreaInfo,
     _collect_subtrees,
+    _detect_layered_products,
     _parse_areas,
     _parse_proposals,
     _parse_single_proposal,
@@ -632,8 +633,63 @@ class TestCollectSubtrees:
         assert subtree == ""
 
 
+# --- Tests: _detect_layered_products ---
+
+
+class TestDetectLayeredProducts:
+    def test_detect_layered(self, tmp_path: Path) -> None:
+        """레이어형 구조를 올바르게 감지."""
+        for layer in ("controller", "service", "repository"):
+            for product in ("vpc", "billing"):
+                (tmp_path / layer / product).mkdir(parents=True)
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert names == {"vpc", "billing"}
+
+    def test_not_layered_single_layer(self, tmp_path: Path) -> None:
+        """레이어가 1개뿐이면 레이어형이 아님."""
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+        (tmp_path / "lib").mkdir()
+
+        result = _detect_layered_products(tmp_path)
+        assert result is None
+
+    def test_not_layered_no_common_children(self, tmp_path: Path) -> None:
+        """공통 서브디렉토리가 없으면 레이어형이 아님."""
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+        (tmp_path / "service" / "billing").mkdir(parents=True)
+
+        result = _detect_layered_products(tmp_path)
+        assert result is None
+
+    def test_requires_two_layer_overlap(self, tmp_path: Path) -> None:
+        """2개 이상의 레이어에 공통 존재하는 것만 상품으로 식별."""
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+        (tmp_path / "service" / "vpc").mkdir(parents=True)
+        (tmp_path / "controller" / "only-here").mkdir(parents=True)
+        # only-here는 1개 레이어에만 존재 → 상품 아님
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert names == {"vpc"}
+        assert "only-here" not in names
+
+    def test_ignores_hidden_dirs(self, tmp_path: Path) -> None:
+        """숨김 디렉토리(.git 등)는 레이어로 취급하지 않음."""
+        (tmp_path / ".git" / "objects").mkdir(parents=True)
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+        (tmp_path / "service" / "vpc").mkdir(parents=True)
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        # .git은 무시하고 정상 감지
+
+
 class TestLayeredTwoPass:
-    """레이어형 구조에서 2-pass 전체 흐름 테스트."""
+    """레이어형 구조에서 전체 흐름 테스트 — Pass 1 건너뛰기 포함."""
 
     def _make_layered_repo(self, tmp_path: Path) -> Path:
         """레이어형 대규모 레포 생성 (>300줄)."""
@@ -647,30 +703,13 @@ class TestLayeredTwoPass:
                     (d / f"file{j}.go").write_text(f"package {product}")
         return tmp_path
 
-    async def test_layered_two_pass(self, tmp_path: Path) -> None:
-        """레이어형 구조에서 상품 단위로 올바르게 식별."""
+    async def test_layered_skips_pass1(self, tmp_path: Path) -> None:
+        """레이어형 구조 감지 시 Pass 1(LLM)을 건너뛰고 Pass 2만 실행."""
         repo = self._make_layered_repo(tmp_path)
 
-        # Pass 1: LLM이 상품 영역을 식별 (레이어가 아닌 상품 이름)
-        pass1_response = json.dumps({
-            "areas": [
-                {
-                    "name": "product00",
-                    "display_name": "상품 00",
-                    "description": "상품 00 설명",
-                    "root_path": "product00",
-                },
-                {
-                    "name": "product01",
-                    "display_name": "상품 01",
-                    "description": "상품 01 설명",
-                    "root_path": "product01",
-                },
-            ]
-        })
-
-        # Pass 2: 각 상품의 스코프
-        pass2_p00 = json.dumps({
+        # Pass 2 응답만 필요 (20개 상품 × 1개씩)
+        # 처음 2개만 제대로 응답, 나머지는 동일 응답 재사용
+        pass2_response = json.dumps({
             "name": "product00",
             "display_name": "상품 00",
             "description": "상품 00",
@@ -682,25 +721,28 @@ class TestLayeredTwoPass:
             ],
             "exclude": ["**/*_test.go"],
         })
-        pass2_p01 = json.dumps({
-            "name": "product01",
-            "display_name": "상품 01",
-            "description": "상품 01",
-            "paths": [
-                "controller/product01/**",
-                "service/product01/**",
-                "repository/product01/**",
-                "model/product01/**",
-            ],
-        })
 
-        mock_llm = MockLLMClient([pass1_response, pass2_p00, pass2_p01])
+        mock_llm = MockLLMClient(pass2_response)  # 모든 호출에 동일 응답
         result = await analyze_repository_scope(repo, mock_llm)
 
-        assert mock_llm.call_count == 3
-        assert len(result.products) == 2
+        # Pass 1이 없으므로 LLM 호출은 Pass 2(상품 수)만큼만
+        assert mock_llm.call_count == 20  # 20개 상품
+        assert len(result.products) == 20
 
-        p00 = next(p for p in result.products if p.name == "product00")
-        assert "controller/product00/**" in p00.paths
-        assert "service/product00/**" in p00.paths
-        assert len(p00.paths) == 4
+    async def test_layered_subtree_in_prompt(self, tmp_path: Path) -> None:
+        """Pass 2 프롬프트에 여러 레이어의 서브트리가 포함되는지 확인."""
+        repo = self._make_layered_repo(tmp_path)
+
+        pass2_response = json.dumps({
+            "name": "product00",
+            "paths": ["controller/product00/**", "service/product00/**"],
+        })
+        mock_llm = MockLLMClient(pass2_response)
+        await analyze_repository_scope(repo, mock_llm)
+
+        # 첫 번째 상품(product00)의 Pass 2 프롬프트에 레이어별 서브트리가 포함
+        first_prompt = mock_llm.prompts[0]
+        assert "[controller/product00]" in first_prompt
+        assert "[service/product00]" in first_prompt
+        assert "[repository/product00]" in first_prompt
+        assert "[model/product00]" in first_prompt

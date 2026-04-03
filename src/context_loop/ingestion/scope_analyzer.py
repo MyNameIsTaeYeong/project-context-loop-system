@@ -198,6 +198,101 @@ class _AreaInfo:
 
 
 # ---------------------------------------------------------------------------
+# Layer pattern detection (코드 레벨 레이어 구조 감지)
+# ---------------------------------------------------------------------------
+
+# 일반적인 아키텍처 레이어 디렉토리 이름
+_KNOWN_LAYER_NAMES = frozenset({
+    "controller", "controllers",
+    "service", "services",
+    "repository", "repositories",
+    "model", "models",
+    "domain", "domains",
+    "handler", "handlers",
+    "route", "routes",
+    "middleware", "middlewares",
+    "view", "views",
+    "dto", "dtos",
+    "entity", "entities",
+    "adapter", "adapters",
+    "port", "ports",
+    "usecase", "usecases",
+    "api",
+    "dao",
+    "mapper", "mappers",
+    "grpc",
+    "rest",
+    "graphql",
+})
+
+
+def _detect_layered_products(clone_dir: Path) -> list[_AreaInfo] | None:
+    """레이어형 디렉토리 구조에서 상품 목록을 코드 레벨로 추출한다.
+
+    최상위 디렉토리가 아키텍처 레이어이고, 그 하위에 동일 이름의
+    서브디렉토리가 2개 이상의 레이어에 걸쳐 존재하면 레이어형으로 판단한다.
+
+    Returns:
+        레이어형이면 _AreaInfo 리스트, 아니면 None.
+    """
+    try:
+        top_dirs = [
+            d for d in clone_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+            and d.name not in {"node_modules", "vendor", "__pycache__", ".venv", "venv"}
+        ]
+    except PermissionError:
+        return None
+
+    # 최상위 디렉토리 중 레이어 이름인 것을 식별
+    layer_dirs = [d for d in top_dirs if d.name.lower() in _KNOWN_LAYER_NAMES]
+
+    if len(layer_dirs) < 2:
+        return None  # 레이어가 2개 미만이면 레이어형이 아님
+
+    # 각 레이어의 하위 디렉토리 이름 수집
+    layer_children: dict[str, set[str]] = {}
+    for ld in layer_dirs:
+        try:
+            children = {
+                c.name for c in ld.iterdir()
+                if c.is_dir() and not c.name.startswith(".")
+            }
+        except PermissionError:
+            children = set()
+        layer_children[ld.name] = children
+
+    # 2개 이상의 레이어에 공통으로 존재하는 서브디렉토리 = 상품
+    all_children: set[str] = set()
+    for children in layer_children.values():
+        all_children |= children
+
+    products: list[str] = []
+    for child in sorted(all_children):
+        count = sum(1 for children in layer_children.values() if child in children)
+        if count >= 2:
+            products.append(child)
+
+    if not products:
+        return None
+
+    logger.info(
+        "레이어형 구조 감지: 레이어=%s, 상품=%d개",
+        [d.name for d in layer_dirs], len(products),
+    )
+
+    return [
+        _AreaInfo(
+            name=product,
+            display_name=product,
+            description=f"레이어형 구조에서 감지된 상품 ({product})",
+            root_path=product,  # 실제 경로가 아닌 상품명 → _collect_subtrees가 처리
+        )
+        for product in products
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Tree building
 # ---------------------------------------------------------------------------
 
@@ -498,16 +593,20 @@ async def _analyze_two_pass(
 ) -> list[ProductScopeProposal]:
     """대규모 레포: 2-pass 분석.
 
-    Pass 1: 얕은 트리 → 영역 식별 (1회 호출)
-    Pass 2: 영역별 서브트리 → 스코프 확정 (영역 수만큼 병렬 호출)
+    레이어형 구조가 감지되면 Pass 1(LLM)을 건너뛰고 코드 레벨로 영역을 추출한다.
+    그 외에는 Pass 1(얕은 트리 → LLM) → Pass 2(영역별 서브트리 → LLM).
     """
-    # Pass 1
-    areas = await _pass1_identify_areas(clone_dir, llm_client, supported_extensions)
-    if not areas:
-        logger.warning("Pass 1에서 상품 영역을 식별하지 못했습니다.")
-        return []
-
-    logger.info("Pass 1 완료: %d개 영역 식별", len(areas))
+    # 레이어형 구조 감지 시도 (LLM 없이)
+    areas = _detect_layered_products(clone_dir)
+    if areas:
+        logger.info("레이어형 구조 감지: %d개 상품, Pass 1 건너뜀", len(areas))
+    else:
+        # Pass 1: LLM으로 영역 식별
+        areas = await _pass1_identify_areas(clone_dir, llm_client, supported_extensions)
+        if not areas:
+            logger.warning("Pass 1에서 상품 영역을 식별하지 못했습니다.")
+            return []
+        logger.info("Pass 1 완료: %d개 영역 식별", len(areas))
 
     # Pass 2 — 병렬 실행 (세마포어로 동시성 제한)
     semaphore = asyncio.Semaphore(max_concurrent)
