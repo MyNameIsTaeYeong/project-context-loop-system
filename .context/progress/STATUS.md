@@ -83,11 +83,14 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-03
-- 내용: Phase 9.4+ — `ingestion/scope_analyzer.py` 추가 (D-027 스코프 자동 제안).
-  - `build_directory_tree()`: 레포 디렉토리 트리 추출 (depth/entries 제한, 불필요 디렉토리 제외)
-  - `analyze_repository_scope()`: LLM에 트리 전달 → 상품 스코프 제안 (name, paths, exclude)
-  - `ScopeAnalysisResult.to_config_dict()`: config.yaml products 섹션으로 변환
-  - 테스트 18개 — 전체 통과
+- 내용: Phase 9.4+ — `ingestion/scope_analyzer.py` 2-pass 분석으로 리팩토링.
+  - 대규모 레포 타임아웃 해결: 단일 LLM 호출 → 2-pass 분할 호출
+  - Pass 1: 얕은 트리(depth 2, directories_only) → 상품 영역 식별 (`_pass1_identify_areas`)
+  - Pass 2: 영역별 서브트리(depth 4, max 300) → 병렬 LLM 호출로 스코프 확정 (`_pass2_refine_area`)
+  - 소규모 레포(≤300줄)는 기존처럼 단일 호출 (`_analyze_single_pass`)
+  - 새 파싱 함수: `_parse_areas()`, `_parse_single_proposal()`
+  - 오류 폴백: Pass 2 실패 시 기본 glob 패턴으로 자동 복구
+  - 테스트 32개 — 전체 통과 (기존 27 + 2-pass 5개 추가)
 - 이전: Phase 9.4 — `ingestion/coordinator.py` 구현 완료 (D-027).
   - `CoordinatorAgent`: 전체 파이프라인 조율 (config 검증 → git sync → 상품별 분류 → Worker/Category 디스패치)
   - `WorkerAgent`/`CategoryAgentProtocol`: Protocol 기반 인터페이스 (Phase 9.5/9.6에서 LLM 구현)

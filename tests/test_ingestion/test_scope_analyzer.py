@@ -1,4 +1,4 @@
-"""스코프 분석기 테스트."""
+"""스코프 분석기 테스트 — 2-pass 대규모 레포 지원 포함."""
 
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ import pytest
 from context_loop.ingestion.scope_analyzer import (
     ProductScopeProposal,
     ScopeAnalysisResult,
+    _AreaInfo,
+    _parse_areas,
     _parse_proposals,
+    _parse_single_proposal,
+    _SINGLE_PASS_THRESHOLD,
     analyze_repository_scope,
     build_directory_tree,
 )
@@ -24,9 +28,15 @@ from context_loop.processor.llm_client import LLMClient
 class MockLLMClient(LLMClient):
     """LLM 응답을 미리 지정하는 목 클라이언트."""
 
-    def __init__(self, response: str) -> None:
-        self._response = response
+    def __init__(self, response: str | list[str]) -> None:
+        # list이면 호출 순서대로 다른 응답 반환
+        if isinstance(response, list):
+            self._responses = response
+        else:
+            self._responses = [response]
+        self._response_index = 0
         self.last_prompt: str = ""
+        self.prompts: list[str] = []
         self.call_count: int = 0
 
     async def complete(
@@ -39,8 +49,11 @@ class MockLLMClient(LLMClient):
         **kwargs: Any,
     ) -> str:
         self.last_prompt = prompt
+        self.prompts.append(prompt)
         self.call_count += 1
-        return self._response
+        idx = min(self._response_index, len(self._responses) - 1)
+        self._response_index += 1
+        return self._responses[idx]
 
 
 # --- Tests: build_directory_tree ---
@@ -195,6 +208,91 @@ class TestParseProposals:
             _parse_proposals("not a dict or list")
 
 
+# --- Tests: _parse_areas (2-pass) ---
+
+
+class TestParseAreas:
+    def test_parse_areas_dict(self) -> None:
+        raw = {
+            "areas": [
+                {
+                    "name": "vpc",
+                    "display_name": "VPC 서비스",
+                    "description": "VPC 관리",
+                    "root_path": "services/vpc",
+                },
+                {
+                    "name": "billing",
+                    "display_name": "과금",
+                    "description": "과금 처리",
+                    "root_path": "services/billing",
+                },
+            ]
+        }
+        areas = _parse_areas(raw)
+        assert len(areas) == 2
+        assert areas[0].name == "vpc"
+        assert areas[0].root_path == "services/vpc"
+        assert areas[1].display_name == "과금"
+
+    def test_parse_areas_list(self) -> None:
+        raw = [
+            {"name": "app", "root_path": "src", "display_name": "App", "description": ""},
+        ]
+        areas = _parse_areas(raw)
+        assert len(areas) == 1
+        assert areas[0].name == "app"
+
+    def test_skip_missing_name_or_root(self) -> None:
+        raw = {
+            "areas": [
+                {"name": "valid", "root_path": "a"},
+                {"name": "no-root"},           # root_path 없음
+                {"root_path": "no-name"},      # name 없음
+                "not-a-dict",
+            ]
+        }
+        areas = _parse_areas(raw)
+        assert len(areas) == 1
+        assert areas[0].name == "valid"
+
+    def test_invalid_format_raises(self) -> None:
+        with pytest.raises(ValueError, match="예상하지 못한 JSON"):
+            _parse_areas("not a dict or list")
+
+
+# --- Tests: _parse_single_proposal (Pass 2) ---
+
+
+class TestParseSingleProposal:
+    def test_parse_full(self) -> None:
+        raw = {
+            "name": "vpc",
+            "display_name": "VPC 서비스",
+            "description": "VPC 관리",
+            "paths": ["services/vpc/**"],
+            "exclude": ["**/*_test.go"],
+        }
+        fallback = _AreaInfo("vpc", "VPC", "desc", "services/vpc")
+        proposal = _parse_single_proposal(raw, fallback)
+        assert proposal.name == "vpc"
+        assert proposal.paths == ["services/vpc/**"]
+        assert proposal.exclude == ["**/*_test.go"]
+
+    def test_fallback_values(self) -> None:
+        raw = {}  # 모든 필드 누락
+        fallback = _AreaInfo("myapp", "My App", "desc", "src/myapp")
+        proposal = _parse_single_proposal(raw, fallback)
+        assert proposal.name == "myapp"
+        assert proposal.display_name == "My App"
+        assert proposal.paths == ["src/myapp/**"]
+
+    def test_invalid_format_raises(self) -> None:
+        fallback = _AreaInfo("x", "X", "", "x")
+        with pytest.raises(ValueError, match="예상하지 못한 JSON"):
+            _parse_single_proposal("not a dict", fallback)
+
+
 # --- Tests: ProductScopeProposal ---
 
 
@@ -250,7 +348,7 @@ class TestScopeAnalysisResult:
         assert "1개 상품" in summary
 
 
-# --- Tests: analyze_repository_scope (integration with mock LLM) ---
+# --- Tests: analyze_repository_scope (single-pass, small repo) ---
 
 
 class TestAnalyzeRepositoryScope:
@@ -292,10 +390,9 @@ class TestAnalyzeRepositoryScope:
 
         result = await analyze_repository_scope(tmp_path, mock_llm)
 
-        # LLM 호출 확인
+        # 소규모 → 단일 호출
         assert mock_llm.call_count == 1
         assert "services/" in mock_llm.last_prompt
-        assert "vpc/" in mock_llm.last_prompt
 
         # 결과 확인
         assert len(result.products) == 3
@@ -332,3 +429,140 @@ class TestAnalyzeRepositoryScope:
         # 트리에 .go만 포함
         assert "main.go" in result.raw_tree
         assert "readme.md" not in result.raw_tree
+
+
+# --- Tests: analyze_repository_scope (two-pass, large repo) ---
+
+
+class TestAnalyzeTwoPass:
+    def _make_large_repo(self, tmp_path: Path) -> Path:
+        """_SINGLE_PASS_THRESHOLD 줄을 초과하는 대규모 레포 생성."""
+        # 60 dirs × 6 lines each = 360+ lines → 2-pass 트리거
+        for i in range(60):
+            svc_dir = tmp_path / "services" / f"svc{i:02d}"
+            svc_dir.mkdir(parents=True)
+            for j in range(5):
+                (svc_dir / f"file{j}.go").write_text(f"package svc{i}")
+        (tmp_path / "infra" / "terraform").mkdir(parents=True)
+        for k in range(10):
+            (tmp_path / "infra" / "terraform" / f"mod{k}.tf").write_text("resource {}")
+        return tmp_path
+
+    async def test_two_pass_triggered(self, tmp_path: Path) -> None:
+        """대규모 레포에서 2-pass 분석이 트리거되는지 확인."""
+        repo = self._make_large_repo(tmp_path)
+
+        # Pass 1 응답: 2개 영역 식별
+        pass1_response = json.dumps({
+            "areas": [
+                {
+                    "name": "services",
+                    "display_name": "서비스",
+                    "description": "마이크로서비스 모음",
+                    "root_path": "services",
+                },
+                {
+                    "name": "infra",
+                    "display_name": "인프라",
+                    "description": "Terraform 코드",
+                    "root_path": "infra",
+                },
+            ]
+        })
+
+        # Pass 2 응답: 각 영역별 스코프
+        pass2_services = json.dumps({
+            "name": "services",
+            "display_name": "서비스",
+            "description": "마이크로서비스 모음",
+            "paths": ["services/**"],
+            "exclude": ["**/*_test.go"],
+        })
+        pass2_infra = json.dumps({
+            "name": "infra",
+            "display_name": "인프라",
+            "description": "Terraform 코드",
+            "paths": ["infra/**"],
+        })
+
+        mock_llm = MockLLMClient([pass1_response, pass2_services, pass2_infra])
+        result = await analyze_repository_scope(repo, mock_llm)
+
+        # 1(pass1) + 2(pass2 per area) = 3 호출
+        assert mock_llm.call_count == 3
+        assert len(result.products) == 2
+
+        names = {p.name for p in result.products}
+        assert names == {"services", "infra"}
+
+        # raw_llm_response는 multi-pass 표시
+        assert "multi-pass" in result.raw_llm_response
+
+    async def test_two_pass_area_not_found_fallback(self, tmp_path: Path) -> None:
+        """Pass 1에서 식별된 경로가 존재하지 않으면 기본 glob 패턴으로 폴백."""
+        repo = self._make_large_repo(tmp_path)
+
+        pass1_response = json.dumps({
+            "areas": [
+                {
+                    "name": "nonexistent",
+                    "display_name": "없는 디렉토리",
+                    "description": "존재하지 않는 경로",
+                    "root_path": "does/not/exist",
+                },
+            ]
+        })
+
+        mock_llm = MockLLMClient([pass1_response])
+        result = await analyze_repository_scope(repo, mock_llm)
+
+        # Pass 2 LLM 호출 없이 폴백 (Pass 1만 1회)
+        assert mock_llm.call_count == 1
+        assert len(result.products) == 1
+        assert result.products[0].name == "nonexistent"
+        assert result.products[0].paths == ["does/not/exist/**"]
+
+    async def test_two_pass_no_areas_returns_empty(self, tmp_path: Path) -> None:
+        """Pass 1에서 영역을 식별하지 못하면 빈 결과 반환."""
+        repo = self._make_large_repo(tmp_path)
+
+        pass1_response = json.dumps({"areas": []})
+        mock_llm = MockLLMClient([pass1_response])
+
+        result = await analyze_repository_scope(repo, mock_llm)
+        assert len(result.products) == 0
+        assert mock_llm.call_count == 1
+
+    async def test_small_repo_uses_single_pass(self, tmp_path: Path) -> None:
+        """소규모 레포(<= 300줄)는 단일 호출로 분석."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("pass")
+
+        response = json.dumps({"products": [{"name": "app", "paths": ["src/**"]}]})
+        mock_llm = MockLLMClient(response)
+
+        result = await analyze_repository_scope(tmp_path, mock_llm)
+        assert mock_llm.call_count == 1
+        assert len(result.products) == 1
+        # single-pass면 raw_llm_response가 빈 문자열
+        assert result.raw_llm_response == ""
+
+    async def test_two_pass_pass2_error_fallback(self, tmp_path: Path) -> None:
+        """Pass 2에서 LLM 오류 시 기본 패턴으로 폴백."""
+        repo = self._make_large_repo(tmp_path)
+
+        pass1_response = json.dumps({
+            "areas": [
+                {"name": "svc", "display_name": "서비스", "description": "서비스", "root_path": "services"},
+            ]
+        })
+        # Pass 2 응답: 잘못된 JSON → extract_json 실패
+        pass2_bad = "이것은 JSON이 아닙니다. 그냥 텍스트입니다."
+
+        mock_llm = MockLLMClient([pass1_response, pass2_bad])
+        result = await analyze_repository_scope(repo, mock_llm)
+
+        # 오류 시에도 폴백 proposal이 생성됨
+        assert len(result.products) == 1
+        assert result.products[0].name == "svc"
+        assert result.products[0].paths == ["services/**"]
