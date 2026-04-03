@@ -354,6 +354,7 @@ async def _analyze_single_pass(
     prompt = _SINGLE_PASS_PROMPT_TEMPLATE.format(tree=tree)
     raw_response = await llm_client.complete(
         prompt, system=_SYSTEM_PROMPT, max_tokens=4096, temperature=0.0,
+        extra_body={"enable_thinking": False},
     )
     parsed = extract_json(raw_response)
     return _parse_proposals(parsed)
@@ -380,6 +381,7 @@ async def _pass1_identify_areas(
     prompt = _PASS1_PROMPT_TEMPLATE.format(tree=shallow_tree)
     raw_response = await llm_client.complete(
         prompt, system=_SYSTEM_PROMPT, max_tokens=2048, temperature=0.0,
+        extra_body={"enable_thinking": False},
     )
     parsed = extract_json(raw_response)
     return _parse_areas(parsed)
@@ -418,6 +420,7 @@ async def _pass2_refine_area(
     )
     raw_response = await llm_client.complete(
         prompt, system=_SYSTEM_PROMPT, max_tokens=1024, temperature=0.0,
+        extra_body={"enable_thinking": False},
     )
     parsed = extract_json(raw_response)
     return _parse_single_proposal(parsed, area)

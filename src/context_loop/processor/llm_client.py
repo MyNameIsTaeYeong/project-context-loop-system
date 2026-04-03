@@ -170,6 +170,9 @@ def extract_json(text: str) -> Any:
     Raises:
         ValueError: JSON을 찾을 수 없거나 파싱 실패 시.
     """
+    # Qwen3 등 추론 모델의 <think>...</think> 태그 제거
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+
     # ```json ... ``` 블록 우선 추출
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
