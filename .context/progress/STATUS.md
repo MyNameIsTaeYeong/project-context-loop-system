@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.4 Coordinator Agent 완료
-- **상태**: coordinator.py 구현 완료. 파이프라인 조율 + Protocol 기반 Worker/Category 디스패치 + 저장 + 테스트 14/14 통과.
+- **Step**: 9.4+ scope_analyzer 추가 완료
+- **상태**: scope_analyzer.py 구현 완료. 디렉토리 트리 추출 + LLM 분석 + 상품 스코프 제안 + 테스트 18/18 통과.
 
 ## Phase별 진행률
 
@@ -83,7 +83,12 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-03
-- 내용: Phase 9.4 — `ingestion/coordinator.py` 구현 완료 (D-027).
+- 내용: Phase 9.4+ — `ingestion/scope_analyzer.py` 추가 (D-027 스코프 자동 제안).
+  - `build_directory_tree()`: 레포 디렉토리 트리 추출 (depth/entries 제한, 불필요 디렉토리 제외)
+  - `analyze_repository_scope()`: LLM에 트리 전달 → 상품 스코프 제안 (name, paths, exclude)
+  - `ScopeAnalysisResult.to_config_dict()`: config.yaml products 섹션으로 변환
+  - 테스트 18개 — 전체 통과
+- 이전: Phase 9.4 — `ingestion/coordinator.py` 구현 완료 (D-027).
   - `CoordinatorAgent`: 전체 파이프라인 조율 (config 검증 → git sync → 상품별 분류 → Worker/Category 디스패치)
   - `WorkerAgent`/`CategoryAgentProtocol`: Protocol 기반 인터페이스 (Phase 9.5/9.6에서 LLM 구현)
   - `asyncio.Semaphore`로 max_concurrent_workers 동시성 제어
