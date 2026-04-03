@@ -17,6 +17,9 @@ from context_loop.processor.llm_client import LLMClient, extract_json
 
 logger = logging.getLogger(__name__)
 
+# 이 줄 수를 초과하면 디렉토리 전용 축약 모드로 전환
+_TREE_COMPACT_THRESHOLD = 800
+
 _SYSTEM_PROMPT = """\
 당신은 소프트웨어 아키텍트입니다.
 Git 레포지토리의 디렉토리 트리를 분석하여 독립적인 상품(서비스/모듈) 단위를 식별하세요.
@@ -104,11 +107,26 @@ class ScopeAnalysisResult:
         return "\n".join(lines)
 
 
+def _count_files(
+    directory: Path,
+    supported_extensions: list[str] | None = None,
+) -> int:
+    """디렉토리 내 직속 파일 수를 반환한다 (재귀 아님)."""
+    try:
+        files = [f for f in directory.iterdir() if f.is_file()]
+    except PermissionError:
+        return 0
+    if supported_extensions:
+        files = [f for f in files if f.suffix.lower() in supported_extensions]
+    return len(files)
+
+
 def build_directory_tree(
     root: Path,
     supported_extensions: list[str] | None = None,
     max_depth: int = 5,
     max_entries: int = 500,
+    directories_only: bool = False,
 ) -> str:
     """디렉토리 트리 문자열을 생성한다.
 
@@ -117,6 +135,8 @@ def build_directory_tree(
         supported_extensions: 표시할 파일 확장자. None이면 모든 파일.
         max_depth: 최대 탐색 깊이.
         max_entries: 최대 항목 수 (초과 시 잘림).
+        directories_only: True면 디렉토리만 표시하고 파일은 개수만 표시.
+            대규모 레포에서 LLM 컨텍스트 초과를 방지한다.
 
     Returns:
         트리 문자열 (예: "services/\\n  vpc/\\n    main.go\\n    handler.go")
@@ -144,14 +164,20 @@ def build_directory_tree(
             if len(lines) >= max_entries:
                 lines.append(f"{prefix}... (잘림)")
                 return
-            lines.append(f"{prefix}{d.name}/")
+            if directories_only:
+                # 디렉토리 내 파일 개수를 함께 표시
+                file_count = _count_files(d, supported_extensions)
+                lines.append(f"{prefix}{d.name}/ ({file_count} files)")
+            else:
+                lines.append(f"{prefix}{d.name}/")
             _walk(d, depth + 1, prefix + "  ")
 
-        for f in files:
-            if len(lines) >= max_entries:
-                lines.append(f"{prefix}... (잘림)")
-                return
-            lines.append(f"{prefix}{f.name}")
+        if not directories_only:
+            for f in files:
+                if len(lines) >= max_entries:
+                    lines.append(f"{prefix}... (잘림)")
+                    return
+                lines.append(f"{prefix}{f.name}")
 
     _walk(root, 0, "")
 
@@ -210,7 +236,23 @@ async def analyze_repository_scope(
         clone_dir,
         supported_extensions=supported_extensions,
         max_depth=max_depth,
+        max_entries=2000,
     )
+
+    # 트리가 너무 크면 디렉토리만 보내는 축약 모드로 전환
+    # (LLM 컨텍스트 초과/타임아웃 방지)
+    tree_lines = tree.count("\n") + 1
+    if tree_lines > _TREE_COMPACT_THRESHOLD:
+        logger.info(
+            "트리가 큼 (%d줄), 디렉토리 전용 축약 모드로 전환", tree_lines
+        )
+        tree = build_directory_tree(
+            clone_dir,
+            supported_extensions=supported_extensions,
+            max_depth=max_depth,
+            max_entries=2000,
+            directories_only=True,
+        )
 
     prompt = _USER_PROMPT_TEMPLATE.format(tree=tree)
     raw_response = await llm_client.complete(

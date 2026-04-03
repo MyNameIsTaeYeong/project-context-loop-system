@@ -114,6 +114,32 @@ class TestBuildDirectoryTree:
         tree = build_directory_tree(tmp_path)
         assert tree == "(빈 디렉토리)"
 
+    def test_directories_only_mode(self, tmp_path: Path) -> None:
+        (tmp_path / "services" / "vpc").mkdir(parents=True)
+        (tmp_path / "services" / "vpc" / "main.go").write_text("package main")
+        (tmp_path / "services" / "vpc" / "handler.go").write_text("package handler")
+        (tmp_path / "services" / "billing").mkdir(parents=True)
+        (tmp_path / "services" / "billing" / "api.py").write_text("pass")
+
+        tree = build_directory_tree(tmp_path, directories_only=True)
+        # 디렉토리는 파일 개수와 함께 표시
+        assert "vpc/ (2 files)" in tree
+        assert "billing/ (1 files)" in tree
+        # 개별 파일 이름은 표시되지 않음
+        assert "main.go" not in tree
+        assert "handler.go" not in tree
+        assert "api.py" not in tree
+
+    def test_directories_only_with_extensions(self, tmp_path: Path) -> None:
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "app.go").write_text("package main")
+        (tmp_path / "src" / "readme.md").write_text("# README")
+
+        tree = build_directory_tree(
+            tmp_path, supported_extensions=[".go"], directories_only=True,
+        )
+        assert "src/ (1 files)" in tree  # .go만 카운트
+
 
 # --- Tests: _parse_proposals ---
 
