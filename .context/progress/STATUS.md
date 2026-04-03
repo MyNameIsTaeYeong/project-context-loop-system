@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.3 config sources.git 타입 모듈 완료
-- **상태**: git_config.py 구현 완료. 카테고리/에이전트 엔드포인트/검증/팩토리 + 테스트 26/26 통과.
+- **Step**: 9.4 Coordinator Agent 완료
+- **상태**: coordinator.py 구현 완료. 파이프라인 조율 + Protocol 기반 Worker/Category 디스패치 + 저장 + 테스트 14/14 통과.
 
 ## Phase별 진행률
 
@@ -67,7 +67,7 @@
 - [x] 9.1 `document_sources` 테이블 추가 (code_doc ↔ git_code 연결, D-026)
 - [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
-- [ ] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
+- [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
 - [ ] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
 - [ ] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
 - [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
@@ -83,7 +83,15 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-03
-- 내용: Phase 9.3 — `ingestion/git_config.py` 구현 완료 (D-028, D-029).
+- 내용: Phase 9.4 — `ingestion/coordinator.py` 구현 완료 (D-027).
+  - `CoordinatorAgent`: 전체 파이프라인 조율 (config 검증 → git sync → 상품별 분류 → Worker/Category 디스패치)
+  - `WorkerAgent`/`CategoryAgentProtocol`: Protocol 기반 인터페이스 (Phase 9.5/9.6에서 LLM 구현)
+  - `asyncio.Semaphore`로 max_concurrent_workers 동시성 제어
+  - `store_directory_summary()`: code_summary 저장 (Level 2, 멱등)
+  - `store_category_document()`: code_doc 저장 + document_sources 연결 (Level 3)
+  - `run_and_store()`: 파이프라인 실행 + DB 저장 통합 메서드
+  - 테스트 14개 (Mock Worker/Category Agent로 E2E 검증) — 전체 통과
+- 이전: Phase 9.3 — `ingestion/git_config.py` 구현 완료 (D-028, D-029).
   - `GitSourceConfig` 타입 안전 dataclass (sources.git 전체 설정 파싱)
   - `CategoryConfig`: 카테고리 정의 + source_id 생성 (상품×카테고리 매트릭스)
   - `ProcessingConfig` + `LLMEndpointConfig`: 에이전트별 엔드포인트 설정
