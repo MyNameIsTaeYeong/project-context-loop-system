@@ -100,8 +100,14 @@ def parse_product_scopes(
     # 자동 탐지 실행 (필요한 경우)
     resolved: dict[str, list[str]] = {}
     if needs_resolve and clone_dir is not None:
+        # 모든 상품의 exclude 패턴을 합산하여 전달
+        all_excludes: list[str] = []
+        for name in needs_resolve:
+            cfg = products_raw.get(name) or {}
+            all_excludes.extend(cfg.get("exclude", []))
         resolved = resolve_product_paths(
             clone_dir, needs_resolve, supported_extensions,
+            exclude_patterns=all_excludes or None,
         )
 
     scopes: list[ProductScope] = []

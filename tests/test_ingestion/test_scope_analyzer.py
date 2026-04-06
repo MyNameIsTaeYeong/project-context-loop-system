@@ -183,3 +183,30 @@ class TestResolveProductPaths:
         assert "vpc_subnet_handler.go" in result["vpc"]
         assert "vpc_subnet_handler.go" in result["subnet"]
         assert "billing_service.go" in result["billing"]
+
+    def test_exclude_patterns(self, tmp_path: Path) -> None:
+        """exclude 패턴에 매칭되는 파일은 제외."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "vpc_service.go").write_text("package vpc")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "vpc_test.go").write_text("package vpc")
+        (tmp_path / "vendor").mkdir()
+        (tmp_path / "vendor" / "vpc_lib.go").write_text("package vpc")
+
+        result = resolve_product_paths(
+            tmp_path, ["vpc"], exclude_patterns=["tests/**", "vendor/**"],
+        )
+
+        assert "src/vpc_service.go" in result["vpc"]
+        assert "tests/vpc_test.go" not in result["vpc"]
+        # vendor는 skip_dirs로도 제외되지만 exclude로도 제외
+        assert not any("vendor" in p for p in result["vpc"])
+
+    def test_exclude_patterns_none(self, tmp_path: Path) -> None:
+        """exclude_patterns가 None이면 모든 파일 포함."""
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "vpc_test.go").write_text("package vpc")
+
+        result = resolve_product_paths(tmp_path, ["vpc"], exclude_patterns=None)
+
+        assert "tests/vpc_test.go" in result["vpc"]

@@ -57,6 +57,7 @@ def resolve_product_paths(
     clone_dir: Path,
     product_names: list[str],
     supported_extensions: list[str] | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, list[str]]:
     """config에 정의된 상품명을 기반으로 레포 전체에서 관련 파일 경로를 탐지한다.
 
@@ -67,10 +68,13 @@ def resolve_product_paths(
         clone_dir: 로컬 clone 경로.
         product_names: config에 정의된 상품명 리스트 (예: ["vpc", "subnet"]).
         supported_extensions: 대상 파일 확장자. None이면 모든 파일.
+        exclude_patterns: 제외할 경로 glob 패턴 리스트 (예: ["tests/**"]).
 
     Returns:
         상품명 → 매칭된 파일 상대 경로 리스트. 매칭 없는 상품은 빈 리스트.
     """
+    import fnmatch
+
     skip_dirs = {".git", "node_modules", "vendor", "__pycache__", ".venv", "venv"}
 
     # 상품별 복수형 변형을 미리 계산
@@ -80,6 +84,11 @@ def resolve_product_paths(
     }
 
     result: dict[str, list[str]] = {name: [] for name in product_names}
+
+    def _is_excluded(rel_path: str) -> bool:
+        if not exclude_patterns:
+            return False
+        return any(fnmatch.fnmatch(rel_path, p) for p in exclude_patterns)
 
     # BFS로 레포 전체 순회 (1회)
     queue: list[Path] = [clone_dir]
@@ -101,10 +110,15 @@ def resolve_product_paths(
                 if entry.suffix.lower() not in supported_extensions:
                     continue
 
+            rel_path = str(entry.relative_to(clone_dir))
+
+            # exclude 패턴 필터
+            if _is_excluded(rel_path):
+                continue
+
             # 각 상품명에 대해 매칭 판정
             for name, variants in product_variants.items():
                 if _filename_matches_product(entry.name, variants):
-                    rel_path = str(entry.relative_to(clone_dir))
                     result[name].append(rel_path)
 
     for name, paths in result.items():

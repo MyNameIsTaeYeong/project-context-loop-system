@@ -188,6 +188,25 @@ class TestParseProductScopes:
         scopes = parse_product_scopes(repo_config)  # clone_dir 없음
         assert scopes[0].paths == []
 
+    def test_auto_resolve_with_exclude(self, tmp_path: Path) -> None:
+        """exclude 패턴이 자동 탐지에 적용되는지 확인."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "vpc_service.go").write_text("package vpc")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "vpc_test.go").write_text("package vpc")
+
+        repo_config = {
+            "products": {
+                "vpc": {
+                    "display_name": "VPC",
+                    "exclude": ["tests/**"],
+                },
+            }
+        }
+        scopes = parse_product_scopes(repo_config, clone_dir=tmp_path)
+        assert "src/vpc_service.go" in scopes[0].paths
+        assert "tests/vpc_test.go" not in scopes[0].paths
+
 
 class TestGetChangedProducts:
     def test_returns_unique_products(self) -> None:
