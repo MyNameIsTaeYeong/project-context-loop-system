@@ -230,13 +230,8 @@ _KNOWN_LAYER_NAMES = frozenset({
 _SKIP_DIRS = {"node_modules", "vendor", "__pycache__", ".venv", "venv"}
 
 
-def _find_layer_group(directory: Path) -> tuple[list[Path], str] | None:
-    """directory의 직속 자식 중 레이어 디렉토리 그룹을 찾는다.
-
-    Returns:
-        (layer_dirs, base_rel_path) 또는 None.
-        base_rel_path는 clone_dir 기준 상대 경로 (빈 문자열이면 clone_dir 자체).
-    """
+def _find_layer_group(directory: Path) -> list[Path] | None:
+    """directory의 직속 자식 중 레이어 디렉토리 그룹(2개 이상)을 찾는다."""
     try:
         children = [
             d for d in directory.iterdir()
@@ -248,58 +243,88 @@ def _find_layer_group(directory: Path) -> tuple[list[Path], str] | None:
 
     layer_dirs = [d for d in children if d.name.lower() in _KNOWN_LAYER_NAMES]
     if len(layer_dirs) >= 2:
-        return layer_dirs, ""
+        return layer_dirs
     return None
+
+
+def _extract_product_from_filename(filename: str, layer_name: str) -> str | None:
+    """파일 이름에서 상품명을 추출한다.
+
+    레이어 이름을 제거하고 남은 부분을 상품명으로 간주한다.
+    예: "vpc_controller.py" (layer=controller) → "vpc"
+        "billing_service.go" (layer=service) → "billing"
+        "iam.py" → "iam" (레이어명이 포함되지 않은 경우 stem 그대로)
+        "__init__.py" → None (무시)
+    """
+    stem = Path(filename).stem
+    if stem.startswith("_") or stem.startswith("."):
+        return None
+
+    # 레이어명의 단수/복수 변형
+    layer_lower = layer_name.lower().rstrip("s")
+    layer_variants = {layer_lower, layer_lower + "s"}
+
+    # 구분자: _ 또는 - 로 분리
+    for sep in ("_", "-"):
+        parts = stem.split(sep)
+        # 레이어명이 포함된 부분을 제거
+        remaining = [p for p in parts if p.lower() not in layer_variants]
+        if len(remaining) < len(parts) and remaining:
+            return sep.join(remaining)
+
+    # 레이어명이 파일명에 포함되지 않은 경우 stem 그대로
+    return stem
 
 
 def _detect_layered_products(
     clone_dir: Path,
-    max_scan_depth: int = 3,
 ) -> list[_AreaInfo] | None:
     """레이어형 디렉토리 구조에서 상품 목록을 코드 레벨로 추출한다.
 
-    clone_dir부터 max_scan_depth까지 탐색하여 레이어 디렉토리 그룹
+    clone_dir부터 끝까지 탐색하여 레이어 디렉토리 그룹
     (controller/, service/ 등이 형제로 존재하는 부모)을 찾는다.
-    레이어 하위에 2개 이상의 레이어에 걸쳐 동일 이름이 존재하면 상품으로 식별.
+
+    상품 식별 방식 2가지:
+    1) 디렉토리 기반: 레이어 하위에 동일 이름의 서브디렉토리가 2개 이상 레이어에 존재
+    2) 파일명 기반: 레이어 하위에 상품명이 포함된 파일이 2개 이상 레이어에 존재
 
     Returns:
         레이어형이면 _AreaInfo 리스트, 아니면 None.
     """
-    # BFS로 레이어 그룹을 찾을 부모 디렉토리 탐색
+    # BFS로 레이어 그룹을 찾을 부모 디렉토리 탐색 (깊이 제한 없음)
     layer_dirs: list[Path] | None = None
     base_path = ""  # clone_dir 기준 상대 경로
 
-    queue: list[tuple[Path, str, int]] = [(clone_dir, "", 0)]
+    queue: list[tuple[Path, str]] = [(clone_dir, "")]
     while queue:
-        current, rel, depth = queue.pop(0)
+        current, rel = queue.pop(0)
 
         result = _find_layer_group(current)
         if result is not None:
-            layer_dirs = result[0]
+            layer_dirs = result
             base_path = rel
             break
 
-        if depth < max_scan_depth:
-            try:
-                subdirs = sorted(
-                    [
-                        d for d in current.iterdir()
-                        if d.is_dir() and not d.name.startswith(".")
-                        and d.name not in _SKIP_DIRS
-                    ],
-                    key=lambda p: p.name,
-                )
-            except PermissionError:
-                continue
-            for sd in subdirs:
-                child_rel = f"{rel}/{sd.name}" if rel else sd.name
-                queue.append((sd, child_rel, depth + 1))
+        try:
+            subdirs = sorted(
+                [
+                    d for d in current.iterdir()
+                    if d.is_dir() and not d.name.startswith(".")
+                    and d.name not in _SKIP_DIRS
+                ],
+                key=lambda p: p.name,
+            )
+        except PermissionError:
+            continue
+        for sd in subdirs:
+            child_rel = f"{rel}/{sd.name}" if rel else sd.name
+            queue.append((sd, child_rel))
 
     if layer_dirs is None:
         return None
 
-    # 각 레이어의 하위 디렉토리 이름 수집
-    layer_children: dict[str, set[str]] = {}
+    # --- 방식 1: 디렉토리 기반 상품 식별 ---
+    layer_dir_children: dict[str, set[str]] = {}
     for ld in layer_dirs:
         try:
             children = {
@@ -308,25 +333,53 @@ def _detect_layered_products(
             }
         except PermissionError:
             children = set()
-        layer_children[ld.name] = children
+        layer_dir_children[ld.name] = children
 
-    # 2개 이상의 레이어에 공통으로 존재하는 서브디렉토리 = 상품
-    all_children: set[str] = set()
-    for children in layer_children.values():
-        all_children |= children
+    all_dir_children: set[str] = set()
+    for children in layer_dir_children.values():
+        all_dir_children |= children
 
-    products: list[str] = []
-    for child in sorted(all_children):
-        count = sum(1 for children in layer_children.values() if child in children)
+    dir_products: list[str] = []
+    for child in sorted(all_dir_children):
+        count = sum(1 for children in layer_dir_children.values() if child in children)
         if count >= 2:
-            products.append(child)
+            dir_products.append(child)
+
+    # --- 방식 2: 파일명 기반 상품 식별 ---
+    file_products: list[str] = []
+    if not dir_products:
+        # 디렉토리 기반으로 상품을 찾지 못한 경우에만 파일명 방식 시도
+        layer_file_products: dict[str, set[str]] = {}
+        for ld in layer_dirs:
+            prods: set[str] = set()
+            try:
+                files = [f for f in ld.iterdir() if f.is_file()]
+            except PermissionError:
+                files = []
+            for f in files:
+                product_name = _extract_product_from_filename(f.name, ld.name)
+                if product_name:
+                    prods.add(product_name)
+            layer_file_products[ld.name] = prods
+
+        all_file_products: set[str] = set()
+        for prods in layer_file_products.values():
+            all_file_products |= prods
+
+        for product in sorted(all_file_products):
+            count = sum(1 for prods in layer_file_products.values() if product in prods)
+            if count >= 2:
+                file_products.append(product)
+
+    products = dir_products or file_products
+    product_type = "directory" if dir_products else "file"
 
     if not products:
         return None
 
     logger.info(
-        "레이어형 구조 감지: base=%s, 레이어=%s, 상품=%d개",
-        base_path or "(root)", [d.name for d in layer_dirs], len(products),
+        "레이어형 구조 감지: base=%s, 레이어=%s, 방식=%s, 상품=%d개",
+        base_path or "(root)", [d.name for d in layer_dirs], product_type, len(products),
     )
 
     return [
@@ -570,7 +623,7 @@ def _collect_subtrees(
         return tree, area.root_path
 
     # 레이어형 구조: layer_base 하위의 레이어 디렉토리들에서
-    # 상품명과 일치하는 서브디렉토리를 찾는다.
+    # 상품명과 일치하는 서브디렉토리 또는 파일을 찾는다.
     product_name = Path(area.root_path).name
     search_root = clone_dir / area.layer_base if area.layer_base else clone_dir
     parts: list[str] = []
@@ -588,6 +641,7 @@ def _collect_subtrees(
         return "", area.root_path
 
     for layer_dir in layer_dirs:
+        # 방식 1: 서브디렉토리 기반
         candidate = layer_dir / product_name
         if candidate.is_dir():
             if area.layer_base:
@@ -602,6 +656,26 @@ def _collect_subtrees(
             )
             parts.append(f"[{rel}]\n{tree}")
             found_paths.append(rel)
+            continue
+
+        # 방식 2: 파일명 기반 — 레이어 디렉토리 내에서 상품명이 포함된 파일 수집
+        try:
+            matching_files = sorted(
+                f.name for f in layer_dir.iterdir()
+                if f.is_file()
+                and _extract_product_from_filename(f.name, layer_dir.name) == product_name
+            )
+        except PermissionError:
+            matching_files = []
+
+        if matching_files:
+            if area.layer_base:
+                rel = f"{area.layer_base}/{layer_dir.name}"
+            else:
+                rel = f"{layer_dir.name}"
+            file_list = "\n".join(f"  {fn}" for fn in matching_files)
+            parts.append(f"[{rel}/ — {product_name} 관련 파일]\n{file_list}")
+            found_paths.append(f"{rel}/*{product_name}*")
 
     if not parts:
         return "", area.root_path

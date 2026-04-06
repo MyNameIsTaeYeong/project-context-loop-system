@@ -14,6 +14,7 @@ from context_loop.ingestion.scope_analyzer import (
     _AreaInfo,
     _collect_subtrees,
     _detect_layered_products,
+    _extract_product_from_filename,
     _parse_areas,
     _parse_proposals,
     _parse_single_proposal,
@@ -641,6 +642,22 @@ class TestCollectSubtrees:
 
         assert subtree == ""
 
+    def test_file_based_subtrees(self, tmp_path: Path) -> None:
+        """파일명 기반 상품의 서브트리 수집."""
+        (tmp_path / "controller").mkdir()
+        (tmp_path / "controller" / "vpc_controller.py").write_text("pass")
+        (tmp_path / "controller" / "billing_controller.py").write_text("pass")
+        (tmp_path / "service").mkdir()
+        (tmp_path / "service" / "vpc_service.py").write_text("pass")
+
+        area = _AreaInfo("vpc", "VPC", "VPC", "vpc", layer_base="")
+        subtree, root = _collect_subtrees(tmp_path, area, None)
+
+        assert "vpc_controller.py" in subtree
+        assert "vpc_service.py" in subtree
+        # billing 파일은 포함되지 않음
+        assert "billing_controller.py" not in subtree
+
 
 # --- Tests: _detect_layered_products ---
 
@@ -719,6 +736,103 @@ class TestDetectLayeredProducts:
 
         result = _detect_layered_products(tmp_path)
         assert result is not None
+
+    def test_file_based_products(self, tmp_path: Path) -> None:
+        """파일명 기반 상품 식별: vpc_controller.py, vpc_service.py → vpc."""
+        (tmp_path / "controller").mkdir()
+        (tmp_path / "controller" / "vpc_controller.py").write_text("class VpcController: ...")
+        (tmp_path / "controller" / "billing_controller.py").write_text("class BillingController: ...")
+        (tmp_path / "service").mkdir()
+        (tmp_path / "service" / "vpc_service.py").write_text("class VpcService: ...")
+        (tmp_path / "service" / "billing_service.py").write_text("class BillingService: ...")
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert names == {"vpc", "billing"}
+
+    def test_file_based_deep(self, tmp_path: Path) -> None:
+        """깊은 레이어형 구조에서 파일명 기반 상품 식별."""
+        base = tmp_path / "src" / "main"
+        (base / "controller").mkdir(parents=True)
+        (base / "controller" / "vpc_controller.py").write_text("pass")
+        (base / "service").mkdir(parents=True)
+        (base / "service" / "vpc_service.py").write_text("pass")
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        assert result[0].name == "vpc"
+        assert result[0].layer_base == "src/main"
+
+    def test_file_based_ignores_init(self, tmp_path: Path) -> None:
+        """__init__.py 등 특수 파일은 무시."""
+        (tmp_path / "controller").mkdir()
+        (tmp_path / "controller" / "__init__.py").write_text("")
+        (tmp_path / "controller" / "vpc_controller.py").write_text("pass")
+        (tmp_path / "service").mkdir()
+        (tmp_path / "service" / "__init__.py").write_text("")
+        (tmp_path / "service" / "vpc_service.py").write_text("pass")
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert "vpc" in names
+        assert "__init__" not in names
+
+    def test_dir_based_takes_priority_over_file_based(self, tmp_path: Path) -> None:
+        """디렉토리 기반과 파일 기반이 혼재하면 디렉토리 기반 우선."""
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+        (tmp_path / "controller" / "vpc" / "handler.py").write_text("pass")
+        (tmp_path / "controller" / "billing_controller.py").write_text("pass")
+        (tmp_path / "service" / "vpc").mkdir(parents=True)
+        (tmp_path / "service" / "vpc" / "logic.py").write_text("pass")
+        (tmp_path / "service" / "billing_service.py").write_text("pass")
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        # 디렉토리 기반으로 vpc만 감지 (billing은 디렉토리 기반에서 매칭 안됨)
+        assert "vpc" in names
+
+    def test_not_layered_no_common_files(self, tmp_path: Path) -> None:
+        """공통 상품 파일이 없으면 레이어형이 아님."""
+        (tmp_path / "controller").mkdir()
+        (tmp_path / "controller" / "vpc_controller.py").write_text("pass")
+        (tmp_path / "service").mkdir()
+        (tmp_path / "service" / "billing_service.py").write_text("pass")
+
+        result = _detect_layered_products(tmp_path)
+        assert result is None
+
+
+# --- Tests: _extract_product_from_filename ---
+
+
+class TestExtractProductFromFilename:
+    def test_underscore_separator(self) -> None:
+        assert _extract_product_from_filename("vpc_controller.py", "controller") == "vpc"
+        assert _extract_product_from_filename("billing_service.go", "service") == "billing"
+
+    def test_hyphen_separator(self) -> None:
+        assert _extract_product_from_filename("vpc-controller.py", "controller") == "vpc"
+
+    def test_plural_layer(self) -> None:
+        """레이어 이름이 복수형이어도 동작."""
+        assert _extract_product_from_filename("vpc_controllers.py", "controller") == "vpc"
+
+    def test_no_layer_in_name(self) -> None:
+        """레이어명이 파일명에 없으면 stem 그대로 반환."""
+        assert _extract_product_from_filename("vpc.py", "controller") == "vpc"
+
+    def test_init_ignored(self) -> None:
+        assert _extract_product_from_filename("__init__.py", "controller") is None
+
+    def test_hidden_file_ignored(self) -> None:
+        assert _extract_product_from_filename(".gitignore", "controller") is None
+
+    def test_multi_part_name(self) -> None:
+        """여러 단어 상품명도 처리."""
+        assert _extract_product_from_filename("cloud_vpc_controller.py", "controller") == "cloud_vpc"
 
 
 class TestLayeredTwoPass:
