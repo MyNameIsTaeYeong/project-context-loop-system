@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.4+ scope_analyzer 개선 완료 (상품 식별 미완)
-- **상태**: scope_analyzer.py 2-pass 아키텍처 + 레이어형 구조 감지 구현. 대규모 레포 타임아웃 해결. 레이어형 구조 감지(디렉토리/파일명 기반) 추가. 실제 레포에서 상품 식별 정확도 미해결 — 추가 튜닝 필요. 테스트 61/61 통과.
+- **Step**: 9.4+ scope_analyzer config 기반 전환 완료
+- **상태**: scope_analyzer.py를 LLM 기반(956줄)에서 config 기반(~120줄)으로 전면 재작성. 사용자가 config에 상품명을 정의하면 레포 전체에서 파일명 토큰 매칭으로 관련 파일 경로를 자동 탐지. LLM 의존 완전 제거. 복수형 변형, 경계 인식 토큰 매칭, exclude 패턴 지원. 테스트 24+4개 통과. 다음: Worker Agent(9.5), Category Agent(9.6) 구현.
 
 ## Phase별 진행률
 
@@ -83,16 +83,14 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-06
-- 내용: Phase 9.4+ — `scope_analyzer.py` 대규모 개선 (상품 식별 정확도 미완).
-  - **2-pass 아키텍처**: 대규모 레포 타임아웃 해결 (단일 호출 → Pass 1 영역 식별 + Pass 2 병렬 스코프 확정)
-  - **코드 레벨 레이어 감지**: `_detect_layered_products()` — BFS로 깊이 제한 없이 레이어 그룹 탐색
-    - 방식 1 (디렉토리 기반): `controller/vpc/` + `service/vpc/` → "vpc" 상품
-    - 방식 2 (파일명 기반): `vpc_controller.py` + `vpc_service.py` → "vpc" 상품
-    - 감지 시 Pass 1(LLM) 건너뛰고 Pass 2만 실행
-  - **`_collect_subtrees()`**: 레이어별 서브트리 합산 (디렉토리/파일 기반 혼합 지원)
-  - **Qwen3 대응**: `enable_thinking: False` + `extract_json`에 `<think>` 태그 제거
-  - **미해결**: 실제 레포에서 상품 식별이 기대와 다른 결과 — 추가 튜닝 필요
-  - 테스트 61개 전체 통과
+- 내용: Phase 9.4+ — `scope_analyzer.py` config 기반 전면 전환 (I-026, I-027 해결).
+  - **LLM 기반 → config 기반 전환**: 956줄 → ~120줄. 2-pass 아키텍처, 레이어 감지, LLM 프롬프트 전량 삭제
+  - **새 아키텍처**: config에 상품명 정의 → `resolve_product_paths()`가 BFS로 레포 전체 순회 → 파일명 토큰 매칭
+  - **핵심 기능**: `_plural_variants()` 복수형 생성, `_filename_matches_product()` 경계 인식 토큰 매칭
+  - **exclude 패턴**: fnmatch glob으로 tests/, vendor/ 등 제외 가능
+  - **`parse_product_scopes()` 연동**: paths 미지정 시 자동 탐지, 수동 paths 우선
+  - **테스트 스크립트**: `scripts/run_product_paths.py` — config yaml 읽어 zero-argument 실행
+  - 테스트 24+4개 전체 통과
 - 이전: Phase 9.4 — `ingestion/coordinator.py` 구현 완료 (D-027).
   - `CoordinatorAgent`: 전체 파이프라인 조율 (config 검증 → git sync → 상품별 분류 → Worker/Category 디스패치)
   - `WorkerAgent`/`CategoryAgentProtocol`: Protocol 기반 인터페이스 (Phase 9.5/9.6에서 LLM 구현)

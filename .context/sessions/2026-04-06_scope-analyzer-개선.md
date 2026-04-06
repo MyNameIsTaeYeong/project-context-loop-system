@@ -1,128 +1,162 @@
-# scope_analyzer 개선 — 레이어형 구조 대응 및 대규모 레포 타임아웃 해결
+# scope_analyzer 개선 — Config 기반 상품명 → 파일 경로 자동 탐지
 
 - **일시**: 2026-04-06
-- **목적**: scope_analyzer.py의 대규모 레포 타임아웃 문제 해결 + 레이어형 디렉토리 구조에서 상품 단위 올바른 식별
+- **목적**: 상품 식별 기능을 LLM 기반에서 config 기반으로 전환. 사용자가 config에 상품명을 정의하면 시스템이 레포 전체에서 해당 상품 관련 파일 경로를 자동 탐지.
 
 ---
 
-## 1. 문제
+## 1. 배경 및 문제
 
-### 1.1 대규모 레포 타임아웃
-- 단일 LLM 호출에 전체 디렉토리 트리를 전달하여 토큰 초과 및 타임아웃 발생
-- `directories_only` 모드, `max_entries=2000` 추가로도 미해결
+### 1.1 기존 방식의 한계 (LLM 기반)
+- `scope_analyzer.py`가 956줄의 LLM 기반 2-pass 분석 코드로 구성
+- 대규모 레포에서 타임아웃 발생
+- 레이어형 구조(`controller/vpc/`, `service/vpc/`)에서 LLM이 레이어를 상품으로 오식별
+- `_detect_layered_products()` 코드 레벨 감지 추가했으나 정확도 미달
+- 프롬프트 튜닝으로는 일관된 결과 보장 불가
 
-### 1.2 레이어형 구조에서 잘못된 상품 식별
-- 레포 구조가 `controller/vpc/`, `service/vpc/`, `repository/vpc/` 형태일 때
-- LLM이 레이어(controller, service)를 상품으로 식별하는 문제
-- 프롬프트 규칙 추가로도 LLM이 일관되게 따르지 않음 → 코드 레벨 감지 필요
-
-### 1.3 다양한 레이어 패턴
-- 레이어 디렉토리가 최상위가 아닌 깊은 경로에 존재 (예: `src/main/controller/`)
-- 상품 구분이 디렉토리가 아닌 파일명으로 되는 경우 (예: `controller/vpc_controller.py`)
-
----
-
-## 2. 해결: 2-pass LLM 분석 아키텍처
-
-### 2.1 자동 선택
-- 트리 ≤ 300줄 → **단일 호출** (`_analyze_single_pass`)
-- 트리 > 300줄 → **2-pass** (`_analyze_two_pass`)
-
-### 2.2 Pass 1 — 영역 식별
-- 얕은 트리(depth 2, directories_only) → 소규모 LLM 호출
-- 상품 영역(`_AreaInfo`) 리스트 반환
-
-### 2.3 Pass 2 — 영역별 스코프 확정
-- 영역별 서브트리(depth 4, max 300) → 병렬 LLM 호출 (semaphore 동시성 제한)
-- 각 영역을 `ProductScopeProposal`로 확정
-- 오류 시 기본 glob 패턴으로 폴백
+### 1.2 결정: Config 기반 전환
+- 상품명은 사용자가 가장 잘 아는 정보 → config에 직접 정의
+- 시스템은 파일명 매칭만 담당 → LLM 의존 완전 제거
+- 단순하고 결정적(deterministic)인 로직으로 재현성 보장
 
 ---
 
-## 3. 해결: 코드 레벨 레이어 감지 (`_detect_layered_products`)
+## 2. 새로운 아키텍처
 
-LLM 프롬프트에 의존하지 않고 디렉토리 구조를 코드 레벨로 분석.
+### 2.1 Config 정의
+```yaml
+sources:
+  git:
+    repositories:
+      - url: "git@github.com:company/repo.git"
+        branch: "main"
+        products:
+          vpc:
+            display_name: "VPC 서비스"
+            exclude:
+              - "tests/**"
+              - "vendor/**"
+          subnet:
+            display_name: "Subnet 서비스"
+```
 
-### 3.1 레이어 그룹 탐색
-- BFS로 디렉토리를 끝까지 탐색 (깊이 제한 없음)
-- `_KNOWN_LAYER_NAMES` (controller, service, repository, model, handler, route 등 30여개)에 해당하는 형제 디렉토리가 2개 이상이면 레이어 그룹으로 판정
-- `layer_base` 필드로 레이어 부모 경로 기록 (예: `"src/main"`)
+- `products.<name>`: 상품명 (파일명 매칭 키)
+- `paths`: 수동 지정 시 자동 탐지 건너뜀 (하위 호환)
+- `exclude`: fnmatch glob 패턴으로 제외할 경로
 
-### 3.2 상품 식별 — 방식 1: 디렉토리 기반 (우선)
+### 2.2 파일명 토큰 매칭
 ```
-controller/vpc/     ← 2개 이상의 레이어에 "vpc" 존재 → 상품
-service/vpc/
-repository/vpc/
+vpc_controller.go → tokens: {"vpc", "controller"} → "vpc" 매칭 ✓
+cloud-vpc-config.yaml → tokens: {"cloud", "vpc", "config"} → "vpc" 매칭 ✓
+evpc_handler.go → tokens: {"evpc", "handler"} → "vpc" 매칭 ✗ (경계 인식)
 ```
-- 2개 이상의 레이어에 동일 이름 서브디렉토리가 존재하면 상품
 
-### 3.3 상품 식별 — 방식 2: 파일명 기반 (폴백)
-```
-controller/vpc_controller.py     ← 파일명에서 레이어명 제거 → "vpc"
-service/vpc_service.py
-```
-- `_extract_product_from_filename()`: 파일 stem에서 레이어명(단수/복수)을 제거하고 남은 부분이 상품명
-- 디렉토리 기반으로 상품을 찾지 못한 경우에만 시도
-- `__init__.py`, 숨김 파일 등은 무시
+- 파일명 stem을 `_`와 `-`로 분리하여 토큰화
+- 토큰 단위 정확 매칭 → substring 오탐 방지
 
-### 3.4 감지 시 흐름
+### 2.3 복수형 변형 생성
 ```
-_detect_layered_products() → 상품 목록
-  ↓ (있으면)
-Pass 1 (LLM) 건너뜀
+vpc → {vpc, vpcs}
+policy → {policy, policys, policies}  (자음+y → ies)
+address → {address, addresss, addresses}  (sibilant → es)
+batch → {batch, batchs, batches}
+box → {box, boxs, boxes}
+```
+
+### 2.4 처리 흐름
+```
+config yaml → product_names
   ↓
-Pass 2만 실행 — _collect_subtrees()로 레이어별 서브트리 합산 → LLM 호출
+resolve_product_paths(clone_dir, product_names, extensions, exclude)
+  ↓
+BFS 레포 전체 순회 (1회)
+  ↓ 각 파일에 대해
+파일명 토큰화 → variants 매칭 → 상품별 경로 수집
+  ↓
+dict[상품명, list[상대경로]]
 ```
 
 ---
 
-## 4. `_collect_subtrees` — 레이어별 서브트리 합산
+## 3. 핵심 함수
 
-- `root_path`가 직접 존재하면 해당 디렉토리 서브트리 반환
-- 존재하지 않으면 `layer_base` 하위 레이어 디렉토리에서 상품명 매칭
-  - 디렉토리 기반: `controller/vpc/` → 서브트리
-  - 파일명 기반: `controller/vpc_controller.py` → 파일 목록
-- 결과 형식: `[controller/vpc]\n서브트리\n\n[service/vpc]\n서브트리`
+### 3.1 `_plural_variants(name)` → `set[str]`
+- 상품명의 복수형 변형 생성
+- 규칙: 기본 +s, 자음+y → ies, sibilant(s/sh/ch/x/z) → es
+
+### 3.2 `_filename_matches_product(filename, variants)` → `bool`
+- 파일명 stem을 `_`/`-`로 토큰화
+- 토큰 집합과 variants 교집합이 있으면 매칭
+
+### 3.3 `resolve_product_paths(clone_dir, product_names, ...)` → `dict`
+- BFS로 레포 전체 순회
+- skip_dirs: `.git`, `node_modules`, `vendor`, `__pycache__`, `.venv`, `venv`
+- 확장자 필터, exclude 패턴 필터 적용
+- 상품명 → 매칭 파일 상대 경로 리스트 반환
+
+### 3.4 `parse_product_scopes()` (git_repository.py)
+- config의 `paths`가 비어있으면 `resolve_product_paths()` 호출
+- 수동 `paths` 지정 시 자동 탐지 건너뜀
+- 모든 상품의 exclude 패턴을 수집하여 전달
 
 ---
 
-## 5. Qwen3 추론 태그 대응
+## 4. 삭제된 코드
 
-- 모든 LLM 호출에 `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` 추가
-- `extract_json()`에 `<think>...</think>` 태그 제거 안전장치 추가
+LLM 기반 상품 식별 관련 코드 **전량 삭제** (~830줄):
+- `_analyze_single_pass()`, `_analyze_two_pass()`
+- `_detect_layered_products()`, `_extract_product_from_filename()`
+- `_collect_subtrees()`, `build_directory_tree()`
+- `_parse_proposals()`, `_parse_areas()`, `_parse_single_proposal()`
+- `_AreaInfo`, `ProductScopeProposal`, `ScopeAnalysisResult`
+- LLM 프롬프트 템플릿 전체
+- `analyze_repository_scope()` (LLM 호출 진입점)
 
 ---
 
-## 6. 미해결 이슈
+## 5. 테스트 스크립트
 
-- **상품 식별 정확도**: 레이어형 감지가 동작하지만 실제 레포에서 여전히 기대와 다른 결과가 나올 수 있음. 실제 레포 구조에 맞춘 추가 튜닝 필요.
-- **혼합 구조**: 일부 상품은 디렉토리 기반, 일부는 파일명 기반인 레포에서의 동작 검증 필요.
+### `scripts/run_product_paths.py`
+- config yaml에서 git URL, 상품명, 확장자를 읽어 자동 실행
+- 아무 파라미터 없이 실행 가능
+- `clone_or_pull()` → `parse_product_scopes()` → 결과 출력
+- `--products`, `--ext`, `--config` 옵션으로 오버라이드 가능
 
 ---
 
-## 7. 변경 파일
+## 6. 변경 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/context_loop/ingestion/scope_analyzer.py` | 2-pass 아키텍처, `_detect_layered_products`, `_extract_product_from_filename`, `_collect_subtrees`, `_AreaInfo.layer_base` |
-| `src/context_loop/processor/llm_client.py` | `extract_json()`에 `<think>` 태그 제거 추가 |
-| `tests/test_ingestion/test_scope_analyzer.py` | 61개 테스트 (기존 9개 → 61개) |
+| `src/context_loop/ingestion/scope_analyzer.py` | 956줄 → ~120줄 전면 재작성. LLM 코드 전량 삭제, config 기반 매칭 3함수만 유지. |
+| `src/context_loop/ingestion/git_repository.py` | `parse_product_scopes()`에 `clone_dir`, `supported_extensions` 파라미터 추가. 자동 탐지 연동. |
+| `tests/test_ingestion/test_scope_analyzer.py` | 973줄 → ~210줄 전면 재작성. 24개 테스트 (복수형 6 + 파일매칭 8 + 경로탐지 10). |
+| `tests/test_ingestion/test_git_repository.py` | 4개 테스트 추가 (자동탐지, 수동우선, clone_dir 없음, exclude). |
+| `scripts/run_product_paths.py` | 신규. Config 기반 상품 경로 탐지 실행 스크립트. |
 
 ---
 
-## 8. 테스트 현황
+## 7. 테스트 현황
 
-- **61개 전체 통과**
-- 주요 테스트 클래스:
-  - `TestBuildDirectoryTree` (9): 트리 생성, 필터링, directories_only
-  - `TestParseProposals` (4): LLM 응답 파싱
-  - `TestParseAreas` (4): Pass 1 응답 파싱
-  - `TestParseSingleProposal` (3): Pass 2 응답 파싱
-  - `TestProductScopeProposal` (2): config dict 변환
-  - `TestScopeAnalysisResult` (2): 결과 요약/변환
-  - `TestAnalyzeRepositoryScope` (3): 단일 호출 E2E
-  - `TestAnalyzeTwoPass` (5): 2-pass E2E
-  - `TestCollectSubtrees` (6): 서브트리 수집 (디렉토리/파일 기반)
-  - `TestDetectLayeredProducts` (12): 레이어 감지 (최상위/깊은/파일명 기반)
-  - `TestExtractProductFromFilename` (7): 파일명 파싱
-  - `TestLayeredTwoPass` (4): 레이어형 2-pass E2E
+- **scope_analyzer 테스트**: 24개 전체 통과
+  - `TestPluralVariants` (6): 기본, 자음+y, 모음+y, sibilant s/ch/x
+  - `TestFilenameMatchesProduct` (8): 토큰 경계, 복수형, 대소문자, 혼합 구분자
+  - `TestResolveProductPaths` (10): 기본, 복수형, 깊은 디렉토리, 확장자 필터, skip_dirs, 오탐 방지, 다중 상품, exclude 패턴
+- **git_repository 테스트**: 기존 + 4개 추가, 전체 통과
+- **전체 테스트**: 366+ 통과 (기존 web 테스트 실패 제외)
+
+---
+
+## 8. 관련 이슈
+
+- **I-026**: scope_analyzer 대규모 레포 타임아웃 → LLM 제거로 근본 해결
+- **I-027**: 상품 식별 정확도 → config 기반 전환으로 해결
+
+---
+
+## 9. 다음 작업
+
+- **9.5 Worker Agent 구현**: Level 1 파일 요약 + Level 2 디렉토리 문서 생성 (D-027)
+- **9.6 Category Agent 구현**: Level 3 상품×카테고리별 관점 문서 생성 (D-027, D-028)
+- **Coordinator 연동**: `parse_product_scopes()` 결과를 Coordinator에서 활용하도록 연결
+- **증분 처리**: git diff 기반 변경 파일만 재탐지
