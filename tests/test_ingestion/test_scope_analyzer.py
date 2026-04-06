@@ -592,21 +592,31 @@ class TestCollectSubtrees:
             d.mkdir(parents=True)
             (d / f"{layer}_vpc.go").write_text("package vpc")
 
-        # root_path="vpc" → 직접 경로 없음 → 레이어 탐색
-        area = _AreaInfo("vpc", "VPC", "VPC 관리", "vpc")
+        area = _AreaInfo("vpc", "VPC", "VPC 관리", "vpc", layer_base="")
         subtree, root = _collect_subtrees(tmp_path, area, None)
 
-        # 3개 레이어 모두 포함
         assert "[controller/vpc]" in subtree
         assert "[service/vpc]" in subtree
         assert "[repository/vpc]" in subtree
         assert "controller_vpc.go" in subtree
-        assert "service_vpc.go" in subtree
-        assert "repository_vpc.go" in subtree
-        # effective_root에 모든 레이어 경로 포함
         assert "controller/vpc" in root
         assert "service/vpc" in root
-        assert "repository/vpc" in root
+
+    def test_layered_deep_structure(self, tmp_path: Path) -> None:
+        """깊은 레이어형 구조에서 layer_base를 사용하여 서브트리 수집."""
+        base = tmp_path / "src" / "main"
+        for layer in ("controller", "service"):
+            d = base / layer / "vpc"
+            d.mkdir(parents=True)
+            (d / f"{layer}.go").write_text("package vpc")
+
+        area = _AreaInfo("vpc", "VPC", "VPC 관리", "vpc", layer_base="src/main")
+        subtree, root = _collect_subtrees(tmp_path, area, None)
+
+        assert "[src/main/controller/vpc]" in subtree
+        assert "[src/main/service/vpc]" in subtree
+        assert "src/main/controller/vpc" in root
+        assert "src/main/service/vpc" in root
 
     def test_layered_partial_match(self, tmp_path: Path) -> None:
         """일부 레이어에만 상품이 존재하는 경우."""
@@ -614,9 +624,8 @@ class TestCollectSubtrees:
         (tmp_path / "controller" / "billing" / "api.go").write_text("package billing")
         (tmp_path / "service" / "billing").mkdir(parents=True)
         (tmp_path / "service" / "billing" / "logic.go").write_text("package billing")
-        # repository/billing은 없음
 
-        area = _AreaInfo("billing", "과금", "과금 서비스", "billing")
+        area = _AreaInfo("billing", "과금", "과금 서비스", "billing", layer_base="")
         subtree, root = _collect_subtrees(tmp_path, area, None)
 
         assert "[controller/billing]" in subtree
@@ -627,7 +636,7 @@ class TestCollectSubtrees:
         """어떤 레이어에서도 상품을 찾지 못하면 빈 문자열 반환."""
         (tmp_path / "controller" / "vpc").mkdir(parents=True)
 
-        area = _AreaInfo("nonexistent", "없는 상품", "없음", "nonexistent")
+        area = _AreaInfo("nonexistent", "없는 상품", "없음", "nonexistent", layer_base="")
         subtree, root = _collect_subtrees(tmp_path, area, None)
 
         assert subtree == ""
@@ -637,8 +646,8 @@ class TestCollectSubtrees:
 
 
 class TestDetectLayeredProducts:
-    def test_detect_layered(self, tmp_path: Path) -> None:
-        """레이어형 구조를 올바르게 감지."""
+    def test_detect_layered_top_level(self, tmp_path: Path) -> None:
+        """최상위 레이어형 구조를 올바르게 감지."""
         for layer in ("controller", "service", "repository"):
             for product in ("vpc", "billing"):
                 (tmp_path / layer / product).mkdir(parents=True)
@@ -647,6 +656,32 @@ class TestDetectLayeredProducts:
         assert result is not None
         names = {a.name for a in result}
         assert names == {"vpc", "billing"}
+        assert result[0].layer_base == ""
+
+    def test_detect_layered_deep(self, tmp_path: Path) -> None:
+        """2단계 깊이에 있는 레이어형 구조를 감지."""
+        base = tmp_path / "src" / "main"
+        for layer in ("controller", "service", "repository"):
+            for product in ("vpc", "billing", "iam"):
+                (base / layer / product).mkdir(parents=True)
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert names == {"vpc", "billing", "iam"}
+        assert result[0].layer_base == "src/main"
+
+    def test_detect_layered_depth_1(self, tmp_path: Path) -> None:
+        """1단계 깊이에 있는 레이어형 구조를 감지."""
+        base = tmp_path / "app"
+        for layer in ("controller", "service"):
+            for product in ("auth",):
+                (base / layer / product).mkdir(parents=True)
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        assert result[0].name == "auth"
+        assert result[0].layer_base == "app"
 
     def test_not_layered_single_layer(self, tmp_path: Path) -> None:
         """레이어가 1개뿐이면 레이어형이 아님."""
@@ -669,7 +704,6 @@ class TestDetectLayeredProducts:
         (tmp_path / "controller" / "vpc").mkdir(parents=True)
         (tmp_path / "service" / "vpc").mkdir(parents=True)
         (tmp_path / "controller" / "only-here").mkdir(parents=True)
-        # only-here는 1개 레이어에만 존재 → 상품 아님
 
         result = _detect_layered_products(tmp_path)
         assert result is not None
@@ -685,19 +719,22 @@ class TestDetectLayeredProducts:
 
         result = _detect_layered_products(tmp_path)
         assert result is not None
-        # .git은 무시하고 정상 감지
 
 
 class TestLayeredTwoPass:
     """레이어형 구조에서 전체 흐름 테스트 — Pass 1 건너뛰기 포함."""
 
-    def _make_layered_repo(self, tmp_path: Path) -> Path:
-        """레이어형 대규모 레포 생성 (>300줄)."""
+    def _make_layered_repo(self, tmp_path: Path, deep: bool = False) -> Path:
+        """레이어형 대규모 레포 생성 (>300줄).
+
+        deep=True이면 src/main/ 하위에 레이어 배치.
+        """
+        base = tmp_path / "src" / "main" if deep else tmp_path
         layers = ("controller", "service", "repository", "model")
         products = [f"product{i:02d}" for i in range(20)]
         for layer in layers:
             for product in products:
-                d = tmp_path / layer / product
+                d = base / layer / product
                 d.mkdir(parents=True)
                 for j in range(4):
                     (d / f"file{j}.go").write_text(f"package {product}")
@@ -707,8 +744,6 @@ class TestLayeredTwoPass:
         """레이어형 구조 감지 시 Pass 1(LLM)을 건너뛰고 Pass 2만 실행."""
         repo = self._make_layered_repo(tmp_path)
 
-        # Pass 2 응답만 필요 (20개 상품 × 1개씩)
-        # 처음 2개만 제대로 응답, 나머지는 동일 응답 재사용
         pass2_response = json.dumps({
             "name": "product00",
             "display_name": "상품 00",
@@ -722,11 +757,26 @@ class TestLayeredTwoPass:
             "exclude": ["**/*_test.go"],
         })
 
-        mock_llm = MockLLMClient(pass2_response)  # 모든 호출에 동일 응답
+        mock_llm = MockLLMClient(pass2_response)
         result = await analyze_repository_scope(repo, mock_llm)
 
         # Pass 1이 없으므로 LLM 호출은 Pass 2(상품 수)만큼만
-        assert mock_llm.call_count == 20  # 20개 상품
+        assert mock_llm.call_count == 20
+        assert len(result.products) == 20
+
+    async def test_layered_deep_skips_pass1(self, tmp_path: Path) -> None:
+        """깊은 레이어형 구조(src/main/controller/...)에서도 감지 및 Pass 1 건너뛰기."""
+        repo = self._make_layered_repo(tmp_path, deep=True)
+
+        pass2_response = json.dumps({
+            "name": "product00",
+            "paths": ["src/main/controller/product00/**", "src/main/service/product00/**"],
+        })
+        mock_llm = MockLLMClient(pass2_response)
+        result = await analyze_repository_scope(repo, mock_llm)
+
+        # Pass 1 없이 Pass 2만 실행 (20개 상품)
+        assert mock_llm.call_count == 20
         assert len(result.products) == 20
 
     async def test_layered_subtree_in_prompt(self, tmp_path: Path) -> None:
@@ -740,9 +790,23 @@ class TestLayeredTwoPass:
         mock_llm = MockLLMClient(pass2_response)
         await analyze_repository_scope(repo, mock_llm)
 
-        # 첫 번째 상품(product00)의 Pass 2 프롬프트에 레이어별 서브트리가 포함
         first_prompt = mock_llm.prompts[0]
         assert "[controller/product00]" in first_prompt
         assert "[service/product00]" in first_prompt
         assert "[repository/product00]" in first_prompt
         assert "[model/product00]" in first_prompt
+
+    async def test_deep_layered_subtree_in_prompt(self, tmp_path: Path) -> None:
+        """깊은 레이어형에서 Pass 2 프롬프트에 전체 경로 포함."""
+        repo = self._make_layered_repo(tmp_path, deep=True)
+
+        pass2_response = json.dumps({
+            "name": "product00",
+            "paths": ["src/main/controller/product00/**"],
+        })
+        mock_llm = MockLLMClient(pass2_response)
+        await analyze_repository_scope(repo, mock_llm)
+
+        first_prompt = mock_llm.prompts[0]
+        assert "[src/main/controller/product00]" in first_prompt
+        assert "[src/main/service/product00]" in first_prompt

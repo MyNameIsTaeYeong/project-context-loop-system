@@ -195,6 +195,7 @@ class _AreaInfo:
     display_name: str
     description: str
     root_path: str
+    layer_base: str = ""  # 레이어형 구조의 기준 경로 (예: "src/main")
 
 
 # ---------------------------------------------------------------------------
@@ -226,29 +227,76 @@ _KNOWN_LAYER_NAMES = frozenset({
 })
 
 
-def _detect_layered_products(clone_dir: Path) -> list[_AreaInfo] | None:
-    """레이어형 디렉토리 구조에서 상품 목록을 코드 레벨로 추출한다.
+_SKIP_DIRS = {"node_modules", "vendor", "__pycache__", ".venv", "venv"}
 
-    최상위 디렉토리가 아키텍처 레이어이고, 그 하위에 동일 이름의
-    서브디렉토리가 2개 이상의 레이어에 걸쳐 존재하면 레이어형으로 판단한다.
+
+def _find_layer_group(directory: Path) -> tuple[list[Path], str] | None:
+    """directory의 직속 자식 중 레이어 디렉토리 그룹을 찾는다.
 
     Returns:
-        레이어형이면 _AreaInfo 리스트, 아니면 None.
+        (layer_dirs, base_rel_path) 또는 None.
+        base_rel_path는 clone_dir 기준 상대 경로 (빈 문자열이면 clone_dir 자체).
     """
     try:
-        top_dirs = [
-            d for d in clone_dir.iterdir()
+        children = [
+            d for d in directory.iterdir()
             if d.is_dir() and not d.name.startswith(".")
-            and d.name not in {"node_modules", "vendor", "__pycache__", ".venv", "venv"}
+            and d.name not in _SKIP_DIRS
         ]
     except PermissionError:
         return None
 
-    # 최상위 디렉토리 중 레이어 이름인 것을 식별
-    layer_dirs = [d for d in top_dirs if d.name.lower() in _KNOWN_LAYER_NAMES]
+    layer_dirs = [d for d in children if d.name.lower() in _KNOWN_LAYER_NAMES]
+    if len(layer_dirs) >= 2:
+        return layer_dirs, ""
+    return None
 
-    if len(layer_dirs) < 2:
-        return None  # 레이어가 2개 미만이면 레이어형이 아님
+
+def _detect_layered_products(
+    clone_dir: Path,
+    max_scan_depth: int = 3,
+) -> list[_AreaInfo] | None:
+    """레이어형 디렉토리 구조에서 상품 목록을 코드 레벨로 추출한다.
+
+    clone_dir부터 max_scan_depth까지 탐색하여 레이어 디렉토리 그룹
+    (controller/, service/ 등이 형제로 존재하는 부모)을 찾는다.
+    레이어 하위에 2개 이상의 레이어에 걸쳐 동일 이름이 존재하면 상품으로 식별.
+
+    Returns:
+        레이어형이면 _AreaInfo 리스트, 아니면 None.
+    """
+    # BFS로 레이어 그룹을 찾을 부모 디렉토리 탐색
+    layer_dirs: list[Path] | None = None
+    base_path = ""  # clone_dir 기준 상대 경로
+
+    queue: list[tuple[Path, str, int]] = [(clone_dir, "", 0)]
+    while queue:
+        current, rel, depth = queue.pop(0)
+
+        result = _find_layer_group(current)
+        if result is not None:
+            layer_dirs = result[0]
+            base_path = rel
+            break
+
+        if depth < max_scan_depth:
+            try:
+                subdirs = sorted(
+                    [
+                        d for d in current.iterdir()
+                        if d.is_dir() and not d.name.startswith(".")
+                        and d.name not in _SKIP_DIRS
+                    ],
+                    key=lambda p: p.name,
+                )
+            except PermissionError:
+                continue
+            for sd in subdirs:
+                child_rel = f"{rel}/{sd.name}" if rel else sd.name
+                queue.append((sd, child_rel, depth + 1))
+
+    if layer_dirs is None:
+        return None
 
     # 각 레이어의 하위 디렉토리 이름 수집
     layer_children: dict[str, set[str]] = {}
@@ -277,8 +325,8 @@ def _detect_layered_products(clone_dir: Path) -> list[_AreaInfo] | None:
         return None
 
     logger.info(
-        "레이어형 구조 감지: 레이어=%s, 상품=%d개",
-        [d.name for d in layer_dirs], len(products),
+        "레이어형 구조 감지: base=%s, 레이어=%s, 상품=%d개",
+        base_path or "(root)", [d.name for d in layer_dirs], len(products),
     )
 
     return [
@@ -286,7 +334,8 @@ def _detect_layered_products(clone_dir: Path) -> list[_AreaInfo] | None:
             name=product,
             display_name=product,
             description=f"레이어형 구조에서 감지된 상품 ({product})",
-            root_path=product,  # 실제 경로가 아닌 상품명 → _collect_subtrees가 처리
+            root_path=product,
+            layer_base=base_path,
         )
         for product in products
     ]
@@ -520,23 +569,31 @@ def _collect_subtrees(
         )
         return tree, area.root_path
 
-    # 레이어형 구조: 최상위 디렉토리들에서 area.root_path(상품명)과
-    # 일치하는 하위 디렉토리를 찾는다.
+    # 레이어형 구조: layer_base 하위의 레이어 디렉토리들에서
+    # 상품명과 일치하는 서브디렉토리를 찾는다.
     product_name = Path(area.root_path).name
+    search_root = clone_dir / area.layer_base if area.layer_base else clone_dir
     parts: list[str] = []
     found_paths: list[str] = []
     try:
-        top_dirs = sorted(
-            [d for d in clone_dir.iterdir() if d.is_dir() and not d.name.startswith(".")],
+        layer_dirs = sorted(
+            [
+                d for d in search_root.iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+                and d.name.lower() in _KNOWN_LAYER_NAMES
+            ],
             key=lambda p: p.name,
         )
     except PermissionError:
         return "", area.root_path
 
-    for top_dir in top_dirs:
-        candidate = top_dir / product_name
+    for layer_dir in layer_dirs:
+        candidate = layer_dir / product_name
         if candidate.is_dir():
-            rel = f"{top_dir.name}/{product_name}"
+            if area.layer_base:
+                rel = f"{area.layer_base}/{layer_dir.name}/{product_name}"
+            else:
+                rel = f"{layer_dir.name}/{product_name}"
             tree = build_directory_tree(
                 candidate,
                 supported_extensions=supported_extensions,
