@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.4+ scope_analyzer 추가 완료
-- **상태**: scope_analyzer.py 구현 완료. 디렉토리 트리 추출 + LLM 분석 + 상품 스코프 제안 + 테스트 18/18 통과.
+- **Step**: 9.4+ scope_analyzer 개선 완료 (상품 식별 미완)
+- **상태**: scope_analyzer.py 2-pass 아키텍처 + 레이어형 구조 감지 구현. 대규모 레포 타임아웃 해결. 레이어형 구조 감지(디렉토리/파일명 기반) 추가. 실제 레포에서 상품 식별 정확도 미해결 — 추가 튜닝 필요. 테스트 61/61 통과.
 
 ## Phase별 진행률
 
@@ -82,15 +82,17 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-03
-- 내용: Phase 9.4+ — `ingestion/scope_analyzer.py` 2-pass 분석으로 리팩토링.
-  - 대규모 레포 타임아웃 해결: 단일 LLM 호출 → 2-pass 분할 호출
-  - Pass 1: 얕은 트리(depth 2, directories_only) → 상품 영역 식별 (`_pass1_identify_areas`)
-  - Pass 2: 영역별 서브트리(depth 4, max 300) → 병렬 LLM 호출로 스코프 확정 (`_pass2_refine_area`)
-  - 소규모 레포(≤300줄)는 기존처럼 단일 호출 (`_analyze_single_pass`)
-  - 새 파싱 함수: `_parse_areas()`, `_parse_single_proposal()`
-  - 오류 폴백: Pass 2 실패 시 기본 glob 패턴으로 자동 복구
-  - 테스트 32개 — 전체 통과 (기존 27 + 2-pass 5개 추가)
+- 일시: 2026-04-06
+- 내용: Phase 9.4+ — `scope_analyzer.py` 대규모 개선 (상품 식별 정확도 미완).
+  - **2-pass 아키텍처**: 대규모 레포 타임아웃 해결 (단일 호출 → Pass 1 영역 식별 + Pass 2 병렬 스코프 확정)
+  - **코드 레벨 레이어 감지**: `_detect_layered_products()` — BFS로 깊이 제한 없이 레이어 그룹 탐색
+    - 방식 1 (디렉토리 기반): `controller/vpc/` + `service/vpc/` → "vpc" 상품
+    - 방식 2 (파일명 기반): `vpc_controller.py` + `vpc_service.py` → "vpc" 상품
+    - 감지 시 Pass 1(LLM) 건너뛰고 Pass 2만 실행
+  - **`_collect_subtrees()`**: 레이어별 서브트리 합산 (디렉토리/파일 기반 혼합 지원)
+  - **Qwen3 대응**: `enable_thinking: False` + `extract_json`에 `<think>` 태그 제거
+  - **미해결**: 실제 레포에서 상품 식별이 기대와 다른 결과 — 추가 튜닝 필요
+  - 테스트 61개 전체 통과
 - 이전: Phase 9.4 — `ingestion/coordinator.py` 구현 완료 (D-027).
   - `CoordinatorAgent`: 전체 파이프라인 조율 (config 검증 → git sync → 상품별 분류 → Worker/Category 디스패치)
   - `WorkerAgent`/`CategoryAgentProtocol`: Protocol 기반 인터페이스 (Phase 9.5/9.6에서 LLM 구현)
