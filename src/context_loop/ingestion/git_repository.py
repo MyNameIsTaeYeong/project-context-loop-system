@@ -72,16 +72,48 @@ def _matches_any(path: str, patterns: list[str]) -> bool:
     return False
 
 
-def parse_product_scopes(repo_config: dict[str, Any]) -> list[ProductScope]:
-    """레포지토리 설정에서 상품 스코프 목록을 파싱한다."""
+def parse_product_scopes(
+    repo_config: dict[str, Any],
+    clone_dir: Path | None = None,
+    supported_extensions: list[str] | None = None,
+) -> list[ProductScope]:
+    """레포지토리 설정에서 상품 스코프 목록을 파싱한다.
+
+    paths가 정의되지 않은 상품이 있고 clone_dir이 제공되면,
+    레포 전체를 스캔하여 상품명이 포함된 파일 경로를 자동으로 채운다.
+
+    Args:
+        repo_config: 레포지토리 설정 dict.
+        clone_dir: 로컬 clone 경로. 제공 시 paths 자동 탐지 활성화.
+        supported_extensions: 자동 탐지 시 대상 파일 확장자.
+    """
+    from context_loop.ingestion.scope_analyzer import resolve_product_paths
+
     products_raw = repo_config.get("products") or {}
+
+    # paths가 비어있는 상품명 수집
+    needs_resolve: list[str] = []
+    for name, cfg in products_raw.items():
+        if not cfg.get("paths"):
+            needs_resolve.append(name)
+
+    # 자동 탐지 실행 (필요한 경우)
+    resolved: dict[str, list[str]] = {}
+    if needs_resolve and clone_dir is not None:
+        resolved = resolve_product_paths(
+            clone_dir, needs_resolve, supported_extensions,
+        )
+
     scopes: list[ProductScope] = []
     for name, cfg in products_raw.items():
+        paths = cfg.get("paths", [])
+        if not paths and name in resolved:
+            paths = resolved[name]
         scopes.append(
             ProductScope(
                 name=name,
                 display_name=cfg.get("display_name", name),
-                paths=cfg.get("paths", []),
+                paths=paths,
                 exclude=cfg.get("exclude", []),
             )
         )
