@@ -27,7 +27,6 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
-from context_loop.ingestion.scope_analyzer import resolve_product_paths  # noqa: E402
 from context_loop.ingestion.git_repository import (  # noqa: E402
     clone_or_pull,
     parse_product_scopes,
@@ -83,14 +82,14 @@ async def run(args: argparse.Namespace) -> None:
             print("경고: url이 비어있는 레포 건너뜀")
             continue
 
-        # 상품명 결정
+        # 상품명 오버라이드
         if args.products:
             product_names = [p.strip() for p in args.products.split(",") if p.strip()]
-            products_raw = {name: products_raw.get(name, {"display_name": name}) for name in product_names}
-        else:
-            product_names = list(products_raw.keys())
+            for name in product_names:
+                if name not in products_raw:
+                    products_raw[name] = {"display_name": name}
 
-        if not product_names:
+        if not products_raw:
             print(f"경고: 상품명이 없는 레포 건너뜀: {repo_url}")
             continue
 
@@ -105,44 +104,26 @@ async def run(args: argparse.Namespace) -> None:
         status = "새로 clone 완료" if is_new else f"pull 완료 (이전: {prev_hash[:8]})"
         print(f"  상태: {status}")
 
-        # 탐지 실행
+        # parse_product_scopes로 탐지
         print(f"\n{'='*60}")
-        print(f"상품명:    {product_names}")
+        print(f"상품명:    {list(products_raw.keys())}")
         print(f"확장자:    {extensions or '(전체)'} ({ext_source})")
-        print(f"{'='*60}")
-
-        result = resolve_product_paths(clone_dir, product_names, extensions)
-
-        total_files = 0
-        for name in product_names:
-            paths = result[name]
-            total_files += len(paths)
-            print(f"\n  [{name}] {len(paths)}개 파일")
-            for p in sorted(paths)[:20]:
-                print(f"    {p}")
-            if len(paths) > 20:
-                print(f"    ... 외 {len(paths) - 20}개")
-
-        print(f"\n  총 {total_files}개 파일 탐지됨")
-
-        # parse_product_scopes 연동
-        print(f"\n{'='*60}")
-        print("[parse_product_scopes 연동] paths 미정의 → 자동 탐지")
         print(f"{'='*60}")
 
         scopes = parse_product_scopes(
             repo_cfg, clone_dir=clone_dir, supported_extensions=extensions,
         )
 
+        total_files = 0
         for scope in scopes:
+            total_files += len(scope.paths)
             has_manual = bool((products_raw.get(scope.name) or {}).get("paths"))
-            label = "(수동 paths 유지)" if has_manual else "(자동 탐지)"
-            print(f"\n  [{scope.name}] {scope.display_name} — {len(scope.paths)}개 paths {label}")
-            for p in sorted(scope.paths)[:15]:
+            label = "수동 paths" if has_manual else "자동 탐지"
+            print(f"\n  [{scope.name}] {scope.display_name} — {len(scope.paths)}개 파일 ({label})")
+            for p in sorted(scope.paths):
                 print(f"    {p}")
-            if len(scope.paths) > 15:
-                print(f"    ... 외 {len(scope.paths) - 15}개")
 
+        print(f"\n  총 {total_files}개 파일 탐지됨 (제한 없음, 전체 결과)")
         print()
 
 
