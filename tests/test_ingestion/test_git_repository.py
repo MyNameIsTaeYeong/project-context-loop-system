@@ -145,6 +145,68 @@ class TestParseProductScopes:
     def test_empty_products(self) -> None:
         assert parse_product_scopes({"url": "x"}) == []
 
+    def test_auto_resolve_paths_when_empty(self, tmp_path: Path) -> None:
+        """paths 미정의 시 clone_dir에서 자동 탐지."""
+        (tmp_path / "controller").mkdir()
+        (tmp_path / "controller" / "vpc_controller.go").write_text("package vpc")
+        (tmp_path / "service").mkdir()
+        (tmp_path / "service" / "vpc_service.go").write_text("package vpc")
+
+        repo_config = {
+            "products": {
+                "vpc": {"display_name": "VPC"},  # paths 없음
+            }
+        }
+        scopes = parse_product_scopes(repo_config, clone_dir=tmp_path)
+        assert len(scopes) == 1
+        assert scopes[0].name == "vpc"
+        assert "controller/vpc_controller.go" in scopes[0].paths
+        assert "service/vpc_service.go" in scopes[0].paths
+
+    def test_manual_paths_not_overridden(self, tmp_path: Path) -> None:
+        """paths가 이미 정의되어 있으면 자동 탐지하지 않음."""
+        (tmp_path / "vpc_extra.go").write_text("package vpc")
+
+        repo_config = {
+            "products": {
+                "vpc": {
+                    "display_name": "VPC",
+                    "paths": ["services/vpc/**"],  # 수동 정의
+                }
+            }
+        }
+        scopes = parse_product_scopes(repo_config, clone_dir=tmp_path)
+        assert scopes[0].paths == ["services/vpc/**"]
+
+    def test_auto_resolve_without_clone_dir(self) -> None:
+        """clone_dir 미제공 시 자동 탐지 미실행."""
+        repo_config = {
+            "products": {
+                "vpc": {"display_name": "VPC"},  # paths 없음
+            }
+        }
+        scopes = parse_product_scopes(repo_config)  # clone_dir 없음
+        assert scopes[0].paths == []
+
+    def test_auto_resolve_with_exclude(self, tmp_path: Path) -> None:
+        """exclude 패턴이 자동 탐지에 적용되는지 확인."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "vpc_service.go").write_text("package vpc")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "vpc_test.go").write_text("package vpc")
+
+        repo_config = {
+            "products": {
+                "vpc": {
+                    "display_name": "VPC",
+                    "exclude": ["tests/**"],
+                },
+            }
+        }
+        scopes = parse_product_scopes(repo_config, clone_dir=tmp_path)
+        assert "src/vpc_service.go" in scopes[0].paths
+        assert "tests/vpc_test.go" not in scopes[0].paths
+
 
 class TestGetChangedProducts:
     def test_returns_unique_products(self) -> None:
