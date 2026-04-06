@@ -253,7 +253,7 @@ def _extract_product_from_filename(filename: str, layer_name: str) -> str | None
     레이어 이름을 제거하고 남은 부분을 상품명으로 간주한다.
     예: "vpc_controller.py" (layer=controller) → "vpc"
         "billing_service.go" (layer=service) → "billing"
-        "iam.py" → "iam" (레이어명이 포함되지 않은 경우 stem 그대로)
+        "iam.py" → None (레이어명이 포함되지 않은 경우 무시 — 오탐 방지)
         "__init__.py" → None (무시)
     """
     stem = Path(filename).stem
@@ -272,57 +272,18 @@ def _extract_product_from_filename(filename: str, layer_name: str) -> str | None
         if len(remaining) < len(parts) and remaining:
             return sep.join(remaining)
 
-    # 레이어명이 파일명에 포함되지 않은 경우 stem 그대로
-    return stem
+    # 레이어명이 파일명에 포함되지 않으면 상품으로 간주하지 않음 (오탐 방지)
+    return None
 
 
-def _detect_layered_products(
-    clone_dir: Path,
-) -> list[_AreaInfo] | None:
-    """레이어형 디렉토리 구조에서 상품 목록을 코드 레벨로 추출한다.
+def _detect_layered_products_in_group(
+    layer_dirs: list[Path],
+    base_path: str,
+) -> list[_AreaInfo]:
+    """단일 레이어 그룹 내에서 상품을 식별한다.
 
-    clone_dir부터 끝까지 탐색하여 레이어 디렉토리 그룹
-    (controller/, service/ 등이 형제로 존재하는 부모)을 찾는다.
-
-    상품 식별 방식 2가지:
-    1) 디렉토리 기반: 레이어 하위에 동일 이름의 서브디렉토리가 2개 이상 레이어에 존재
-    2) 파일명 기반: 레이어 하위에 상품명이 포함된 파일이 2개 이상 레이어에 존재
-
-    Returns:
-        레이어형이면 _AreaInfo 리스트, 아니면 None.
+    디렉토리 기반과 파일명 기반 감지를 결합하여 혼합 구조도 지원한다.
     """
-    # BFS로 레이어 그룹을 찾을 부모 디렉토리 탐색 (깊이 제한 없음)
-    layer_dirs: list[Path] | None = None
-    base_path = ""  # clone_dir 기준 상대 경로
-
-    queue: list[tuple[Path, str]] = [(clone_dir, "")]
-    while queue:
-        current, rel = queue.pop(0)
-
-        result = _find_layer_group(current)
-        if result is not None:
-            layer_dirs = result
-            base_path = rel
-            break
-
-        try:
-            subdirs = sorted(
-                [
-                    d for d in current.iterdir()
-                    if d.is_dir() and not d.name.startswith(".")
-                    and d.name not in _SKIP_DIRS
-                ],
-                key=lambda p: p.name,
-            )
-        except PermissionError:
-            continue
-        for sd in subdirs:
-            child_rel = f"{rel}/{sd.name}" if rel else sd.name
-            queue.append((sd, child_rel))
-
-    if layer_dirs is None:
-        return None
-
     # --- 방식 1: 디렉토리 기반 상품 식별 ---
     layer_dir_children: dict[str, set[str]] = {}
     for ld in layer_dirs:
@@ -339,47 +300,53 @@ def _detect_layered_products(
     for children in layer_dir_children.values():
         all_dir_children |= children
 
-    dir_products: list[str] = []
-    for child in sorted(all_dir_children):
+    dir_products: set[str] = set()
+    for child in all_dir_children:
         count = sum(1 for children in layer_dir_children.values() if child in children)
         if count >= 2:
-            dir_products.append(child)
+            dir_products.add(child)
 
     # --- 방식 2: 파일명 기반 상품 식별 ---
-    file_products: list[str] = []
-    if not dir_products:
-        # 디렉토리 기반으로 상품을 찾지 못한 경우에만 파일명 방식 시도
-        layer_file_products: dict[str, set[str]] = {}
-        for ld in layer_dirs:
-            prods: set[str] = set()
-            try:
-                files = [f for f in ld.iterdir() if f.is_file()]
-            except PermissionError:
-                files = []
-            for f in files:
-                product_name = _extract_product_from_filename(f.name, ld.name)
-                if product_name:
-                    prods.add(product_name)
-            layer_file_products[ld.name] = prods
+    # 디렉토리 기반 결과와 결합 (상호배타가 아닌 합집합)
+    layer_file_products: dict[str, set[str]] = {}
+    for ld in layer_dirs:
+        prods: set[str] = set()
+        try:
+            files = [f for f in ld.iterdir() if f.is_file()]
+        except PermissionError:
+            files = []
+        for f in files:
+            product_name = _extract_product_from_filename(f.name, ld.name)
+            if product_name:
+                prods.add(product_name)
+        layer_file_products[ld.name] = prods
 
-        all_file_products: set[str] = set()
-        for prods in layer_file_products.values():
-            all_file_products |= prods
+    file_products: set[str] = set()
+    all_file_products: set[str] = set()
+    for prods in layer_file_products.values():
+        all_file_products |= prods
 
-        for product in sorted(all_file_products):
-            count = sum(1 for prods in layer_file_products.values() if product in prods)
-            if count >= 2:
-                file_products.append(product)
+    for product in all_file_products:
+        count = sum(1 for prods in layer_file_products.values() if product in prods)
+        if count >= 2:
+            file_products.add(product)
 
-    products = dir_products or file_products
-    product_type = "directory" if dir_products else "file"
+    # 합집합: 디렉토리 기반 + 파일 기반
+    combined = sorted(dir_products | file_products)
 
-    if not products:
-        return None
+    if not combined:
+        return []
+
+    method_parts = []
+    if dir_products:
+        method_parts.append("directory")
+    if file_products - dir_products:
+        method_parts.append("file")
+    product_type = "+".join(method_parts) or "none"
 
     logger.info(
         "레이어형 구조 감지: base=%s, 레이어=%s, 방식=%s, 상품=%d개",
-        base_path or "(root)", [d.name for d in layer_dirs], product_type, len(products),
+        base_path or "(root)", [d.name for d in layer_dirs], product_type, len(combined),
     )
 
     return [
@@ -390,8 +357,65 @@ def _detect_layered_products(
             root_path=product,
             layer_base=base_path,
         )
-        for product in products
+        for product in combined
     ]
+
+
+def _detect_layered_products(
+    clone_dir: Path,
+) -> list[_AreaInfo] | None:
+    """레이어형 디렉토리 구조에서 상품 목록을 코드 레벨로 추출한다.
+
+    clone_dir부터 탐색하여 레이어 디렉토리 그룹
+    (controller/, service/ 등이 형제로 존재하는 부모)을 모두 찾는다.
+
+    상품 식별 방식 2가지 (결합):
+    1) 디렉토리 기반: 레이어 하위에 동일 이름의 서브디렉토리가 2개 이상 레이어에 존재
+    2) 파일명 기반: 레이어 하위에 상품명이 포함된 파일이 2개 이상 레이어에 존재
+
+    모노레포 내 여러 위치에 레이어 그룹이 존재할 수 있으므로 모두 탐색한다.
+
+    Returns:
+        레이어형이면 _AreaInfo 리스트, 아니면 None.
+    """
+    # BFS로 레이어 그룹이 있는 모든 부모 디렉토리 탐색
+    layer_groups: list[tuple[list[Path], str]] = []  # (layer_dirs, base_path)
+
+    queue: list[tuple[Path, str]] = [(clone_dir, "")]
+    while queue:
+        current, rel = queue.pop(0)
+
+        result = _find_layer_group(current)
+        if result is not None:
+            layer_groups.append((result, rel))
+            # 이 디렉토리 하위는 레이어이므로 더 이상 탐색하지 않음
+            continue
+
+        try:
+            subdirs = sorted(
+                [
+                    d for d in current.iterdir()
+                    if d.is_dir() and not d.name.startswith(".")
+                    and d.name not in _SKIP_DIRS
+                ],
+                key=lambda p: p.name,
+            )
+        except PermissionError:
+            continue
+        for sd in subdirs:
+            child_rel = f"{rel}/{sd.name}" if rel else sd.name
+            queue.append((sd, child_rel))
+
+    if not layer_groups:
+        return None
+
+    # 각 레이어 그룹에서 상품 식별 후 합산
+    all_areas: list[_AreaInfo] = []
+    for layer_dirs, base_path in layer_groups:
+        areas = _detect_layered_products_in_group(layer_dirs, base_path)
+        all_areas.extend(areas)
+
+    return all_areas if all_areas else None
 
 
 # ---------------------------------------------------------------------------

@@ -779,8 +779,8 @@ class TestDetectLayeredProducts:
         assert "vpc" in names
         assert "__init__" not in names
 
-    def test_dir_based_takes_priority_over_file_based(self, tmp_path: Path) -> None:
-        """디렉토리 기반과 파일 기반이 혼재하면 디렉토리 기반 우선."""
+    def test_mixed_dir_and_file_based(self, tmp_path: Path) -> None:
+        """디렉토리 기반과 파일 기반이 혼재하면 두 방식을 결합하여 모두 감지."""
         (tmp_path / "controller" / "vpc").mkdir(parents=True)
         (tmp_path / "controller" / "vpc" / "handler.py").write_text("pass")
         (tmp_path / "controller" / "billing_controller.py").write_text("pass")
@@ -791,8 +791,9 @@ class TestDetectLayeredProducts:
         result = _detect_layered_products(tmp_path)
         assert result is not None
         names = {a.name for a in result}
-        # 디렉토리 기반으로 vpc만 감지 (billing은 디렉토리 기반에서 매칭 안됨)
+        # 디렉토리 기반으로 vpc, 파일 기반으로 billing 모두 감지
         assert "vpc" in names
+        assert "billing" in names
 
     def test_not_layered_no_common_files(self, tmp_path: Path) -> None:
         """공통 상품 파일이 없으면 레이어형이 아님."""
@@ -803,6 +804,51 @@ class TestDetectLayeredProducts:
 
         result = _detect_layered_products(tmp_path)
         assert result is None
+
+    def test_multiple_layer_groups(self, tmp_path: Path) -> None:
+        """모노레포 내 서로 다른 위치에 여러 레이어 그룹이 있는 경우 모두 탐색."""
+        # 첫 번째 레이어 그룹: apps/user-service/
+        base1 = tmp_path / "apps" / "user-service"
+        for layer in ("controller", "service"):
+            for product in ("auth", "profile"):
+                (base1 / layer / product).mkdir(parents=True)
+
+        # 두 번째 레이어 그룹: apps/payment-service/
+        base2 = tmp_path / "apps" / "payment-service"
+        for layer in ("controller", "service"):
+            for product in ("billing", "invoice"):
+                (base2 / layer / product).mkdir(parents=True)
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert names == {"auth", "profile", "billing", "invoice"}
+
+    def test_file_based_no_false_positive_without_layer_name(self, tmp_path: Path) -> None:
+        """레이어명이 파일명에 없는 파일은 상품으로 오인하지 않음."""
+        (tmp_path / "controller").mkdir()
+        (tmp_path / "controller" / "utils.py").write_text("pass")
+        (tmp_path / "controller" / "base.py").write_text("pass")
+        (tmp_path / "service").mkdir()
+        (tmp_path / "service" / "utils.py").write_text("pass")
+        (tmp_path / "service" / "base.py").write_text("pass")
+
+        result = _detect_layered_products(tmp_path)
+        # utils.py, base.py에는 레이어명이 포함되지 않으므로 상품 아님
+        assert result is None
+
+    def test_mixed_structure_with_utils(self, tmp_path: Path) -> None:
+        """디렉토리 기반 상품 + 레이어명 없는 유틸 파일이 혼재할 때 유틸은 제외."""
+        (tmp_path / "controller" / "vpc").mkdir(parents=True)
+        (tmp_path / "controller" / "utils.py").write_text("pass")
+        (tmp_path / "service" / "vpc").mkdir(parents=True)
+        (tmp_path / "service" / "utils.py").write_text("pass")
+
+        result = _detect_layered_products(tmp_path)
+        assert result is not None
+        names = {a.name for a in result}
+        assert "vpc" in names
+        assert "utils" not in names
 
 
 # --- Tests: _extract_product_from_filename ---
@@ -821,8 +867,8 @@ class TestExtractProductFromFilename:
         assert _extract_product_from_filename("vpc_controllers.py", "controller") == "vpc"
 
     def test_no_layer_in_name(self) -> None:
-        """레이어명이 파일명에 없으면 stem 그대로 반환."""
-        assert _extract_product_from_filename("vpc.py", "controller") == "vpc"
+        """레이어명이 파일명에 없으면 None 반환 (오탐 방지)."""
+        assert _extract_product_from_filename("vpc.py", "controller") is None
 
     def test_init_ignored(self) -> None:
         assert _extract_product_from_filename("__init__.py", "controller") is None
