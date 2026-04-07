@@ -70,6 +70,7 @@
 - `asyncio.gather` 기반 병렬 실행, 부분 실패 허용 (graceful degradation)
 - Worker 단위: 디렉토리 기반 + 크기 제한 (30개 초과 시 분할, 3개 미만 시 병합)
 - Phase 9.4, 9.5, 9.6
+- **진행 상태**: Coordinator(9.4) + Worker Agent(9.5) 구현 완료. Category Agent(9.6) 잔여.
 
 ### I-024: 카테고리 프롬프트 시스템 설계
 - D-028에 따라 카테고리를 config 프롬프트로만 정의하여 코드 변경 없이 확장 가능하게

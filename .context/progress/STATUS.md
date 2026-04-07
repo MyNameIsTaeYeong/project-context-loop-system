@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.4+ scope_analyzer config 기반 전환 완료
-- **상태**: scope_analyzer.py를 LLM 기반(956줄)에서 config 기반(~120줄)으로 전면 재작성. 사용자가 config에 상품명을 정의하면 레포 전체에서 파일명 토큰 매칭으로 관련 파일 경로를 자동 탐지. LLM 의존 완전 제거. 복수형 변형, 경계 인식 토큰 매칭, exclude 패턴 지원. 테스트 24+4개 통과. 다음: Worker Agent(9.5), Category Agent(9.6) 구현.
+- **Step**: 9.5 Worker Agent 구현 완료
+- **상태**: `LLMWorkerAgent` 구현 완료. Level 1 파일 요약(worker 엔드포인트) + Level 2 디렉토리 종합 문서(synthesizer 엔드포인트) 생성. 관점 중립적 사실 요약. 병렬 처리(asyncio.Semaphore), 개별 파일 실패 허용, 장문 절삭 지원. 테스트 13개 통과. 수동 테스트 스크립트(`scripts/run_worker_agent.py`) 추가. 다음: Category Agent(9.6) 구현.
 
 ## Phase별 진행률
 
@@ -68,7 +68,7 @@
 - [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
-- [ ] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
+- [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
 - [ ] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
 - [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
 - [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
@@ -82,8 +82,18 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-06
-- 내용: Phase 9.4+ — `scope_analyzer.py` config 기반 전면 전환 (I-026, I-027 해결).
+- 일시: 2026-04-07
+- 내용: Phase 9.5 — `LLMWorkerAgent` 구현 완료.
+  - **`ingestion/worker_agent.py`** 신규 모듈: `LLMWorkerAgent` 클래스
+  - **Level 1 (파일 요약)**: 각 파일을 worker LLM(경량 모델)으로 요약. 관점 중립 사실 기반.
+  - **Level 2 (디렉토리 문서)**: 파일 요약을 synthesizer LLM(중간 모델)으로 종합.
+  - **엔드포인트 분리**: D-029에 따라 worker/synthesizer 별도 LLM 클라이언트 사용
+  - **에러 처리**: 개별 파일 실패 시 나머지 정상 진행, 전체 실패 시 에러 메시지 반환
+  - **병렬 처리**: `asyncio.Semaphore`로 `max_concurrent_files` 동시성 제한
+  - **장문 절삭**: `max_file_tokens` 초과 시 내용 절삭
+  - **테스트**: 13개 (Level 1 단위 5 + 에러 2 + Level 2 단위 2 + 전체 흐름 4) — 전체 통과
+  - **수동 테스트**: `scripts/run_worker_agent.py` — 로컬 디렉토리 모드 + 전체 파이프라인 모드
+- 이전: Phase 9.4+ — `scope_analyzer.py` config 기반 전면 전환 (I-026, I-027 해결).
   - **LLM 기반 → config 기반 전환**: 956줄 → ~120줄. 2-pass 아키텍처, 레이어 감지, LLM 프롬프트 전량 삭제
   - **새 아키텍처**: config에 상품명 정의 → `resolve_product_paths()`가 BFS로 레포 전체 순회 → 파일명 토큰 매칭
   - **핵심 기능**: `_plural_variants()` 복수형 생성, `_filename_matches_product()` 경계 인식 토큰 매칭
