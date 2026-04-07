@@ -24,8 +24,8 @@ from context_loop.ingestion.git_config import (
 )
 from context_loop.ingestion.git_repository import (
     FileInfo,
+    _repo_clone_dir,
     collect_files,
-    get_changed_products,
     group_files_by_directory,
     parse_product_scopes,
     sync_repository,
@@ -212,9 +212,9 @@ class CoordinatorAgent:
     ) -> list[ProductResult]:
         """단일 레포지토리를 처리한다.
 
-        1. git sync (clone/pull + git_code 저장)
-        2. 상품별 파일 수집 + 그룹핑
-        3. Worker + Category Agent 실행
+        1. git clone/pull + 원본 코드 DB 저장 (git_code)
+        2. 상품 스코프 파싱
+        3. 상품별 파일 수집 + Worker/Category Agent 실행
         """
         repo_dict = {
             "url": repo_config.url,
@@ -222,7 +222,8 @@ class CoordinatorAgent:
             "products": repo_config.products,
         }
 
-        # git sync
+        # 1. git clone/pull + git_code 저장
+        clone_dir = _repo_clone_dir(self._config.data_dir, repo_config.url)
         sync_result = await sync_repository(self._store, self._config, repo_dict)
         logger.info(
             "레포 동기화: %s (생성=%d, 갱신=%d)",
@@ -231,38 +232,34 @@ class CoordinatorAgent:
             len(sync_result.updated),
         )
 
-        # 상품 스코프 파싱 + 전체 파일 수집
-        from context_loop.ingestion.git_repository import _repo_clone_dir
-
-        clone_dir = _repo_clone_dir(self._config.data_dir, repo_config.url)
+        # 2. 상품 스코프 파싱
         scopes = parse_product_scopes(
             repo_dict,
             clone_dir=clone_dir,
             supported_extensions=self._git_config.supported_extensions or None,
         )
-        all_files = collect_files(
-            clone_dir,
-            scopes,
-            self._git_config.supported_extensions,
-            self._git_config.file_size_limit_kb,
-        )
 
-        # 상품별 분류
-        files_by_product: dict[str, list[FileInfo]] = {}
-        for f in all_files:
-            files_by_product.setdefault(f.product, []).append(f)
-
-        # 상품별 병렬 처리
+        # 3. 상품별 파일 수집 + Worker/Category Agent 실행
         product_results: list[ProductResult] = []
-        for product_name, product_files in files_by_product.items():
+        for scope in scopes:
+            product_files = collect_files(
+                clone_dir,
+                [scope],
+                self._git_config.supported_extensions,
+                self._git_config.file_size_limit_kb,
+            )
+            if not product_files:
+                logger.info("상품 %s: 수집된 파일 없음, 건너뜀", scope.name)
+                continue
+
             try:
-                pr = await self._process_product(product_name, product_files)
+                pr = await self._process_product(scope.name, product_files)
                 product_results.append(pr)
             except Exception as exc:
-                logger.error("상품 처리 실패: %s — %s", product_name, exc)
+                logger.error("상품 처리 실패: %s — %s", scope.name, exc)
                 product_results.append(
                     ProductResult(
-                        product=product_name,
+                        product=scope.name,
                         errors=[{"phase": "product", "error": str(exc)}],
                     )
                 )
