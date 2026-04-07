@@ -232,10 +232,14 @@ class CoordinatorAgent:
         )
 
         # 상품 스코프 파싱 + 전체 파일 수집
-        scopes = parse_product_scopes(repo_dict)
         from context_loop.ingestion.git_repository import _repo_clone_dir
 
         clone_dir = _repo_clone_dir(self._config.data_dir, repo_config.url)
+        scopes = parse_product_scopes(
+            repo_dict,
+            clone_dir=clone_dir,
+            supported_extensions=self._git_config.supported_extensions or None,
+        )
         all_files = collect_files(
             clone_dir,
             scopes,
