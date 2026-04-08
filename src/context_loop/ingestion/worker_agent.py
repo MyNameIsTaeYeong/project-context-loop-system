@@ -191,8 +191,9 @@ class LLMWorkerAgent:
             summary = await self._worker_llm.complete(
                 prompt,
                 system=_FILE_SUMMARY_SYSTEM,
-                max_tokens=512,
+                max_tokens=4096,
                 temperature=0.1,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
 
             return FileSummary(
@@ -229,8 +230,9 @@ class LLMWorkerAgent:
         document = await self._synthesizer_llm.complete(
             prompt,
             system=_DIR_SYNTHESIS_SYSTEM,
-            max_tokens=1536,
+            max_tokens=8192,
             temperature=0.1,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
         return document.strip()

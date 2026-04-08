@@ -167,11 +167,11 @@ class TestFileSummary:
 
         # worker_llm이 Level 1 호출
         assert len(worker_llm.calls) == 1
-        assert worker_llm.calls[0]["max_tokens"] == 512
+        assert worker_llm.calls[0]["max_tokens"] == 4096
 
         # synth_llm이 Level 2 호출
         assert len(synth_llm.calls) == 1
-        assert synth_llm.calls[0]["max_tokens"] == 1536
+        assert synth_llm.calls[0]["max_tokens"] == 8192
 
         assert result.file_summaries[0].summary == "worker 응답"
         assert result.document == "synthesizer 응답"
