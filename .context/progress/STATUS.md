@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.5 Worker Agent 구현 완료
-- **상태**: `LLMWorkerAgent` 구현 완료. Level 1 파일 요약(worker 엔드포인트) + Level 2 디렉토리 종합 문서(synthesizer 엔드포인트) 생성. 관점 중립적 사실 요약. 병렬 처리(asyncio.Semaphore), 개별 파일 실패 허용, 장문 절삭 지원. 테스트 13개 통과. 수동 테스트 스크립트(`scripts/run_worker_agent.py`) 추가. 다음: Category Agent(9.6) 구현.
+- **Step**: 9.6 Category Agent 구현 완료
+- **상태**: `LLMCategoryAgent` 구현 완료. Level 2 디렉토리 문서(Worker 출력)를 종합하여 카테고리별 관점 문서(Level 3) 생성. config 프롬프트를 system 프롬프트로 사용(D-028). orchestrator 엔드포인트(고성능 모델) 사용(D-029). 장문 입력 절삭 지원(max_input_chars). 테스트 13개 통과. 수동 테스트 스크립트(`scripts/run_category_agent.py`) 추가. 다음: 원본 코드 저장(9.7) 구현.
 
 ## Phase별 진행률
 
@@ -69,7 +69,7 @@
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
 - [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
-- [ ] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
+- [x] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
 - [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
 - [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
 - [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
@@ -83,7 +83,24 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-08
-- 내용: Phase 9.5 Worker Agent 구현 + Coordinator 리팩토링 완료.
+- 내용: Phase 9.6 Category Agent 구현 완료.
+  - **`ingestion/category_agent.py`** 신규: `LLMCategoryAgent` 클래스
+    - Level 2 디렉토리 문서를 종합하여 카테고리별 관점 문서(Level 3) 생성
+    - config의 카테고리 프롬프트를 system 프롬프트로 사용 (D-028)
+    - orchestrator 엔드포인트(Opus급 고성능 모델) 사용 (D-029)
+    - max_tokens=16384, temperature=0.1, `enable_thinking=False`
+    - 장문 입력 절삭(`max_input_chars=80000` 초과 시)
+    - 빈 입력 시 빈 문서 반환 (LLM 호출 안 함)
+    - 테스트 13개 전체 통과
+  - **수동 테스트 스크립트** `scripts/run_category_agent.py`
+    - `--input-dir` 모드: Worker 출력(_level2_summary.md)을 읽어 Category Agent 실행
+    - `--full-pipeline` 모드: Git clone → Worker → Category Agent 순차 실행
+    - `--categories` 옵션: 특정 카테고리만 선택 실행
+    - 결과를 `scripts/output/{product}/category/{category}.md`에 저장
+  - **Coordinator 수정 불필요**: 기존 `_run_category_agent()` 메서드(coordinator.py:350-358)가
+    `CategoryAgentProtocol`을 통해 `LLMCategoryAgent`를 그대로 호출
+  - 다음: 원본 코드 저장(9.7) — git_code DB + document_sources 연결
+- 이전: Phase 9.5 Worker Agent 구현 + Coordinator 리팩토링 완료.
   - **`ingestion/worker_agent.py`** 신규: `LLMWorkerAgent` 클래스
     - Level 1 (파일 요약): worker LLM, max_tokens=4096, `enable_thinking=False`
     - Level 2 (디렉토리 문서): synthesizer LLM, max_tokens=8192, `enable_thinking=False`
