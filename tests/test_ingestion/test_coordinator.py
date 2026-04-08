@@ -201,7 +201,7 @@ class TestCoordinatorNoAgents:
 
 class TestCoordinatorWithMockAgents:
     async def test_full_pipeline(self, store: MetadataStore, tmp_path: Path) -> None:
-        """전체 파이프라인: git sync → Worker → Category Agent."""
+        """전체 파이프라인: git clone → Worker → Category Agent."""
         origin = tmp_path / "origin"
         _init_git_repo(origin, {
             "services/vpc/main.go": "package main",
@@ -219,10 +219,6 @@ class TestCoordinatorWithMockAgents:
             worker=worker, category_agent=cat_agent,
         )
         result = await coord.run()
-
-        # git_code 저장 확인
-        git_docs = await store.list_documents(source_type="git_code")
-        assert len(git_docs) == 2
 
         # Worker 호출 확인
         assert len(worker.calls) >= 1

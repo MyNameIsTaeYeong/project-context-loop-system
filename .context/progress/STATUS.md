@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.4+ scope_analyzer config 기반 전환 완료
-- **상태**: scope_analyzer.py를 LLM 기반(956줄)에서 config 기반(~120줄)으로 전면 재작성. 사용자가 config에 상품명을 정의하면 레포 전체에서 파일명 토큰 매칭으로 관련 파일 경로를 자동 탐지. LLM 의존 완전 제거. 복수형 변형, 경계 인식 토큰 매칭, exclude 패턴 지원. 테스트 24+4개 통과. 다음: Worker Agent(9.5), Category Agent(9.6) 구현.
+- **Step**: 9.5 Worker Agent 구현 완료
+- **상태**: `LLMWorkerAgent` 구현 완료. Level 1 파일 요약(worker 엔드포인트) + Level 2 디렉토리 종합 문서(synthesizer 엔드포인트) 생성. 관점 중립적 사실 요약. 병렬 처리(asyncio.Semaphore), 개별 파일 실패 허용, 장문 절삭 지원. 테스트 13개 통과. 수동 테스트 스크립트(`scripts/run_worker_agent.py`) 추가. 다음: Category Agent(9.6) 구현.
 
 ## Phase별 진행률
 
@@ -68,7 +68,7 @@
 - [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
-- [ ] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
+- [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
 - [ ] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
 - [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
 - [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
@@ -82,8 +82,26 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-06
-- 내용: Phase 9.4+ — `scope_analyzer.py` config 기반 전면 전환 (I-026, I-027 해결).
+- 일시: 2026-04-08
+- 내용: Phase 9.5 Worker Agent 구현 + Coordinator 리팩토링 완료.
+  - **`ingestion/worker_agent.py`** 신규: `LLMWorkerAgent` 클래스
+    - Level 1 (파일 요약): worker LLM, max_tokens=4096, `enable_thinking=False`
+    - Level 2 (디렉토리 문서): synthesizer LLM, max_tokens=8192, `enable_thinking=False`
+    - 관점 중립 사실 요약. 개별 파일 실패 허용. `asyncio.Semaphore(max_concurrent_files=5)` 병렬 처리.
+    - 장문 절삭(`max_file_tokens` 초과 시)
+    - 테스트 13개 전체 통과
+  - **Coordinator `_process_repository` 리팩토링 (D-030)**
+    - `sync_repository()` 제거 → `clone_or_pull()`만 호출 (불필요한 git_code DB I/O 제거)
+    - scopes를 직접 순회하며 상품별 `collect_files([scope])` → `_process_product()` 호출
+    - `parse_product_scopes(clone_dir=...)` 전달 버그 수정
+  - **수동 테스트 스크립트** `scripts/run_worker_agent.py`
+    - `--local-dir` 모드: 로컬 파일 직접 분석
+    - `--full-pipeline` 모드: Git clone → 상품별 Worker 실행
+    - 결과를 `scripts/output/{product}/{directory}/` 하위에 마크다운 파일로 저장
+    - `_level1_{filename}.md` (파일별 요약) + `_level2_summary.md` (디렉토리 종합)
+  - **설계 결정**: D-030 — git_code DB 저장을 Phase 9.7로 분리
+  - 다음: Category Agent(9.6) 구현
+- 이전: Phase 9.4+ — `scope_analyzer.py` config 기반 전면 전환 (I-026, I-027 해결).
   - **LLM 기반 → config 기반 전환**: 956줄 → ~120줄. 2-pass 아키텍처, 레이어 감지, LLM 프롬프트 전량 삭제
   - **새 아키텍처**: config에 상품명 정의 → `resolve_product_paths()`가 BFS로 레포 전체 순회 → 파일명 토큰 매칭
   - **핵심 기능**: `_plural_variants()` 복수형 생성, `_filename_matches_product()` 경계 인식 토큰 매칭
