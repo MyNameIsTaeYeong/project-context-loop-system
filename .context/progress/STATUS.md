@@ -83,21 +83,24 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-08
-- 내용: `_process_repository` 리팩토링 (D-030).
-  - `sync_repository()` 대신 `clone_or_pull()`만 호출하여 불필요한 git_code DB 저장 제거
-  - scopes를 직접 순회하며 상품별 `collect_files` → `_process_product` 호출
-  - `parse_product_scopes`에 `clone_dir` 전달하여 자동 탐지 지원 (기존 버그 수정)
-  - git_code DB 저장 + document_sources 연결은 Phase 9.7로 분리 (D-030)
-- 이전: Phase 9.5 — `LLMWorkerAgent` 구현 완료.
-  - **`ingestion/worker_agent.py`** 신규 모듈: `LLMWorkerAgent` 클래스
-  - **Level 1 (파일 요약)**: 각 파일을 worker LLM(경량 모델)으로 요약. 관점 중립 사실 기반.
-  - **Level 2 (디렉토리 문서)**: 파일 요약을 synthesizer LLM(중간 모델)으로 종합.
-  - **엔드포인트 분리**: D-029에 따라 worker/synthesizer 별도 LLM 클라이언트 사용
-  - **에러 처리**: 개별 파일 실패 시 나머지 정상 진행, 전체 실패 시 에러 메시지 반환
-  - **병렬 처리**: `asyncio.Semaphore`로 `max_concurrent_files` 동시성 제한
-  - **장문 절삭**: `max_file_tokens` 초과 시 내용 절삭
-  - **테스트**: 13개 (Level 1 단위 5 + 에러 2 + Level 2 단위 2 + 전체 흐름 4) — 전체 통과
-  - **수동 테스트**: `scripts/run_worker_agent.py` — 로컬 디렉토리 모드 + 전체 파이프라인 모드
+- 내용: Phase 9.5 Worker Agent 구현 + Coordinator 리팩토링 완료.
+  - **`ingestion/worker_agent.py`** 신규: `LLMWorkerAgent` 클래스
+    - Level 1 (파일 요약): worker LLM, max_tokens=4096, `enable_thinking=False`
+    - Level 2 (디렉토리 문서): synthesizer LLM, max_tokens=8192, `enable_thinking=False`
+    - 관점 중립 사실 요약. 개별 파일 실패 허용. `asyncio.Semaphore(max_concurrent_files=5)` 병렬 처리.
+    - 장문 절삭(`max_file_tokens` 초과 시)
+    - 테스트 13개 전체 통과
+  - **Coordinator `_process_repository` 리팩토링 (D-030)**
+    - `sync_repository()` 제거 → `clone_or_pull()`만 호출 (불필요한 git_code DB I/O 제거)
+    - scopes를 직접 순회하며 상품별 `collect_files([scope])` → `_process_product()` 호출
+    - `parse_product_scopes(clone_dir=...)` 전달 버그 수정
+  - **수동 테스트 스크립트** `scripts/run_worker_agent.py`
+    - `--local-dir` 모드: 로컬 파일 직접 분석
+    - `--full-pipeline` 모드: Git clone → 상품별 Worker 실행
+    - 결과를 `scripts/output/{product}/{directory}/` 하위에 마크다운 파일로 저장
+    - `_level1_{filename}.md` (파일별 요약) + `_level2_summary.md` (디렉토리 종합)
+  - **설계 결정**: D-030 — git_code DB 저장을 Phase 9.7로 분리
+  - 다음: Category Agent(9.6) 구현
 - 이전: Phase 9.4+ — `scope_analyzer.py` config 기반 전면 전환 (I-026, I-027 해결).
   - **LLM 기반 → config 기반 전환**: 956줄 → ~120줄. 2-pass 아키텍처, 레이어 감지, LLM 프롬프트 전량 삭제
   - **새 아키텍처**: config에 상품명 정의 → `resolve_product_paths()`가 BFS로 레포 전체 순회 → 파일명 토큰 매칭
