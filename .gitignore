@@ -21,3 +21,6 @@ uv.lock
 # Environment
 .env
 .env.local
+
+# Scripts output
+scripts/output/
