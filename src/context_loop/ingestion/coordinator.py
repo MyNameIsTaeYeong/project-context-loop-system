@@ -25,10 +25,10 @@ from context_loop.ingestion.git_config import (
 from context_loop.ingestion.git_repository import (
     FileInfo,
     _repo_clone_dir,
+    clone_or_pull,
     collect_files,
     group_files_by_directory,
     parse_product_scopes,
-    sync_repository,
 )
 from context_loop.storage.metadata_store import MetadataStore
 
@@ -212,9 +212,13 @@ class CoordinatorAgent:
     ) -> list[ProductResult]:
         """단일 레포지토리를 처리한다.
 
-        1. git clone/pull + 원본 코드 DB 저장 (git_code)
+        1. git clone/pull
         2. 상품 스코프 파싱
         3. 상품별 파일 수집 + Worker/Category Agent 실행
+
+        Note:
+            원본 코드의 git_code DB 저장 및 document_sources 연결은
+            Phase 9.7에서 별도 구현한다.
         """
         repo_dict = {
             "url": repo_config.url,
@@ -222,14 +226,15 @@ class CoordinatorAgent:
             "products": repo_config.products,
         }
 
-        # 1. git clone/pull + git_code 저장
+        # 1. git clone/pull
         clone_dir = _repo_clone_dir(self._config.data_dir, repo_config.url)
-        sync_result = await sync_repository(self._store, self._config, repo_dict)
+        is_new, prev_commit = await clone_or_pull(
+            repo_config.url, clone_dir, repo_config.branch,
+        )
         logger.info(
-            "레포 동기화: %s (생성=%d, 갱신=%d)",
+            "레포 %s: %s",
             repo_config.url,
-            len(sync_result.created),
-            len(sync_result.updated),
+            "새로 clone" if is_new else f"pull 완료 (이전: {prev_commit})",
         )
 
         # 2. 상품 스코프 파싱

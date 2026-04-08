@@ -82,8 +82,13 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-07
-- 내용: Phase 9.5 — `LLMWorkerAgent` 구현 완료.
+- 일시: 2026-04-08
+- 내용: `_process_repository` 리팩토링 (D-030).
+  - `sync_repository()` 대신 `clone_or_pull()`만 호출하여 불필요한 git_code DB 저장 제거
+  - scopes를 직접 순회하며 상품별 `collect_files` → `_process_product` 호출
+  - `parse_product_scopes`에 `clone_dir` 전달하여 자동 탐지 지원 (기존 버그 수정)
+  - git_code DB 저장 + document_sources 연결은 Phase 9.7로 분리 (D-030)
+- 이전: Phase 9.5 — `LLMWorkerAgent` 구현 완료.
   - **`ingestion/worker_agent.py`** 신규 모듈: `LLMWorkerAgent` 클래스
   - **Level 1 (파일 요약)**: 각 파일을 worker LLM(경량 모델)으로 요약. 관점 중립 사실 기반.
   - **Level 2 (디렉토리 문서)**: 파일 요약을 synthesizer LLM(중간 모델)으로 종합.

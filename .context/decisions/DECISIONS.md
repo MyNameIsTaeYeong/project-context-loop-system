@@ -389,3 +389,13 @@
 - **config 구조**: `sources.git.processing` 하위에 에이전트별 `endpoint`, `model`, `api_key` 지정. 미지정 시 기존 `llm.endpoint` 폴백.
 - **비용 예시** (파일 500개, 디렉토리 50개, 카테고리 5개, 상품 1개): Worker 500회(Haiku) + Synthesizer 50회(Sonnet) + Category 5회(Opus) + 검증 50회(Sonnet) → 모두 Opus 대비 80%+ 비용 절감.
 - **이유**: 작업 복잡도에 맞는 모델을 배치하여 비용 최적화. 엔드포인트 방식 통일로 기존 `llm_client.py`의 `EndpointLLMClient`를 그대로 재사용. 에이전트별 엔드포인트를 분리하면 Worker는 빠르고 저렴한 자체 서버, Category Agent는 고성능 서버로 분배 가능.
+
+---
+
+## D-030: git_code DB 저장을 Phase 9.7로 분리
+
+- **일시**: 2026-04-08
+- **맥락**: `_process_repository`가 `sync_repository()`를 호출하면서 원본 코드를 매번 `git_code`로 DB에 저장하고 있었으나, 저장된 `git_code`를 실제로 읽어서 사용하는 코드(검색 시 원본 코드 첨부, `document_sources` 연결)가 아직 없음. Worker/Category Agent는 `collect_files()`로 디스크에서 직접 파일을 읽으므로 DB의 `git_code`를 참조하지 않음.
+- **결정**: `_process_repository`에서 `sync_repository`를 제거하고 `clone_or_pull`만 호출. `git_code` DB 저장 + `document_sources` 연결은 Phase 9.7에서 구현한다.
+- **이유**: 사용처 없이 매 실행마다 모든 파일을 DB에 insert/update하는 것은 불필요한 I/O 비용. 9.7에서 `git_code` 저장과 `document_sources` 연결을 함께 구현하면 저장 즉시 연결까지 완결되어 더 깔끔함.
+- **영향**: `sync_repository()` 함수 자체는 삭제하지 않고 유지. 9.7 구현 시 Coordinator에서 적절한 시점에 호출하거나, 별도 메서드로 재구성.

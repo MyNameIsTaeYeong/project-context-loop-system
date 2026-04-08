@@ -58,7 +58,7 @@
 ### I-021: document_sources 테이블 및 검색 시 원본 코드 첨부
 - `document_sources` 테이블 추가하여 code_doc ↔ git_code N:M 관계 관리
 - context_assembler에서 code_doc chunk 반환 시 원본 코드를 함께 제공하는 옵션 구현
-- D-026 관련, Phase 9.1, 9.5
+- D-026, D-030 관련, Phase 9.7에서 git_code 저장 + document_sources 연결을 함께 구현
 
 ### I-022: LLM 생성 문서의 환각 검증 메커니즘
 - code_doc이 원본 코드와 불일치하는 경우를 감지하는 방법 검토 필요
