@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.6 Category Agent 구현 완료 (병렬 제어 + 스트리밍 제거 포함)
-- **상태**: `LLMCategoryAgent` 구현 완료. Level 2 디렉토리 문서(Worker 출력)를 종합하여 카테고리별 관점 문서(Level 3) 생성. config 프롬프트를 system 프롬프트로 사용(D-028). orchestrator 엔드포인트(고성능 모델) 사용(D-029). 글자수 기반 동적 배치 + map-reduce로 대형 입력 타임아웃 방지. Map 배치는 `asyncio.Semaphore(4)`로 최대 4개 병렬 실행하여 서버 과부하 방지. 스트리밍 기능 제거 — 직렬 Map + 타임아웃 설정으로 안정성 확보. `EndpointLLMClient` 타임아웃 설정 지원. `max_chars_per_batch=8000`으로 배치 크기 축소. 테스트 25개 통과. 수동 테스트 스크립트(`scripts/run_category_agent.py`) 추가. 다음: 원본 코드 저장(9.7) 구현.
+- **Step**: 9.7 원본 코드 저장 (git_code) + document_sources 연결 완료
+- **상태**: `run_and_store()`에서 원본 코드 파일을 `git_code` 문서로 DB에 저장하고, `document_sources` 테이블로 `code_summary`/`code_doc` ↔ `git_code` N:M 연결을 자동 구축. `context_assembler`에 `include_source_code` 옵션 추가하여 검색 시 LLM 생성 문서와 원본 코드를 함께 반환 가능. `_collect_git_code_ids()` 헬퍼로 `source_directories` 기반 매칭. `ProductResult`에 `files`/`repo_url` 필드 추가. 테스트 24개(coordinator) + 22개(context_assembler) 전체 통과. 다음: code_doc → 기존 파이프라인 연결(9.8) 구현.
 
 ## Phase별 진행률
 
@@ -70,7 +70,7 @@
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
 - [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
 - [x] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
-- [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
+- [x] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026, D-030)
 - [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
 - [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
 - [ ] 9.10 GitHub webhook 기반 자동 동기화

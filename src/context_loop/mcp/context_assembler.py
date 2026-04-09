@@ -59,6 +59,7 @@ async def assemble_context(
     rerank_top_k: int | None = None,
     rerank_score_threshold: float = 0.0,
     hyde_enabled: bool = False,
+    include_source_code: bool = False,
 ) -> str:
     """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
@@ -79,6 +80,7 @@ async def assemble_context(
         rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
         rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
+        include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
 
     Returns:
         조립된 컨텍스트 텍스트.
@@ -121,6 +123,13 @@ async def assemble_context(
         )
         if graph_result:
             sections.append(graph_result.text)
+
+    # 4. Phase 9.7: 원본 소스 코드 첨부
+    if include_source_code and chunk_results:
+        doc_ids = _extract_doc_ids(chunk_results)
+        source_section = await _fetch_and_format_source_code(doc_ids, meta_store)
+        if source_section:
+            sections.append(source_section)
 
     if not sections:
         return "관련 컨텍스트를 찾을 수 없습니다."
@@ -246,6 +255,7 @@ async def assemble_context_with_sources(
     rerank_top_k: int | None = None,
     rerank_score_threshold: float = 0.0,
     hyde_enabled: bool = False,
+    include_source_code: bool = False,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -266,6 +276,7 @@ async def assemble_context_with_sources(
         rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
         rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
+        include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -335,6 +346,80 @@ async def assemble_context_with_sources(
                     title = doc_cache[doc_id]["title"]
                     sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
 
+    # Phase 9.7: 원본 소스 코드 첨부
+    if include_source_code and chunk_results:
+        hit_doc_ids = _extract_doc_ids(chunk_results)
+        source_section = await _fetch_and_format_source_code(
+            hit_doc_ids, meta_store,
+        )
+        if source_section:
+            sections.append(source_section)
+
     context_text = "\n\n---\n\n".join(sections) if sections else ""
     sources.sort(key=lambda s: s.similarity, reverse=True)
     return AssembledContext(context_text=context_text, sources=sources)
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.7: 원본 소스 코드 첨부 헬퍼
+# ---------------------------------------------------------------------------
+
+
+def _extract_doc_ids(chunk_results: list[dict[str, Any]]) -> set[int]:
+    """청크 검색 결과에서 고유 문서 ID를 추출한다."""
+    ids: set[int] = set()
+    for r in chunk_results:
+        doc_id = r.get("metadata", {}).get("document_id")
+        if doc_id is not None:
+            ids.add(doc_id)
+    return ids
+
+
+async def _fetch_and_format_source_code(
+    doc_ids: set[int],
+    meta_store: MetadataStore,
+) -> str | None:
+    """code_doc/code_summary 문서의 원본 git_code 소스를 조회하여 포맷팅한다.
+
+    document_sources 테이블을 통해 연결된 git_code 문서의 원본 코드를
+    검증용 섹션으로 조립한다.
+
+    Returns:
+        포맷팅된 소스 코드 섹션 문자열. 소스가 없으면 None.
+    """
+    source_parts: list[str] = []
+    seen_source_ids: set[int] = set()
+
+    for doc_id in doc_ids:
+        doc = await meta_store.get_document(doc_id)
+        if not doc or doc["source_type"] not in ("code_doc", "code_summary"):
+            continue
+
+        sources = await meta_store.get_document_sources(doc_id)
+        for src in sources:
+            src_id = src["source_doc_id"]
+            if src_id in seen_source_ids:
+                continue
+            seen_source_ids.add(src_id)
+
+            src_doc = await meta_store.get_document(src_id)
+            if not src_doc or not src_doc.get("original_content"):
+                continue
+
+            file_path = src.get("file_path") or src_doc.get("source_id", "")
+            title = src_doc.get("title", file_path)
+            content = src_doc["original_content"]
+
+            # 파일 확장자에서 언어 힌트 추출
+            ext = ""
+            if "." in file_path:
+                ext = file_path.rsplit(".", 1)[-1]
+
+            source_parts.append(
+                f"### {title} ({file_path})\n```{ext}\n{content}\n```"
+            )
+
+    if not source_parts:
+        return None
+
+    return "## 원본 소스 코드 (검증용)\n\n" + "\n\n".join(source_parts)

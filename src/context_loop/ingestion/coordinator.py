@@ -29,6 +29,7 @@ from context_loop.ingestion.git_repository import (
     collect_files,
     group_files_by_directory,
     parse_product_scopes,
+    store_git_code,
 )
 from context_loop.storage.metadata_store import MetadataStore
 
@@ -76,6 +77,9 @@ class ProductResult:
     directory_summaries: list[DirectorySummary] = field(default_factory=list)
     category_documents: list[CategoryDocument] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
+    # Phase 9.7: git_code 저장 및 document_sources 연결용
+    files: list[FileInfo] = field(default_factory=list)
+    repo_url: str = ""
 
 
 @dataclass
@@ -216,9 +220,8 @@ class CoordinatorAgent:
         2. 상품 스코프 파싱
         3. 상품별 파일 수집 + Worker/Category Agent 실행
 
-        Note:
-            원본 코드의 git_code DB 저장 및 document_sources 연결은
-            Phase 9.7에서 별도 구현한다.
+        원본 코드 파일(FileInfo)은 ProductResult.files에 보존되어
+        run_and_store()에서 git_code 저장 및 document_sources 연결에 사용된다.
         """
         repo_dict = {
             "url": repo_config.url,
@@ -259,6 +262,8 @@ class CoordinatorAgent:
 
             try:
                 pr = await self._process_product(scope.name, product_files)
+                pr.files = product_files
+                pr.repo_url = repo_config.url
                 product_results.append(pr)
             except Exception as exc:
                 logger.error("상품 처리 실패: %s — %s", scope.name, exc)
@@ -455,26 +460,54 @@ class CoordinatorAgent:
     async def run_and_store(self) -> PipelineResult:
         """파이프라인을 실행하고 결과를 DB에 저장한다.
 
-        run()의 결과를 받아 code_summary와 code_doc을 저장하고,
-        document_sources 연결까지 수행하는 상위 레벨 메서드.
+        run()의 결과를 받아:
+        1. git_code 문서 저장 (원본 코드 파일)
+        2. code_summary 저장 (Level 2) + document_sources 연결
+        3. code_doc 저장 (Level 3) + document_sources 연결
         """
         result = await self.run()
 
         for pr in result.product_results:
-            # Level 2 저장
+            # Phase 9.7: git_code 저장 + git_code_map 구축
+            git_code_map: dict[str, int] = {}
+            for fi in pr.files:
+                try:
+                    doc_result = await store_git_code(
+                        self._store, fi, pr.repo_url,
+                    )
+                    git_code_map[fi.relative_path] = doc_result["id"]
+                except Exception as exc:
+                    logger.error(
+                        "git_code 저장 실패: %s — %s",
+                        fi.relative_path, exc,
+                    )
+
+            # Level 2 저장 + document_sources 연결
             for ds in pr.directory_summaries:
                 try:
-                    await self.store_directory_summary(ds)
+                    doc_id = await self.store_directory_summary(ds)
+                    # Phase 9.7: code_summary ↔ git_code 연결
+                    for fs in ds.file_summaries:
+                        git_code_id = git_code_map.get(fs.relative_path)
+                        if git_code_id is not None:
+                            await self._store.add_document_source(
+                                doc_id, git_code_id, fs.relative_path,
+                            )
                 except Exception as exc:
                     logger.error(
                         "디렉토리 요약 저장 실패: %s/%s — %s",
                         ds.product, ds.directory, exc,
                     )
 
-            # Level 3 저장
+            # Level 3 저장 + document_sources 연결
             for cd in pr.category_documents:
                 try:
-                    await self.store_category_document(cd)
+                    related_ids = _collect_git_code_ids(
+                        cd.source_directories, git_code_map,
+                    )
+                    await self.store_category_document(
+                        cd, source_git_code_ids=related_ids or None,
+                    )
                 except Exception as exc:
                     logger.error(
                         "카테고리 문서 저장 실패: %s/%s — %s",
@@ -482,3 +515,22 @@ class CoordinatorAgent:
                     )
 
         return result
+
+
+def _collect_git_code_ids(
+    source_directories: list[str],
+    git_code_map: dict[str, int],
+) -> list[int]:
+    """source_directories에 속하는 파일의 git_code 문서 ID를 수집한다."""
+    ids: list[int] = []
+    seen: set[int] = set()
+    for path, gid in git_code_map.items():
+        if gid in seen:
+            continue
+        for src_dir in source_directories:
+            # "." 은 루트 디렉토리 — 모든 파일 매칭
+            if src_dir == "." or path.startswith(src_dir + "/") or path == src_dir:
+                ids.append(gid)
+                seen.add(gid)
+                break
+    return ids
