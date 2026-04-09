@@ -339,8 +339,8 @@ class TestBatchSplitting:
 
 
 class TestMapReduce:
-    async def test_map_calls_are_sequential(self) -> None:
-        """Map 배치들이 직렬로 순서대로 호출된다."""
+    async def test_map_then_reduce_order(self) -> None:
+        """Map 호출이 모두 완료된 후 Reduce가 호출된다."""
         call_order: list[str] = []
 
         async def mock_complete(prompt, **kwargs):
@@ -365,9 +365,45 @@ class TestMapReduce:
             directory_summaries=summaries,
         )
 
-        # map이 먼저 순서대로, reduce가 마지막
-        assert call_order == ["map", "map", "map", "reduce"]
+        # map이 먼저, reduce가 마지막
+        assert call_order.count("map") == 3
+        assert call_order[-1] == "reduce"
         assert result.document == "최종 문서"
+
+    async def test_concurrency_limited_to_max_concurrent_batches(self) -> None:
+        """세마포어가 동시 Map 호출 수를 max_concurrent_batches로 제한한다."""
+        import asyncio
+
+        max_concurrent = 0
+        current_concurrent = 0
+
+        async def mock_complete(prompt, **kwargs):
+            nonlocal max_concurrent, current_concurrent
+            current_concurrent += 1
+            if current_concurrent > max_concurrent:
+                max_concurrent = current_concurrent
+            await asyncio.sleep(0.01)
+            current_concurrent -= 1
+            return "부분 문서"
+
+        mock_llm = AsyncMock()
+        mock_llm.complete.side_effect = mock_complete
+        agent = LLMCategoryAgent(
+            mock_llm, max_chars_per_batch=100, max_concurrent_batches=2,
+        )
+
+        summaries = [
+            _make_dir_summary(directory=f"dir_{i}", document="X" * 100)
+            for i in range(6)
+        ]
+
+        await agent.generate_document(
+            product="vpc",
+            category=_make_category(),
+            directory_summaries=summaries,
+        )
+
+        assert max_concurrent <= 2
 
     async def test_map_batch_failure_is_tolerated(self) -> None:
         """Map 배치 일부가 실패해도 나머지로 Reduce를 수행한다."""

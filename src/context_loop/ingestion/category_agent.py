@@ -101,6 +101,7 @@ class LLMCategoryAgent:
         llm: Level 3 카테고리 문서 생성용 LLM 클라이언트 (고성능 모델).
         max_chars_per_batch: 배치당 최대 글자수. 이 값에 따라 분할 횟수가
             동적으로 결정된다.
+        max_concurrent_batches: 동시에 실행할 최대 Map 배치 수.
     """
 
     def __init__(
@@ -108,9 +109,11 @@ class LLMCategoryAgent:
         llm: LLMClient,
         *,
         max_chars_per_batch: int = 8000,
+        max_concurrent_batches: int = 4,
     ) -> None:
         self._llm = llm
         self._max_chars_per_batch = max_chars_per_batch
+        self._semaphore = asyncio.Semaphore(max_concurrent_batches)
 
     async def generate_document(
         self,
@@ -205,28 +208,38 @@ class LLMCategoryAgent:
     ) -> str:
         """Map-Reduce로 문서를 생성한다.
 
-        Map: 배치별 부분 관점 문서 생성 (직렬 — 서버 과부하 방지)
+        Map: 배치별 부분 관점 문서 생성 (최대 4개 병렬)
         Reduce: 부분 문서를 종합하여 최종 문서 생성
         """
         total_dirs = sum(len(b) for b in batches)
         logger.info(
             "Category Agent map-reduce: 상품=%s, 카테고리=%s, "
-            "디렉토리=%d개, 배치=%d개",
+            "디렉토리=%d개, 배치=%d개, 동시실행=%d",
             product, category.name, total_dirs, len(batches),
+            self._semaphore._value,
         )
 
-        # Map: 직렬로 부분 문서 생성 (서버 과부하 방지)
+        # Map: 세마포어로 동시 실행 수를 제한하여 병렬 처리
+        async def _guarded_map(batch, idx):
+            async with self._semaphore:
+                return await self._map_batch(
+                    product, category, batch, idx, len(batches),
+                )
+
+        map_tasks = [
+            _guarded_map(batch, i + 1)
+            for i, batch in enumerate(batches)
+        ]
+        map_results = await asyncio.gather(*map_tasks, return_exceptions=True)
+
         partial_docs: list[str] = []
-        for i, batch in enumerate(batches):
-            try:
-                result = await self._map_batch(
-                    product, category, batch, i + 1, len(batches),
-                )
-                partial_docs.append(result)
-            except Exception as exc:
+        for i, result in enumerate(map_results):
+            if isinstance(result, Exception):
                 logger.warning(
-                    "Map 배치 %d/%d 실패: %s", i + 1, len(batches), exc,
+                    "Map 배치 %d/%d 실패: %s", i + 1, len(batches), result,
                 )
+            else:
+                partial_docs.append(result)
 
         if not partial_docs:
             return f"[{product}] {category.display_name}: 모든 배치 처리가 실패했습니다."
