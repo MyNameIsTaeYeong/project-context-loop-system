@@ -125,8 +125,6 @@ class EndpointLLMClient(LLMClient):
         model: 사용할 모델 ID.
         api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
         timeout: HTTP 요청 타임아웃(초). 대형 입력 처리 시 충분히 높게 설정.
-        stream: True이면 스트리밍 응답을 사용한다. 토큰이 도착하는 동안
-            HTTP 커넥션이 유지되어 장시간 생성에도 타임아웃이 발생하지 않는다.
     """
 
     def __init__(
@@ -135,7 +133,6 @@ class EndpointLLMClient(LLMClient):
         model: str,
         api_key: str = "none",
         timeout: float = 600.0,
-        stream: bool = False,
     ) -> None:
         import httpx  # noqa: PLC0415
         from openai import AsyncOpenAI  # noqa: PLC0415
@@ -146,7 +143,6 @@ class EndpointLLMClient(LLMClient):
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
         self._model = model
-        self._stream = stream
 
     async def complete(
         self,
@@ -170,24 +166,8 @@ class EndpointLLMClient(LLMClient):
         if "extra_body" in kwargs:
             api_kwargs["extra_body"] = kwargs["extra_body"]
 
-        if self._stream:
-            return await self._complete_stream(api_kwargs)
-
         response = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
         return response.choices[0].message.content or ""
-
-    async def _complete_stream(self, api_kwargs: dict[str, Any]) -> str:
-        """스트리밍으로 응답을 수집하여 전체 문자열을 반환한다."""
-        stream = await self._client.chat.completions.create(
-            **api_kwargs,
-            stream=True,
-        )
-        chunks: list[str] = []
-        async for chunk in stream:  # type: ignore[union-attr]
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                chunks.append(delta.content)
-        return "".join(chunks)
 
 
 def extract_json(text: str) -> Any:

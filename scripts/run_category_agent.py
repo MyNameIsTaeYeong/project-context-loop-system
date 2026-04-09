@@ -133,7 +133,7 @@ async def run_from_input(args: argparse.Namespace) -> None:
 
     # orchestrator LLM 클라이언트 생성
     try:
-        orchestrator_llm = git_config.build_llm_client("orchestrator", stream=True)
+        orchestrator_llm = git_config.build_llm_client("orchestrator")
     except ValueError as e:
         print(f"오류: {e}")
         print()
@@ -222,7 +222,7 @@ async def run_full_pipeline(args: argparse.Namespace) -> None:
     try:
         worker_llm = git_config.build_llm_client("worker")
         synthesizer_llm = git_config.build_llm_client("synthesizer")
-        orchestrator_llm = git_config.build_llm_client("orchestrator", stream=True)
+        orchestrator_llm = git_config.build_llm_client("orchestrator")
     except ValueError as e:
         print(f"오류: {e}")
         sys.exit(1)

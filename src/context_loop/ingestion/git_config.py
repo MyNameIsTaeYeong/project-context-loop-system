@@ -131,14 +131,12 @@ class GitSourceConfig:
         agent: str,
         *,
         timeout: float = 600.0,
-        stream: bool = False,
     ) -> LLMClient:
         """에이전트용 LLM 클라이언트를 생성한다 (D-029).
 
         Args:
             agent: "worker", "synthesizer", "orchestrator" 중 하나.
             timeout: HTTP 요청 타임아웃(초). 기본 600초.
-            stream: True이면 스트리밍 응답을 사용한다.
 
         Returns:
             EndpointLLMClient 인스턴스.
@@ -157,7 +155,6 @@ class GitSourceConfig:
             model=cfg.model,
             api_key=cfg.api_key or "none",
             timeout=timeout,
-            stream=stream,
         )
 
     def validate(self) -> list[str]:
