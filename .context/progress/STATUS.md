@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.6 Category Agent 구현 완료
-- **상태**: `LLMCategoryAgent` 구현 완료. Level 2 디렉토리 문서(Worker 출력)를 종합하여 카테고리별 관점 문서(Level 3) 생성. config 프롬프트를 system 프롬프트로 사용(D-028). orchestrator 엔드포인트(고성능 모델) 사용(D-029). 글자수 기반 동적 배치 + map-reduce로 대형 입력 타임아웃 방지. `EndpointLLMClient` 타임아웃 설정 지원. 테스트 24개 통과. 수동 테스트 스크립트(`scripts/run_category_agent.py`) 추가. 다음: 원본 코드 저장(9.7) 구현.
+- **Step**: 9.6 Category Agent 구현 완료 (병렬 제어 + 스트리밍 제거 포함)
+- **상태**: `LLMCategoryAgent` 구현 완료. Level 2 디렉토리 문서(Worker 출력)를 종합하여 카테고리별 관점 문서(Level 3) 생성. config 프롬프트를 system 프롬프트로 사용(D-028). orchestrator 엔드포인트(고성능 모델) 사용(D-029). 글자수 기반 동적 배치 + map-reduce로 대형 입력 타임아웃 방지. Map 배치는 `asyncio.Semaphore(4)`로 최대 4개 병렬 실행하여 서버 과부하 방지. 스트리밍 기능 제거 — 직렬 Map + 타임아웃 설정으로 안정성 확보. `EndpointLLMClient` 타임아웃 설정 지원. `max_chars_per_batch=8000`으로 배치 크기 축소. 테스트 25개 통과. 수동 테스트 스크립트(`scripts/run_category_agent.py`) 추가. 다음: 원본 코드 저장(9.7) 구현.
 
 ## Phase별 진행률
 
@@ -82,19 +82,30 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-08
-- 내용: Phase 9.6 Category Agent 구현 완료 + Map-Reduce 타임아웃 대응.
+- 일시: 2026-04-09
+- 내용: Phase 9.6 Category Agent — 서버 과부하 대응 및 안정화.
+  - **Map 배치 병렬 제어**: 무제한 병렬 → `asyncio.Semaphore(4)` 최대 4개 동시 실행
+    - 초기: `asyncio.gather`로 전체 병렬 → 서버 "peer closed connection" 오류
+    - 1차 대응: 직렬 처리로 전환 → 안정적이나 느림
+    - 최종: 세마포어(4)로 제한된 병렬 → 속도와 안정성 균형
+    - `max_concurrent_batches` 파라미터로 조정 가능
+  - **스트리밍 기능 제거**: `EndpointLLMClient`의 `stream` 파라미터 및 `_complete_stream()` 삭제
+    - `git_config.build_llm_client()`의 `stream` 파라미터 삭제
+    - `scripts/run_category_agent.py`의 `stream=True` 호출 제거
+    - 스트리밍 전용 테스트 8개 → 일반 응답 테스트 3개로 교체
+  - **배치 크기 축소**: `max_chars_per_batch` 15000 → 8000 (prefill 타임아웃 방지)
+  - 테스트 25개(category_agent) + 3개(llm_client) 전체 통과
+- 이전 (2026-04-08): Phase 9.6 Category Agent 구현 완료 + Map-Reduce 타임아웃 대응.
   - **`ingestion/category_agent.py`** 신규: `LLMCategoryAgent` 클래스
     - Level 2 디렉토리 문서를 종합하여 카테고리별 관점 문서(Level 3) 생성
     - config의 카테고리 프롬프트를 system 프롬프트로 사용 (D-028)
     - orchestrator 엔드포인트(Opus급 고성능 모델) 사용 (D-029)
-    - **글자수 기반 동적 배치 + Map-Reduce**: `max_chars_per_batch=15000` 기준으로
+    - **글자수 기반 동적 배치 + Map-Reduce**: `max_chars_per_batch=8000` 기준으로
       디렉토리 요약을 배치로 분할. 배치 1개이면 단일 호출, 2개 이상이면
-      Map(배치별 부분 문서 병렬 생성) → Reduce(부분 문서 종합) 2단계 처리
+      Map(배치별 부분 문서 최대 4개 병렬 생성) → Reduce(부분 문서 종합) 2단계 처리
     - Map: max_tokens=8192, Reduce/단일: max_tokens=16384
     - Map 배치 일부 실패 허용, 부분 문서 1개만 남으면 Reduce 생략
     - 빈 입력 시 빈 문서 반환 (LLM 호출 안 함)
-    - 테스트 24개 전체 통과
   - **`processor/llm_client.py`**: `EndpointLLMClient`에 `timeout` 파라미터 추가
     - 기본 600초, connect 10초. 대형 입력 처리 시 안전망 역할
     - `git_config.build_llm_client(agent, timeout=...)` 으로 에이전트별 설정 가능
