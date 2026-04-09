@@ -339,8 +339,8 @@ class TestBatchSplitting:
 
 
 class TestMapReduce:
-    async def test_map_calls_are_parallel(self) -> None:
-        """Map 배치들이 asyncio.gather로 병렬 호출된다."""
+    async def test_map_calls_are_sequential(self) -> None:
+        """Map 배치들이 직렬로 순서대로 호출된다."""
         call_order: list[str] = []
 
         async def mock_complete(prompt, **kwargs):
@@ -365,9 +365,8 @@ class TestMapReduce:
             directory_summaries=summaries,
         )
 
-        # map이 먼저, reduce가 마지막
-        assert call_order[-1] == "reduce"
-        assert call_order.count("map") == 3
+        # map이 먼저 순서대로, reduce가 마지막
+        assert call_order == ["map", "map", "map", "reduce"]
         assert result.document == "최종 문서"
 
     async def test_map_batch_failure_is_tolerated(self) -> None:
