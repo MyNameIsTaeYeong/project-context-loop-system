@@ -107,7 +107,7 @@ class LLMCategoryAgent:
         self,
         llm: LLMClient,
         *,
-        max_chars_per_batch: int = 15000,
+        max_chars_per_batch: int = 8000,
     ) -> None:
         self._llm = llm
         self._max_chars_per_batch = max_chars_per_batch
