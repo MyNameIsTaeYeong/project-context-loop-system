@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.5 Worker Agent 구현 완료
-- **상태**: `LLMWorkerAgent` 구현 완료. Level 1 파일 요약(worker 엔드포인트) + Level 2 디렉토리 종합 문서(synthesizer 엔드포인트) 생성. 관점 중립적 사실 요약. 병렬 처리(asyncio.Semaphore), 개별 파일 실패 허용, 장문 절삭 지원. 테스트 13개 통과. 수동 테스트 스크립트(`scripts/run_worker_agent.py`) 추가. 다음: Category Agent(9.6) 구현.
+- **Step**: 9.6 Category Agent 구현 완료 (병렬 제어 + 스트리밍 제거 포함)
+- **상태**: `LLMCategoryAgent` 구현 완료. Level 2 디렉토리 문서(Worker 출력)를 종합하여 카테고리별 관점 문서(Level 3) 생성. config 프롬프트를 system 프롬프트로 사용(D-028). orchestrator 엔드포인트(고성능 모델) 사용(D-029). 글자수 기반 동적 배치 + map-reduce로 대형 입력 타임아웃 방지. Map 배치는 `asyncio.Semaphore(4)`로 최대 4개 병렬 실행하여 서버 과부하 방지. 스트리밍 기능 제거 — 직렬 Map + 타임아웃 설정으로 안정성 확보. `EndpointLLMClient` 타임아웃 설정 지원. `max_chars_per_batch=8000`으로 배치 크기 축소. 테스트 25개 통과. 수동 테스트 스크립트(`scripts/run_category_agent.py`) 추가. 다음: 원본 코드 저장(9.7) 구현.
 
 ## Phase별 진행률
 
@@ -69,7 +69,7 @@
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
 - [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
-- [ ] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
+- [x] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
 - [ ] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026)
 - [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
 - [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
@@ -82,8 +82,42 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-08
-- 내용: Phase 9.5 Worker Agent 구현 + Coordinator 리팩토링 완료.
+- 일시: 2026-04-09
+- 내용: Phase 9.6 Category Agent — 서버 과부하 대응 및 안정화.
+  - **Map 배치 병렬 제어**: 무제한 병렬 → `asyncio.Semaphore(4)` 최대 4개 동시 실행
+    - 초기: `asyncio.gather`로 전체 병렬 → 서버 "peer closed connection" 오류
+    - 1차 대응: 직렬 처리로 전환 → 안정적이나 느림
+    - 최종: 세마포어(4)로 제한된 병렬 → 속도와 안정성 균형
+    - `max_concurrent_batches` 파라미터로 조정 가능
+  - **스트리밍 기능 제거**: `EndpointLLMClient`의 `stream` 파라미터 및 `_complete_stream()` 삭제
+    - `git_config.build_llm_client()`의 `stream` 파라미터 삭제
+    - `scripts/run_category_agent.py`의 `stream=True` 호출 제거
+    - 스트리밍 전용 테스트 8개 → 일반 응답 테스트 3개로 교체
+  - **배치 크기 축소**: `max_chars_per_batch` 15000 → 8000 (prefill 타임아웃 방지)
+  - 테스트 25개(category_agent) + 3개(llm_client) 전체 통과
+- 이전 (2026-04-08): Phase 9.6 Category Agent 구현 완료 + Map-Reduce 타임아웃 대응.
+  - **`ingestion/category_agent.py`** 신규: `LLMCategoryAgent` 클래스
+    - Level 2 디렉토리 문서를 종합하여 카테고리별 관점 문서(Level 3) 생성
+    - config의 카테고리 프롬프트를 system 프롬프트로 사용 (D-028)
+    - orchestrator 엔드포인트(Opus급 고성능 모델) 사용 (D-029)
+    - **글자수 기반 동적 배치 + Map-Reduce**: `max_chars_per_batch=8000` 기준으로
+      디렉토리 요약을 배치로 분할. 배치 1개이면 단일 호출, 2개 이상이면
+      Map(배치별 부분 문서 최대 4개 병렬 생성) → Reduce(부분 문서 종합) 2단계 처리
+    - Map: max_tokens=8192, Reduce/단일: max_tokens=16384
+    - Map 배치 일부 실패 허용, 부분 문서 1개만 남으면 Reduce 생략
+    - 빈 입력 시 빈 문서 반환 (LLM 호출 안 함)
+  - **`processor/llm_client.py`**: `EndpointLLMClient`에 `timeout` 파라미터 추가
+    - 기본 600초, connect 10초. 대형 입력 처리 시 안전망 역할
+    - `git_config.build_llm_client(agent, timeout=...)` 으로 에이전트별 설정 가능
+  - **수동 테스트 스크립트** `scripts/run_category_agent.py`
+    - `--input-dir` 모드: Worker 출력(_level2_summary.md)을 읽어 Category Agent 실행
+    - `--full-pipeline` 모드: Git clone → Worker → Category Agent 순차 실행
+    - `--categories` 옵션: 특정 카테고리만 선택 실행
+    - 결과를 `scripts/output/{product}/category/{category}.md`에 저장
+  - **Coordinator 수정 불필요**: 기존 `_run_category_agent()` 메서드가
+    `CategoryAgentProtocol`을 통해 `LLMCategoryAgent`를 그대로 호출
+  - 다음: 원본 코드 저장(9.7) — git_code DB + document_sources 연결
+- 이전: Phase 9.5 Worker Agent 구현 + Coordinator 리팩토링 완료.
   - **`ingestion/worker_agent.py`** 신규: `LLMWorkerAgent` 클래스
     - Level 1 (파일 요약): worker LLM, max_tokens=4096, `enable_thinking=False`
     - Level 2 (디렉토리 문서): synthesizer LLM, max_tokens=8192, `enable_thinking=False`

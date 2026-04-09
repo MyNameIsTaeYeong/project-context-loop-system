@@ -124,11 +124,24 @@ class EndpointLLMClient(LLMClient):
         endpoint: 모델 서버 엔드포인트 URL (예: "http://localhost:8080/v1").
         model: 사용할 모델 ID.
         api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
+        timeout: HTTP 요청 타임아웃(초). 대형 입력 처리 시 충분히 높게 설정.
     """
 
-    def __init__(self, endpoint: str, model: str, api_key: str = "none") -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        api_key: str = "none",
+        timeout: float = 600.0,
+    ) -> None:
+        import httpx  # noqa: PLC0415
         from openai import AsyncOpenAI  # noqa: PLC0415
-        self._client = AsyncOpenAI(api_key=api_key or "none", base_url=endpoint)
+
+        self._client = AsyncOpenAI(
+            api_key=api_key or "none",
+            base_url=endpoint,
+            timeout=httpx.Timeout(timeout, connect=10.0),
+        )
         self._model = model
 
     async def complete(
@@ -152,6 +165,7 @@ class EndpointLLMClient(LLMClient):
         }
         if "extra_body" in kwargs:
             api_kwargs["extra_body"] = kwargs["extra_body"]
+
         response = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
         return response.choices[0].message.content or ""
 
