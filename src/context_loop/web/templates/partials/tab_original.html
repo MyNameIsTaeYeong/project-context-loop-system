@@ -1,4 +1,4 @@
-{% if doc.source_type in ('code_doc', 'code_summary') %}
+{% if doc.source_type in ('code_file_summary', 'code_doc', 'code_summary') %}
 <article x-data="{ view: 'rendered' }">
     <div role="group" style="margin-bottom: 1rem;">
         <button :class="view === 'rendered' ? '' : 'outline'"

@@ -572,8 +572,8 @@ class TestPhase97GitCodeStorage:
 
         # git_code → 참조하는 문서 조회
         referencing = await store.get_documents_by_source(git_codes[0]["id"])
-        # code_summary 1개 + code_doc 5개 = 6개
-        assert len(referencing) == 6
+        # code_file_summary 1개 + code_summary 1개 + code_doc 5개 = 7개
+        assert len(referencing) == 7
 
 
 class TestCollectGitCodeIds:

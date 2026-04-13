@@ -405,6 +405,63 @@ class CoordinatorAgent:
         )
         return doc_id
 
+    async def store_file_summary(
+        self,
+        file_summary: FileSummary,
+        product: str,
+        source_git_code_id: int | None = None,
+    ) -> int:
+        """Level 1 파일 요약을 code_file_summary 문서로 저장한다.
+
+        Args:
+            file_summary: Worker Agent의 파일별 요약.
+            product: 상품명.
+            source_git_code_id: 연결할 git_code 문서 ID (document_sources용).
+
+        Returns:
+            생성된 문서 ID.
+        """
+        from context_loop.ingestion.git_repository import compute_content_hash
+
+        source_id = f"{product}:{file_summary.relative_path}"
+        content_hash = compute_content_hash(file_summary.summary)
+
+        existing_docs = await self._store.list_documents(
+            source_type="code_file_summary",
+        )
+        existing = next(
+            (d for d in existing_docs if d.get("source_id") == source_id), None
+        )
+
+        if existing and existing["content_hash"] == content_hash:
+            doc_id = existing["id"]
+        elif existing:
+            await self._store.update_document_content(
+                existing["id"], file_summary.summary, content_hash
+            )
+            await self._store.update_document_status(
+                existing["id"], status="changed",
+            )
+            doc_id = existing["id"]
+        else:
+            filename = file_summary.relative_path.rsplit("/", 1)[-1]
+            doc_id = await self._store.create_document(
+                source_type="code_file_summary",
+                source_id=source_id,
+                title=f"[{product}] {filename}",
+                original_content=file_summary.summary,
+                content_hash=content_hash,
+            )
+
+        # document_sources: code_file_summary → git_code
+        if source_git_code_id is not None:
+            await self._store.delete_document_sources(doc_id)
+            await self._store.add_document_source(
+                doc_id, source_git_code_id, file_summary.relative_path,
+            )
+
+        return doc_id
+
     async def store_category_document(
         self,
         cat_doc: CategoryDocument,
@@ -462,8 +519,9 @@ class CoordinatorAgent:
 
         run()의 결과를 받아:
         1. git_code 문서 저장 (원본 코드 파일)
-        2. code_summary 저장 (Level 2) + document_sources 연결
-        3. code_doc 저장 (Level 3) + document_sources 연결
+        2. code_file_summary 저장 (Level 1) + document_sources 연결
+        3. code_summary 저장 (Level 2) + document_sources 연결
+        4. code_doc 저장 (Level 3) + document_sources 연결
         """
         result = await self.run()
 
@@ -481,6 +539,21 @@ class CoordinatorAgent:
                         "git_code 저장 실패: %s — %s",
                         fi.relative_path, exc,
                     )
+
+            # Level 1 저장 (code_file_summary) + document_sources 연결
+            for ds in pr.directory_summaries:
+                for fs in ds.file_summaries:
+                    try:
+                        git_code_id = git_code_map.get(fs.relative_path)
+                        await self.store_file_summary(
+                            fs, ds.product,
+                            source_git_code_id=git_code_id,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "파일 요약 저장 실패: %s/%s — %s",
+                            ds.product, fs.relative_path, exc,
+                        )
 
             # Level 2 저장 + document_sources 연결
             for ds in pr.directory_summaries:

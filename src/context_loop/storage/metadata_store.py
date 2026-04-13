@@ -545,7 +545,7 @@ class MetadataStore:
             stats[key] = row[0] if row else 0
 
         # Git 소스 타입별 문서 수
-        for source_type in ("code_doc", "code_summary", "git_code"):
+        for source_type in ("code_file_summary", "code_doc", "code_summary", "git_code"):
             cursor = await self.db.execute(
                 "SELECT COUNT(*) FROM documents WHERE source_type = ?",
                 (source_type,),

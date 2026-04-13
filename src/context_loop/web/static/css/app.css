@@ -33,6 +33,7 @@
 .badge-none { background: #e2e3e5; color: #999; }
 
 /* Git 소스 타입별 배지 */
+.badge-source-code_file_summary { background: #fff3cd; color: #856404; }
 .badge-source-code_doc { background: #d4edda; color: #155724; }
 .badge-source-code_summary { background: #cce5ff; color: #004085; }
 .badge-source-git_code { background: #e8daef; color: #6c3483; }
