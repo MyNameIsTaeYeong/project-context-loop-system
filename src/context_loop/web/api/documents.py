@@ -118,10 +118,15 @@ async def tab_original(
     doc = await meta_store.get_document(document_id)
     if not doc:
         raise HTTPException(404)
+    # git_code일 때 source_id에서 확장자 기반 언어 힌트 추출
+    lang_hint = ""
+    if doc.get("source_type") == "git_code" and doc.get("source_id"):
+        lang_hint = _guess_language(doc["source_id"])
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_original.html", {
         "request": request,
         "doc": doc,
+        "lang_hint": lang_hint,
     })
 
 
@@ -168,6 +173,27 @@ async def tab_graph(
         "request": request,
         "graph_data": json.dumps(graph_data, ensure_ascii=False),
         "has_graph": bool(nodes),
+    })
+
+
+@router.get("/partials/document/{document_id}/sources")
+async def tab_sources(
+    request: Request,
+    document_id: int,
+    meta_store: MetadataStore = Depends(get_meta_store),
+):
+    """소스 연결 탭 HTML 파셜."""
+    doc = await meta_store.get_document(document_id)
+    if not doc:
+        raise HTTPException(404)
+    sources = await meta_store.get_document_sources(document_id)
+    reverse_refs = await meta_store.get_documents_by_source(document_id)
+    templates = get_templates(request)
+    return templates.TemplateResponse("partials/tab_sources.html", {
+        "request": request,
+        "doc": doc,
+        "sources": sources,
+        "reverse_refs": reverse_refs,
     })
 
 
@@ -317,3 +343,35 @@ async def _run_pipeline(
     except Exception:
         logger.exception("문서 %d 파이프라인 실행 실패", document_id)
         await meta_store.update_document_status(document_id, "failed")
+
+
+# --- Helpers ---
+
+_EXT_LANG_MAP: dict[str, str] = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".tsx": "tsx", ".jsx": "jsx",
+    ".java": "java", ".kt": "kotlin", ".scala": "scala",
+    ".go": "go", ".rs": "rust", ".c": "c", ".cpp": "cpp", ".h": "cpp",
+    ".cs": "csharp", ".rb": "ruby", ".php": "php", ".swift": "swift",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".sql": "sql", ".html": "html", ".css": "css", ".scss": "scss",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".xml": "xml", ".md": "markdown", ".txt": "plaintext",
+    ".dockerfile": "dockerfile", ".gradle": "gradle",
+}
+
+
+def _guess_language(source_id: str) -> str:
+    """source_id (repo_url:relative_path 형식)에서 파일 확장자 기반 언어를 추측한다."""
+    path = source_id.rsplit(":", 1)[-1] if ":" in source_id else source_id
+    # Dockerfile 등 확장자 없는 파일 처리
+    basename = path.rsplit("/", 1)[-1].lower()
+    if basename == "dockerfile":
+        return "dockerfile"
+    if basename == "makefile":
+        return "makefile"
+    dot_idx = path.rfind(".")
+    if dot_idx == -1:
+        return ""
+    ext = path[dot_idx:].lower()
+    return _EXT_LANG_MAP.get(ext, "")

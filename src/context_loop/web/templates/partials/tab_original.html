@@ -1,3 +1,33 @@
+{% if doc.source_type in ('code_doc', 'code_summary') %}
+<article x-data="{ view: 'rendered' }">
+    <div role="group" style="margin-bottom: 1rem;">
+        <button :class="view === 'rendered' ? '' : 'outline'"
+                @click="view = 'rendered'">Rendered</button>
+        <button :class="view === 'raw' ? '' : 'outline'"
+                @click="view = 'raw'">Raw</button>
+    </div>
+    <div x-show="view === 'rendered'" x-cloak id="md-rendered"></div>
+    <div x-show="view === 'raw'" x-cloak>
+        <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
+    </div>
+</article>
+<pre id="md-raw-content" style="display:none">{{ doc.original_content or '' }}</pre>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+    (function() {
+        var raw = document.getElementById('md-raw-content').textContent;
+        document.getElementById('md-rendered').innerHTML = marked.parse(raw);
+    })();
+</script>
+{% elif doc.source_type == 'git_code' %}
+<article>
+    <pre><code class="language-{{ lang_hint or '' }}">{{ doc.original_content or '(no content)' }}</code></pre>
+</article>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+{% else %}
 <article>
     <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
 </article>
+{% endif %}
