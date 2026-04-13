@@ -3,7 +3,7 @@
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
 - **Step**: 9.7 원본 코드 저장 (git_code) + document_sources 연결 완료
-- **상태**: `run_and_store()`에서 원본 코드 파일을 `git_code` 문서로 DB에 저장하고, `document_sources` 테이블로 `code_summary`/`code_doc` ↔ `git_code` N:M 연결을 자동 구축. `context_assembler`에 `include_source_code` 옵션 추가하여 검색 시 LLM 생성 문서와 원본 코드를 함께 반환 가능. `_collect_git_code_ids()` 헬퍼로 `source_directories` 기반 매칭. `ProductResult`에 `files`/`repo_url` 필드 추가. 테스트 24개(coordinator) + 22개(context_assembler) 전체 통과. 다음: code_doc → 기존 파이프라인 연결(9.8) 구현.
+- **상태**: `run_and_store()`에서 원본 코드 파일을 `git_code` 문서로 DB에 저장하고, `document_sources` 테이블로 `code_summary`/`code_doc` ↔ `git_code` N:M 연결을 자동 구축. `context_assembler`에 `include_source_code` 옵션 추가하여 검색 시 LLM 생성 문서와 원본 코드를 함께 반환 가능. `_collect_git_code_ids()` 헬퍼로 `source_directories` 기반 매칭. `ProductResult`에 `files`/`repo_url` 필드 추가. 검증 스크립트 `scripts/run_git_code_store.py` 제공 (Mock Agent 기반 E2E 검증 9섹션). 테스트 24개(coordinator) + 22개(context_assembler) 전체 통과. 다음: code_doc → 기존 파이프라인 연결(9.8) 구현.
 
 ## Phase별 진행률
 
@@ -82,8 +82,27 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-09
-- 내용: Phase 9.6 Category Agent — 서버 과부하 대응 및 안정화.
+- 일시: 2026-04-13
+- 내용: Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
+  - **핵심 구현** (`ingestion/coordinator.py`)
+    - `ProductResult`에 `files: list[FileInfo]`, `repo_url: str` 필드 추가
+    - `run_and_store()`에서 `store_git_code()`로 원본 코드 → `git_code` 문서 DB 저장
+    - `git_code_map` (relative_path → document_id) 구축 후 document_sources 연결:
+      - code_summary ↔ git_code: file_summaries의 relative_path로 1:1 매칭
+      - code_doc ↔ git_code: `_collect_git_code_ids()`로 source_directories 기반 매칭
+    - `run()`은 side-effect-free 원칙 유지 (D-031)
+  - **원본 코드 첨부** (`mcp/context_assembler.py`)
+    - `include_source_code: bool = False` 파라미터 추가 (opt-in)
+    - `_extract_doc_ids()`: 검색 결과에서 document_id 추출
+    - `_fetch_and_format_source_code()`: document_sources를 따라 git_code 원본을 마크다운 코드 블록으로 포맷
+    - 중복 git_code 제거 (seen_source_ids), 언어 힌트 자동 추출
+  - **검증 스크립트** `scripts/run_git_code_store.py` (기존 `run_phase97_test.py`에서 리네임)
+    - 기존 스크립트(`run_worker_agent.py`, `run_category_agent.py`)와 동일한 `--config`/`-c` + `--full-pipeline` 패턴 적용
+    - 3가지 모드: 샘플 레포(기본), `--full-pipeline`(config yaml), `--repo`(로컬 레포)
+    - Mock Agent 기반 E2E 검증 9섹션: run() 전달, git_code 저장, code_summary 연결, code_doc 연결, 역방향 조회, 멱등성, _collect_git_code_ids, 원본 코드 첨부, DB 통계
+  - **테스트**: coordinator 24개 + context_assembler 22개 전체 통과 (기존 418개 비-web 테스트 무회귀)
+  - **설계 결정**: D-031 — git_code 저장과 document_sources 연결을 run_and_store()에서 수행
+- 이전 (2026-04-09): Phase 9.6 Category Agent — 서버 과부하 대응 및 안정화.
   - **Map 배치 병렬 제어**: 무제한 병렬 → `asyncio.Semaphore(4)` 최대 4개 동시 실행
     - 초기: `asyncio.gather`로 전체 병렬 → 서버 "peer closed connection" 오류
     - 1차 대응: 직렬 처리로 전환 → 안정적이나 느림
