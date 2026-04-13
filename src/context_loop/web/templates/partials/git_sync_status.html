@@ -1,0 +1,77 @@
+{% if sync_status.state == 'idle' %}
+<div>
+    <p>No sync running. Click below to start.</p>
+    <button hx-post="/api/git-sync/start"
+            hx-swap="none"
+            hx-on::after-request="if(event.detail.successful) { htmx.ajax('GET', '/partials/git-sync/status', {target: '#sync-status', swap: 'innerHTML'}); }"
+            hx-on::response-error="alert('Error: ' + event.detail.xhr.responseText)">
+        Start Sync
+    </button>
+</div>
+
+{% elif sync_status.state == 'running' %}
+<div hx-get="/partials/git-sync/status" hx-trigger="every 3s" hx-swap="innerHTML">
+    <p aria-busy="true">
+        {{ sync_status.phase }}
+        <small style="margin-left: 1rem;">({{ sync_status.elapsed_seconds }}s elapsed)</small>
+    </p>
+</div>
+
+{% elif sync_status.state == 'completed' %}
+<div>
+    <div class="grid" style="margin-bottom: 1rem;">
+        <article>
+            <header>Products</header>
+            <p class="stat-number">{{ sync_status.result.products or 0 }}</p>
+        </article>
+        <article>
+            <header>Files Processed</header>
+            <p class="stat-number">{{ sync_status.result.files_processed or 0 }}</p>
+        </article>
+        <article>
+            <header>Documents Generated</header>
+            <p class="stat-number">{{ sync_status.result.documents_generated or 0 }}</p>
+        </article>
+        <article>
+            <header>Errors</header>
+            <p class="stat-number">{{ sync_status.result.errors or 0 }}</p>
+        </article>
+    </div>
+
+    {% if sync_status.result.error_details %}
+    <details>
+        <summary style="color: var(--pico-del-color);">Error details</summary>
+        <ul>
+            {% for err in sync_status.result.error_details %}
+            <li><code>{{ err.phase or '' }}</code>: {{ err.error or err }}</li>
+            {% endfor %}
+        </ul>
+    </details>
+    {% endif %}
+
+    <p><small>Completed in {{ sync_status.elapsed_seconds }}s</small></p>
+    <div role="group">
+        <button hx-post="/api/git-sync/start"
+                hx-swap="none"
+                hx-on::after-request="if(event.detail.successful) { htmx.ajax('GET', '/partials/git-sync/status', {target: '#sync-status', swap: 'innerHTML'}); }"
+                hx-on::response-error="alert('Error: ' + event.detail.xhr.responseText)">
+            Sync Again
+        </button>
+        <a href="/" role="button" class="outline">View Dashboard</a>
+    </div>
+</div>
+
+{% elif sync_status.state == 'failed' %}
+<div>
+    <p style="color: var(--pico-del-color);">
+        Sync failed: {{ sync_status.error }}
+    </p>
+    <p><small>Failed after {{ sync_status.elapsed_seconds }}s</small></p>
+    <button hx-post="/api/git-sync/start"
+            hx-swap="none"
+            hx-on::after-request="if(event.detail.successful) { htmx.ajax('GET', '/partials/git-sync/status', {target: '#sync-status', swap: 'innerHTML'}); }"
+            hx-on::response-error="alert('Error: ' + event.detail.xhr.responseText)">
+        Retry
+    </button>
+</div>
+{% endif %}

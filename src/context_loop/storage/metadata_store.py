@@ -543,4 +543,14 @@ class MetadataStore:
             cursor = await self.db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
             row = await cursor.fetchone()
             stats[key] = row[0] if row else 0
+
+        # Git 소스 타입별 문서 수
+        for source_type in ("code_file_summary", "code_doc", "code_summary", "git_code"):
+            cursor = await self.db.execute(
+                "SELECT COUNT(*) FROM documents WHERE source_type = ?",
+                (source_type,),
+            )
+            row = await cursor.fetchone()
+            stats[f"{source_type}_count"] = row[0] if row else 0
+
         return stats

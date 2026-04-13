@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+
+{% block title %}Git Sync - Context Loop{% endblock %}
+
+{% block content %}
+<h2>Git Sync</h2>
+
+<!-- 1. 설정 상태 -->
+<article>
+    <header>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong>Configuration</strong>
+            {% if git_config.enabled %}
+            <span class="badge badge-completed">Enabled</span>
+            {% else %}
+            <span class="badge badge-failed">Disabled</span>
+            {% endif %}
+        </div>
+    </header>
+
+    {% if not git_config.enabled %}
+    <p>Git source is disabled. Set <code>sources.git.enabled: true</code> in <code>config.yaml</code> to enable.</p>
+    {% else %}
+
+    {% if issues %}
+    <details>
+        <summary style="color: var(--pico-del-color);">Configuration warnings ({{ issues|length }})</summary>
+        <ul>
+            {% for issue in issues %}
+            <li>{{ issue }}</li>
+            {% endfor %}
+        </ul>
+    </details>
+    {% endif %}
+
+    <table>
+        <thead>
+            <tr><th>Repository</th><th>Branch</th><th>Products</th></tr>
+        </thead>
+        <tbody>
+            {% for repo in git_config.repositories %}
+            <tr>
+                <td><code>{{ repo.url }}</code></td>
+                <td>{{ repo.branch }}</td>
+                <td>{{ repo.products | list | join(', ') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    {% if git_config.categories %}
+    <details>
+        <summary>Categories ({{ git_config.categories | length }})</summary>
+        <table>
+            <thead><tr><th>Name</th><th>Display Name</th><th>Audience</th></tr></thead>
+            <tbody>
+                {% for name, cat in git_config.categories.items() %}
+                <tr>
+                    <td><code>{{ name }}</code></td>
+                    <td>{{ cat.display_name }}</td>
+                    <td>{{ cat.target_audience or '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </details>
+    {% endif %}
+
+    <details>
+        <summary>Processing Settings</summary>
+        <table>
+            <tbody>
+                <tr><td>Max concurrent workers</td><td>{{ git_config.processing.max_concurrent_workers }}</td></tr>
+                <tr><td>Files per worker</td><td>{{ git_config.processing.min_files_per_worker }} ~ {{ git_config.processing.max_files_per_worker }}</td></tr>
+                <tr><td>File size limit</td><td>{{ git_config.file_size_limit_kb }} KB</td></tr>
+                <tr><td>Supported extensions</td><td>{{ git_config.supported_extensions | join(', ') or 'all' }}</td></tr>
+                <tr>
+                    <td>Worker endpoint</td>
+                    <td>{{ 'Configured' if git_config.processing.worker.is_configured else 'Global fallback' }}</td>
+                </tr>
+                <tr>
+                    <td>Synthesizer endpoint</td>
+                    <td>{{ 'Configured' if git_config.processing.synthesizer.is_configured else 'Global fallback' }}</td>
+                </tr>
+                <tr>
+                    <td>Orchestrator endpoint</td>
+                    <td>{{ 'Configured' if git_config.processing.orchestrator.is_configured else 'Global fallback' }}</td>
+                </tr>
+            </tbody>
+        </table>
+    </details>
+
+    {% endif %}
+</article>
+
+{% if git_config.enabled %}
+<!-- 2. 동기화 실행 -->
+<article>
+    <header><strong>Sync Control</strong></header>
+    <div id="sync-status"
+         hx-get="/partials/git-sync/status"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+        <p aria-busy="true">Loading status...</p>
+    </div>
+</article>
+
+<!-- 3. 생성된 문서 -->
+<article>
+    <header><strong>Generated Documents</strong></header>
+    {% if stats.code_file_summary_count or stats.code_doc_count or stats.code_summary_count %}
+    <div class="grid" style="margin-bottom: 1rem;">
+        <div><strong>{{ stats.code_file_summary_count }}</strong> File Summaries</div>
+        <div><strong>{{ stats.code_doc_count }}</strong> Code Docs</div>
+        <div><strong>{{ stats.code_summary_count }}</strong> Code Summaries</div>
+        <div><strong>{{ stats.git_code_count }}</strong> Git Code Files</div>
+    </div>
+    {% endif %}
+    <div id="git-doc-list"
+         hx-get="/partials/git-sync/documents"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+        <p aria-busy="true">Loading documents...</p>
+    </div>
+</article>
+{% endif %}
+
+{% endblock %}

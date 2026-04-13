@@ -16,3 +16,23 @@
         <p class="stat-number">{{ stats.edge_count }}</p>
     </article>
 </div>
+{% if stats.code_file_summary_count or stats.code_doc_count or stats.code_summary_count or stats.git_code_count %}
+<div class="grid">
+    <article>
+        <header>File Summaries</header>
+        <p class="stat-number">{{ stats.code_file_summary_count }}</p>
+    </article>
+    <article>
+        <header>Code Docs</header>
+        <p class="stat-number">{{ stats.code_doc_count }}</p>
+    </article>
+    <article>
+        <header>Code Summaries</header>
+        <p class="stat-number">{{ stats.code_summary_count }}</p>
+    </article>
+    <article>
+        <header>Git Code Files</header>
+        <p class="stat-number">{{ stats.git_code_count }}</p>
+    </article>
+</div>
+{% endif %}
