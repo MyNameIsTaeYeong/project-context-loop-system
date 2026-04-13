@@ -404,3 +404,207 @@ class TestStorageHelpers:
         # code_doc 저장 확인
         code_docs = await store.list_documents(source_type="code_doc")
         assert len(code_docs) == 5  # 기본 카테고리 5개
+
+
+# --- Tests: Phase 9.7 — git_code 저장 + document_sources 연결 ---
+
+
+class TestPhase97GitCodeStorage:
+    async def test_run_populates_files_and_repo_url(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """run() 결과에 files와 repo_url이 채워진다."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {
+            "services/vpc/main.go": "package main",
+            "services/vpc/handler.go": "package handler",
+        })
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+        worker = MockWorker()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg, worker=worker,
+        )
+        result = await coord.run()
+
+        pr = result.product_results[0]
+        assert pr.repo_url == str(origin)
+        assert len(pr.files) == 2
+        paths = {f.relative_path for f in pr.files}
+        assert "services/vpc/main.go" in paths
+        assert "services/vpc/handler.go" in paths
+
+    async def test_run_and_store_creates_git_code_documents(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """run_and_store()가 git_code 문서를 DB에 저장한다."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {
+            "services/vpc/main.go": "package main",
+            "services/vpc/handler.go": "package handler",
+        })
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+        )
+        await coord.run_and_store()
+
+        git_codes = await store.list_documents(source_type="git_code")
+        assert len(git_codes) == 2
+        source_ids = {d["source_id"] for d in git_codes}
+        assert "services/vpc/main.go" in source_ids
+        assert "services/vpc/handler.go" in source_ids
+
+        # 원본 코드 내용 확인
+        for doc in git_codes:
+            if doc["source_id"] == "services/vpc/main.go":
+                assert doc["original_content"] == "package main"
+
+    async def test_run_and_store_links_code_summary_to_git_code(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """code_summary가 document_sources를 통해 git_code와 연결된다."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {
+            "services/vpc/main.go": "package main",
+            "services/vpc/handler.go": "package handler",
+        })
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+        worker = MockWorker()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg, worker=worker,
+        )
+        await coord.run_and_store()
+
+        summaries = await store.list_documents(source_type="code_summary")
+        assert len(summaries) >= 1
+
+        # code_summary → git_code 연결 확인
+        summary = summaries[0]
+        sources = await store.get_document_sources(summary["id"])
+        assert len(sources) == 2  # main.go, handler.go
+
+        source_paths = {s.get("file_path") for s in sources}
+        assert "services/vpc/main.go" in source_paths
+        assert "services/vpc/handler.go" in source_paths
+
+    async def test_run_and_store_links_code_doc_to_git_code(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """code_doc가 document_sources를 통해 git_code와 연결된다."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+        )
+        await coord.run_and_store()
+
+        code_docs = await store.list_documents(source_type="code_doc")
+        assert len(code_docs) == 5  # 5 categories
+
+        # 모든 code_doc이 git_code와 연결되어야 함
+        for doc in code_docs:
+            sources = await store.get_document_sources(doc["id"])
+            assert len(sources) >= 1
+            # git_code 문서의 source_type 확인
+            src_doc = await store.get_document(sources[0]["source_doc_id"])
+            assert src_doc is not None
+            assert src_doc["source_type"] == "git_code"
+
+    async def test_run_and_store_git_code_idempotent(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """run_and_store()를 두 번 실행해도 git_code가 중복 생성되지 않는다."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+        worker = MockWorker()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg, worker=worker,
+        )
+        await coord.run_and_store()
+        await coord.run_and_store()
+
+        git_codes = await store.list_documents(source_type="git_code")
+        assert len(git_codes) == 1  # 중복 없음
+
+    async def test_run_and_store_reverse_lookup(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """git_code에서 역방향으로 code_doc/code_summary를 조회할 수 있다."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+        )
+        await coord.run_and_store()
+
+        git_codes = await store.list_documents(source_type="git_code")
+        assert len(git_codes) == 1
+
+        # git_code → 참조하는 문서 조회
+        referencing = await store.get_documents_by_source(git_codes[0]["id"])
+        # code_summary 1개 + code_doc 5개 = 6개
+        assert len(referencing) == 6
+
+
+class TestCollectGitCodeIds:
+    def test_basic_matching(self) -> None:
+        from context_loop.ingestion.coordinator import _collect_git_code_ids
+
+        git_code_map = {
+            "src/payment/processor.py": 10,
+            "src/payment/validator.py": 11,
+            "src/auth/login.py": 12,
+        }
+        ids = _collect_git_code_ids(["src/payment"], git_code_map)
+        assert set(ids) == {10, 11}
+
+    def test_root_directory(self) -> None:
+        from context_loop.ingestion.coordinator import _collect_git_code_ids
+
+        git_code_map = {"a.py": 1, "b.py": 2}
+        ids = _collect_git_code_ids(["."], git_code_map)
+        assert set(ids) == {1, 2}
+
+    def test_no_match(self) -> None:
+        from context_loop.ingestion.coordinator import _collect_git_code_ids
+
+        git_code_map = {"src/a.py": 1}
+        ids = _collect_git_code_ids(["lib"], git_code_map)
+        assert ids == []
+
+    def test_no_duplicate_ids(self) -> None:
+        from context_loop.ingestion.coordinator import _collect_git_code_ids
+
+        git_code_map = {"src/a.py": 1}
+        ids = _collect_git_code_ids(["src", "src"], git_code_map)
+        assert ids == [1]  # 중복 없음

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from context_loop.mcp.context_assembler import (
+    _fetch_and_format_source_code,
     _search_chunks,
     _search_graph_with_llm,
     assemble_context,
@@ -525,3 +526,232 @@ async def test_assemble_context_hyde_disabled_no_llm_call(stores) -> None:
     )
     # HyDE 비활성 → LLM 호출 없음 (그래프도 비활성)
     llm.complete.assert_not_called()
+
+
+# --- Phase 9.7: 원본 소스 코드 첨부 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_format_source_code(stores) -> None:
+    """code_doc의 document_sources에서 git_code 원본을 포맷팅한다."""
+    meta_store, _, _ = stores
+
+    # git_code 문서 생성
+    git_id = await meta_store.create_document(
+        source_type="git_code",
+        source_id="src/main.py",
+        title="main.py",
+        original_content="print('hello')",
+        content_hash="h_gc1",
+    )
+    # code_doc 문서 생성 + document_sources 연결
+    doc_id = await meta_store.create_document(
+        source_type="code_doc",
+        source_id="product:architecture",
+        title="아키텍처 문서",
+        original_content="# 아키텍처\n설명...",
+        content_hash="h_cd1",
+    )
+    await meta_store.add_document_source(doc_id, git_id, "src/main.py")
+
+    result = await _fetch_and_format_source_code({doc_id}, meta_store)
+    assert result is not None
+    assert "원본 소스 코드" in result
+    assert "main.py" in result
+    assert "print('hello')" in result
+    assert "```py" in result  # 확장자 기반 언어 힌트
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_format_source_code_no_sources(stores) -> None:
+    """document_sources가 없으면 None을 반환한다."""
+    meta_store, _, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="code_doc",
+        source_id="product:dev",
+        title="개발 가이드",
+        original_content="# 개발\n...",
+        content_hash="h_cd2",
+    )
+
+    result = await _fetch_and_format_source_code({doc_id}, meta_store)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_format_source_code_non_code_doc(stores) -> None:
+    """code_doc/code_summary가 아닌 문서는 소스 코드를 조회하지 않는다."""
+    meta_store, _, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual",
+        title="일반 문서",
+        original_content="내용",
+        content_hash="h_mn1",
+    )
+
+    result = await _fetch_and_format_source_code({doc_id}, meta_store)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_format_source_code_deduplicates(stores) -> None:
+    """여러 code_doc이 같은 git_code를 참조해도 중복 없이 한 번만 포함된다."""
+    meta_store, _, _ = stores
+
+    git_id = await meta_store.create_document(
+        source_type="git_code",
+        source_id="src/shared.go",
+        title="shared.go",
+        original_content="package shared",
+        content_hash="h_gc2",
+    )
+    doc_id1 = await meta_store.create_document(
+        source_type="code_doc", source_id="p:arch",
+        title="아키텍처", original_content="doc1", content_hash="h_cd3",
+    )
+    doc_id2 = await meta_store.create_document(
+        source_type="code_doc", source_id="p:dev",
+        title="개발", original_content="doc2", content_hash="h_cd4",
+    )
+    await meta_store.add_document_source(doc_id1, git_id, "src/shared.go")
+    await meta_store.add_document_source(doc_id2, git_id, "src/shared.go")
+
+    result = await _fetch_and_format_source_code({doc_id1, doc_id2}, meta_store)
+    assert result is not None
+    # shared.go가 한 번만 나와야 함
+    assert result.count("shared.go") == 2  # 제목 + file_path 각 1번
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_include_source_code(stores) -> None:
+    """include_source_code=True일 때 원본 코드가 컨텍스트에 포함된다."""
+    meta_store, vector_store, graph_store = stores
+
+    # git_code
+    git_id = await meta_store.create_document(
+        source_type="git_code",
+        source_id="services/vpc/main.go",
+        title="main.go",
+        original_content="package main\nfunc main() {}",
+        content_hash="h_gc_ac",
+    )
+    # code_doc
+    doc_id = await meta_store.create_document(
+        source_type="code_doc",
+        source_id="vpc:architecture",
+        title="[VPC] 아키텍처",
+        original_content="# VPC 아키텍처 분석",
+        content_hash="h_cd_ac",
+    )
+    await meta_store.add_document_source(doc_id, git_id, "services/vpc/main.go")
+
+    # 벡터 저장소에 code_doc 청크 추가
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["VPC 아키텍처 분석 내용"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    result = await assemble_context(
+        query="VPC 아키텍처",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=False,
+        include_source_code=True,
+    )
+    assert "VPC 아키텍처 분석" in result  # 청크 내용
+    assert "원본 소스 코드" in result  # 소스 코드 섹션
+    assert "package main" in result  # 원본 코드 내용
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_with_sources_include_source_code(stores) -> None:
+    """assemble_context_with_sources에서도 include_source_code가 동작한다."""
+    meta_store, vector_store, graph_store = stores
+
+    git_id = await meta_store.create_document(
+        source_type="git_code",
+        source_id="lib/util.py",
+        title="util.py",
+        original_content="def helper(): pass",
+        content_hash="h_gc_aws",
+    )
+    doc_id = await meta_store.create_document(
+        source_type="code_summary",
+        source_id="product:lib",
+        title="[product] lib 요약",
+        original_content="# lib 요약",
+        content_hash="h_cs_aws",
+    )
+    await meta_store.add_document_source(doc_id, git_id, "lib/util.py")
+
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["유틸 함수 요약"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    assembled = await assemble_context_with_sources(
+        query="유틸 함수",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=False,
+        include_source_code=True,
+    )
+    assert "원본 소스 코드" in assembled.context_text
+    assert "def helper(): pass" in assembled.context_text
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_source_code_disabled_by_default(stores) -> None:
+    """include_source_code=False(기본값)일 때 원본 코드가 포함되지 않는다."""
+    meta_store, vector_store, graph_store = stores
+
+    git_id = await meta_store.create_document(
+        source_type="git_code",
+        source_id="src/a.py",
+        title="a.py",
+        original_content="SECRET_CODE = 42",
+        content_hash="h_gc_def",
+    )
+    doc_id = await meta_store.create_document(
+        source_type="code_doc",
+        source_id="p:arch",
+        title="문서",
+        original_content="# 문서",
+        content_hash="h_cd_def",
+    )
+    await meta_store.add_document_source(doc_id, git_id, "src/a.py")
+
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["문서 내용"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    result = await assemble_context(
+        query="검색",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=False,
+        # include_source_code 기본값 = False
+    )
+    assert "SECRET_CODE" not in result
+    assert "원본 소스 코드" not in result

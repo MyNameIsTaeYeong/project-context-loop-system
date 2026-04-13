@@ -399,3 +399,13 @@
 - **결정**: `_process_repository`에서 `sync_repository`를 제거하고 `clone_or_pull`만 호출. `git_code` DB 저장 + `document_sources` 연결은 Phase 9.7에서 구현한다.
 - **이유**: 사용처 없이 매 실행마다 모든 파일을 DB에 insert/update하는 것은 불필요한 I/O 비용. 9.7에서 `git_code` 저장과 `document_sources` 연결을 함께 구현하면 저장 즉시 연결까지 완결되어 더 깔끔함.
 - **영향**: `sync_repository()` 함수 자체는 삭제하지 않고 유지. 9.7 구현 시 Coordinator에서 적절한 시점에 호출하거나, 별도 메서드로 재구성.
+
+---
+
+## D-031: Phase 9.7 — git_code 저장과 document_sources 연결을 run_and_store()에서 수행
+
+- **일시**: 2026-04-09
+- **맥락**: D-030에서 분리한 git_code DB 저장과 document_sources 연결을 구현해야 함. `run()`은 순수 연산(git clone/pull 제외), `run_and_store()`가 DB 저장을 담당하는 기존 구조를 유지할지, `_process_repository()` 내부에서 즉시 저장할지 결정 필요.
+- **결정**: `ProductResult`에 `files: list[FileInfo]`와 `repo_url: str` 필드를 추가하여 `run()` 결과에 원본 파일 정보를 보존하고, `run_and_store()`에서 (1) `store_git_code()`로 git_code 저장 + git_code_map 구축, (2) code_summary 저장 시 file_summaries 기반으로 document_sources 연결, (3) code_doc 저장 시 source_directories 기반으로 document_sources 연결.
+- **이유**: `run()`의 부작용 최소화(side-effect-free) 원칙 유지. 모든 DB 쓰기를 `run_and_store()`에 집중하여 테스트 용이성과 관심사 분리 보장. `context_assembler`에는 `include_source_code` 옵션으로 검색 시 원본 코드 첨부를 opt-in 방식으로 제공.
+- **영향**: `ProductResult` 구조 변경(하위 호환 — 새 필드 모두 기본값 있음). `context_assembler`의 `assemble_context`/`assemble_context_with_sources` 함수 시그니처에 `include_source_code` 파라미터 추가(기본값 False, 기존 호출 영향 없음).
