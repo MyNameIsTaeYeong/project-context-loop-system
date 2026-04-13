@@ -185,7 +185,9 @@ async def _run_sync(
         try:
             from context_loop.ingestion.worker_agent import LLMWorkerAgent
 
-            worker = LLMWorkerAgent(git_config)
+            worker_llm = git_config.build_llm_client("worker")
+            synthesizer_llm = git_config.build_llm_client("synthesizer")
+            worker = LLMWorkerAgent(worker_llm, synthesizer_llm)
             _sync_status.phase = "Worker Agent 준비 완료"
         except Exception as exc:
             logger.warning("Worker Agent 생성 실패 (LLM 없이 진행): %s", exc)
@@ -193,7 +195,8 @@ async def _run_sync(
         try:
             from context_loop.ingestion.category_agent import LLMCategoryAgent
 
-            category_agent = LLMCategoryAgent(git_config)
+            orchestrator_llm = git_config.build_llm_client("orchestrator")
+            category_agent = LLMCategoryAgent(orchestrator_llm)
             _sync_status.phase = "Category Agent 준비 완료"
         except Exception as exc:
             logger.warning("Category Agent 생성 실패 (LLM 없이 진행): %s", exc)
