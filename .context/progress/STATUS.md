@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.7 원본 코드 저장 (git_code) + document_sources 연결 완료
-- **상태**: `run_and_store()`에서 원본 코드 파일을 `git_code` 문서로 DB에 저장하고, `document_sources` 테이블로 `code_summary`/`code_doc` ↔ `git_code` N:M 연결을 자동 구축. `context_assembler`에 `include_source_code` 옵션 추가하여 검색 시 LLM 생성 문서와 원본 코드를 함께 반환 가능. `_collect_git_code_ids()` 헬퍼로 `source_directories` 기반 매칭. `ProductResult`에 `files`/`repo_url` 필드 추가. 검증 스크립트 `scripts/run_git_code_store.py` 제공 (Mock Agent 기반 E2E 검증 9섹션). 테스트 24개(coordinator) + 22개(context_assembler) 전체 통과. 다음: code_doc → 기존 파이프라인 연결(9.8) 구현.
+- **Step**: 9.8 code_doc → 기존 파이프라인 연결 완료
+- **상태**: `CoordinatorAgent`에 파이프라인 의존성(VectorStore, GraphStore, LLMClient, Embeddings)을 optional로 추가. `store_*()` 메서드가 `tuple[int, bool]` 반환하여 신규/변경 여부 추적. `_process_through_pipeline()` 헬퍼로 `process_document()` 호출 — 파이프라인 실패가 저장을 중단하지 않도록 개별 try/except 격리. `run_and_store()`에서 code_file_summary(L1) + code_summary(L2) + code_doc(L3) 저장 직후 파이프라인 실행 (git_code는 제외). `git_sync.py`에서 앱 레벨 파이프라인 의존성을 CoordinatorAgent에 전달. 테스트 36개(coordinator, +12 신규) 전체 통과. 전체 430개 비-web 테스트 무회귀. 다음: 증분 처리(9.9) — git diff 기반 변경 디렉토리만 재처리.
 
 ## Phase별 진행률
 
@@ -71,7 +71,7 @@
 - [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
 - [x] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
 - [x] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026, D-030)
-- [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
+- [x] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
 - [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
 - [ ] 9.10 GitHub webhook 기반 자동 동기화
 - [ ] 9.11 커밋 히스토리 / PR 리뷰 수집 및 컨텍스트화
@@ -82,8 +82,19 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-13
-- 내용: Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
+- 일시: 2026-04-14
+- 내용: Phase 9.8 code_doc → 기존 파이프라인 연결 구현 완료.
+  - **핵심 구현** (`ingestion/coordinator.py`)
+    - `CoordinatorAgent.__init__`에 파이프라인 의존성 추가 (keyword-only): `vector_store`, `graph_store`, `pipeline_llm_client`, `embedding_client` — 모두 optional
+    - `_pipeline_available` 프로퍼티: 4개 의존성이 모두 설정되었는지 확인
+    - `_process_through_pipeline(document_id)`: `process_document()` 호출 + 실패 격리 (try/except → None 반환)
+    - `store_directory_summary()`, `store_file_summary()`, `store_category_document()` 반환 타입을 `tuple[int, bool]`로 변경 — (doc_id, needs_pipeline). 신규/변경 시 True, 무변경 시 False
+    - `run_and_store()`에서 각 store 직후 `_process_through_pipeline()` 호출. git_code는 원본 코드이므로 파이프라인 미적용
+  - **웹 연동** (`web/api/git_sync.py`)
+    - `start_sync()`에서 앱 레벨 파이프라인 의존성(VectorStore, GraphStore, LLMClient, Embeddings) 주입
+    - `_run_sync()`를 통해 CoordinatorAgent에 전달
+  - **테스트**: coordinator 36개(+12 신규 Phase 9.8 전용) 전체 통과. 전체 430개 비-web 테스트 무회귀
+- 이전 (2026-04-13): Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
   - **핵심 구현** (`ingestion/coordinator.py`)
     - `ProductResult`에 `files: list[FileInfo]`, `repo_url: str` 필드 추가
     - `run_and_store()`에서 `store_git_code()`로 원본 코드 → `git_code` 문서 DB 저장

@@ -409,3 +409,11 @@
 - **결정**: `ProductResult`에 `files: list[FileInfo]`와 `repo_url: str` 필드를 추가하여 `run()` 결과에 원본 파일 정보를 보존하고, `run_and_store()`에서 (1) `store_git_code()`로 git_code 저장 + git_code_map 구축, (2) code_summary 저장 시 file_summaries 기반으로 document_sources 연결, (3) code_doc 저장 시 source_directories 기반으로 document_sources 연결.
 - **이유**: `run()`의 부작용 최소화(side-effect-free) 원칙 유지. 모든 DB 쓰기를 `run_and_store()`에 집중하여 테스트 용이성과 관심사 분리 보장. `context_assembler`에는 `include_source_code` 옵션으로 검색 시 원본 코드 첨부를 opt-in 방식으로 제공.
 - **영향**: `ProductResult` 구조 변경(하위 호환 — 새 필드 모두 기본값 있음). `context_assembler`의 `assemble_context`/`assemble_context_with_sources` 함수 시그니처에 `include_source_code` 파라미터 추가(기본값 False, 기존 호출 영향 없음).
+
+## D-032: Phase 9.8 — code_doc 파이프라인 연결 방식
+
+- **일시**: 2026-04-14
+- **맥락**: Phase 9.7까지 Git 기반 문서(code_file_summary, code_summary, code_doc)가 DB에 저장되지만, 기존 처리 파이프라인(LLM 분류 → 청킹 → 임베딩 → 그래프 추출)을 거치지 않아 벡터 검색/그래프 탐색에서 검색 불가. 파이프라인 연결 방식 결정 필요: (A) CoordinatorAgent 내부에서 즉시 처리, (B) 저장 후 별도 배치 처리, (C) 웹 UI에서 수동 트리거.
+- **결정**: (A) CoordinatorAgent에 파이프라인 의존성을 optional keyword-only 파라미터로 추가하여, `run_and_store()` 내에서 각 store 직후 즉시 `process_document()` 호출. `store_*()` 메서드는 `tuple[int, bool]`을 반환하여 신규/변경 여부를 추적. `_process_through_pipeline()` 헬퍼에서 개별 try/except로 실패 격리. git_code(원본 코드)는 파이프라인 처리 대상에서 제외.
+- **이유**: (A)가 가장 단순하고, 문서 저장과 파이프라인 처리가 동일 흐름에서 완결됨. 파이프라인 의존성이 optional이므로 기존 테스트(Mock Agent 기반)와 완전 호환. 파이프라인 실패가 저장을 중단하지 않으므로 부분 성공이 보장됨.
+- **영향**: `store_*()` 반환 타입 변경 `int → tuple[int, bool]` (기존 테스트 업데이트 필요). `git_sync.py`에서 앱 레벨 VectorStore/GraphStore/LLMClient/Embeddings를 CoordinatorAgent에 전달.

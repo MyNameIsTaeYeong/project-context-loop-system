@@ -9,11 +9,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.git_config import GitSourceConfig, load_git_source_config
+from context_loop.processor.llm_client import LLMClient
+from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
-from context_loop.web.dependencies import get_config, get_meta_store, get_templates
+from context_loop.storage.vector_store import VectorStore
+from context_loop.web.dependencies import (
+    get_config,
+    get_embedding_client,
+    get_graph_store,
+    get_llm_client,
+    get_meta_store,
+    get_templates,
+    get_vector_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +152,10 @@ async def sync_status_json():
 async def start_sync(
     config: Config = Depends(get_config),
     meta_store: MetadataStore = Depends(get_meta_store),
+    vector_store: VectorStore = Depends(get_vector_store),
+    graph_store: GraphStore = Depends(get_graph_store),
+    llm_client: LLMClient = Depends(get_llm_client),
+    embedding_client: Embeddings = Depends(get_embedding_client),
 ):
     """Git 동기화를 백그라운드로 시작한다."""
     global _sync_status
@@ -161,8 +177,14 @@ async def start_sync(
         started_at=time.time(),
     )
 
-    # 백그라운드에서 실행
-    asyncio.create_task(_run_sync(config, meta_store, git_config))
+    # 백그라운드에서 실행 (Phase 9.8: 파이프라인 의존성 전달)
+    asyncio.create_task(_run_sync(
+        config, meta_store, git_config,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        embedding_client=embedding_client,
+    ))
 
     return {"status": "started"}
 
@@ -171,6 +193,11 @@ async def _run_sync(
     config: Config,
     meta_store: MetadataStore,
     git_config: GitSourceConfig,
+    *,
+    vector_store: VectorStore | None = None,
+    graph_store: GraphStore | None = None,
+    llm_client: LLMClient | None = None,
+    embedding_client: Embeddings | None = None,
 ) -> None:
     """백그라운드에서 Git 동기화 파이프라인을 실행한다."""
     global _sync_status
@@ -207,6 +234,10 @@ async def _run_sync(
             git_config=git_config,
             worker=worker,
             category_agent=category_agent,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            pipeline_llm_client=llm_client,
+            embedding_client=embedding_client,
         )
 
         _sync_status.phase = "Git 레포지토리 동기화 중..."

@@ -7,6 +7,7 @@
 4. Worker Agent 병렬 디스패치 → Level 1 파일 요약 + Level 2 디렉토리 문서
 5. Category Agent 병렬 디스패치 → Level 3 상품×카테고리 관점 문서
 6. 결과 저장 (code_summary, code_doc) + document_sources 연결
+7. (Phase 9.8) 저장된 문서를 기존 파이프라인(chunker → embedder → graph_extractor)으로 처리
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from context_loop.config import Config
 from context_loop.ingestion.git_config import (
@@ -32,6 +33,13 @@ from context_loop.ingestion.git_repository import (
     store_git_code,
 )
 from context_loop.storage.metadata_store import MetadataStore
+
+if TYPE_CHECKING:
+    from langchain_core.embeddings import Embeddings
+
+    from context_loop.processor.llm_client import LLMClient
+    from context_loop.storage.graph_store import GraphStore
+    from context_loop.storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +146,10 @@ class CoordinatorAgent:
         git_config: 파싱된 GitSourceConfig. None이면 config에서 로드.
         worker: Worker Agent 구현체.
         category_agent: Category Agent 구현체.
+        vector_store: VectorStore 인스턴스 (Phase 9.8 파이프라인용, optional).
+        graph_store: GraphStore 인스턴스 (Phase 9.8 파이프라인용, optional).
+        pipeline_llm_client: LLM 클라이언트 (Phase 9.8 파이프라인용, optional).
+        embedding_client: 임베딩 클라이언트 (Phase 9.8 파이프라인용, optional).
     """
 
     def __init__(
@@ -147,6 +159,11 @@ class CoordinatorAgent:
         git_config: GitSourceConfig | None = None,
         worker: WorkerAgent | None = None,
         category_agent: CategoryAgentProtocol | None = None,
+        *,
+        vector_store: VectorStore | None = None,
+        graph_store: GraphStore | None = None,
+        pipeline_llm_client: LLMClient | None = None,
+        embedding_client: Embeddings | None = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -156,6 +173,11 @@ class CoordinatorAgent:
         self._semaphore = asyncio.Semaphore(
             self._git_config.processing.max_concurrent_workers
         )
+        # Phase 9.8: 기존 처리 파이프라인 의존성
+        self._vector_store = vector_store
+        self._graph_store = graph_store
+        self._pipeline_llm_client = pipeline_llm_client
+        self._embedding_client = embedding_client
 
     # --- Public API ---
 
@@ -364,16 +386,82 @@ class CoordinatorAgent:
             product, category, directory_summaries
         )
 
+    # --- Phase 9.8: Pipeline Processing ---
+
+    @property
+    def _pipeline_available(self) -> bool:
+        """파이프라인 의존성이 모두 설정되었는지 확인한다."""
+        return all([
+            self._vector_store is not None,
+            self._graph_store is not None,
+            self._pipeline_llm_client is not None,
+            self._embedding_client is not None,
+        ])
+
+    async def _process_through_pipeline(self, document_id: int) -> dict[str, Any] | None:
+        """저장된 문서를 기존 파이프라인으로 처리한다 (Phase 9.8).
+
+        classifier → chunker → embedder → graph_extractor 순서로 처리.
+        파이프라인 의존성이 미설정이면 건너뛴다.
+        실패해도 예외를 전파하지 않는다 (저장은 이미 완료).
+
+        Args:
+            document_id: 처리할 문서 ID.
+
+        Returns:
+            처리 결과 dict 또는 None (건너뛰기/실패 시).
+        """
+        if not self._pipeline_available:
+            logger.debug(
+                "파이프라인 의존성 미설정, 건너뜀: document_id=%d", document_id,
+            )
+            return None
+
+        try:
+            from context_loop.processor.pipeline import PipelineConfig, process_document
+
+            pipeline_config = PipelineConfig(
+                chunk_size=self._config.get("processor.chunk_size", 512),
+                chunk_overlap=self._config.get("processor.chunk_overlap", 50),
+                embedding_model=self._config.get(
+                    "processor.embedding_model", "text-embedding-3-small",
+                ),
+            )
+
+            result = await process_document(
+                document_id,
+                meta_store=self._store,
+                vector_store=self._vector_store,  # type: ignore[arg-type]
+                graph_store=self._graph_store,  # type: ignore[arg-type]
+                llm_client=self._pipeline_llm_client,  # type: ignore[arg-type]
+                embedding_client=self._embedding_client,  # type: ignore[arg-type]
+                config=pipeline_config,
+            )
+            logger.info(
+                "파이프라인 처리 완료: document_id=%d, method=%s, chunks=%d, nodes=%d",
+                document_id,
+                result["storage_method"],
+                result["chunk_count"],
+                result["node_count"],
+            )
+            return result
+        except Exception as exc:
+            logger.error(
+                "파이프라인 처리 실패: document_id=%d — %s", document_id, exc,
+            )
+            return None
+
     # --- Storage Helpers ---
 
     async def store_directory_summary(
         self,
         summary: DirectorySummary,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Level 2 디렉토리 요약을 code_summary 문서로 저장한다.
 
         Returns:
-            생성된 문서 ID.
+            (문서 ID, 파이프라인 처리 필요 여부) 튜플.
+            신규/변경 시 True, 무변경 시 False.
         """
         from context_loop.ingestion.git_repository import compute_content_hash
 
@@ -387,14 +475,14 @@ class CoordinatorAgent:
         )
 
         if existing and existing["content_hash"] == content_hash:
-            return existing["id"]
+            return existing["id"], False
 
         if existing:
             await self._store.update_document_content(
                 existing["id"], summary.document, content_hash
             )
             await self._store.update_document_status(existing["id"], status="changed")
-            return existing["id"]
+            return existing["id"], True
 
         doc_id = await self._store.create_document(
             source_type="code_summary",
@@ -403,14 +491,14 @@ class CoordinatorAgent:
             original_content=summary.document,
             content_hash=content_hash,
         )
-        return doc_id
+        return doc_id, True
 
     async def store_file_summary(
         self,
         file_summary: FileSummary,
         product: str,
         source_git_code_id: int | None = None,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Level 1 파일 요약을 code_file_summary 문서로 저장한다.
 
         Args:
@@ -419,7 +507,8 @@ class CoordinatorAgent:
             source_git_code_id: 연결할 git_code 문서 ID (document_sources용).
 
         Returns:
-            생성된 문서 ID.
+            (문서 ID, 파이프라인 처리 필요 여부) 튜플.
+            신규/변경 시 True, 무변경 시 False.
         """
         from context_loop.ingestion.git_repository import compute_content_hash
 
@@ -433,6 +522,7 @@ class CoordinatorAgent:
             (d for d in existing_docs if d.get("source_id") == source_id), None
         )
 
+        needs_pipeline = False
         if existing and existing["content_hash"] == content_hash:
             doc_id = existing["id"]
         elif existing:
@@ -443,6 +533,7 @@ class CoordinatorAgent:
                 existing["id"], status="changed",
             )
             doc_id = existing["id"]
+            needs_pipeline = True
         else:
             filename = file_summary.relative_path.rsplit("/", 1)[-1]
             doc_id = await self._store.create_document(
@@ -452,6 +543,7 @@ class CoordinatorAgent:
                 original_content=file_summary.summary,
                 content_hash=content_hash,
             )
+            needs_pipeline = True
 
         # document_sources: code_file_summary → git_code
         if source_git_code_id is not None:
@@ -460,13 +552,13 @@ class CoordinatorAgent:
                 doc_id, source_git_code_id, file_summary.relative_path,
             )
 
-        return doc_id
+        return doc_id, needs_pipeline
 
     async def store_category_document(
         self,
         cat_doc: CategoryDocument,
         source_git_code_ids: list[int] | None = None,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Level 3 카테고리 문서를 code_doc으로 저장한다.
 
         Args:
@@ -474,7 +566,8 @@ class CoordinatorAgent:
             source_git_code_ids: 연결할 git_code 문서 ID 목록 (document_sources용).
 
         Returns:
-            생성된 문서 ID.
+            (문서 ID, 파이프라인 처리 필요 여부) 튜플.
+            신규/변경 시 True, 무변경 시 False.
         """
         from context_loop.ingestion.git_repository import compute_content_hash
 
@@ -489,7 +582,7 @@ class CoordinatorAgent:
         )
 
         if existing and existing["content_hash"] == content_hash:
-            return existing["id"]
+            return existing["id"], False
 
         if existing:
             await self._store.update_document_content(
@@ -512,18 +605,21 @@ class CoordinatorAgent:
             for git_code_id in source_git_code_ids:
                 await self._store.add_document_source(doc_id, git_code_id)
 
-        return doc_id
+        return doc_id, True
 
     async def run_and_store(self) -> PipelineResult:
         """파이프라인을 실행하고 결과를 DB에 저장한다.
 
         run()의 결과를 받아:
-        1. git_code 문서 저장 (원본 코드 파일)
-        2. code_file_summary 저장 (Level 1) + document_sources 연결
-        3. code_summary 저장 (Level 2) + document_sources 연결
-        4. code_doc 저장 (Level 3) + document_sources 연결
+        1. git_code 문서 저장 (원본 코드 파일 — 파이프라인 불필요)
+        2. code_file_summary 저장 (Level 1) + document_sources 연결 + 파이프라인
+        3. code_summary 저장 (Level 2) + document_sources 연결 + 파이프라인
+        4. code_doc 저장 (Level 3) + document_sources 연결 + 파이프라인
         """
         result = await self.run()
+
+        pipeline_processed = 0
+        pipeline_failed = 0
 
         for pr in result.product_results:
             # Phase 9.7: git_code 저장 + git_code_map 구축
@@ -540,25 +636,31 @@ class CoordinatorAgent:
                         fi.relative_path, exc,
                     )
 
-            # Level 1 저장 (code_file_summary) + document_sources 연결
+            # Level 1 저장 (code_file_summary) + document_sources 연결 + 파이프라인
             for ds in pr.directory_summaries:
                 for fs in ds.file_summaries:
                     try:
                         git_code_id = git_code_map.get(fs.relative_path)
-                        await self.store_file_summary(
+                        doc_id, needs_pipeline = await self.store_file_summary(
                             fs, ds.product,
                             source_git_code_id=git_code_id,
                         )
+                        if needs_pipeline:
+                            pipe_result = await self._process_through_pipeline(doc_id)
+                            if pipe_result:
+                                pipeline_processed += 1
+                            else:
+                                pipeline_failed += 1
                     except Exception as exc:
                         logger.error(
                             "파일 요약 저장 실패: %s/%s — %s",
                             ds.product, fs.relative_path, exc,
                         )
 
-            # Level 2 저장 + document_sources 연결
+            # Level 2 저장 + document_sources 연결 + 파이프라인
             for ds in pr.directory_summaries:
                 try:
-                    doc_id = await self.store_directory_summary(ds)
+                    doc_id, needs_pipeline = await self.store_directory_summary(ds)
                     # Phase 9.7: code_summary ↔ git_code 연결
                     for fs in ds.file_summaries:
                         git_code_id = git_code_map.get(fs.relative_path)
@@ -566,26 +668,44 @@ class CoordinatorAgent:
                             await self._store.add_document_source(
                                 doc_id, git_code_id, fs.relative_path,
                             )
+                    if needs_pipeline:
+                        pipe_result = await self._process_through_pipeline(doc_id)
+                        if pipe_result:
+                            pipeline_processed += 1
+                        else:
+                            pipeline_failed += 1
                 except Exception as exc:
                     logger.error(
                         "디렉토리 요약 저장 실패: %s/%s — %s",
                         ds.product, ds.directory, exc,
                     )
 
-            # Level 3 저장 + document_sources 연결
+            # Level 3 저장 + document_sources 연결 + 파이프라인
             for cd in pr.category_documents:
                 try:
                     related_ids = _collect_git_code_ids(
                         cd.source_directories, git_code_map,
                     )
-                    await self.store_category_document(
+                    doc_id, needs_pipeline = await self.store_category_document(
                         cd, source_git_code_ids=related_ids or None,
                     )
+                    if needs_pipeline:
+                        pipe_result = await self._process_through_pipeline(doc_id)
+                        if pipe_result:
+                            pipeline_processed += 1
+                        else:
+                            pipeline_failed += 1
                 except Exception as exc:
                     logger.error(
                         "카테고리 문서 저장 실패: %s/%s — %s",
                         cd.product, cd.category, exc,
                     )
+
+        if self._pipeline_available:
+            logger.info(
+                "파이프라인 처리 집계: 성공=%d, 실패=%d",
+                pipeline_processed, pipeline_failed,
+            )
 
         return result
 

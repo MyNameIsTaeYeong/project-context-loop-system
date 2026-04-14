@@ -322,8 +322,9 @@ class TestStorageHelpers:
             file_summaries=[FileSummary("a.go", "summary")],
             document="# handler\n디렉토리 문서",
         )
-        doc_id = await coord.store_directory_summary(ds)
+        doc_id, needs_pipeline = await coord.store_directory_summary(ds)
         assert doc_id > 0
+        assert needs_pipeline is True
 
         doc = await store.get_document(doc_id)
         assert doc is not None
@@ -336,9 +337,11 @@ class TestStorageHelpers:
         coord = CoordinatorAgent(store, config, git_config=git_cfg)
 
         ds = DirectorySummary("dir", "vpc", [], "doc content")
-        id1 = await coord.store_directory_summary(ds)
-        id2 = await coord.store_directory_summary(ds)
+        id1, needs1 = await coord.store_directory_summary(ds)
+        id2, needs2 = await coord.store_directory_summary(ds)
         assert id1 == id2  # 동일 content → 동일 ID
+        assert needs1 is True  # 최초 저장
+        assert needs2 is False  # 변경 없음
 
     async def test_store_category_document(self, store: MetadataStore, tmp_path: Path) -> None:
         config = Config(config_path=tmp_path / "config.yaml")
@@ -351,8 +354,9 @@ class TestStorageHelpers:
             document="# VPC 아키텍처\n설명...",
             source_directories=["dir1"],
         )
-        doc_id = await coord.store_category_document(cd)
+        doc_id, needs_pipeline = await coord.store_category_document(cd)
         assert doc_id > 0
+        assert needs_pipeline is True
 
         doc = await store.get_document(doc_id)
         assert doc is not None
@@ -373,7 +377,7 @@ class TestStorageHelpers:
         )
 
         cd = CategoryDocument("vpc", "architecture", "doc", ["dir1"])
-        doc_id = await coord.store_category_document(cd, source_git_code_ids=[git_id])
+        doc_id, _ = await coord.store_category_document(cd, source_git_code_ids=[git_id])
 
         # document_sources 확인
         sources = await store.get_document_sources(doc_id)
@@ -608,3 +612,385 @@ class TestCollectGitCodeIds:
         git_code_map = {"src/a.py": 1}
         ids = _collect_git_code_ids(["src", "src"], git_code_map)
         assert ids == [1]  # 중복 없음
+
+
+# --- Tests: Phase 9.8 — Pipeline Processing ---
+
+
+class TestPhase98PipelineProcessing:
+    """Phase 9.8: code_doc → 기존 파이프라인 연결 테스트."""
+
+    async def test_pipeline_available_false_without_deps(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 의존성 미설정 시 _pipeline_available은 False."""
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+        coord = CoordinatorAgent(store, config, git_config=git_cfg)
+        assert coord._pipeline_available is False
+
+    async def test_pipeline_available_true_with_all_deps(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """모든 파이프라인 의존성이 설정되면 _pipeline_available은 True."""
+        from unittest.mock import MagicMock
+
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            pipeline_llm_client=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+        assert coord._pipeline_available is True
+
+    async def test_pipeline_available_false_partial_deps(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """일부 파이프라인 의존성만 설정되면 _pipeline_available은 False."""
+        from unittest.mock import MagicMock
+
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            vector_store=MagicMock(),
+            # graph_store, pipeline_llm_client, embedding_client 미설정
+        )
+        assert coord._pipeline_available is False
+
+    async def test_process_through_pipeline_skips_without_deps(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 의존성 없으면 _process_through_pipeline은 None 반환."""
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+        coord = CoordinatorAgent(store, config, git_config=git_cfg)
+
+        result = await coord._process_through_pipeline(999)
+        assert result is None
+
+    async def test_process_through_pipeline_calls_process_document(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 의존성이 있으면 process_document가 호출된다."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+
+        mock_vs = MagicMock()
+        mock_gs = MagicMock()
+        mock_llm = MagicMock()
+        mock_emb = MagicMock()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            vector_store=mock_vs,
+            graph_store=mock_gs,
+            pipeline_llm_client=mock_llm,
+            embedding_client=mock_emb,
+        )
+
+        # 테스트용 문서 생성
+        doc_id = await store.create_document(
+            source_type="code_doc",
+            source_id="test:arch",
+            title="Test Doc",
+            original_content="# Test\nSome content",
+            content_hash="hash1",
+        )
+
+        expected_result = {
+            "document_id": doc_id,
+            "storage_method": "chunk",
+            "chunk_count": 1,
+            "node_count": 0,
+            "edge_count": 0,
+        }
+
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            new_callable=AsyncMock,
+            return_value=expected_result,
+        ) as mock_pd:
+            result = await coord._process_through_pipeline(doc_id)
+
+        assert result == expected_result
+        mock_pd.assert_called_once()
+        call_kwargs = mock_pd.call_args
+        assert call_kwargs[0][0] == doc_id
+        assert call_kwargs[1]["meta_store"] is store
+        assert call_kwargs[1]["vector_store"] is mock_vs
+        assert call_kwargs[1]["graph_store"] is mock_gs
+        assert call_kwargs[1]["llm_client"] is mock_llm
+        assert call_kwargs[1]["embedding_client"] is mock_emb
+
+    async def test_process_through_pipeline_handles_error(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 처리 실패 시 None을 반환하고 예외를 전파하지 않는다."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            pipeline_llm_client=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+
+        doc_id = await store.create_document(
+            source_type="code_doc",
+            source_id="test:fail",
+            title="Fail Doc",
+            original_content="content",
+            content_hash="h",
+        )
+
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("LLM 호출 실패"),
+        ):
+            result = await coord._process_through_pipeline(doc_id)
+
+        assert result is None  # 예외가 전파되지 않음
+
+    async def test_store_file_summary_returns_needs_pipeline(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """store_file_summary의 needs_pipeline 반환값을 확인."""
+        config = Config(config_path=tmp_path / "config.yaml")
+        git_cfg = GitSourceConfig()
+        coord = CoordinatorAgent(store, config, git_config=git_cfg)
+
+        fs = FileSummary("main.go", "파일 요약")
+        doc_id, needs = await coord.store_file_summary(fs, "vpc")
+        assert doc_id > 0
+        assert needs is True
+
+        # 동일 내용 재저장 → 변경 없음
+        _, needs2 = await coord.store_file_summary(fs, "vpc")
+        assert needs2 is False
+
+        # 내용 변경 → 재처리 필요
+        fs_updated = FileSummary("main.go", "수정된 요약")
+        _, needs3 = await coord.store_file_summary(fs_updated, "vpc")
+        assert needs3 is True
+
+    async def test_run_and_store_without_pipeline_deps(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 의존성 없이 run_and_store()는 기존처럼 저장만 수행."""
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+            # 파이프라인 의존성 없음
+        )
+        result = await coord.run_and_store()
+
+        # 문서는 저장되지만 status는 pending (파이프라인 미처리)
+        code_docs = await store.list_documents(source_type="code_doc")
+        assert len(code_docs) == 5
+        for doc in code_docs:
+            full_doc = await store.get_document(doc["id"])
+            assert full_doc["status"] == "pending"
+
+    async def test_run_and_store_with_pipeline_deps(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 의존성이 있으면 저장 후 파이프라인이 호출된다."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            pipeline_llm_client=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+
+        call_count = 0
+
+        async def mock_process_document(document_id, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "document_id": document_id,
+                "storage_method": "chunk",
+                "chunk_count": 1,
+                "node_count": 0,
+                "edge_count": 0,
+            }
+
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            side_effect=mock_process_document,
+        ):
+            result = await coord.run_and_store()
+
+        # Level 1 (code_file_summary) 1개 + Level 2 (code_summary) 1개
+        # + Level 3 (code_doc) 5개 = 7개
+        assert call_count == 7
+
+    async def test_run_and_store_pipeline_failure_does_not_block(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """파이프라인 처리 실패가 다른 문서 저장을 중단하지 않는다."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            pipeline_llm_client=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+
+        # 모든 파이프라인 호출이 실패하도록 설정
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("LLM 서버 다운"),
+        ):
+            result = await coord.run_and_store()
+
+        # 파이프라인 실패에도 불구하고 모든 문서가 저장됨
+        code_docs = await store.list_documents(source_type="code_doc")
+        assert len(code_docs) == 5
+
+        summaries = await store.list_documents(source_type="code_summary")
+        assert len(summaries) >= 1
+
+        file_summaries = await store.list_documents(source_type="code_file_summary")
+        assert len(file_summaries) >= 1
+
+    async def test_run_and_store_idempotent_skips_pipeline(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """두 번째 run_and_store()에서는 변경 없으므로 파이프라인 호출 안 함."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+
+        worker = MockWorker()
+        cat_agent = MockCategoryAgent()
+
+        # 첫 번째 실행 — 파이프라인 없이
+        coord1 = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+        )
+        await coord1.run_and_store()
+
+        # 두 번째 실행 — 파이프라인 있지만 변경 없음
+        call_count = 0
+
+        async def mock_process_document(document_id, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "document_id": document_id,
+                "storage_method": "chunk",
+                "chunk_count": 1,
+                "node_count": 0,
+                "edge_count": 0,
+            }
+
+        coord2 = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=worker, category_agent=cat_agent,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            pipeline_llm_client=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            side_effect=mock_process_document,
+        ):
+            await coord2.run_and_store()
+
+        # 변경 없으므로 파이프라인 호출 0회
+        assert call_count == 0
+
+    async def test_git_code_not_processed_through_pipeline(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """git_code 문서는 파이프라인으로 처리되지 않는다."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+
+        # Worker/Category Agent 없이 — git_code만 저장
+        coord = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            worker=None, category_agent=None,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            pipeline_llm_client=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+
+        call_count = 0
+
+        async def mock_process_document(document_id, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {"document_id": document_id, "storage_method": "chunk",
+                    "chunk_count": 0, "node_count": 0, "edge_count": 0}
+
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            side_effect=mock_process_document,
+        ):
+            await coord.run_and_store()
+
+        # Worker가 없으므로 code_file_summary, code_summary, code_doc 없음
+        # git_code만 저장됨 → 파이프라인 호출 0회
+        assert call_count == 0
+        git_codes = await store.list_documents(source_type="git_code")
+        assert len(git_codes) >= 1
