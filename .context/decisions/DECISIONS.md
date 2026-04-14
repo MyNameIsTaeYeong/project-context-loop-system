@@ -428,3 +428,18 @@
   - **Level 3**: RAG 안티패턴 — (1) 고정 관점이 사용자 질의와 불일치할 수 있음, (2) 7x 정보 중복으로 검색 노이즈 증가, (3) 높은 LLM 비용 (Opus급 모델 5회 호출/상품)
   - Level 1 + 기존 파이프라인(chunker → embedder → graph_extractor)만으로 파일 간 관계를 엔티티/관계 그래프로 자동 추출 가능
 - **영향**: `category_agent.py` 삭제, `worker_agent.py` 단순화(단일 LLM), `coordinator.py`에서 Level 2/3 관련 코드 제거, `git_sync.py`에서 synthesizer/orchestrator LLM 생성 제거. LLM 비용 대폭 절감 (모델 3개 → 1개).
+
+---
+
+## D-034: Worker Agent 제거 — git_code 직접 파이프라인 처리
+
+- **일시**: 2026-04-14
+- **맥락**: D-033에서 Level 2/3를 제거한 후, Worker Agent의 유일한 역할은 Level 1(code_file_summary) — 원본 코드를 LLM으로 요약하여 별도 문서로 저장. 이 중간 요약 단계의 실효성을 검토.
+- **결정**: Worker Agent를 완전 제거. 원본 코드(git_code)를 기존 파이프라인(chunker → embedder → graph_extractor)으로 직접 처리. 저장 방식은 hybrid 고정 (LLM Classifier 건너뜀).
+- **이유**:
+  - **정보 손실**: LLM 요약은 필연적으로 세부 사항을 누락. 특히 함수 시그니처, 에러 처리, 엣지 케이스 등 검색 시 중요한 정보가 사라짐
+  - **그래프 추출 정확도**: 원본 코드에서 직접 엔티티/관계를 추출하면 요약에서 추출할 때보다 정확도가 높음 (구조화된 코드 → 구조화된 그래프)
+  - **LLM 비용 절감**: 파일당 요약 LLM 호출 1회 제거. 파이프라인의 그래프 추출 LLM 호출만 유지
+  - **Classifier 비결정성**: 같은 성격의 파일이어도 LLM Classifier가 chunk/hybrid를 비일관적으로 판정. hybrid 고정으로 일관성 확보
+  - **복잡도 감소**: Worker Agent 전체 + WorkerAgentProtocol 제거. 멀티에이전트 시스템에서 단순 파이프라인으로 전환
+- **영향**: `worker_agent.py` 삭제, `coordinator.py`에서 Worker 관련 코드 전면 제거, `git_sync.py`에서 Worker 생성 로직 제거. `pipeline.py`에 `storage_method_override` 파라미터 추가. 전체 흐름: git clone → store git_code → pipeline(hybrid).

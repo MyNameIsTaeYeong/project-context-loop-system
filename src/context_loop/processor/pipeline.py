@@ -50,12 +50,13 @@ async def process_document(
     llm_client: LLMClient,
     embedding_client: Embeddings,
     config: PipelineConfig | None = None,
+    storage_method_override: StorageMethod | None = None,
 ) -> dict[str, Any]:
     """단일 문서를 전체 파이프라인으로 처리한다.
 
     처리 순서:
     1. 문서 로드 및 재처리 시작 (파생 데이터 삭제 + status='processing')
-    2. LLM Classifier로 저장 방식 판정
+    2. LLM Classifier로 저장 방식 판정 (storage_method_override 시 건너뜀)
     3. chunk 또는 hybrid → 청킹 + 임베딩 + 벡터DB 저장
     4. graph 또는 hybrid → 그래프 추출 + GraphStore 저장
     5. SQLite에 청크 메타데이터 저장
@@ -69,6 +70,7 @@ async def process_document(
         llm_client: LLMClient 인스턴스.
         embedding_client: EmbeddingClient 인스턴스.
         config: PipelineConfig. None이면 기본값 사용.
+        storage_method_override: 저장 방식을 직접 지정. 설정 시 LLM Classifier를 건너뛴다.
 
     Returns:
         처리 결과 dict:
@@ -90,8 +92,12 @@ async def process_document(
         title = doc["title"]
         content = doc["original_content"] or ""
 
-        # 1. LLM 분류
-        storage_method, reason = await classify_document(llm_client, title, content)
+        # 1. 저장 방식 결정 (오버라이드 또는 LLM 분류)
+        if storage_method_override is not None:
+            storage_method = storage_method_override
+            reason = "storage_method_override"
+        else:
+            storage_method, reason = await classify_document(llm_client, title, content)
         logger.info(
             "분류 결과 — document_id=%d, method=%s, reason=%s",
             document_id,

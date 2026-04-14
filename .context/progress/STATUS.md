@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8+ Level 2/3 문서 생성 제거 (D-033) — Level 1(code_file_summary)만 유지
-- **상태**: 3단계 문서 생성 계층(Level 1 파일 요약, Level 2 디렉토리 종합, Level 3 카테고리 관점)에서 Level 2/3를 완전 제거. Level 2(code_summary)의 디렉토리 내 관계는 Level 1의 그래프 추출 + 크로스-문서 엔티티 병합(D-024)이 더 효과적으로 처리. Level 3(code_doc)는 고정 관점의 중복 정보 생성(RAG 안티패턴). Worker Agent에서 synthesizer LLM 제거, Category Agent 전체 삭제, Coordinator에서 Level 2/3 저장/처리 로직 제거. 테스트 38개(ingestion) 전체 통과. 전체 394개 비-web 테스트 무회귀. 다음: 증분 처리(9.9) — git diff 기반 변경 디렉토리만 재처리.
+- **Step**: 9.8+ Worker Agent 제거 + git_code 직접 파이프라인 처리 (D-033, D-034)
+- **상태**: 멀티에이전트 문서 생성 계층 전면 제거 완료. (1) D-033: Level 2(code_summary), Level 3(code_doc) 제거, Category Agent 삭제. (2) D-034: Worker Agent 완전 제거 — 원본 코드(git_code)를 기존 파이프라인(chunker → embedder → graph_extractor)으로 직접 처리, hybrid 고정(Classifier 건너뜀). `pipeline.py`에 `storage_method_override` 파라미터 추가. 전체 흐름: git clone → store git_code → pipeline(hybrid). 테스트 372개 비-web 전체 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
 
 ## Phase별 진행률
 
@@ -68,11 +68,11 @@
 - [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
-- [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 (D-027)
+- [x] ~~9.5 Worker Agent 구현~~ — Worker Agent 제거 (D-034)
 - [x] ~~9.6 Category Agent 구현~~ — Level 2/3 제거 (D-033)
 - [x] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026, D-030)
-- [x] 9.8 code_file_summary → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
-- [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
+- [x] 9.8 git_code → 기존 파이프라인 직접 연결 (hybrid 고정, Classifier 건너뜀) (D-034)
+- [ ] 9.9 증분 처리 — git diff 기반 변경 파일만 재처리
 - [ ] 9.10 GitHub webhook 기반 자동 동기화
 - [ ] 9.11 커밋 히스토리 / PR 리뷰 수집 및 컨텍스트화
 
@@ -83,18 +83,20 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-14
-- 내용: Level 2/3 문서 생성 제거 (D-033) — Level 1(code_file_summary)만 유지.
+- 내용: Worker Agent 제거 + git_code 직접 파이프라인 처리 (D-034).
+  - **D-033 (이전)**: Level 2/3 문서 생성 제거 — Category Agent 삭제, synthesizer LLM 제거
+  - **D-034 (현재)**: Worker Agent 완전 제거. 원본 코드(git_code)를 기존 파이프라인으로 직접 처리
   - **제거된 항목**:
-    - `category_agent.py` 전체 삭제 (Level 3 카테고리 관점 문서 생성)
-    - `worker_agent.py`: synthesizer LLM 제거, `_synthesize_directory()` 제거, `_DIR_SYNTHESIS_*` 프롬프트 제거
-    - `coordinator.py`: `CategoryDocument` dataclass, `CategoryAgentProtocol`, `store_directory_summary()`, `store_category_document()`, `_collect_git_code_ids()` 제거. `run_and_store()`에서 Level 2/3 저장 블록 제거
-    - `git_sync.py`: Category Agent 생성 블록, synthesizer/orchestrator LLM 생성 제거
-    - `test_category_agent.py` 전체 삭제
-  - **유지/단순화**:
-    - Level 1 파일 요약 (code_file_summary) — Worker Agent(worker_llm만 사용)
-    - git_code 원본 코드 저장 + document_sources 연결
-    - 파이프라인 연결 (Phase 9.8) — code_file_summary만 처리
-  - **테스트**: ingestion 38개 전체 통과. 전체 394개 비-web 테스트 무회귀
+    - `worker_agent.py` 전체 삭제
+    - `test_worker_agent.py` 전체 삭제
+    - `coordinator.py`: `FileSummary`, `DirectorySummary`, `WorkerAgentProtocol`, `worker` 파라미터, `_process_product()`, `_run_worker()`, `store_file_summary()`, Worker dispatch 로직 전면 제거
+    - `git_sync.py`: Worker Agent 생성 블록 제거, 문서 목록을 `git_code`로 변경
+  - **추가/변경**:
+    - `pipeline.py`: `storage_method_override` 파라미터 추가 — 설정 시 LLM Classifier 건너뜀
+    - `coordinator.py`: `_process_through_pipeline()` — hybrid 고정으로 파이프라인 직접 호출
+    - `run_and_store()`: git_code 저장 → 변경분만 파이프라인 처리 (store_git_code().changed 기반)
+  - **전체 흐름**: git clone → store git_code → pipeline(chunker → embedder → graph_extractor, hybrid 고정)
+  - **테스트**: 372개 비-web 테스트 전체 통과
 - 이전 (2026-04-13): Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
   - **핵심 구현** (`ingestion/coordinator.py`)
     - `ProductResult`에 `files: list[FileInfo]`, `repo_url: str` 필드 추가

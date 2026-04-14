@@ -124,7 +124,7 @@ async def sync_documents_partial(
     """Git 관련 문서 목록 파셜."""
     templates = get_templates(request)
     docs: list[dict[str, Any]] = []
-    for source_type in ("code_file_summary",):
+    for source_type in ("git_code",):
         type_docs = await meta_store.list_documents(source_type=source_type)
         docs.extend(type_docs)
     # 최신순 정렬, 상위 50개
@@ -205,23 +205,10 @@ async def _run_sync(
     try:
         from context_loop.ingestion.coordinator import CoordinatorAgent
 
-        # Worker Agent 생성
-        worker = None
-
-        try:
-            from context_loop.ingestion.worker_agent import LLMWorkerAgent
-
-            worker_llm = git_config.build_llm_client("worker")
-            worker = LLMWorkerAgent(worker_llm)
-            _sync_status.phase = "Worker Agent 준비 완료"
-        except Exception as exc:
-            logger.warning("Worker Agent 생성 실패 (LLM 없이 진행): %s", exc)
-
         coordinator = CoordinatorAgent(
             store=meta_store,
             config=config,
             git_config=git_config,
-            worker=worker,
             vector_store=vector_store,
             graph_store=graph_store,
             pipeline_llm_client=llm_client,
