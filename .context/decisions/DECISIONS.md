@@ -417,3 +417,14 @@
 - **결정**: (A) CoordinatorAgent에 파이프라인 의존성을 optional keyword-only 파라미터로 추가하여, `run_and_store()` 내에서 각 store 직후 즉시 `process_document()` 호출. `store_*()` 메서드는 `tuple[int, bool]`을 반환하여 신규/변경 여부를 추적. `_process_through_pipeline()` 헬퍼에서 개별 try/except로 실패 격리. git_code(원본 코드)는 파이프라인 처리 대상에서 제외.
 - **이유**: (A)가 가장 단순하고, 문서 저장과 파이프라인 처리가 동일 흐름에서 완결됨. 파이프라인 의존성이 optional이므로 기존 테스트(Mock Agent 기반)와 완전 호환. 파이프라인 실패가 저장을 중단하지 않으므로 부분 성공이 보장됨.
 - **영향**: `store_*()` 반환 타입 변경 `int → tuple[int, bool]` (기존 테스트 업데이트 필요). `git_sync.py`에서 앱 레벨 VectorStore/GraphStore/LLMClient/Embeddings를 CoordinatorAgent에 전달.
+
+## D-033: Level 2/3 문서 생성 제거 — Level 1(code_file_summary)만 유지
+
+- **일시**: 2026-04-14
+- **맥락**: 3단계 문서 생성 계층(Level 1 파일 요약, Level 2 디렉토리 종합, Level 3 카테고리 관점)의 실효성 검토. Level 2는 같은 디렉토리 내 파일 관계만 포착하여 범위 제한적. Level 3는 고정된 5개 관점으로 문서를 7배 중복 생성하며, 검색 시 사용자 질의와 관점 불일치 가능성 높음.
+- **결정**: Level 2(code_summary/디렉토리 종합)와 Level 3(code_doc/카테고리 관점)를 완전 제거. Level 1(code_file_summary/파일별 요약)만 유지. Category Agent 전체 삭제, Worker Agent에서 synthesizer LLM 제거.
+- **이유**:
+  - **Level 2**: 디렉토리 내 관계만 포착. 크로스-디렉토리 관계(더 가치 있음)는 Level 1의 그래프 추출 + 크로스-문서 엔티티 병합(D-024)이 더 효과적으로 처리
+  - **Level 3**: RAG 안티패턴 — (1) 고정 관점이 사용자 질의와 불일치할 수 있음, (2) 7x 정보 중복으로 검색 노이즈 증가, (3) 높은 LLM 비용 (Opus급 모델 5회 호출/상품)
+  - Level 1 + 기존 파이프라인(chunker → embedder → graph_extractor)만으로 파일 간 관계를 엔티티/관계 그래프로 자동 추출 가능
+- **영향**: `category_agent.py` 삭제, `worker_agent.py` 단순화(단일 LLM), `coordinator.py`에서 Level 2/3 관련 코드 제거, `git_sync.py`에서 synthesizer/orchestrator LLM 생성 제거. LLM 비용 대폭 절감 (모델 3개 → 1개).

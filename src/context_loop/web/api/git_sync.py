@@ -124,7 +124,7 @@ async def sync_documents_partial(
     """Git 관련 문서 목록 파셜."""
     templates = get_templates(request)
     docs: list[dict[str, Any]] = []
-    for source_type in ("code_file_summary", "code_doc", "code_summary"):
+    for source_type in ("code_file_summary",):
         type_docs = await meta_store.list_documents(source_type=source_type)
         docs.extend(type_docs)
     # 최신순 정렬, 상위 50개
@@ -205,35 +205,23 @@ async def _run_sync(
     try:
         from context_loop.ingestion.coordinator import CoordinatorAgent
 
-        # Worker / Category Agent 생성
+        # Worker Agent 생성
         worker = None
-        category_agent = None
 
         try:
             from context_loop.ingestion.worker_agent import LLMWorkerAgent
 
             worker_llm = git_config.build_llm_client("worker")
-            synthesizer_llm = git_config.build_llm_client("synthesizer")
-            worker = LLMWorkerAgent(worker_llm, synthesizer_llm)
+            worker = LLMWorkerAgent(worker_llm)
             _sync_status.phase = "Worker Agent 준비 완료"
         except Exception as exc:
             logger.warning("Worker Agent 생성 실패 (LLM 없이 진행): %s", exc)
-
-        try:
-            from context_loop.ingestion.category_agent import LLMCategoryAgent
-
-            orchestrator_llm = git_config.build_llm_client("orchestrator")
-            category_agent = LLMCategoryAgent(orchestrator_llm)
-            _sync_status.phase = "Category Agent 준비 완료"
-        except Exception as exc:
-            logger.warning("Category Agent 생성 실패 (LLM 없이 진행): %s", exc)
 
         coordinator = CoordinatorAgent(
             store=meta_store,
             config=config,
             git_config=git_config,
             worker=worker,
-            category_agent=category_agent,
             vector_store=vector_store,
             graph_store=graph_store,
             pipeline_llm_client=llm_client,
@@ -250,16 +238,15 @@ async def _run_sync(
             "products": len(result.product_results),
             "files_processed": result.total_files_processed,
             "directories": result.total_directories,
-            "documents_generated": result.total_documents_generated,
             "errors": len(result.errors),
             "error_details": result.errors[:10],  # 상위 10개만
         }
 
         logger.info(
-            "Git 동기화 완료: 상품=%d, 파일=%d, 문서=%d, 오류=%d",
+            "Git 동기화 완료: 상품=%d, 파일=%d, 디렉토리=%d, 오류=%d",
             len(result.product_results),
             result.total_files_processed,
-            result.total_documents_generated,
+            result.total_directories,
             len(result.errors),
         )
 

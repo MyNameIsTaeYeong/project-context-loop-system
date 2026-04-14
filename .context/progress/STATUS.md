@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8 code_doc → 기존 파이프라인 연결 완료
-- **상태**: `CoordinatorAgent`에 파이프라인 의존성(VectorStore, GraphStore, LLMClient, Embeddings)을 optional로 추가. `store_*()` 메서드가 `tuple[int, bool]` 반환하여 신규/변경 여부 추적. `_process_through_pipeline()` 헬퍼로 `process_document()` 호출 — 파이프라인 실패가 저장을 중단하지 않도록 개별 try/except 격리. `run_and_store()`에서 code_file_summary(L1) + code_summary(L2) + code_doc(L3) 저장 직후 파이프라인 실행 (git_code는 제외). `git_sync.py`에서 앱 레벨 파이프라인 의존성을 CoordinatorAgent에 전달. 테스트 36개(coordinator, +12 신규) 전체 통과. 전체 430개 비-web 테스트 무회귀. 다음: 증분 처리(9.9) — git diff 기반 변경 디렉토리만 재처리.
+- **Step**: 9.8+ Level 2/3 문서 생성 제거 (D-033) — Level 1(code_file_summary)만 유지
+- **상태**: 3단계 문서 생성 계층(Level 1 파일 요약, Level 2 디렉토리 종합, Level 3 카테고리 관점)에서 Level 2/3를 완전 제거. Level 2(code_summary)의 디렉토리 내 관계는 Level 1의 그래프 추출 + 크로스-문서 엔티티 병합(D-024)이 더 효과적으로 처리. Level 3(code_doc)는 고정 관점의 중복 정보 생성(RAG 안티패턴). Worker Agent에서 synthesizer LLM 제거, Category Agent 전체 삭제, Coordinator에서 Level 2/3 저장/처리 로직 제거. 테스트 38개(ingestion) 전체 통과. 전체 394개 비-web 테스트 무회귀. 다음: 증분 처리(9.9) — git diff 기반 변경 디렉토리만 재처리.
 
 ## Phase별 진행률
 
@@ -68,10 +68,10 @@
 - [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
-- [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
-- [x] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
+- [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 (D-027)
+- [x] ~~9.6 Category Agent 구현~~ — Level 2/3 제거 (D-033)
 - [x] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026, D-030)
-- [x] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
+- [x] 9.8 code_file_summary → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
 - [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
 - [ ] 9.10 GitHub webhook 기반 자동 동기화
 - [ ] 9.11 커밋 히스토리 / PR 리뷰 수집 및 컨텍스트화
@@ -83,17 +83,18 @@
 
 ## 마지막 업데이트
 - 일시: 2026-04-14
-- 내용: Phase 9.8 code_doc → 기존 파이프라인 연결 구현 완료.
-  - **핵심 구현** (`ingestion/coordinator.py`)
-    - `CoordinatorAgent.__init__`에 파이프라인 의존성 추가 (keyword-only): `vector_store`, `graph_store`, `pipeline_llm_client`, `embedding_client` — 모두 optional
-    - `_pipeline_available` 프로퍼티: 4개 의존성이 모두 설정되었는지 확인
-    - `_process_through_pipeline(document_id)`: `process_document()` 호출 + 실패 격리 (try/except → None 반환)
-    - `store_directory_summary()`, `store_file_summary()`, `store_category_document()` 반환 타입을 `tuple[int, bool]`로 변경 — (doc_id, needs_pipeline). 신규/변경 시 True, 무변경 시 False
-    - `run_and_store()`에서 각 store 직후 `_process_through_pipeline()` 호출. git_code는 원본 코드이므로 파이프라인 미적용
-  - **웹 연동** (`web/api/git_sync.py`)
-    - `start_sync()`에서 앱 레벨 파이프라인 의존성(VectorStore, GraphStore, LLMClient, Embeddings) 주입
-    - `_run_sync()`를 통해 CoordinatorAgent에 전달
-  - **테스트**: coordinator 36개(+12 신규 Phase 9.8 전용) 전체 통과. 전체 430개 비-web 테스트 무회귀
+- 내용: Level 2/3 문서 생성 제거 (D-033) — Level 1(code_file_summary)만 유지.
+  - **제거된 항목**:
+    - `category_agent.py` 전체 삭제 (Level 3 카테고리 관점 문서 생성)
+    - `worker_agent.py`: synthesizer LLM 제거, `_synthesize_directory()` 제거, `_DIR_SYNTHESIS_*` 프롬프트 제거
+    - `coordinator.py`: `CategoryDocument` dataclass, `CategoryAgentProtocol`, `store_directory_summary()`, `store_category_document()`, `_collect_git_code_ids()` 제거. `run_and_store()`에서 Level 2/3 저장 블록 제거
+    - `git_sync.py`: Category Agent 생성 블록, synthesizer/orchestrator LLM 생성 제거
+    - `test_category_agent.py` 전체 삭제
+  - **유지/단순화**:
+    - Level 1 파일 요약 (code_file_summary) — Worker Agent(worker_llm만 사용)
+    - git_code 원본 코드 저장 + document_sources 연결
+    - 파이프라인 연결 (Phase 9.8) — code_file_summary만 처리
+  - **테스트**: ingestion 38개 전체 통과. 전체 394개 비-web 테스트 무회귀
 - 이전 (2026-04-13): Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
   - **핵심 구현** (`ingestion/coordinator.py`)
     - `ProductResult`에 `files: list[FileInfo]`, `repo_url: str` 필드 추가

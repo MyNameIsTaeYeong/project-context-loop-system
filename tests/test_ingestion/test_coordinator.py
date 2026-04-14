@@ -9,11 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 from context_loop.config import Config
 from context_loop.ingestion.coordinator import (
-    CategoryDocument,
     CoordinatorAgent,
     DirectorySummary,
     FileSummary,
@@ -21,11 +19,7 @@ from context_loop.ingestion.coordinator import (
     ProductResult,
 )
 from context_loop.ingestion.git_config import (
-    CategoryConfig,
     GitSourceConfig,
-    LLMEndpointConfig,
-    ProcessingConfig,
-    RepositoryConfig,
     load_git_source_config,
 )
 from context_loop.ingestion.git_repository import FileInfo
@@ -87,11 +81,11 @@ async def store(tmp_path: Path) -> MetadataStore:
     await s.close()
 
 
-# --- Mock Worker / Category Agent ---
+# --- Mock Worker ---
 
 
 class MockWorker:
-    """Worker Agent 목 구현 — 파일 내용을 합쳐서 요약 반환."""
+    """Worker Agent 목 구현 — 파일별 요약 반환."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []  # (dir, product, file_count)
@@ -107,38 +101,10 @@ class MockWorker:
             FileSummary(f.relative_path, f"요약: {f.relative_path}")
             for f in files
         ]
-        doc = f"# {directory}\n\n{product} 디렉토리 문서. 파일 {len(files)}개."
         return DirectorySummary(
             directory=directory,
             product=product,
             file_summaries=file_summaries,
-            document=doc,
-        )
-
-
-class MockCategoryAgent:
-    """Category Agent 목 구현."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, int]] = []  # (product, category, dir_count)
-
-    async def generate_document(
-        self,
-        product: str,
-        category: CategoryConfig,
-        directory_summaries: list[DirectorySummary],
-    ) -> CategoryDocument:
-        self.calls.append((product, category.name, len(directory_summaries)))
-        doc = (
-            f"# [{product}] {category.display_name}\n\n"
-            f"대상: {category.target_audience}\n"
-            f"디렉토리 {len(directory_summaries)}개 분석."
-        )
-        return CategoryDocument(
-            product=product,
-            category=category.name,
-            document=doc,
-            source_directories=[ds.directory for ds in directory_summaries],
         )
 
 
@@ -151,20 +117,9 @@ class TestDataTypes:
             directory="services/vpc",
             product="vpc",
             file_summaries=[FileSummary("a.go", "summary a")],
-            document="doc",
         )
         assert ds.product == "vpc"
         assert len(ds.file_summaries) == 1
-
-    def test_category_document(self) -> None:
-        cd = CategoryDocument(
-            product="vpc",
-            category="architecture",
-            document="doc",
-            source_directories=["dir1", "dir2"],
-        )
-        assert cd.product == "vpc"
-        assert len(cd.source_directories) == 2
 
     def test_product_result(self) -> None:
         pr = ProductResult(product="vpc")
@@ -201,7 +156,7 @@ class TestCoordinatorNoAgents:
 
 class TestCoordinatorWithMockAgents:
     async def test_full_pipeline(self, store: MetadataStore, tmp_path: Path) -> None:
-        """전체 파이프라인: git clone → Worker → Category Agent."""
+        """전체 파이프라인: git clone → Worker → Level 1 파일 요약."""
         origin = tmp_path / "origin"
         _init_git_repo(origin, {
             "services/vpc/main.go": "package main",
@@ -212,11 +167,9 @@ class TestCoordinatorWithMockAgents:
         git_cfg = load_git_source_config(config)
 
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
-
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
         )
         result = await coord.run()
 
@@ -224,37 +177,11 @@ class TestCoordinatorWithMockAgents:
         assert len(worker.calls) >= 1
         assert worker.calls[0][1] == "vpc"  # product
 
-        # Category Agent 호출 확인 (기본 5개 카테고리)
-        assert len(cat_agent.calls) == 5
-        cat_names = {c[1] for c in cat_agent.calls}
-        assert "architecture" in cat_names
-        assert "development" in cat_names
-
         # 결과 확인
         assert len(result.product_results) == 1
         pr = result.product_results[0]
         assert pr.product == "vpc"
         assert len(pr.directory_summaries) >= 1
-        assert len(pr.category_documents) == 5
-
-    async def test_worker_only_no_category(self, store: MetadataStore, tmp_path: Path) -> None:
-        """Worker만 있고 Category Agent 없으면 Level 2까지만 처리."""
-        origin = tmp_path / "origin"
-        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
-
-        config = _make_config(tmp_path, str(origin))
-        git_cfg = load_git_source_config(config)
-
-        worker = MockWorker()
-        coord = CoordinatorAgent(
-            store, config, git_config=git_cfg,
-            worker=worker, category_agent=None,
-        )
-        result = await coord.run()
-
-        pr = result.product_results[0]
-        assert len(pr.directory_summaries) >= 1
-        assert len(pr.category_documents) == 0  # Category Agent 없음
 
     async def test_concurrency_semaphore(self, store: MetadataStore, tmp_path: Path) -> None:
         """max_concurrent_workers 세마포어가 동작하는지 확인."""
@@ -273,7 +200,7 @@ class TestCoordinatorWithMockAgents:
         worker = MockWorker()
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=None,
+            worker=worker,
         )
         # 세마포어 재설정
         coord._semaphore = asyncio.Semaphore(2)
@@ -298,7 +225,7 @@ class TestCoordinatorWithMockAgents:
 
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=FailingWorker(), category_agent=None,
+            worker=FailingWorker(),
         )
         result = await coord.run()
 
@@ -311,81 +238,36 @@ class TestCoordinatorWithMockAgents:
 
 
 class TestStorageHelpers:
-    async def test_store_directory_summary(self, store: MetadataStore, tmp_path: Path) -> None:
+    async def test_store_file_summary(self, store: MetadataStore, tmp_path: Path) -> None:
+        """store_file_summary가 code_file_summary 문서를 저장한다."""
         config = Config(config_path=tmp_path / "config.yaml")
         git_cfg = GitSourceConfig()
         coord = CoordinatorAgent(store, config, git_config=git_cfg)
 
-        ds = DirectorySummary(
-            directory="services/vpc/handler",
-            product="vpc",
-            file_summaries=[FileSummary("a.go", "summary")],
-            document="# handler\n디렉토리 문서",
-        )
-        doc_id, needs_pipeline = await coord.store_directory_summary(ds)
+        fs = FileSummary("main.go", "파일 요약 내용")
+        doc_id, needs_pipeline = await coord.store_file_summary(fs, "vpc")
         assert doc_id > 0
         assert needs_pipeline is True
 
         doc = await store.get_document(doc_id)
         assert doc is not None
-        assert doc["source_type"] == "code_summary"
-        assert doc["source_id"] == "vpc:services/vpc/handler"
+        assert doc["source_type"] == "code_file_summary"
+        assert doc["source_id"] == "vpc:main.go"
 
-    async def test_store_directory_summary_idempotent(self, store: MetadataStore, tmp_path: Path) -> None:
+    async def test_store_file_summary_idempotent(self, store: MetadataStore, tmp_path: Path) -> None:
         config = Config(config_path=tmp_path / "config.yaml")
         git_cfg = GitSourceConfig()
         coord = CoordinatorAgent(store, config, git_config=git_cfg)
 
-        ds = DirectorySummary("dir", "vpc", [], "doc content")
-        id1, needs1 = await coord.store_directory_summary(ds)
-        id2, needs2 = await coord.store_directory_summary(ds)
+        fs = FileSummary("main.go", "요약")
+        id1, needs1 = await coord.store_file_summary(fs, "vpc")
+        id2, needs2 = await coord.store_file_summary(fs, "vpc")
         assert id1 == id2  # 동일 content → 동일 ID
         assert needs1 is True  # 최초 저장
         assert needs2 is False  # 변경 없음
 
-    async def test_store_category_document(self, store: MetadataStore, tmp_path: Path) -> None:
-        config = Config(config_path=tmp_path / "config.yaml")
-        git_cfg = load_git_source_config(config)
-        coord = CoordinatorAgent(store, config, git_config=git_cfg)
-
-        cd = CategoryDocument(
-            product="vpc",
-            category="architecture",
-            document="# VPC 아키텍처\n설명...",
-            source_directories=["dir1"],
-        )
-        doc_id, needs_pipeline = await coord.store_category_document(cd)
-        assert doc_id > 0
-        assert needs_pipeline is True
-
-        doc = await store.get_document(doc_id)
-        assert doc is not None
-        assert doc["source_type"] == "code_doc"
-        assert doc["source_id"] == "vpc:architecture"
-        assert "아키텍처" in doc["title"]
-
-    async def test_store_category_document_with_sources(self, store: MetadataStore, tmp_path: Path) -> None:
-        """document_sources 연결이 저장되는지 확인."""
-        config = Config(config_path=tmp_path / "config.yaml")
-        git_cfg = load_git_source_config(config)
-        coord = CoordinatorAgent(store, config, git_config=git_cfg)
-
-        # git_code 문서 생성
-        git_id = await store.create_document(
-            source_type="git_code", source_id="vpc.tf",
-            title="vpc.tf", original_content="code", content_hash="h1",
-        )
-
-        cd = CategoryDocument("vpc", "architecture", "doc", ["dir1"])
-        doc_id, _ = await coord.store_category_document(cd, source_git_code_ids=[git_id])
-
-        # document_sources 확인
-        sources = await store.get_document_sources(doc_id)
-        assert len(sources) == 1
-        assert sources[0]["source_doc_id"] == git_id
-
     async def test_run_and_store(self, store: MetadataStore, tmp_path: Path) -> None:
-        """run_and_store()가 DB에 code_summary + code_doc을 저장하는지 확인."""
+        """run_and_store()가 DB에 code_file_summary를 저장하는지 확인."""
         origin = tmp_path / "origin"
         _init_git_repo(origin, {"services/vpc/main.go": "package main"})
 
@@ -393,21 +275,15 @@ class TestStorageHelpers:
         git_cfg = load_git_source_config(config)
 
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
-
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
         )
         result = await coord.run_and_store()
 
-        # code_summary 저장 확인
-        summaries = await store.list_documents(source_type="code_summary")
-        assert len(summaries) >= 1
-
-        # code_doc 저장 확인
-        code_docs = await store.list_documents(source_type="code_doc")
-        assert len(code_docs) == 5  # 기본 카테고리 5개
+        # code_file_summary 저장 확인
+        file_summaries = await store.list_documents(source_type="code_file_summary")
+        assert len(file_summaries) >= 1
 
 
 # --- Tests: Phase 9.7 — git_code 저장 + document_sources 연결 ---
@@ -453,11 +329,10 @@ class TestPhase97GitCodeStorage:
         config = _make_config(tmp_path, str(origin))
         git_cfg = load_git_source_config(config)
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
 
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
         )
         await coord.run_and_store()
 
@@ -472,10 +347,10 @@ class TestPhase97GitCodeStorage:
             if doc["source_id"] == "services/vpc/main.go":
                 assert doc["original_content"] == "package main"
 
-    async def test_run_and_store_links_code_summary_to_git_code(
+    async def test_run_and_store_links_file_summary_to_git_code(
         self, store: MetadataStore, tmp_path: Path,
     ) -> None:
-        """code_summary가 document_sources를 통해 git_code와 연결된다."""
+        """code_file_summary가 document_sources를 통해 git_code와 연결된다."""
         origin = tmp_path / "origin"
         _init_git_repo(origin, {
             "services/vpc/main.go": "package main",
@@ -491,44 +366,13 @@ class TestPhase97GitCodeStorage:
         )
         await coord.run_and_store()
 
-        summaries = await store.list_documents(source_type="code_summary")
-        assert len(summaries) >= 1
+        file_summaries = await store.list_documents(source_type="code_file_summary")
+        assert len(file_summaries) == 2
 
-        # code_summary → git_code 연결 확인
-        summary = summaries[0]
-        sources = await store.get_document_sources(summary["id"])
-        assert len(sources) == 2  # main.go, handler.go
-
-        source_paths = {s.get("file_path") for s in sources}
-        assert "services/vpc/main.go" in source_paths
-        assert "services/vpc/handler.go" in source_paths
-
-    async def test_run_and_store_links_code_doc_to_git_code(
-        self, store: MetadataStore, tmp_path: Path,
-    ) -> None:
-        """code_doc가 document_sources를 통해 git_code와 연결된다."""
-        origin = tmp_path / "origin"
-        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
-
-        config = _make_config(tmp_path, str(origin))
-        git_cfg = load_git_source_config(config)
-        worker = MockWorker()
-        cat_agent = MockCategoryAgent()
-
-        coord = CoordinatorAgent(
-            store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
-        )
-        await coord.run_and_store()
-
-        code_docs = await store.list_documents(source_type="code_doc")
-        assert len(code_docs) == 5  # 5 categories
-
-        # 모든 code_doc이 git_code와 연결되어야 함
-        for doc in code_docs:
-            sources = await store.get_document_sources(doc["id"])
-            assert len(sources) >= 1
-            # git_code 문서의 source_type 확인
+        # code_file_summary → git_code 연결 확인
+        for fs_doc in file_summaries:
+            sources = await store.get_document_sources(fs_doc["id"])
+            assert len(sources) == 1
             src_doc = await store.get_document(sources[0]["source_doc_id"])
             assert src_doc is not None
             assert src_doc["source_type"] == "git_code"
@@ -556,18 +400,17 @@ class TestPhase97GitCodeStorage:
     async def test_run_and_store_reverse_lookup(
         self, store: MetadataStore, tmp_path: Path,
     ) -> None:
-        """git_code에서 역방향으로 code_doc/code_summary를 조회할 수 있다."""
+        """git_code에서 역방향으로 code_file_summary를 조회할 수 있다."""
         origin = tmp_path / "origin"
         _init_git_repo(origin, {"services/vpc/main.go": "package main"})
 
         config = _make_config(tmp_path, str(origin))
         git_cfg = load_git_source_config(config)
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
 
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
         )
         await coord.run_and_store()
 
@@ -576,49 +419,16 @@ class TestPhase97GitCodeStorage:
 
         # git_code → 참조하는 문서 조회
         referencing = await store.get_documents_by_source(git_codes[0]["id"])
-        # code_file_summary 1개 + code_summary 1개 + code_doc 5개 = 7개
-        assert len(referencing) == 7
-
-
-class TestCollectGitCodeIds:
-    def test_basic_matching(self) -> None:
-        from context_loop.ingestion.coordinator import _collect_git_code_ids
-
-        git_code_map = {
-            "src/payment/processor.py": 10,
-            "src/payment/validator.py": 11,
-            "src/auth/login.py": 12,
-        }
-        ids = _collect_git_code_ids(["src/payment"], git_code_map)
-        assert set(ids) == {10, 11}
-
-    def test_root_directory(self) -> None:
-        from context_loop.ingestion.coordinator import _collect_git_code_ids
-
-        git_code_map = {"a.py": 1, "b.py": 2}
-        ids = _collect_git_code_ids(["."], git_code_map)
-        assert set(ids) == {1, 2}
-
-    def test_no_match(self) -> None:
-        from context_loop.ingestion.coordinator import _collect_git_code_ids
-
-        git_code_map = {"src/a.py": 1}
-        ids = _collect_git_code_ids(["lib"], git_code_map)
-        assert ids == []
-
-    def test_no_duplicate_ids(self) -> None:
-        from context_loop.ingestion.coordinator import _collect_git_code_ids
-
-        git_code_map = {"src/a.py": 1}
-        ids = _collect_git_code_ids(["src", "src"], git_code_map)
-        assert ids == [1]  # 중복 없음
+        # code_file_summary 1개
+        assert len(referencing) == 1
+        assert referencing[0]["source_type"] == "code_file_summary"
 
 
 # --- Tests: Phase 9.8 — Pipeline Processing ---
 
 
 class TestPhase98PipelineProcessing:
-    """Phase 9.8: code_doc → 기존 파이프라인 연결 테스트."""
+    """Phase 9.8: 파이프라인 연결 테스트."""
 
     async def test_pipeline_available_false_without_deps(
         self, store: MetadataStore, tmp_path: Path,
@@ -696,8 +506,8 @@ class TestPhase98PipelineProcessing:
 
         # 테스트용 문서 생성
         doc_id = await store.create_document(
-            source_type="code_doc",
-            source_id="test:arch",
+            source_type="code_file_summary",
+            source_id="test:main.go",
             title="Test Doc",
             original_content="# Test\nSome content",
             content_hash="hash1",
@@ -745,7 +555,7 @@ class TestPhase98PipelineProcessing:
         )
 
         doc_id = await store.create_document(
-            source_type="code_doc",
+            source_type="code_file_summary",
             source_id="test:fail",
             title="Fail Doc",
             original_content="content",
@@ -794,21 +604,16 @@ class TestPhase98PipelineProcessing:
         git_cfg = load_git_source_config(config)
 
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
-
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
             # 파이프라인 의존성 없음
         )
         result = await coord.run_and_store()
 
-        # 문서는 저장되지만 status는 pending (파이프라인 미처리)
-        code_docs = await store.list_documents(source_type="code_doc")
-        assert len(code_docs) == 5
-        for doc in code_docs:
-            full_doc = await store.get_document(doc["id"])
-            assert full_doc["status"] == "pending"
+        # code_file_summary 저장 확인
+        file_summaries = await store.list_documents(source_type="code_file_summary")
+        assert len(file_summaries) >= 1
 
     async def test_run_and_store_with_pipeline_deps(
         self, store: MetadataStore, tmp_path: Path,
@@ -823,11 +628,9 @@ class TestPhase98PipelineProcessing:
         git_cfg = load_git_source_config(config)
 
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
-
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
             pipeline_llm_client=MagicMock(),
@@ -853,9 +656,8 @@ class TestPhase98PipelineProcessing:
         ):
             result = await coord.run_and_store()
 
-        # Level 1 (code_file_summary) 1개 + Level 2 (code_summary) 1개
-        # + Level 3 (code_doc) 5개 = 7개
-        assert call_count == 7
+        # Level 1 (code_file_summary) 1개만 파이프라인 처리
+        assert call_count == 1
 
     async def test_run_and_store_pipeline_failure_does_not_block(
         self, store: MetadataStore, tmp_path: Path,
@@ -870,11 +672,9 @@ class TestPhase98PipelineProcessing:
         git_cfg = load_git_source_config(config)
 
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
-
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
             pipeline_llm_client=MagicMock(),
@@ -889,13 +689,7 @@ class TestPhase98PipelineProcessing:
         ):
             result = await coord.run_and_store()
 
-        # 파이프라인 실패에도 불구하고 모든 문서가 저장됨
-        code_docs = await store.list_documents(source_type="code_doc")
-        assert len(code_docs) == 5
-
-        summaries = await store.list_documents(source_type="code_summary")
-        assert len(summaries) >= 1
-
+        # 파이프라인 실패에도 불구하고 문서가 저장됨
         file_summaries = await store.list_documents(source_type="code_file_summary")
         assert len(file_summaries) >= 1
 
@@ -912,12 +706,11 @@ class TestPhase98PipelineProcessing:
         git_cfg = load_git_source_config(config)
 
         worker = MockWorker()
-        cat_agent = MockCategoryAgent()
 
         # 첫 번째 실행 — 파이프라인 없이
         coord1 = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
         )
         await coord1.run_and_store()
 
@@ -937,7 +730,7 @@ class TestPhase98PipelineProcessing:
 
         coord2 = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=worker, category_agent=cat_agent,
+            worker=worker,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
             pipeline_llm_client=MagicMock(),
@@ -965,10 +758,10 @@ class TestPhase98PipelineProcessing:
         config = _make_config(tmp_path, str(origin))
         git_cfg = load_git_source_config(config)
 
-        # Worker/Category Agent 없이 — git_code만 저장
+        # Worker 없이 — git_code만 저장
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
-            worker=None, category_agent=None,
+            worker=None,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
             pipeline_llm_client=MagicMock(),
@@ -989,7 +782,7 @@ class TestPhase98PipelineProcessing:
         ):
             await coord.run_and_store()
 
-        # Worker가 없으므로 code_file_summary, code_summary, code_doc 없음
+        # Worker가 없으므로 code_file_summary 없음
         # git_code만 저장됨 → 파이프라인 호출 0회
         assert call_count == 0
         git_codes = await store.list_documents(source_type="git_code")

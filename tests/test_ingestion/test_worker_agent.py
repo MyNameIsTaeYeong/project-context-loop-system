@@ -1,4 +1,4 @@
-"""Worker Agent (LLMWorkerAgent) 테스트 — Phase 9.5."""
+"""Worker Agent (LLMWorkerAgent) 테스트 — Level 1 파일 요약."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from context_loop.ingestion.coordinator import DirectorySummary, FileSummary
 from context_loop.ingestion.git_repository import FileInfo
 from context_loop.ingestion.worker_agent import (
     LLMWorkerAgent,
-    _DIR_SYNTHESIS_SYSTEM,
-    _DIR_SYNTHESIS_TEMPLATE,
     _FILE_SUMMARY_SYSTEM,
     _FILE_SUMMARY_TEMPLATE,
 )
@@ -115,9 +113,8 @@ class TestFileSummary:
 
     async def test_single_file_summary(self) -> None:
         """파일 1개 → FileSummary 1개 생성."""
-        worker_llm = MockLLMClient("파일 요약 결과")
-        synth_llm = MockLLMClient("디렉토리 문서")
-        agent = LLMWorkerAgent(worker_llm, synth_llm)
+        llm = MockLLMClient("파일 요약 결과")
+        agent = LLMWorkerAgent(llm)
 
         files = [_make_file()]
         result = await agent.process_directory("services/vpc", "vpc", files)
@@ -127,66 +124,55 @@ class TestFileSummary:
         assert result.file_summaries[0].summary == "파일 요약 결과"
 
     async def test_multiple_files_call_count(self) -> None:
-        """파일 N개 → Level 1 호출 N회, Level 2 호출 1회."""
-        worker_llm = MockLLMClient("요약")
-        synth_llm = MockLLMClient("종합 문서")
-        agent = LLMWorkerAgent(worker_llm, synth_llm)
+        """파일 N개 → Level 1 호출 N회."""
+        llm = MockLLMClient("요약")
+        agent = LLMWorkerAgent(llm)
 
         files = [
             _make_file(f"services/vpc/file{i}.go") for i in range(5)
         ]
         result = await agent.process_directory("services/vpc", "vpc", files)
 
-        assert len(worker_llm.calls) == 5  # Level 1: 파일 수만큼
-        assert len(synth_llm.calls) == 1   # Level 2: 1회
+        assert len(llm.calls) == 5  # Level 1: 파일 수만큼
         assert len(result.file_summaries) == 5
 
     async def test_file_summary_prompt_contains_content(self) -> None:
         """Level 1 프롬프트에 파일 내용이 포함되는지 확인."""
-        worker_llm = MockLLMClient("요약")
-        synth_llm = MockLLMClient("문서")
-        agent = LLMWorkerAgent(worker_llm, synth_llm)
+        llm = MockLLMClient("요약")
+        agent = LLMWorkerAgent(llm)
 
         content = "func CreateVPC() { return vpc.New() }"
         files = [_make_file(content=content)]
         await agent.process_directory("services/vpc", "vpc", files)
 
-        prompt = worker_llm.calls[0]["prompt"]
+        prompt = llm.calls[0]["prompt"]
         assert "CreateVPC" in prompt
         assert "services/vpc/main.go" in prompt
-        assert worker_llm.calls[0]["system"] == _FILE_SUMMARY_SYSTEM
+        assert llm.calls[0]["system"] == _FILE_SUMMARY_SYSTEM
 
     async def test_file_summary_uses_worker_endpoint(self) -> None:
-        """Level 1은 worker LLM을, Level 2는 synthesizer LLM을 사용."""
-        worker_llm = MockLLMClient("worker 응답")
-        synth_llm = MockLLMClient("synthesizer 응답")
-        agent = LLMWorkerAgent(worker_llm, synth_llm)
+        """Level 1은 worker LLM을 사용."""
+        llm = MockLLMClient("worker 응답")
+        agent = LLMWorkerAgent(llm)
 
         files = [_make_file()]
         result = await agent.process_directory("services/vpc", "vpc", files)
 
-        # worker_llm이 Level 1 호출
-        assert len(worker_llm.calls) == 1
-        assert worker_llm.calls[0]["max_tokens"] == 4096
-
-        # synth_llm이 Level 2 호출
-        assert len(synth_llm.calls) == 1
-        assert synth_llm.calls[0]["max_tokens"] == 8192
-
+        assert len(llm.calls) == 1
+        assert llm.calls[0]["max_tokens"] == 4096
         assert result.file_summaries[0].summary == "worker 응답"
-        assert result.document == "synthesizer 응답"
+        assert result.document == ""  # Level 2 제거됨
 
     async def test_long_file_truncated(self) -> None:
         """max_file_tokens 초과 시 내용이 절삭된다."""
-        worker_llm = MockLLMClient("요약")
-        synth_llm = MockLLMClient("문서")
-        agent = LLMWorkerAgent(worker_llm, synth_llm, max_file_tokens=100)
+        llm = MockLLMClient("요약")
+        agent = LLMWorkerAgent(llm, max_file_tokens=100)
 
         long_content = "x" * 500
         files = [_make_file(content=long_content)]
         await agent.process_directory("services/vpc", "vpc", files)
 
-        prompt = worker_llm.calls[0]["prompt"]
+        prompt = llm.calls[0]["prompt"]
         assert "이하 생략" in prompt
         # 원본 500자가 아닌 절삭된 내용
         assert "x" * 500 not in prompt
@@ -216,9 +202,8 @@ class TestFileSummaryErrors:
                     raise r
                 return r
 
-        worker_llm = PartialFailLLM()
-        synth_llm = MockLLMClient("종합 문서")
-        agent = LLMWorkerAgent(worker_llm, synth_llm, max_concurrent_files=1)
+        llm = PartialFailLLM()
+        agent = LLMWorkerAgent(llm, max_concurrent_files=1)
 
         files = [_make_file(f"file{i}.go") for i in range(3)]
         result = await agent.process_directory("dir", "vpc", files)
@@ -228,11 +213,9 @@ class TestFileSummaryErrors:
         assert result.file_summaries[1].summary.startswith("[요약 실패")
         assert result.file_summaries[2].summary == "성공 요약 3"
 
-    async def test_all_files_fail_produces_error_document(self) -> None:
-        """모든 파일 요약 실패 시 디렉토리 문서에 에러 메시지."""
-        agent = LLMWorkerAgent(
-            FailingLLMClient(), MockLLMClient("이건 호출 안 됨")
-        )
+    async def test_all_files_fail(self) -> None:
+        """모든 파일 요약 실패 시 에러 요약이 기록된다."""
+        agent = LLMWorkerAgent(FailingLLMClient())
 
         files = [_make_file("a.go"), _make_file("b.go")]
         result = await agent.process_directory("dir", "vpc", files)
@@ -240,59 +223,7 @@ class TestFileSummaryErrors:
         assert all(
             fs.summary.startswith("[요약 실패") for fs in result.file_summaries
         )
-        assert "실패" in result.document
-        # synthesizer가 호출되지 않아야 함
-        assert result.document.startswith("[vpc]")
-
-
-# ---------------------------------------------------------------------------
-# Tests: Level 2 — 디렉토리 종합 문서
-# ---------------------------------------------------------------------------
-
-
-class TestDirectorySynthesis:
-    """Level 2 디렉토리 종합 문서 테스트."""
-
-    async def test_directory_document_contains_summaries(self) -> None:
-        """Level 2 프롬프트에 모든 Level 1 요약이 포함된다."""
-        worker_llm = SequentialMockLLMClient(["요약A", "요약B"])
-        synth_llm = MockLLMClient("종합 결과")
-        agent = LLMWorkerAgent(worker_llm, synth_llm)
-
-        files = [_make_file("a.go"), _make_file("b.go")]
-        result = await agent.process_directory("dir", "vpc", files)
-
-        synth_prompt = synth_llm.calls[0]["prompt"]
-        assert "요약A" in synth_prompt
-        assert "요약B" in synth_prompt
-        assert synth_llm.calls[0]["system"] == _DIR_SYNTHESIS_SYSTEM
-        assert result.document == "종합 결과"
-
-    async def test_directory_document_excludes_failed_summaries(self) -> None:
-        """실패한 요약은 Level 2 프롬프트에서 제외된다."""
-
-        class OneFailLLM(LLMClient):
-            def __init__(self) -> None:
-                self._index = 0
-
-            async def complete(self, prompt: str, **kwargs) -> str:
-                idx = self._index
-                self._index += 1
-                if idx == 1:
-                    raise RuntimeError("fail")
-                return f"요약{idx}"
-
-        worker_llm = OneFailLLM()
-        synth_llm = MockLLMClient("종합")
-        agent = LLMWorkerAgent(worker_llm, synth_llm, max_concurrent_files=1)
-
-        files = [_make_file("a.go"), _make_file("b.go"), _make_file("c.go")]
-        await agent.process_directory("dir", "vpc", files)
-
-        synth_prompt = synth_llm.calls[0]["prompt"]
-        assert "요약0" in synth_prompt
-        assert "요약2" in synth_prompt
-        assert "요약 실패" not in synth_prompt
+        assert result.document == ""  # Level 2 제거됨
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +236,7 @@ class TestProcessDirectory:
 
     async def test_empty_files_returns_empty(self) -> None:
         """빈 파일 리스트 → 빈 결과."""
-        agent = LLMWorkerAgent(MockLLMClient(), MockLLMClient())
+        agent = LLMWorkerAgent(MockLLMClient())
         result = await agent.process_directory("dir", "vpc", [])
 
         assert result.directory == "dir"
@@ -315,7 +246,7 @@ class TestProcessDirectory:
 
     async def test_return_type_correctness(self) -> None:
         """반환 타입이 DirectorySummary이고 모든 필드가 올바른 타입."""
-        agent = LLMWorkerAgent(MockLLMClient("요약"), MockLLMClient("문서"))
+        agent = LLMWorkerAgent(MockLLMClient("요약"))
         files = [_make_file()]
         result = await agent.process_directory("services/vpc", "vpc", files)
 
@@ -345,25 +276,20 @@ class TestProcessDirectory:
                 current_concurrent -= 1
                 return "요약"
 
-        agent = LLMWorkerAgent(
-            TrackingLLM(), MockLLMClient("문서"), max_concurrent_files=2
-        )
+        agent = LLMWorkerAgent(TrackingLLM(), max_concurrent_files=2)
         files = [_make_file(f"f{i}.go") for i in range(6)]
         await agent.process_directory("dir", "vpc", files)
 
         assert max_concurrent <= 2
 
     async def test_full_pipeline_with_sequential_responses(self) -> None:
-        """전체 흐름: 파일 3개 → Level 1 × 3 → Level 2 × 1."""
-        worker_llm = SequentialMockLLMClient([
+        """전체 흐름: 파일 3개 → Level 1 × 3."""
+        llm = SequentialMockLLMClient([
             "main.go: VPC 생성 로직",
             "subnet.go: 서브넷 관리",
             "nat.go: NAT 게이트웨이",
         ])
-        synth_llm = MockLLMClient(
-            "VPC 디렉토리는 VPC 생성, 서브넷, NAT 관리를 담당합니다."
-        )
-        agent = LLMWorkerAgent(worker_llm, synth_llm)
+        agent = LLMWorkerAgent(llm)
 
         files = [
             _make_file("services/vpc/main.go", content="func CreateVPC(){}"),
@@ -375,8 +301,6 @@ class TestProcessDirectory:
         # Level 1 결과
         assert len(result.file_summaries) == 3
         assert "VPC 생성" in result.file_summaries[0].summary
-
-        # Level 2 결과
-        assert "VPC 디렉토리" in result.document
+        assert result.document == ""  # Level 2 제거됨
         assert result.directory == "services/vpc"
         assert result.product == "vpc"
