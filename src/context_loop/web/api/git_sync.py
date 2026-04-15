@@ -224,16 +224,14 @@ async def _run_sync(
         _sync_status.result = {
             "products": len(result.product_results),
             "files_processed": result.total_files_processed,
-            "directories": result.total_directories,
             "errors": len(result.errors),
             "error_details": result.errors[:10],  # 상위 10개만
         }
 
         logger.info(
-            "Git 동기화 완료: 상품=%d, 파일=%d, 디렉토리=%d, 오류=%d",
+            "Git 동기화 완료: 상품=%d, 파일=%d, 오류=%d",
             len(result.product_results),
             result.total_files_processed,
-            result.total_directories,
             len(result.errors),
         )
 
