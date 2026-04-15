@@ -99,6 +99,11 @@ Section ({chunk_index}/{total_chunks}):
 
 _CODE_SOURCE_TYPES = frozenset({"git_code"})
 
+# 문서: 4,000자 (산문은 짧게 나눠야 LLM이 정확하게 추출)
+_DEFAULT_MAX_CONTENT_CHARS = 4000
+# 코드: 32,000자 (구조화된 코드는 긴 입력도 정확하게 처리 가능, map-reduce 최소화)
+_CODE_MAX_CONTENT_CHARS = 32000
+
 
 def _select_prompts(source_type: str | None) -> tuple[str, str, str]:
     """소스 타입에 따라 (system, user_template, chunk_template)을 반환한다."""
@@ -157,7 +162,7 @@ async def extract_graph(
     title: str,
     content: str,
     *,
-    max_content_chars: int = 4000,
+    max_content_chars: int | None = None,
     source_type: str | None = None,
 ) -> GraphData:
     """LLM을 사용하여 문서에서 엔티티와 관계를 추출한다.
@@ -170,13 +175,21 @@ async def extract_graph(
         client: LLMClient 인스턴스.
         title: 문서 제목.
         content: 문서 원본 내용.
-        max_content_chars: LLM 1회 호출당 최대 문자 수.
+        max_content_chars: LLM 1회 호출당 최대 문자 수. None이면 source_type에 따라
+            자동 결정 (코드: 32,000자, 문서: 4,000자).
         source_type: 소스 타입 ("git_code" 등). 코드 타입이면 코드 전용 프롬프트 사용.
 
     Returns:
         추출된 GraphData (entities, relations).
     """
     system_prompt, user_template, chunk_template = _select_prompts(source_type)
+
+    if max_content_chars is None:
+        max_content_chars = (
+            _CODE_MAX_CONTENT_CHARS
+            if source_type in _CODE_SOURCE_TYPES
+            else _DEFAULT_MAX_CONTENT_CHARS
+        )
 
     if len(content) <= max_content_chars:
         return await _extract_single(
