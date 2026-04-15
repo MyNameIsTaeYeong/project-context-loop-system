@@ -10,7 +10,10 @@ from context_loop.processor.graph_extractor import (
     Entity,
     GraphData,
     Relation,
+    _CODE_SYSTEM_PROMPT,
+    _SYSTEM_PROMPT,
     _merge_graphs,
+    _select_prompts,
     _split_content,
     extract_graph,
 )
@@ -21,10 +24,12 @@ class MockLLMClient(LLMClient):
     def __init__(self, response: str) -> None:
         self._response = response
         self.call_count = 0
+        self.last_system: str | None = None
 
     async def complete(self, prompt: str, *, system: str | None = None,
                        max_tokens: int = 1024, temperature: float = 0.0) -> str:
         self.call_count += 1
+        self.last_system = system
         return self._response
 
 
@@ -356,3 +361,138 @@ async def test_extract_graph_map_reduce_partial_failure() -> None:
     # 2번째 청크 실패해도 나머지 결과 반환
     assert len(result.entities) >= 1
     assert result.entities[0].name == "ServiceA"
+
+
+# --- 코드 전용 그래프 추출 테스트 ---
+
+
+_CODE_RESPONSE = json.dumps({
+    "entities": [
+        {"name": "HandleRequest", "type": "function", "description": "HTTP request handler"},
+        {"name": "VPCService", "type": "struct", "description": "VPC CRUD service"},
+        {"name": "Repository", "type": "interface", "description": "Data access interface"},
+    ],
+    "relations": [
+        {"source": "HandleRequest", "target": "VPCService", "type": "calls", "label": "invokes"},
+        {"source": "VPCService", "target": "Repository", "type": "implements"},
+    ],
+})
+
+
+def test_select_prompts_document() -> None:
+    """source_type이 None이면 문서용 프롬프트를 반환한다."""
+    sys_p, _, _ = _select_prompts(None)
+    assert sys_p is _SYSTEM_PROMPT
+
+
+def test_select_prompts_confluence() -> None:
+    """source_type이 'confluence'이면 문서용 프롬프트를 반환한다."""
+    sys_p, _, _ = _select_prompts("confluence")
+    assert sys_p is _SYSTEM_PROMPT
+
+
+def test_select_prompts_git_code() -> None:
+    """source_type이 'git_code'이면 코드용 프롬프트를 반환한다."""
+    sys_p, _, _ = _select_prompts("git_code")
+    assert sys_p is _CODE_SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_extract_graph_code_uses_code_prompt() -> None:
+    """source_type='git_code'일 때 코드 전용 프롬프트가 사용된다."""
+    client = MockLLMClient(_CODE_RESPONSE)
+    result = await extract_graph(
+        client, "handler.go", "package main\nfunc HandleRequest() {}",
+        source_type="git_code",
+    )
+    assert client.last_system is _CODE_SYSTEM_PROMPT
+    assert len(result.entities) == 3
+
+
+@pytest.mark.asyncio
+async def test_extract_graph_document_uses_document_prompt() -> None:
+    """source_type이 None이면 기존 문서 프롬프트가 사용된다."""
+    client = MockLLMClient(_VALID_RESPONSE)
+    result = await extract_graph(client, "Architecture", "System architecture doc")
+    assert client.last_system is _SYSTEM_PROMPT
+    assert len(result.entities) == 3
+
+
+@pytest.mark.asyncio
+async def test_extract_graph_code_entity_types() -> None:
+    """코드 전용 엔티티 타입이 올바르게 파싱된다."""
+    client = MockLLMClient(_CODE_RESPONSE)
+    result = await extract_graph(
+        client, "handler.go", "code",
+        source_type="git_code",
+    )
+    types = {e.entity_type for e in result.entities}
+    assert "function" in types
+    assert "struct" in types
+    assert "interface" in types
+
+
+@pytest.mark.asyncio
+async def test_extract_graph_code_relation_types() -> None:
+    """코드 전용 관계 타입이 올바르게 파싱된다."""
+    client = MockLLMClient(_CODE_RESPONSE)
+    result = await extract_graph(
+        client, "handler.go", "code",
+        source_type="git_code",
+    )
+    rel_types = {r.relation_type for r in result.relations}
+    assert "calls" in rel_types
+    assert "implements" in rel_types
+
+
+@pytest.mark.asyncio
+async def test_extract_graph_code_map_reduce() -> None:
+    """긴 코드 파일도 코드 전용 프롬프트로 map-reduce 처리된다."""
+    resp1 = json.dumps({
+        "entities": [
+            {"name": "funcA", "type": "function"},
+            {"name": "pkgX", "type": "package"},
+        ],
+        "relations": [
+            {"source": "funcA", "target": "pkgX", "type": "imports"},
+        ],
+    })
+    resp2 = json.dumps({
+        "entities": [
+            {"name": "funcB", "type": "function"},
+            {"name": "pkgX", "type": "package"},  # 중복
+        ],
+        "relations": [
+            {"source": "funcB", "target": "funcA", "type": "calls"},
+        ],
+    })
+
+    class CapturingClient(LLMClient):
+        def __init__(self) -> None:
+            self.call_count = 0
+            self.systems: list[str | None] = []
+
+        async def complete(self, prompt: str, *, system: str | None = None,
+                           max_tokens: int = 1024, temperature: float = 0.0) -> str:
+            self.call_count += 1
+            self.systems.append(system)
+            return resp1 if self.call_count == 1 else resp2
+
+    client = CapturingClient()
+    content = "line " * 500 + "\n\n" + "code " * 500
+    result = await extract_graph(
+        client, "big_file.go", content,
+        max_content_chars=100,
+        source_type="git_code",
+    )
+
+    assert client.call_count >= 2
+    # 모든 호출이 코드 프롬프트를 사용해야 함
+    for sys in client.systems:
+        assert sys is _CODE_SYSTEM_PROMPT
+    # pkgX 중복 제거
+    entity_names = {e.name for e in result.entities}
+    assert "funcA" in entity_names
+    assert "funcB" in entity_names
+    assert "pkgX" in entity_names
+    assert len([e for e in result.entities if e.name == "pkgX"]) == 1

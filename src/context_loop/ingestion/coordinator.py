@@ -6,7 +6,7 @@
 3. 상품별 파일 수집
 4. git_code 문서 DB 저장 (원본 코드)
 5. 신규/변경된 git_code를 기존 파이프라인(chunker → embedder → graph_extractor)으로
-   hybrid 방식으로 직접 처리 (LLM Classifier 건너뜀)
+   graph 방식으로 직접 처리 (LLM Classifier 건너뜀, 코드 전용 프롬프트 사용)
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ class CoordinatorAgent:
 
         run()의 결과를 받아:
         1. git_code 문서 저장 (원본 코드)
-        2. 신규/변경된 git_code를 파이프라인으로 처리 (hybrid 고정, Classifier 건너뜀)
+        2. 신규/변경된 git_code를 파이프라인으로 처리 (graph 고정, Classifier 건너뜀)
         """
         result = await self.run()
 
@@ -261,7 +261,7 @@ class CoordinatorAgent:
     async def _process_through_pipeline(self, document_id: int) -> dict[str, Any] | None:
         """저장된 문서를 기존 파이프라인으로 처리한다.
 
-        git_code는 항상 hybrid로 처리 (Classifier 건너뜀).
+        git_code는 항상 graph로 처리 (Classifier 건너뜀, 코드 전용 프롬프트).
         파이프라인 의존성이 미설정이면 건너뛴다.
         실패해도 예외를 전파하지 않는다 (저장은 이미 완료).
         """
@@ -290,7 +290,7 @@ class CoordinatorAgent:
                 llm_client=self._pipeline_llm_client,  # type: ignore[arg-type]
                 embedding_client=self._embedding_client,  # type: ignore[arg-type]
                 config=pipeline_config,
-                storage_method_override="hybrid",
+                storage_method_override="graph",
             )
             logger.info(
                 "파이프라인 처리 완료: document_id=%d, method=%s, chunks=%d, nodes=%d",

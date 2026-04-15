@@ -91,6 +91,7 @@ async def process_document(
     try:
         title = doc["title"]
         content = doc["original_content"] or ""
+        source_type = doc.get("source_type")
 
         # 1. 저장 방식 결정 (오버라이드 또는 LLM 분류)
         if storage_method_override is not None:
@@ -150,7 +151,7 @@ async def process_document(
 
         # 3. 그래프 처리 (graph or hybrid)
         if storage_method in ("graph", "hybrid"):
-            graph_data = await extract_graph(llm_client, title, content)
+            graph_data = await extract_graph(llm_client, title, content, source_type=source_type)
             if graph_data.entities:
                 result = await graph_store.save_graph_data(document_id, graph_data)
                 node_count = result["nodes"]

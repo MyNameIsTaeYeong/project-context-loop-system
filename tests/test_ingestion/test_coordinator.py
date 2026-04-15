@@ -243,7 +243,7 @@ class TestPipelineProcessing:
     async def test_process_through_pipeline_calls_process_document(
         self, store: MetadataStore, tmp_path: Path,
     ) -> None:
-        """파이프라인 호출 시 storage_method_override='hybrid'가 전달된다."""
+        """파이프라인 호출 시 storage_method_override='graph'가 전달된다."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         config = Config(config_path=tmp_path / "config.yaml")
@@ -272,8 +272,8 @@ class TestPipelineProcessing:
 
         expected_result = {
             "document_id": doc_id,
-            "storage_method": "hybrid",
-            "chunk_count": 1,
+            "storage_method": "graph",
+            "chunk_count": 0,
             "node_count": 2,
             "edge_count": 1,
         }
@@ -290,7 +290,7 @@ class TestPipelineProcessing:
         call_kwargs = mock_pd.call_args
         assert call_kwargs[0][0] == doc_id
         assert call_kwargs[1]["meta_store"] is store
-        assert call_kwargs[1]["storage_method_override"] == "hybrid"
+        assert call_kwargs[1]["storage_method_override"] == "graph"
 
     async def test_process_through_pipeline_handles_error(
         self, store: MetadataStore, tmp_path: Path,
@@ -368,13 +368,13 @@ class TestPipelineProcessing:
         async def mock_process_document(document_id, **kwargs):
             nonlocal call_count
             call_count += 1
-            assert kwargs.get("storage_method_override") == "hybrid"
+            assert kwargs.get("storage_method_override") == "graph"
             return {
                 "document_id": document_id,
-                "storage_method": "hybrid",
-                "chunk_count": 1,
-                "node_count": 0,
-                "edge_count": 0,
+                "storage_method": "graph",
+                "chunk_count": 0,
+                "node_count": 2,
+                "edge_count": 1,
             }
 
         with patch(
@@ -444,10 +444,10 @@ class TestPipelineProcessing:
             call_count += 1
             return {
                 "document_id": document_id,
-                "storage_method": "hybrid",
-                "chunk_count": 1,
-                "node_count": 0,
-                "edge_count": 0,
+                "storage_method": "graph",
+                "chunk_count": 0,
+                "node_count": 2,
+                "edge_count": 1,
             }
 
         coord2 = CoordinatorAgent(

@@ -442,4 +442,18 @@
   - **LLM 비용 절감**: 파일당 요약 LLM 호출 1회 제거. 파이프라인의 그래프 추출 LLM 호출만 유지
   - **Classifier 비결정성**: 같은 성격의 파일이어도 LLM Classifier가 chunk/hybrid를 비일관적으로 판정. hybrid 고정으로 일관성 확보
   - **복잡도 감소**: Worker Agent 전체 + WorkerAgentProtocol 제거. 멀티에이전트 시스템에서 단순 파이프라인으로 전환
-- **영향**: `worker_agent.py` 삭제, `coordinator.py`에서 Worker 관련 코드 전면 제거, `git_sync.py`에서 Worker 생성 로직 제거. `pipeline.py`에 `storage_method_override` 파라미터 추가. 전체 흐름: git clone → store git_code → pipeline(hybrid).
+- **영향**: `worker_agent.py` 삭제, `coordinator.py`에서 Worker 관련 코드 전면 제거, `git_sync.py`에서 Worker 생성 로직 제거. `pipeline.py`에 `storage_method_override` 파라미터 추가. 전체 흐름: git clone → store git_code → pipeline(graph).
+
+---
+
+## D-035: 코드 전용 그래프 스키마 — git_code graph-only 처리
+
+- **일시**: 2026-04-15
+- **맥락**: D-034에서 git_code를 hybrid(chunker + graph_extractor)로 처리했으나, 기존 chunker는 마크다운 문서용(`\n\n` 단락 경계, 헤딩 인식)이라 코드에 적용 시 함수 중간에서 잘리는 등 의미 없는 청크 생성. 코드에서 실질적 가치는 엔티티/관계 그래프.
+- **결정**: (1) git_code의 storage_method를 `hybrid` → `graph`로 변경 — 코드 청킹을 건너뛰고 그래프 추출만 수행. (2) `graph_extractor.py`에 코드 전용 프롬프트 추가 — `source_type` 파라미터로 문서/코드 자동 분기.
+- **이유**:
+  - **청킹 부적합**: 토큰 기반 분할이 코드 구조(함수/클래스 경계)를 무시 — 잘린 코드 조각은 유용한 컨텍스트가 아님
+  - **코드 전용 엔티티**: 기존 프롬프트의 entity_type(person, system, team...)은 코드 구조와 불일치. 코드에는 function, class, struct, interface, package 등이 필요
+  - **코드 전용 관계**: calls, imports, implements, contains, raises 등 코드 구조 관계가 필요
+  - **기존 문서 그래프 무변경**: source_type 기반 분기로 문서(Confluence 등)는 기존 프롬프트 그대로 사용
+- **영향**: `graph_extractor.py`에 `_CODE_SYSTEM_PROMPT` + `source_type` 파라미터 추가. `pipeline.py`에서 `doc["source_type"]`을 `extract_graph()`에 전달. `coordinator.py`에서 `storage_method_override="graph"`. GraphStore/검색 경로는 변경 없음 (entity_type은 자유 문자열).

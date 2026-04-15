@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8+ Worker Agent 제거 + git_code 직접 파이프라인 처리 (D-033, D-034)
-- **상태**: 멀티에이전트 문서 생성 계층 전면 제거 완료. (1) D-033: Level 2(code_summary), Level 3(code_doc) 제거, Category Agent 삭제. (2) D-034: Worker Agent 완전 제거 — 원본 코드(git_code)를 기존 파이프라인(chunker → embedder → graph_extractor)으로 직접 처리, hybrid 고정(Classifier 건너뜀). `pipeline.py`에 `storage_method_override` 파라미터 추가. 전체 흐름: git clone → store git_code → pipeline(hybrid). 테스트 372개 비-web 전체 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
+- **Step**: 9.8+ 코드 전용 그래프 스키마 + graph-only 처리 (D-033, D-034, D-035)
+- **상태**: 멀티에이전트 제거 + 코드 전용 그래프 추출 완료. (1) D-033: Level 2/3 제거. (2) D-034: Worker Agent 제거. (3) D-035: 코드 전용 그래프 스키마 — `graph_extractor.py`에 `source_type` 파라미터 추가, git_code는 코드 전용 프롬프트(function/class/struct/interface + calls/imports/implements 등)로 graph-only 처리 (chunking 건너뜀). 기존 문서 그래프 추출은 변경 없음. 전체 흐름: git clone → store git_code → pipeline(graph, 코드 전용 프롬프트). 테스트 380개 비-web 전체 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
 
 ## Phase별 진행률
 
@@ -82,21 +82,17 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-14
-- 내용: Worker Agent 제거 + git_code 직접 파이프라인 처리 (D-034).
-  - **D-033 (이전)**: Level 2/3 문서 생성 제거 — Category Agent 삭제, synthesizer LLM 제거
-  - **D-034 (현재)**: Worker Agent 완전 제거. 원본 코드(git_code)를 기존 파이프라인으로 직접 처리
-  - **제거된 항목**:
-    - `worker_agent.py` 전체 삭제
-    - `test_worker_agent.py` 전체 삭제
-    - `coordinator.py`: `FileSummary`, `DirectorySummary`, `WorkerAgentProtocol`, `worker` 파라미터, `_process_product()`, `_run_worker()`, `store_file_summary()`, Worker dispatch 로직 전면 제거
-    - `git_sync.py`: Worker Agent 생성 블록 제거, 문서 목록을 `git_code`로 변경
-  - **추가/변경**:
-    - `pipeline.py`: `storage_method_override` 파라미터 추가 — 설정 시 LLM Classifier 건너뜀
-    - `coordinator.py`: `_process_through_pipeline()` — hybrid 고정으로 파이프라인 직접 호출
-    - `run_and_store()`: git_code 저장 → 변경분만 파이프라인 처리 (store_git_code().changed 기반)
-  - **전체 흐름**: git clone → store git_code → pipeline(chunker → embedder → graph_extractor, hybrid 고정)
-  - **테스트**: 372개 비-web 테스트 전체 통과
+- 일시: 2026-04-15
+- 내용: 코드 전용 그래프 스키마 + graph-only 처리 (D-035).
+  - **D-035**: git_code를 코드 전용 프롬프트로 graph-only 처리
+  - **변경 사항**:
+    - `graph_extractor.py`: `source_type` 파라미터 추가. `_CODE_SYSTEM_PROMPT` + `_select_prompts()` — git_code는 코드 전용 엔티티(function, class, struct, interface, package, module, endpoint, error_type, constant, type_alias) + 관계(calls, imports, implements, contains, returns, depends_on, raises, receives) 프롬프트 사용
+    - `pipeline.py`: `doc["source_type"]`을 `extract_graph()`에 전달
+    - `coordinator.py`: `storage_method_override`를 `"hybrid"` → `"graph"`로 변경 — 코드 chunking 건너뜀
+  - **기존 문서**: 변경 없음 — `source_type`이 `git_code`가 아니면 기존 프롬프트 사용
+  - **GraphStore/검색**: 변경 없음 — entity_type은 자유 문자열이므로 코드/문서 엔티티 자연 공존
+  - **전체 흐름**: git clone → store git_code → pipeline(graph_extractor with 코드 전용 프롬프트, chunking 건너뜀)
+  - **테스트**: 380개 비-web 테스트 전체 통과 (신규 8개: 코드 프롬프트 선택, 코드 엔티티/관계 파싱, map-reduce)
 - 이전 (2026-04-13): Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
   - **핵심 구현** (`ingestion/coordinator.py`)
     - `ProductResult`에 `files: list[FileInfo]`, `repo_url: str` 필드 추가
