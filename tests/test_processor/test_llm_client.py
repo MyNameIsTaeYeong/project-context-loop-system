@@ -19,16 +19,11 @@ def _make_client() -> tuple[EndpointLLMClient, AsyncMock]:
 
 
 def _setup_response(mock_inner: AsyncMock, text: str) -> None:
-    """스트리밍 응답을 설정한다."""
-
-    async def _stream_chunks():
-        """텍스트를 스트리밍 청크로 반환하는 async iterator."""
-        chunk = MagicMock()
-        chunk.choices = [MagicMock()]
-        chunk.choices[0].delta.content = text
-        yield chunk
-
-    mock_inner.chat.completions.create.return_value = _stream_chunks()
+    """일반 응답을 설정한다."""
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = text
+    mock_inner.chat.completions.create.return_value = mock_response
 
 
 # --- Tests ---

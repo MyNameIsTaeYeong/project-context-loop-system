@@ -162,18 +162,12 @@ class EndpointLLMClient(LLMClient):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stream": True,
         }
         if "extra_body" in kwargs:
             api_kwargs["extra_body"] = kwargs["extra_body"]
 
-        stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
-        chunks: list[str] = []
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                chunks.append(delta.content)
-        return "".join(chunks)
+        response = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
+        return response.choices[0].message.content or ""
 
 
 def extract_json(text: str) -> Any:
