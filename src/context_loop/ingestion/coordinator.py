@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -152,35 +153,54 @@ class CoordinatorAgent:
 
         run()의 결과를 받아:
         1. git_code 문서 저장 (원본 코드)
-        2. 신규/변경된 git_code를 파이프라인으로 처리 (graph 고정, Classifier 건너뜀)
+        2. 신규/변경된 git_code를 파이프라인으로 병렬 처리 (graph 고정, Classifier 건너뜀)
         """
         result = await self.run()
 
         pipeline_processed = 0
         pipeline_failed = 0
 
+        # 1단계: 파일 저장 (DB 쓰기 — 순차)
+        pending_ids: list[tuple[str, int]] = []
         for pr in result.product_results:
             for fi in pr.files:
                 try:
                     doc_result = await store_git_code(
                         self._store, fi, pr.repo_url,
                     )
-                    # 신규 또는 변경된 파일만 파이프라인 처리
                     if doc_result.get("changed", False):
-                        pipe_result = await self._process_through_pipeline(
-                            doc_result["id"],
-                        )
-                        if pipe_result:
-                            pipeline_processed += 1
-                        elif self._pipeline_available:
-                            pipeline_failed += 1
+                        pending_ids.append((fi.relative_path, doc_result["id"]))
                 except Exception as exc:
                     logger.error(
-                        "git_code 처리 실패: %s — %s",
+                        "git_code 저장 실패: %s — %s",
                         fi.relative_path, exc,
                     )
 
-        if self._pipeline_available:
+        # 2단계: 파이프라인 병렬 처리 (LLM 호출 — 동시 파일 수 제한)
+        if pending_ids and self._pipeline_available:
+            _MAX_FILE_CONCURRENCY = 3
+            semaphore = asyncio.Semaphore(_MAX_FILE_CONCURRENCY)
+
+            async def _process_one(path: str, doc_id: int) -> bool:
+                async with semaphore:
+                    pipe_result = await self._process_through_pipeline(doc_id)
+                    return pipe_result is not None
+
+            tasks = [
+                _process_one(path, doc_id)
+                for path, doc_id in pending_ids
+            ]
+            results_flags = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for (path, _), flag in zip(pending_ids, results_flags):
+                if isinstance(flag, Exception):
+                    logger.error("파이프라인 병렬 처리 예외: %s — %s", path, flag)
+                    pipeline_failed += 1
+                elif flag:
+                    pipeline_processed += 1
+                else:
+                    pipeline_failed += 1
+
             logger.info(
                 "파이프라인 처리 집계: 성공=%d, 실패=%d",
                 pipeline_processed, pipeline_failed,
