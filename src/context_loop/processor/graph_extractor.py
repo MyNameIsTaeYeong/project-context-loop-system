@@ -2,6 +2,7 @@
 
 문서 내용에서 엔티티(노드)와 관계(엣지)를 추출하여 그래프 구조로 반환한다.
 긴 문서는 map-reduce 방식으로 분할 추출 후 병합한다.
+소스 타입에 따라 문서용/코드용 프롬프트를 자동 선택한다.
 """
 
 from __future__ import annotations
@@ -12,6 +13,10 @@ from dataclasses import dataclass, field
 from context_loop.processor.llm_client import LLMClient, extract_json
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 문서용 프롬프트 (기존)
+# ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """You are a knowledge graph extractor.
 Extract entities and relationships from the given document.
@@ -45,6 +50,61 @@ _USER_PROMPT_CHUNK_TEMPLATE = """Extract entities and relationships from this se
 
 Section ({chunk_index}/{total_chunks}):
 {content}"""
+
+# ---------------------------------------------------------------------------
+# 코드용 프롬프트
+# ---------------------------------------------------------------------------
+
+_CODE_SYSTEM_PROMPT = """You are a source code knowledge graph extractor.
+Extract code entities and their relationships from the given source code file.
+
+Rules:
+- Focus on code structure: functions, classes, interfaces, modules, and their interactions
+- Entity types: "function", "class", "struct", "interface", "package", "module", "endpoint", "error_type", "constant", "type_alias", "other"
+- Relation types: "calls", "imports", "implements", "contains", "returns", "depends_on", "raises", "receives", "related_to"
+- Use the actual names from the code (function names, class names, package names)
+- Keep entity names as they appear in the code (preserve casing)
+- "contains" means a class/struct/module defines a function/method
+- "calls" means a function invokes another function
+- "imports" means a file/module imports another package/module
+- "implements" means a class/struct implements an interface
+- "raises" means a function raises/returns an error type
+- Extract only relationships that are explicit in the code
+
+Respond ONLY with a JSON object in this exact format:
+{
+  "entities": [
+    {"name": "EntityName", "type": "entity_type", "description": "brief description of what it does"}
+  ],
+  "relations": [
+    {"source": "Entity A", "target": "Entity B", "type": "relation_type", "label": "optional label"}
+  ]
+}"""
+
+_CODE_USER_PROMPT_TEMPLATE = """Extract code entities and relationships from this source file:
+
+File: {title}
+
+Source code:
+{content}"""
+
+_CODE_USER_PROMPT_CHUNK_TEMPLATE = """Extract code entities and relationships from this section of the source file "{title}":
+
+Section ({chunk_index}/{total_chunks}):
+{content}"""
+
+# ---------------------------------------------------------------------------
+# 소스 타입에 따른 프롬프트 선택
+# ---------------------------------------------------------------------------
+
+_CODE_SOURCE_TYPES = frozenset({"git_code"})
+
+
+def _select_prompts(source_type: str | None) -> tuple[str, str, str]:
+    """소스 타입에 따라 (system, user_template, chunk_template)을 반환한다."""
+    if source_type in _CODE_SOURCE_TYPES:
+        return _CODE_SYSTEM_PROMPT, _CODE_USER_PROMPT_TEMPLATE, _CODE_USER_PROMPT_CHUNK_TEMPLATE
+    return _SYSTEM_PROMPT, _USER_PROMPT_TEMPLATE, _USER_PROMPT_CHUNK_TEMPLATE
 
 
 @dataclass
@@ -98,38 +158,54 @@ async def extract_graph(
     content: str,
     *,
     max_content_chars: int = 4000,
+    source_type: str | None = None,
 ) -> GraphData:
     """LLM을 사용하여 문서에서 엔티티와 관계를 추출한다.
 
     문서가 max_content_chars보다 길면 map-reduce 방식으로 분할 추출 후 병합한다.
     짧은 문서는 기존과 동일하게 단일 호출로 처리한다.
+    source_type에 따라 문서용/코드용 프롬프트를 자동 선택한다.
 
     Args:
         client: LLMClient 인스턴스.
         title: 문서 제목.
         content: 문서 원본 내용.
         max_content_chars: LLM 1회 호출당 최대 문자 수.
+        source_type: 소스 타입 ("git_code" 등). 코드 타입이면 코드 전용 프롬프트 사용.
 
     Returns:
         추출된 GraphData (entities, relations).
     """
+    system_prompt, user_template, chunk_template = _select_prompts(source_type)
+
     if len(content) <= max_content_chars:
-        return await _extract_single(client, title, content)
+        return await _extract_single(
+            client, title, content,
+            system_prompt=system_prompt,
+            user_template=user_template,
+        )
 
     # Map-reduce: 긴 문서를 청크로 분할하여 각각 추출 후 병합
-    return await _extract_map_reduce(client, title, content, max_content_chars)
+    return await _extract_map_reduce(
+        client, title, content, max_content_chars,
+        system_prompt=system_prompt,
+        chunk_template=chunk_template,
+    )
 
 
 async def _extract_single(
     client: LLMClient,
     title: str,
     content: str,
+    *,
+    system_prompt: str = _SYSTEM_PROMPT,
+    user_template: str = _USER_PROMPT_TEMPLATE,
 ) -> GraphData:
     """단일 LLM 호출로 그래프를 추출한다."""
-    prompt = _USER_PROMPT_TEMPLATE.format(title=title, content=content)
+    prompt = user_template.format(title=title, content=content)
     response = await client.complete(
         prompt,
-        system=_SYSTEM_PROMPT,
+        system=system_prompt,
         max_tokens=4096,
         temperature=0.0,
     )
@@ -141,6 +217,9 @@ async def _extract_map_reduce(
     title: str,
     content: str,
     max_content_chars: int,
+    *,
+    system_prompt: str = _SYSTEM_PROMPT,
+    chunk_template: str = _USER_PROMPT_CHUNK_TEMPLATE,
 ) -> GraphData:
     """긴 문서를 분할하여 그래프 추출 후 병합한다 (map-reduce).
 
@@ -156,7 +235,7 @@ async def _extract_map_reduce(
 
     all_graphs: list[GraphData] = []
     for i, chunk in enumerate(chunks):
-        prompt = _USER_PROMPT_CHUNK_TEMPLATE.format(
+        prompt = chunk_template.format(
             title=title,
             content=chunk,
             chunk_index=i + 1,
@@ -165,7 +244,7 @@ async def _extract_map_reduce(
         try:
             response = await client.complete(
                 prompt,
-                system=_SYSTEM_PROMPT,
+                system=system_prompt,
                 max_tokens=4096,
                 temperature=0.0,
             )

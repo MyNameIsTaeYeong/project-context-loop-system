@@ -409,3 +409,51 @@
 - **결정**: `ProductResult`에 `files: list[FileInfo]`와 `repo_url: str` 필드를 추가하여 `run()` 결과에 원본 파일 정보를 보존하고, `run_and_store()`에서 (1) `store_git_code()`로 git_code 저장 + git_code_map 구축, (2) code_summary 저장 시 file_summaries 기반으로 document_sources 연결, (3) code_doc 저장 시 source_directories 기반으로 document_sources 연결.
 - **이유**: `run()`의 부작용 최소화(side-effect-free) 원칙 유지. 모든 DB 쓰기를 `run_and_store()`에 집중하여 테스트 용이성과 관심사 분리 보장. `context_assembler`에는 `include_source_code` 옵션으로 검색 시 원본 코드 첨부를 opt-in 방식으로 제공.
 - **영향**: `ProductResult` 구조 변경(하위 호환 — 새 필드 모두 기본값 있음). `context_assembler`의 `assemble_context`/`assemble_context_with_sources` 함수 시그니처에 `include_source_code` 파라미터 추가(기본값 False, 기존 호출 영향 없음).
+
+## D-032: Phase 9.8 — code_doc 파이프라인 연결 방식
+
+- **일시**: 2026-04-14
+- **맥락**: Phase 9.7까지 Git 기반 문서(code_file_summary, code_summary, code_doc)가 DB에 저장되지만, 기존 처리 파이프라인(LLM 분류 → 청킹 → 임베딩 → 그래프 추출)을 거치지 않아 벡터 검색/그래프 탐색에서 검색 불가. 파이프라인 연결 방식 결정 필요: (A) CoordinatorAgent 내부에서 즉시 처리, (B) 저장 후 별도 배치 처리, (C) 웹 UI에서 수동 트리거.
+- **결정**: (A) CoordinatorAgent에 파이프라인 의존성을 optional keyword-only 파라미터로 추가하여, `run_and_store()` 내에서 각 store 직후 즉시 `process_document()` 호출. `store_*()` 메서드는 `tuple[int, bool]`을 반환하여 신규/변경 여부를 추적. `_process_through_pipeline()` 헬퍼에서 개별 try/except로 실패 격리. git_code(원본 코드)는 파이프라인 처리 대상에서 제외.
+- **이유**: (A)가 가장 단순하고, 문서 저장과 파이프라인 처리가 동일 흐름에서 완결됨. 파이프라인 의존성이 optional이므로 기존 테스트(Mock Agent 기반)와 완전 호환. 파이프라인 실패가 저장을 중단하지 않으므로 부분 성공이 보장됨.
+- **영향**: `store_*()` 반환 타입 변경 `int → tuple[int, bool]` (기존 테스트 업데이트 필요). `git_sync.py`에서 앱 레벨 VectorStore/GraphStore/LLMClient/Embeddings를 CoordinatorAgent에 전달.
+
+## D-033: Level 2/3 문서 생성 제거 — Level 1(code_file_summary)만 유지
+
+- **일시**: 2026-04-14
+- **맥락**: 3단계 문서 생성 계층(Level 1 파일 요약, Level 2 디렉토리 종합, Level 3 카테고리 관점)의 실효성 검토. Level 2는 같은 디렉토리 내 파일 관계만 포착하여 범위 제한적. Level 3는 고정된 5개 관점으로 문서를 7배 중복 생성하며, 검색 시 사용자 질의와 관점 불일치 가능성 높음.
+- **결정**: Level 2(code_summary/디렉토리 종합)와 Level 3(code_doc/카테고리 관점)를 완전 제거. Level 1(code_file_summary/파일별 요약)만 유지. Category Agent 전체 삭제, Worker Agent에서 synthesizer LLM 제거.
+- **이유**:
+  - **Level 2**: 디렉토리 내 관계만 포착. 크로스-디렉토리 관계(더 가치 있음)는 Level 1의 그래프 추출 + 크로스-문서 엔티티 병합(D-024)이 더 효과적으로 처리
+  - **Level 3**: RAG 안티패턴 — (1) 고정 관점이 사용자 질의와 불일치할 수 있음, (2) 7x 정보 중복으로 검색 노이즈 증가, (3) 높은 LLM 비용 (Opus급 모델 5회 호출/상품)
+  - Level 1 + 기존 파이프라인(chunker → embedder → graph_extractor)만으로 파일 간 관계를 엔티티/관계 그래프로 자동 추출 가능
+- **영향**: `category_agent.py` 삭제, `worker_agent.py` 단순화(단일 LLM), `coordinator.py`에서 Level 2/3 관련 코드 제거, `git_sync.py`에서 synthesizer/orchestrator LLM 생성 제거. LLM 비용 대폭 절감 (모델 3개 → 1개).
+
+---
+
+## D-034: Worker Agent 제거 — git_code 직접 파이프라인 처리
+
+- **일시**: 2026-04-14
+- **맥락**: D-033에서 Level 2/3를 제거한 후, Worker Agent의 유일한 역할은 Level 1(code_file_summary) — 원본 코드를 LLM으로 요약하여 별도 문서로 저장. 이 중간 요약 단계의 실효성을 검토.
+- **결정**: Worker Agent를 완전 제거. 원본 코드(git_code)를 기존 파이프라인(chunker → embedder → graph_extractor)으로 직접 처리. 저장 방식은 hybrid 고정 (LLM Classifier 건너뜀).
+- **이유**:
+  - **정보 손실**: LLM 요약은 필연적으로 세부 사항을 누락. 특히 함수 시그니처, 에러 처리, 엣지 케이스 등 검색 시 중요한 정보가 사라짐
+  - **그래프 추출 정확도**: 원본 코드에서 직접 엔티티/관계를 추출하면 요약에서 추출할 때보다 정확도가 높음 (구조화된 코드 → 구조화된 그래프)
+  - **LLM 비용 절감**: 파일당 요약 LLM 호출 1회 제거. 파이프라인의 그래프 추출 LLM 호출만 유지
+  - **Classifier 비결정성**: 같은 성격의 파일이어도 LLM Classifier가 chunk/hybrid를 비일관적으로 판정. hybrid 고정으로 일관성 확보
+  - **복잡도 감소**: Worker Agent 전체 + WorkerAgentProtocol 제거. 멀티에이전트 시스템에서 단순 파이프라인으로 전환
+- **영향**: `worker_agent.py` 삭제, `coordinator.py`에서 Worker 관련 코드 전면 제거, `git_sync.py`에서 Worker 생성 로직 제거. `pipeline.py`에 `storage_method_override` 파라미터 추가. 전체 흐름: git clone → store git_code → pipeline(graph).
+
+---
+
+## D-035: 코드 전용 그래프 스키마 — git_code graph-only 처리
+
+- **일시**: 2026-04-15
+- **맥락**: D-034에서 git_code를 hybrid(chunker + graph_extractor)로 처리했으나, 기존 chunker는 마크다운 문서용(`\n\n` 단락 경계, 헤딩 인식)이라 코드에 적용 시 함수 중간에서 잘리는 등 의미 없는 청크 생성. 코드에서 실질적 가치는 엔티티/관계 그래프.
+- **결정**: (1) git_code의 storage_method를 `hybrid` → `graph`로 변경 — 코드 청킹을 건너뛰고 그래프 추출만 수행. (2) `graph_extractor.py`에 코드 전용 프롬프트 추가 — `source_type` 파라미터로 문서/코드 자동 분기.
+- **이유**:
+  - **청킹 부적합**: 토큰 기반 분할이 코드 구조(함수/클래스 경계)를 무시 — 잘린 코드 조각은 유용한 컨텍스트가 아님
+  - **코드 전용 엔티티**: 기존 프롬프트의 entity_type(person, system, team...)은 코드 구조와 불일치. 코드에는 function, class, struct, interface, package 등이 필요
+  - **코드 전용 관계**: calls, imports, implements, contains, raises 등 코드 구조 관계가 필요
+  - **기존 문서 그래프 무변경**: source_type 기반 분기로 문서(Confluence 등)는 기존 프롬프트 그대로 사용
+- **영향**: `graph_extractor.py`에 `_CODE_SYSTEM_PROMPT` + `source_type` 파라미터 추가. `pipeline.py`에서 `doc["source_type"]`을 `extract_graph()`에 전달. `coordinator.py`에서 `storage_method_override="graph"`. GraphStore/검색 경로는 변경 없음 (entity_type은 자유 문자열).

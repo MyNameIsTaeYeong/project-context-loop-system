@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.7 원본 코드 저장 (git_code) + document_sources 연결 완료
-- **상태**: `run_and_store()`에서 원본 코드 파일을 `git_code` 문서로 DB에 저장하고, `document_sources` 테이블로 `code_summary`/`code_doc` ↔ `git_code` N:M 연결을 자동 구축. `context_assembler`에 `include_source_code` 옵션 추가하여 검색 시 LLM 생성 문서와 원본 코드를 함께 반환 가능. `_collect_git_code_ids()` 헬퍼로 `source_directories` 기반 매칭. `ProductResult`에 `files`/`repo_url` 필드 추가. 검증 스크립트 `scripts/run_git_code_store.py` 제공 (Mock Agent 기반 E2E 검증 9섹션). 테스트 24개(coordinator) + 22개(context_assembler) 전체 통과. 다음: code_doc → 기존 파이프라인 연결(9.8) 구현.
+- **Step**: 9.8+ 코드 전용 그래프 스키마 + graph-only 처리 (D-033, D-034, D-035)
+- **상태**: 멀티에이전트 제거 + 코드 전용 그래프 추출 완료. (1) D-033: Level 2/3 제거. (2) D-034: Worker Agent 제거. (3) D-035: 코드 전용 그래프 스키마 — `graph_extractor.py`에 `source_type` 파라미터 추가, git_code는 코드 전용 프롬프트(function/class/struct/interface + calls/imports/implements 등)로 graph-only 처리 (chunking 건너뜀). 기존 문서 그래프 추출은 변경 없음. 전체 흐름: git clone → store git_code → pipeline(graph, 코드 전용 프롬프트). 테스트 380개 비-web 전체 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
 
 ## Phase별 진행률
 
@@ -68,11 +68,11 @@
 - [x] 9.2 `ingestion/git_repository.py` — Git repo clone/pull, 상품별 스코핑, 변경 감지
 - [x] 9.3 config에 `sources.git` 섹션 추가 — 상품 정의, 카테고리 프롬프트, 에이전트별 엔드포인트 (D-028, D-029)
 - [x] 9.4 Coordinator Agent 구현 — 전체 파이프라인 조율 (D-027)
-- [x] 9.5 Worker Agent 구현 — Level 1 파일 요약 + Level 2 디렉토리 문서 (D-027)
-- [x] 9.6 Category Agent 구현 — Level 3 상품×카테고리별 관점 문서 (D-027, D-028)
+- [x] ~~9.5 Worker Agent 구현~~ — Worker Agent 제거 (D-034)
+- [x] ~~9.6 Category Agent 구현~~ — Level 2/3 제거 (D-033)
 - [x] 9.7 원본 코드 저장 (git_code) + document_sources 연결 (D-025, D-026, D-030)
-- [ ] 9.8 code_doc → 기존 파이프라인 연결 (chunker → embedder → graph_extractor)
-- [ ] 9.9 증분 처리 — git diff 기반 변경 디렉토리만 재처리
+- [x] 9.8 git_code → 기존 파이프라인 직접 연결 (hybrid 고정, Classifier 건너뜀) (D-034)
+- [ ] 9.9 증분 처리 — git diff 기반 변경 파일만 재처리
 - [ ] 9.10 GitHub webhook 기반 자동 동기화
 - [ ] 9.11 커밋 히스토리 / PR 리뷰 수집 및 컨텍스트화
 
@@ -82,8 +82,18 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-13
-- 내용: Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
+- 일시: 2026-04-15
+- 내용: 코드 전용 그래프 스키마 + graph-only 처리 (D-035).
+  - **D-035**: git_code를 코드 전용 프롬프트로 graph-only 처리
+  - **변경 사항**:
+    - `graph_extractor.py`: `source_type` 파라미터 추가. `_CODE_SYSTEM_PROMPT` + `_select_prompts()` — git_code는 코드 전용 엔티티(function, class, struct, interface, package, module, endpoint, error_type, constant, type_alias) + 관계(calls, imports, implements, contains, returns, depends_on, raises, receives) 프롬프트 사용
+    - `pipeline.py`: `doc["source_type"]`을 `extract_graph()`에 전달
+    - `coordinator.py`: `storage_method_override`를 `"hybrid"` → `"graph"`로 변경 — 코드 chunking 건너뜀
+  - **기존 문서**: 변경 없음 — `source_type`이 `git_code`가 아니면 기존 프롬프트 사용
+  - **GraphStore/검색**: 변경 없음 — entity_type은 자유 문자열이므로 코드/문서 엔티티 자연 공존
+  - **전체 흐름**: git clone → store git_code → pipeline(graph_extractor with 코드 전용 프롬프트, chunking 건너뜀)
+  - **테스트**: 380개 비-web 테스트 전체 통과 (신규 8개: 코드 프롬프트 선택, 코드 엔티티/관계 파싱, map-reduce)
+- 이전 (2026-04-13): Phase 9.7 원본 코드 저장 (git_code) + document_sources 연결 구현 완료.
   - **핵심 구현** (`ingestion/coordinator.py`)
     - `ProductResult`에 `files: list[FileInfo]`, `repo_url: str` 필드 추가
     - `run_and_store()`에서 `store_git_code()`로 원본 코드 → `git_code` 문서 DB 저장
