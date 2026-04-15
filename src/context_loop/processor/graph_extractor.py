@@ -102,7 +102,7 @@ _CODE_SOURCE_TYPES = frozenset({"git_code"})
 # 문서: 4,000자 (산문은 짧게 나눠야 LLM이 정확하게 추출)
 _DEFAULT_MAX_CONTENT_CHARS = 4000
 # 코드: 32,000자 (구조화된 코드는 긴 입력도 정확하게 처리 가능, map-reduce 최소화)
-_CODE_MAX_CONTENT_CHARS = 32000
+_CODE_MAX_CONTENT_CHARS = 16000
 
 
 def _select_prompts(source_type: str | None) -> tuple[str, str, str]:
