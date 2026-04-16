@@ -45,25 +45,28 @@ class TestPythonExtraction:
             return 42
     """)
 
-    def test_extracts_top_level_symbols(self) -> None:
-        """최상위 함수/클래스를 추출한다."""
+    def test_extracts_symbols_with_method_level_chunking(self) -> None:
+        """클래스 메서드를 개별 심볼로 추출한다."""
         result = extract_code_symbols(self._PYTHON_CODE, "service.py")
 
         assert result.language == "python"
         names = {s.name for s in result.symbols}
-        assert "MyService" in names
+        # 클래스 내부 메서드가 개별 심볼로 추출됨
+        assert "__init__" in names
+        assert "run" in names
+        # 최상위 함수도 추출
         assert "handle_request" in names
         assert "helper" in names
-        # 클래스 내부 메서드는 별도 심볼이 아님
-        assert "__init__" not in names
-        assert "run" not in names
+        # 메서드가 있는 클래스는 클래스 자체가 심볼로 추출되지 않음
+        assert "MyService" not in names
 
     def test_symbol_types(self) -> None:
         """심볼 유형이 올바르게 설정된다."""
         result = extract_code_symbols(self._PYTHON_CODE, "service.py")
 
         types = {s.name: s.symbol_type for s in result.symbols}
-        assert types["MyService"] == "class"
+        assert types["__init__"] == "method"
+        assert types["run"] == "method"
         assert types["handle_request"] == "function"
         assert types["helper"] == "function"
 
@@ -87,20 +90,45 @@ class TestPythonExtraction:
         """독스트링을 추출한다."""
         result = extract_code_symbols(self._PYTHON_CODE, "service.py")
 
-        svc = next(s for s in result.symbols if s.name == "MyService")
-        assert "서비스 클래스" in svc.docstring
-
         handle = next(s for s in result.symbols if s.name == "handle_request")
         assert "요청을 처리" in handle.docstring
 
-    def test_body_contains_full_code(self) -> None:
-        """심볼 body에 전체 코드가 포함된다."""
+    def test_method_parent_info(self) -> None:
+        """메서드에 부모 클래스 정보가 설정된다."""
         result = extract_code_symbols(self._PYTHON_CODE, "service.py")
 
-        svc = next(s for s in result.symbols if s.name == "MyService")
-        assert "class MyService" in svc.body
-        assert "def __init__" in svc.body
-        assert "def run" in svc.body
+        init = next(s for s in result.symbols if s.name == "__init__")
+        assert init.parent_name == "MyService"
+        assert init.parent_signature == "class MyService"
+        assert init.symbol_type == "method"
+
+        run = next(s for s in result.symbols if s.name == "run")
+        assert run.parent_name == "MyService"
+
+    def test_method_body_contains_own_code(self) -> None:
+        """메서드 body에 해당 메서드의 코드만 포함된다."""
+        result = extract_code_symbols(self._PYTHON_CODE, "service.py")
+
+        init = next(s for s in result.symbols if s.name == "__init__")
+        assert "def __init__" in init.body
+        assert "self.name = name" in init.body
+        # 다른 메서드의 코드는 포함하지 않음
+        assert "def run" not in init.body
+
+    def test_class_without_methods_stays_single_symbol(self) -> None:
+        """메서드가 없는 클래스는 전체가 단일 심볼로 추출된다."""
+        code = textwrap.dedent("""\
+            class Config:
+                \"\"\"설정 클래스.\"\"\"
+                DEBUG = True
+                PORT = 8080
+        """)
+        result = extract_code_symbols(code, "config.py")
+
+        assert len(result.symbols) == 1
+        assert result.symbols[0].name == "Config"
+        assert result.symbols[0].symbol_type == "class"
+        assert result.symbols[0].parent_name == ""
 
     def test_empty_content(self) -> None:
         """빈 내용은 빈 결과를 반환한다."""
@@ -159,13 +187,25 @@ class TestGoExtraction:
     """)
 
     def test_extracts_functions(self) -> None:
-        """Go 함수를 추출한다."""
+        """Go 함수와 리시버 메서드를 추출한다."""
         result = extract_code_symbols(self._GO_CODE, "handler.go")
 
         assert result.language == "go"
         names = {s.name for s in result.symbols}
         assert "HandleRequest" in names
         assert "Create" in names
+
+    def test_receiver_method_has_parent(self) -> None:
+        """Go 리시버 메서드에 부모 타입 정보가 설정된다."""
+        result = extract_code_symbols(self._GO_CODE, "handler.go")
+
+        create = next(s for s in result.symbols if s.name == "Create")
+        assert create.symbol_type == "method"
+        assert create.parent_name == "VPCService"
+
+        handle = next(s for s in result.symbols if s.name == "HandleRequest")
+        assert handle.symbol_type == "function"
+        assert handle.parent_name == ""
 
     def test_extracts_types(self) -> None:
         """Go struct/interface를 추출한다."""
@@ -231,12 +271,13 @@ class TestTypeScriptExtraction:
     """)
 
     def test_extracts_symbols(self) -> None:
-        """TypeScript 클래스/함수를 추출한다."""
+        """TypeScript 클래스 메서드와 함수를 추출한다."""
         result = extract_code_symbols(self._TS_CODE, "user.ts")
 
         assert result.language == "typescript"
         names = {s.name for s in result.symbols}
-        assert "UserService" in names
+        # 클래스 메서드가 개별 심볼로 추출됨
+        assert "constructor" in names or "getUser" in names
         assert "handleRequest" in names
 
     def test_extracts_imports(self) -> None:
@@ -255,7 +296,7 @@ class TestTypeScriptExtraction:
 class TestJavaScriptExtraction:
     """JavaScript 코드 심볼 추출 테스트."""
 
-    def test_extracts_function_and_class(self) -> None:
+    def test_extracts_function_and_class_methods(self) -> None:
         code = textwrap.dedent("""\
             const express = require('express');
 
@@ -273,9 +314,15 @@ class TestJavaScriptExtraction:
 
         assert result.language == "javascript"
         names = {s.name for s in result.symbols}
-        assert "Router" in names
+        # 클래스 메서드가 개별로 추출됨
+        assert "constructor" in names
         assert "createApp" in names
         assert "express" in result.imports
+
+        # constructor는 Router의 메서드
+        ctor = next(s for s in result.symbols if s.name == "constructor")
+        assert ctor.parent_name == "Router"
+        assert ctor.symbol_type == "method"
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +444,35 @@ class TestToChunks:
 
         assert "VPC를 생성한다." in embed_texts[0]
 
+    def test_method_chunk_includes_parent_info(self) -> None:
+        """메서드 청크에 부모 클래스 정보가 포함된다."""
+        extraction = CodeExtraction(
+            file_path="service.py",
+            language="python",
+            symbols=[
+                CodeSymbol(
+                    name="run",
+                    symbol_type="method",
+                    signature="def run(self) -> None",
+                    body="    def run(self) -> None:\n        pass",
+                    line_start=5,
+                    line_end=6,
+                    parent_name="MyService",
+                    parent_signature="class MyService",
+                ),
+            ],
+            imports=[],
+        )
+        chunks, embed_texts = to_chunks(extraction, "service.py")
+
+        assert len(chunks) == 1
+        # 헤더에 부모 클래스 정보 포함
+        assert "# class MyService" in chunks[0].content
+        # section_path에 부모 클래스 포함
+        assert chunks[0].section_path == "service.py > MyService > run"
+        # 임베딩 텍스트에 부모 클래스 이름 포함
+        assert "MyService" in embed_texts[0]
+
     def test_empty_symbols_returns_empty(self) -> None:
         extraction = CodeExtraction(file_path="empty.py", language="python")
         chunks, embed_texts = to_chunks(extraction, "empty.py")
@@ -465,17 +541,42 @@ class TestToGraphData:
             assert r.source == "handler.go"
             assert r.relation_type == "imports"
 
-    def test_no_calls_contains_relations(self) -> None:
-        """calls, contains 등 LLM 전용 관계는 생성하지 않는다."""
+    def test_contains_relations_for_methods(self) -> None:
+        """메서드가 있으면 클래스 → 메서드 contains 관계가 생성된다."""
         extraction = CodeExtraction(
             file_path="service.py",
             language="python",
             symbols=[
                 CodeSymbol(
-                    name="MyClass", symbol_type="class",
-                    signature="class MyClass", body="...",
-                    line_start=1, line_end=5,
+                    name="run", symbol_type="method",
+                    signature="def run(self)", body="...",
+                    line_start=3, line_end=5,
+                    parent_name="MyClass", parent_signature="class MyClass",
                 ),
+                CodeSymbol(
+                    name="helper", symbol_type="function",
+                    signature="def helper()", body="...",
+                    line_start=7, line_end=9,
+                ),
+            ],
+            imports=["os"],
+        )
+        graph = to_graph_data(extraction, "service.py")
+
+        relation_types = {r.relation_type for r in graph.relations}
+        assert "imports" in relation_types
+        assert "contains" in relation_types
+
+        contains_rel = next(r for r in graph.relations if r.relation_type == "contains")
+        assert contains_rel.source == "MyClass"
+        assert contains_rel.target == "run"
+
+    def test_no_calls_relations(self) -> None:
+        """calls 등 LLM 전용 관계는 생성하지 않는다."""
+        extraction = CodeExtraction(
+            file_path="service.py",
+            language="python",
+            symbols=[
                 CodeSymbol(
                     name="helper", symbol_type="function",
                     signature="def helper()", body="...",
@@ -514,23 +615,40 @@ class TestEndToEnd:
         chunks, embed_texts = to_chunks(extraction, "reader.py")
         graph = to_graph_data(extraction, "reader.py")
 
-        # 심볼 2개 (FileReader, main)
+        # 심볼 2개 (FileReader.read 메서드, main 함수)
         assert len(extraction.symbols) == 2
+        names = {s.name for s in extraction.symbols}
+        assert "read" in names
+        assert "main" in names
 
-        # 청크 2개 (전체 코드 포함)
+        # read 메서드는 FileReader의 메서드
+        read_sym = next(s for s in extraction.symbols if s.name == "read")
+        assert read_sym.parent_name == "FileReader"
+        assert read_sym.symbol_type == "method"
+
+        # 청크 2개
         assert len(chunks) == 2
-        assert any("FileReader" in c.content for c in chunks)
-        assert any("def main" in c.content for c in chunks)
+        # 메서드 청크에 부모 클래스 정보가 포함됨
+        read_chunk = next(c for c in chunks if "def read" in c.content)
+        assert "# class FileReader" in read_chunk.content
+        assert "reader.py > FileReader > read" == read_chunk.section_path
 
-        # 임베딩 텍스트 2개 (시그니처 기반, 코드 본문 없음)
+        # 임베딩 텍스트에 코드 본문 없음
         assert len(embed_texts) == 2
-        assert any("FileReader" in t for t in embed_texts)
         assert not any("read_text()" in t for t in embed_texts)
+        # 임베딩 텍스트에 부모 클래스 이름 포함
+        read_embed = next(t for t in embed_texts if "read" in t and "main" not in t)
+        assert "FileReader" in read_embed
 
-        # 그래프: module + 2 symbols = 3 entities, 1 import relation
-        assert len(graph.entities) == 3
-        assert len(graph.relations) == 1
-        assert graph.relations[0].target == "pathlib"
+        # 그래프: module + FileReader class + 2 symbols = 4 entities
+        assert len(graph.entities) == 4
+        # 1 import + 1 contains (FileReader→read)
+        assert len(graph.relations) == 2
+        assert any(r.target == "pathlib" for r in graph.relations)
+        assert any(
+            r.source == "FileReader" and r.target == "read" and r.relation_type == "contains"
+            for r in graph.relations
+        )
 
     def test_go_end_to_end(self) -> None:
         code = textwrap.dedent("""\

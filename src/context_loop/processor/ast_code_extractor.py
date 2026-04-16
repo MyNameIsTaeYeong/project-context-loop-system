@@ -30,16 +30,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CodeSymbol:
-    """코드 심볼 (함수, 클래스, 타입 등).
+    """코드 심볼 (함수, 클래스, 메서드, 타입 등).
 
     Attributes:
         name: 심볼 이름.
-        symbol_type: 심볼 유형 (function, class, struct, interface).
+        symbol_type: 심볼 유형 (function, class, method, struct, interface).
         signature: 함수/타입 시그니처.
         body: 심볼 전체 소스 코드.
         line_start: 시작 라인 (1-based).
         line_end: 종료 라인 (1-based).
         docstring: 독스트링 또는 주석.
+        parent_name: 소속 클래스/구조체 이름. 최상위 심볼은 빈 문자열.
+        parent_signature: 소속 클래스의 시그니처. 최상위 심볼은 빈 문자열.
     """
 
     name: str
@@ -49,6 +51,8 @@ class CodeSymbol:
     line_start: int
     line_end: int
     docstring: str = ""
+    parent_name: str = ""
+    parent_signature: str = ""
 
 
 @dataclass
@@ -145,7 +149,17 @@ def to_chunks(
 
     for i, sym in enumerate(extraction.symbols):
         # 저장/반환용: 전체 코드
-        header = f"# File: {file_title}\n# {sym.symbol_type}: {sym.signature}\n\n"
+        if sym.parent_name:
+            header = (
+                f"# File: {file_title}\n"
+                f"# {sym.parent_signature}\n"
+                f"# {sym.symbol_type}: {sym.signature}\n\n"
+            )
+            section_path = f"{file_title} > {sym.parent_name} > {sym.name}"
+        else:
+            header = f"# File: {file_title}\n# {sym.symbol_type}: {sym.signature}\n\n"
+            section_path = f"{file_title} > {sym.name}"
+
         chunk_content = header + sym.body
 
         chunks.append(Chunk(
@@ -153,11 +167,14 @@ def to_chunks(
             index=i,
             content=chunk_content,
             token_count=count_tokens(chunk_content),
-            section_path=f"{file_title} > {sym.name}",
+            section_path=section_path,
         ))
 
-        # 임베딩용: 이름 + 시그니처 + docstring
-        embed_parts = [file_title, sym.name, sym.signature]
+        # 임베딩용: 이름 + 시그니처 + docstring + (부모 클래스)
+        embed_parts = [file_title]
+        if sym.parent_name:
+            embed_parts.append(sym.parent_name)
+        embed_parts.extend([sym.name, sym.signature])
         if sym.docstring:
             embed_parts.append(sym.docstring)
         embed_texts.append("\n".join(embed_parts))
@@ -179,6 +196,17 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
         ),
     ]
 
+    # 부모 클래스 엔티티를 중복 없이 추가
+    parent_names: set[str] = set()
+    for sym in extraction.symbols:
+        if sym.parent_name and sym.parent_name not in parent_names:
+            parent_names.add(sym.parent_name)
+            entities.append(Entity(
+                name=sym.parent_name,
+                entity_type="class",
+                description=sym.parent_signature,
+            ))
+
     for sym in extraction.symbols:
         entities.append(Entity(
             name=sym.name,
@@ -195,6 +223,15 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
         for imp in extraction.imports
     ]
 
+    # 메서드 → 클래스 contains 관계
+    for sym in extraction.symbols:
+        if sym.parent_name:
+            relations.append(Relation(
+                source=sym.parent_name,
+                target=sym.name,
+                relation_type="contains",
+            ))
+
     return GraphData(entities=entities, relations=relations)
 
 
@@ -204,7 +241,11 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
 
 
 def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
-    """Python AST를 사용한 심볼 추출."""
+    """Python AST를 사용한 심볼 추출.
+
+    클래스는 메서드 단위로 분할하여 각 메서드를 개별 심볼로 추출한다.
+    메서드가 없는 클래스는 클래스 전체를 단일 심볼로 추출한다.
+    """
     tree = ast.parse(content)
     lines = content.splitlines(keepends=True)
 
@@ -225,16 +266,44 @@ def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
                 docstring=ast.get_docstring(node) or "",
             ))
         elif isinstance(node, ast.ClassDef):
-            body = "".join(lines[node.lineno - 1 : node.end_lineno])
-            symbols.append(CodeSymbol(
-                name=node.name,
-                symbol_type="class",
-                signature=f"class {node.name}",
-                body=body,
-                line_start=node.lineno,
-                line_end=node.end_lineno or node.lineno,
-                docstring=ast.get_docstring(node) or "",
-            ))
+            class_sig = f"class {node.name}"
+            class_doc = ast.get_docstring(node) or ""
+
+            # 클래스 내부 메서드를 개별 심볼로 추출
+            methods = [
+                child for child in ast.iter_child_nodes(node)
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+
+            if methods:
+                for method in methods:
+                    method_body = "".join(
+                        lines[method.lineno - 1 : method.end_lineno],
+                    )
+                    method_sig = _python_func_sig(method)
+                    symbols.append(CodeSymbol(
+                        name=method.name,
+                        symbol_type="method",
+                        signature=method_sig,
+                        body=method_body,
+                        line_start=method.lineno,
+                        line_end=method.end_lineno or method.lineno,
+                        docstring=ast.get_docstring(method) or "",
+                        parent_name=node.name,
+                        parent_signature=class_sig,
+                    ))
+            else:
+                # 메서드가 없는 클래스는 전체를 단일 심볼로
+                body = "".join(lines[node.lineno - 1 : node.end_lineno])
+                symbols.append(CodeSymbol(
+                    name=node.name,
+                    symbol_type="class",
+                    signature=class_sig,
+                    body=body,
+                    line_start=node.lineno,
+                    line_end=node.end_lineno or node.lineno,
+                    docstring=class_doc,
+                ))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 imports.append(alias.name)
@@ -322,7 +391,11 @@ def _extract_brace_language(
 
 
 def _extract_brace_symbols(content: str, language: str) -> list[CodeSymbol]:
-    """키워드 감지 + 중괄호 매칭으로 심볼을 추출한다."""
+    """키워드 감지 + 중괄호 매칭으로 심볼을 추출한다.
+
+    Go: 리시버 메서드(func (s *Type) Method)는 parent_name으로 Type을 기록한다.
+    Java/TS/JS: 클래스 내부 메서드를 개별 심볼로 추출하고 parent_name에 클래스명을 기록한다.
+    """
     patterns = _DEFINITION_PATTERNS.get(language, [])
     if not patterns:
         return []
@@ -331,13 +404,50 @@ def _extract_brace_symbols(content: str, language: str) -> list[CodeSymbol]:
     symbols: list[CodeSymbol] = []
     used_ranges: list[tuple[int, int]] = []
 
+    # Go 리시버 메서드 패턴: func (s *Type) Method(
+    go_receiver_pattern = re.compile(
+        r"^func\s+\(\s*\w+\s+\*?(\w+)\s*\)\s+(\w+)\s*\(",
+    )
+
     for line_idx, line in enumerate(lines):
         # 이미 다른 심볼 범위에 포함된 라인은 건너뜀
         if any(s <= line_idx < e for s, e in used_ranges):
             continue
 
+        stripped = line.strip()
+
+        # Go 리시버 메서드를 먼저 확인
+        if language == "go":
+            recv_m = go_receiver_pattern.match(stripped)
+            if recv_m:
+                parent_type = recv_m.group(1)
+                method_name = recv_m.group(2)
+                block_start = sum(len(l) for l in lines[:line_idx])
+                brace_pos = content.find("{", block_start)
+                if brace_pos != -1:
+                    block_end = _find_matching_brace(content, brace_pos)
+                    body = content[block_start:block_end]
+                    end_line = content[:block_end].count("\n") + 1
+                    sig_end = body.find("{")
+                    signature = body[:sig_end].strip() if sig_end != -1 else stripped
+                    docstring = _extract_preceding_comment(lines, line_idx)
+
+                    symbols.append(CodeSymbol(
+                        name=method_name,
+                        symbol_type="method",
+                        signature=signature,
+                        body=body,
+                        line_start=line_idx + 1,
+                        line_end=end_line,
+                        docstring=docstring,
+                        parent_name=parent_type,
+                        parent_signature=f"type {parent_type} struct",
+                    ))
+                    used_ranges.append((line_idx, end_line))
+                    continue
+
         for pattern, sym_type in patterns:
-            m = pattern.match(line.strip())
+            m = pattern.match(stripped)
             if not m:
                 continue
 
@@ -354,24 +464,139 @@ def _extract_brace_symbols(content: str, language: str) -> list[CodeSymbol]:
 
             # 시그니처: 첫 번째 줄 (또는 { 이전까지)
             sig_end = body.find("{")
-            signature = body[:sig_end].strip() if sig_end != -1 else line.strip()
+            signature = body[:sig_end].strip() if sig_end != -1 else stripped
 
             # docstring: 직전 줄의 주석
             docstring = _extract_preceding_comment(lines, line_idx)
 
-            symbols.append(CodeSymbol(
-                name=name,
-                symbol_type=sym_type,
-                signature=signature,
-                body=body,
-                line_start=line_idx + 1,
-                line_end=end_line,
-                docstring=docstring,
-            ))
+            # Java/TS/JS 클래스는 내부 메서드를 개별 추출
+            if sym_type == "class" and language in ("java", "typescript", "javascript"):
+                inner_methods = _extract_class_methods(
+                    body, language, name, signature, line_idx,
+                )
+                if inner_methods:
+                    symbols.extend(inner_methods)
+                else:
+                    symbols.append(CodeSymbol(
+                        name=name,
+                        symbol_type=sym_type,
+                        signature=signature,
+                        body=body,
+                        line_start=line_idx + 1,
+                        line_end=end_line,
+                        docstring=docstring,
+                    ))
+            else:
+                symbols.append(CodeSymbol(
+                    name=name,
+                    symbol_type=sym_type,
+                    signature=signature,
+                    body=body,
+                    line_start=line_idx + 1,
+                    line_end=end_line,
+                    docstring=docstring,
+                ))
             used_ranges.append((line_idx, end_line))
             break  # 한 라인에서 하나의 패턴만 매칭
 
     return symbols
+
+
+# 클래스 내부 메서드를 감지하는 패턴 (언어별)
+_METHOD_PATTERNS: dict[str, list[re.Pattern[str]]] = {
+    "java": [
+        re.compile(
+            r"^\s*(?:public|private|protected|static|final|synchronized|\s)*"
+            r"[\w<>\[\],\s]+\s+(\w+)\s*\(",
+        ),
+    ],
+    "typescript": [
+        re.compile(r"^\s*(?:public|private|protected|static|readonly|\s)*(?:async\s+)?(\w+)\s*\("),
+    ],
+    "javascript": [
+        re.compile(r"^\s*(?:static\s+)?(?:async\s+)?(\w+)\s*\("),
+    ],
+}
+
+
+def _extract_class_methods(
+    class_body: str,
+    language: str,
+    class_name: str,
+    class_signature: str,
+    class_line_offset: int,
+) -> list[CodeSymbol]:
+    """클래스 본문에서 메서드를 개별 심볼로 추출한다."""
+    method_patterns = _METHOD_PATTERNS.get(language, [])
+    if not method_patterns:
+        return []
+
+    # 클래스 본문에서 첫 번째 { 이후부터 파싱
+    brace_pos = class_body.find("{")
+    if brace_pos == -1:
+        return []
+
+    inner_content = class_body[brace_pos + 1 :]
+    inner_lines = inner_content.splitlines(keepends=True)
+
+    methods: list[CodeSymbol] = []
+    used_ranges: list[tuple[int, int]] = []
+    # inner_content가 class_body 내에서 시작하는 offset
+    inner_offset = brace_pos + 1
+
+    for line_idx, line in enumerate(inner_lines):
+        if any(s <= line_idx < e for s, e in used_ranges):
+            continue
+
+        stripped = line.strip()
+        # 클래스 이름과 같은 이름(생성자 등)은 건너뜀 — 필드 선언도 건너뜀
+        if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
+            continue
+
+        for pattern in method_patterns:
+            m = pattern.match(stripped)
+            if not m:
+                continue
+
+            name = m.group(1)
+            # 필드 선언이나 클래스/인터페이스 키워드는 건너뜀
+            if name in ("class", "interface", "enum", "return", "if", "for",
+                        "while", "switch", "try", "catch", "throw", "new"):
+                continue
+
+            # 메서드 블록 시작 위치 계산
+            method_start_in_inner = sum(len(l) for l in inner_lines[:line_idx])
+            method_start_in_body = inner_offset + method_start_in_inner
+            method_brace = class_body.find("{", method_start_in_body)
+            if method_brace == -1:
+                continue
+
+            method_end = _find_matching_brace(class_body, method_brace)
+            method_body = class_body[method_start_in_body:method_end]
+            method_end_line = class_body[:method_end].count("\n")
+
+            # 시그니처
+            sig_end = method_body.find("{")
+            method_sig = method_body[:sig_end].strip() if sig_end != -1 else stripped
+
+            # docstring: 직전 줄의 주석
+            docstring = _extract_preceding_comment(inner_lines, line_idx)
+
+            methods.append(CodeSymbol(
+                name=name,
+                symbol_type="method",
+                signature=method_sig,
+                body=method_body,
+                line_start=class_line_offset + 1 + inner_content[:method_start_in_inner].count("\n") + 1,
+                line_end=class_line_offset + 1 + method_end_line,
+                docstring=docstring,
+                parent_name=class_name,
+                parent_signature=class_signature,
+            ))
+            used_ranges.append((line_idx, line_idx + method_body.count("\n") + 1))
+            break
+
+    return methods
 
 
 def _extract_brace_imports(content: str, language: str) -> list[str]:
