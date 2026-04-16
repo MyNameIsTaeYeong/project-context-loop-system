@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 
@@ -98,6 +99,7 @@ Section ({chunk_index}/{total_chunks}):
 # ---------------------------------------------------------------------------
 
 _CODE_SOURCE_TYPES = frozenset({"git_code"})
+_CODE_MAX_CONTENT_CHARS = 2000
 
 
 def _select_prompts(source_type: str | None) -> tuple[str, str, str]:
@@ -178,6 +180,9 @@ async def extract_graph(
     """
     system_prompt, user_template, chunk_template = _select_prompts(source_type)
 
+    if source_type in _CODE_SOURCE_TYPES:
+        max_content_chars = _CODE_MAX_CONTENT_CHARS
+
     if len(content) <= max_content_chars:
         return await _extract_single(
             client, title, content,
@@ -212,6 +217,11 @@ async def _extract_single(
     return _parse_graph_response(response)
 
 
+_MAX_CONCURRENCY = 4
+_MAX_RETRIES = 2
+_RETRY_BASE_DELAY = 2.0
+
+
 async def _extract_map_reduce(
     client: LLMClient,
     title: str,
@@ -223,8 +233,11 @@ async def _extract_map_reduce(
 ) -> GraphData:
     """긴 문서를 분할하여 그래프 추출 후 병합한다 (map-reduce).
 
-    1. Map: 문서를 max_content_chars 크기 청크로 분할, 각 청크에서 그래프 추출
+    1. Map: 문서를 max_content_chars 크기 청크로 분할, 각 청크에서 병렬 그래프 추출
     2. Reduce: 전체 결과를 병합 (동일 엔티티 중복 제거, 관계 중복 제거)
+
+    청크를 병렬로 처리하되 Semaphore로 동시 요청 수를 제한하고,
+    실패 시 지수 백오프로 재시도한다.
     """
     chunks = _split_content(content, max_content_chars)
     total = len(chunks)
@@ -233,25 +246,45 @@ async def _extract_map_reduce(
         title, total, len(content),
     )
 
-    all_graphs: list[GraphData] = []
-    for i, chunk in enumerate(chunks):
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+
+    async def _extract_chunk(i: int, chunk: str) -> GraphData | None:
         prompt = chunk_template.format(
             title=title,
             content=chunk,
             chunk_index=i + 1,
             total_chunks=total,
         )
-        try:
-            response = await client.complete(
-                prompt,
-                system=system_prompt,
-                max_tokens=4096,
-                temperature=0.0,
-            )
-            graph = _parse_graph_response(response)
-            all_graphs.append(graph)
-        except Exception:
-            logger.warning("청크 %d/%d 그래프 추출 실패, 건너뜀", i + 1, total, exc_info=True)
+        async with semaphore:
+            for attempt in range(_MAX_RETRIES + 1):
+                try:
+                    response = await client.complete(
+                        prompt,
+                        system=system_prompt,
+                        max_tokens=4096,
+                        temperature=0.0,
+                    )
+                    return _parse_graph_response(response)
+                except Exception:
+                    if attempt < _MAX_RETRIES:
+                        delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "청크 %d/%d 추출 실패 (시도 %d/%d), %.1f초 후 재시도",
+                            i + 1, total, attempt + 1, _MAX_RETRIES + 1, delay,
+                            exc_info=True,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.warning(
+                            "청크 %d/%d 그래프 추출 최종 실패, 건너뜀",
+                            i + 1, total, exc_info=True,
+                        )
+        return None
+
+    results = await asyncio.gather(*[
+        _extract_chunk(i, chunk) for i, chunk in enumerate(chunks)
+    ])
+    all_graphs = [g for g in results if g is not None]
 
     merged = _merge_graphs(all_graphs)
     logger.info(

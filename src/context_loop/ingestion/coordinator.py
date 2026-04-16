@@ -5,12 +5,12 @@
 2. 레포지토리별 clone/pull
 3. 상품별 파일 수집
 4. git_code 문서 DB 저장 (원본 코드)
-5. 신규/변경된 git_code를 기존 파이프라인(chunker → embedder → graph_extractor)으로
-   graph 방식으로 직접 처리 (LLM Classifier 건너뜀, 코드 전용 프롬프트 사용)
+5. 신규/변경된 git_code를 AST 기반으로 처리 (심볼 청크 + import 그래프, LLM 불필요)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -152,35 +152,54 @@ class CoordinatorAgent:
 
         run()의 결과를 받아:
         1. git_code 문서 저장 (원본 코드)
-        2. 신규/변경된 git_code를 파이프라인으로 처리 (graph 고정, Classifier 건너뜀)
+        2. 신규/변경된 git_code를 파이프라인으로 병렬 처리 (graph 고정, Classifier 건너뜀)
         """
         result = await self.run()
 
         pipeline_processed = 0
         pipeline_failed = 0
 
+        # 1단계: 파일 저장 (DB 쓰기 — 순차)
+        pending_ids: list[tuple[str, int]] = []
         for pr in result.product_results:
             for fi in pr.files:
                 try:
                     doc_result = await store_git_code(
                         self._store, fi, pr.repo_url,
                     )
-                    # 신규 또는 변경된 파일만 파이프라인 처리
                     if doc_result.get("changed", False):
-                        pipe_result = await self._process_through_pipeline(
-                            doc_result["id"],
-                        )
-                        if pipe_result:
-                            pipeline_processed += 1
-                        elif self._pipeline_available:
-                            pipeline_failed += 1
+                        pending_ids.append((fi.relative_path, doc_result["id"]))
                 except Exception as exc:
                     logger.error(
-                        "git_code 처리 실패: %s — %s",
+                        "git_code 저장 실패: %s — %s",
                         fi.relative_path, exc,
                     )
 
-        if self._pipeline_available:
+        # 2단계: 파이프라인 병렬 처리 (LLM 호출 — 동시 파일 수 제한)
+        if pending_ids and self._pipeline_available:
+            _MAX_FILE_CONCURRENCY = 3
+            semaphore = asyncio.Semaphore(_MAX_FILE_CONCURRENCY)
+
+            async def _process_one(path: str, doc_id: int) -> bool:
+                async with semaphore:
+                    pipe_result = await self._process_through_pipeline(doc_id)
+                    return pipe_result is not None
+
+            tasks = [
+                _process_one(path, doc_id)
+                for path, doc_id in pending_ids
+            ]
+            results_flags = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for (path, _), flag in zip(pending_ids, results_flags):
+                if isinstance(flag, Exception):
+                    logger.error("파이프라인 병렬 처리 예외: %s — %s", path, flag)
+                    pipeline_failed += 1
+                elif flag:
+                    pipeline_processed += 1
+                else:
+                    pipeline_failed += 1
+
             logger.info(
                 "파이프라인 처리 집계: 성공=%d, 실패=%d",
                 pipeline_processed, pipeline_failed,
@@ -259,9 +278,9 @@ class CoordinatorAgent:
         ])
 
     async def _process_through_pipeline(self, document_id: int) -> dict[str, Any] | None:
-        """저장된 문서를 기존 파이프라인으로 처리한다.
+        """저장된 문서를 파이프라인으로 처리한다.
 
-        git_code는 항상 graph로 처리 (Classifier 건너뜀, 코드 전용 프롬프트).
+        git_code는 AST 기반 정적 추출로 처리 (LLM 호출 없음).
         파이프라인 의존성이 미설정이면 건너뛴다.
         실패해도 예외를 전파하지 않는다 (저장은 이미 완료).
         """
@@ -290,7 +309,7 @@ class CoordinatorAgent:
                 llm_client=self._pipeline_llm_client,  # type: ignore[arg-type]
                 embedding_client=self._embedding_client,  # type: ignore[arg-type]
                 config=pipeline_config,
-                storage_method_override="graph",
+                storage_method_override="hybrid",
             )
             logger.info(
                 "파이프라인 처리 완료: document_id=%d, method=%s, chunks=%d, nodes=%d",
