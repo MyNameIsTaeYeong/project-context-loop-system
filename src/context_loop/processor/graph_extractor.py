@@ -99,6 +99,7 @@ Section ({chunk_index}/{total_chunks}):
 # ---------------------------------------------------------------------------
 
 _CODE_SOURCE_TYPES = frozenset({"git_code"})
+_CODE_MAX_CONTENT_CHARS = 2000
 
 
 def _select_prompts(source_type: str | None) -> tuple[str, str, str]:
@@ -178,6 +179,9 @@ async def extract_graph(
         추출된 GraphData (entities, relations).
     """
     system_prompt, user_template, chunk_template = _select_prompts(source_type)
+
+    if source_type in _CODE_SOURCE_TYPES:
+        max_content_chars = _CODE_MAX_CONTENT_CHARS
 
     if len(content) <= max_content_chars:
         return await _extract_single(
