@@ -126,14 +126,25 @@ def extract_code_symbols(content: str, file_path: str) -> CodeExtraction:
     )
 
 
-def to_chunks(extraction: CodeExtraction, file_title: str) -> list[Chunk]:
-    """CodeExtraction을 Chunk 리스트로 변환한다.
+def to_chunks(
+    extraction: CodeExtraction,
+    file_title: str,
+) -> tuple[list[Chunk], list[str]]:
+    """CodeExtraction을 Chunk 리스트 + 임베딩 텍스트로 변환한다.
 
     각 심볼(함수/클래스)이 하나의 청크가 된다.
-    심볼이 없으면 빈 리스트를 반환한다.
+
+    Returns:
+        (chunks, embed_texts) 튜플.
+        - chunks: 전체 코드가 포함된 Chunk 리스트 (검색 결과로 반환될 내용).
+        - embed_texts: 검색용 임베딩 텍스트 리스트 (이름 + 시그니처 + docstring).
+          전체 코드 대신 의미 요약만 임베딩하여 자연어 질의와의 유사도를 높인다.
     """
     chunks: list[Chunk] = []
+    embed_texts: list[str] = []
+
     for i, sym in enumerate(extraction.symbols):
+        # 저장/반환용: 전체 코드
         header = f"# File: {file_title}\n# {sym.symbol_type}: {sym.signature}\n\n"
         chunk_content = header + sym.body
 
@@ -144,7 +155,14 @@ def to_chunks(extraction: CodeExtraction, file_title: str) -> list[Chunk]:
             token_count=count_tokens(chunk_content),
             section_path=f"{file_title} > {sym.name}",
         ))
-    return chunks
+
+        # 임베딩용: 이름 + 시그니처 + docstring
+        embed_parts = [file_title, sym.name, sym.signature]
+        if sym.docstring:
+            embed_parts.append(sym.docstring)
+        embed_texts.append("\n".join(embed_parts))
+
+    return chunks, embed_texts
 
 
 def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:

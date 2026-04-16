@@ -360,7 +360,7 @@ class TestToChunks:
             ],
             imports=["context"],
         )
-        chunks = to_chunks(extraction, "handler.go")
+        chunks, embed_texts = to_chunks(extraction, "handler.go")
 
         assert len(chunks) == 1
         assert chunks[0].index == 0
@@ -369,10 +369,39 @@ class TestToChunks:
         assert chunks[0].section_path == "handler.go > HandleRequest"
         assert chunks[0].token_count > 0
 
+        # 임베딩 텍스트는 이름+시그니처 (코드 본문 제외)
+        assert len(embed_texts) == 1
+        assert "HandleRequest" in embed_texts[0]
+        assert "func HandleRequest(ctx context.Context)" in embed_texts[0]
+        assert "// ..." not in embed_texts[0]  # 코드 본문은 포함하지 않음
+
+    def test_docstring_included_in_embed_text(self) -> None:
+        """docstring이 있으면 임베딩 텍스트에 포함된다."""
+        extraction = CodeExtraction(
+            file_path="service.py",
+            language="python",
+            symbols=[
+                CodeSymbol(
+                    name="create_vpc",
+                    symbol_type="function",
+                    signature="def create_vpc(name: str) -> VPC",
+                    body="def create_vpc(name: str) -> VPC:\n    ...",
+                    line_start=1,
+                    line_end=2,
+                    docstring="VPC를 생성한다.",
+                ),
+            ],
+            imports=[],
+        )
+        _, embed_texts = to_chunks(extraction, "service.py")
+
+        assert "VPC를 생성한다." in embed_texts[0]
+
     def test_empty_symbols_returns_empty(self) -> None:
         extraction = CodeExtraction(file_path="empty.py", language="python")
-        chunks = to_chunks(extraction, "empty.py")
+        chunks, embed_texts = to_chunks(extraction, "empty.py")
         assert chunks == []
+        assert embed_texts == []
 
 
 # ---------------------------------------------------------------------------
@@ -482,16 +511,21 @@ class TestEndToEnd:
                 print(reader.read("test.txt"))
         """)
         extraction = extract_code_symbols(code, "reader.py")
-        chunks = to_chunks(extraction, "reader.py")
+        chunks, embed_texts = to_chunks(extraction, "reader.py")
         graph = to_graph_data(extraction, "reader.py")
 
         # 심볼 2개 (FileReader, main)
         assert len(extraction.symbols) == 2
 
-        # 청크 2개
+        # 청크 2개 (전체 코드 포함)
         assert len(chunks) == 2
         assert any("FileReader" in c.content for c in chunks)
         assert any("def main" in c.content for c in chunks)
+
+        # 임베딩 텍스트 2개 (시그니처 기반, 코드 본문 없음)
+        assert len(embed_texts) == 2
+        assert any("FileReader" in t for t in embed_texts)
+        assert not any("read_text()" in t for t in embed_texts)
 
         # 그래프: module + 2 symbols = 3 entities, 1 import relation
         assert len(graph.entities) == 3
@@ -509,9 +543,10 @@ class TestEndToEnd:
             }
         """)
         extraction = extract_code_symbols(code, "hello.go")
-        chunks = to_chunks(extraction, "hello.go")
+        chunks, embed_texts = to_chunks(extraction, "hello.go")
         graph = to_graph_data(extraction, "hello.go")
 
         assert len(extraction.symbols) >= 1
         assert any("Hello" in c.content for c in chunks)
+        assert any("Hello" in t for t in embed_texts)
         assert any(r.target == "fmt" for r in graph.relations)

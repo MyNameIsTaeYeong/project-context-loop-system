@@ -114,10 +114,12 @@ async def process_document(
             extraction = extract_code_symbols(content, title)
 
             # 심볼 → 청크 → 벡터DB
-            chunks = to_chunks(extraction, title)
+            chunks, embed_texts = to_chunks(extraction, title)
             if chunks:
-                texts = [c.content for c in chunks]
-                embeddings = await embedding_client.aembed_documents(texts)
+                # 임베딩: 이름+시그니처+docstring (검색 정확도)
+                # 저장: 전체 코드 (반환 내용)
+                embeddings = await embedding_client.aembed_documents(embed_texts)
+                documents = [c.content for c in chunks]
 
                 chunk_ids = [c.id for c in chunks]
                 metadatas = [
@@ -130,7 +132,7 @@ async def process_document(
                     for c in chunks
                 ]
                 vector_store.delete_by_document(document_id)
-                vector_store.add_chunks(chunk_ids, embeddings, texts, metadatas)
+                vector_store.add_chunks(chunk_ids, embeddings, documents, metadatas)
 
                 await meta_store.delete_chunks_by_document(document_id)
                 for chunk, cid in zip(chunks, chunk_ids):
