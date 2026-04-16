@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8+ 코드 전용 그래프 스키마 + graph-only 처리 (D-033, D-034, D-035)
-- **상태**: 멀티에이전트 제거 + 코드 전용 그래프 추출 완료. (1) D-033: Level 2/3 제거. (2) D-034: Worker Agent 제거. (3) D-035: 코드 전용 그래프 스키마 — `graph_extractor.py`에 `source_type` 파라미터 추가, git_code는 코드 전용 프롬프트(function/class/struct/interface + calls/imports/implements 등)로 graph-only 처리 (chunking 건너뜀). 기존 문서 그래프 추출은 변경 없음. 전체 흐름: git clone → store git_code → pipeline(graph, 코드 전용 프롬프트). 테스트 380개 비-web 전체 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
+- **Step**: 9.8++ AST 기반 정적 코드 추출 + 메서드 단위 청킹 (D-036, D-037)
+- **상태**: LLM 기반 코드 그래프 추출을 AST 기반 정적 분석으로 완전 전환. (1) D-036: `ast_code_extractor.py` 신규 — Python ast 모듈 + Go/Java/TS/JS 키워드+중괄호 매칭으로 심볼/import 추출. LLM 호출 제로, 파일당 수 ms. `pipeline.py`에서 `source_type == "git_code"` 시 AST 경로 분기. 임베딩 텍스트(이름+시그니처+docstring)와 저장 문서(전체 코드) 분리로 검색 정확도 향상. (2) D-037: 클래스 → 메서드 단위 청킹. `parent_name`/`parent_signature`로 소속 클래스 추적. 클래스→메서드 `contains` 관계 자동 생성. 전체 흐름: git clone → store git_code → AST 추출(extract_code_symbols) → 심볼 청크(to_chunks) + import 그래프(to_graph_data) → 벡터DB + GraphStore. 테스트 33개 + 기존 141개 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
 
 ## Phase별 진행률
 
@@ -82,8 +82,25 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-15
-- 내용: 코드 전용 그래프 스키마 + graph-only 처리 (D-035).
+- 일시: 2026-04-16
+- 내용: git_code를 LLM 기반에서 AST 기반 정적 추출로 전환 (D-036, D-037).
+  - **배경**: D-035의 LLM 기반 코드 그래프 추출에서 빈번한 타임아웃 발생. 코드는 구조화된 데이터이므로 LLM 추론이 불필요 — AST 정적 분석으로 100% 정확한 추출 가능.
+  - **D-036**: `ast_code_extractor.py` 신규 모듈
+    - Python: `ast` 모듈 기반 정확한 파싱
+    - Go/Java/TS/JS: 키워드 + 중괄호 매칭
+    - 추출: 함수/클래스/메서드/struct/interface 심볼 + import 관계
+    - `pipeline.py`: `source_type == "git_code"` 시 AST 경로 분기, LLM 호출 완전 우회
+    - `coordinator.py`: `storage_method_override` `"graph"` → `"hybrid"` — 벡터 검색 활성화
+    - 임베딩/저장 분리: 임베딩(이름+시그니처+docstring) vs 저장(전체 코드)
+  - **D-037**: 메서드 단위 청킹
+    - 클래스 내부 메서드를 개별 청크로 분할, `parent_name`/`parent_signature`로 소속 추적
+    - `section_path`: `file > class > method` 계층 구조
+    - Go 리시버 메서드, Java/TS/JS 클래스 메서드 모두 지원
+    - 클래스→메서드 `contains` 관계 자동 생성
+    - 메서드 없는 클래스(데이터 클래스)는 기존처럼 단일 심볼 유지
+  - **전체 흐름**: git clone → store git_code → extract_code_symbols() → to_chunks() + to_graph_data() → 벡터DB + GraphStore
+  - **테스트**: ast_code_extractor 33개 + 기존 141개 통과
+- 이전 (2026-04-15): 코드 전용 그래프 스키마 + graph-only 처리 (D-035).
   - **D-035**: git_code를 코드 전용 프롬프트로 graph-only 처리
   - **변경 사항**:
     - `graph_extractor.py`: `source_type` 파라미터 추가. `_CODE_SYSTEM_PROMPT` + `_select_prompts()` — git_code는 코드 전용 엔티티(function, class, struct, interface, package, module, endpoint, error_type, constant, type_alias) + 관계(calls, imports, implements, contains, returns, depends_on, raises, receives) 프롬프트 사용

@@ -457,3 +457,45 @@
   - **코드 전용 관계**: calls, imports, implements, contains, raises 등 코드 구조 관계가 필요
   - **기존 문서 그래프 무변경**: source_type 기반 분기로 문서(Confluence 등)는 기존 프롬프트 그대로 사용
 - **영향**: `graph_extractor.py`에 `_CODE_SYSTEM_PROMPT` + `source_type` 파라미터 추가. `pipeline.py`에서 `doc["source_type"]`을 `extract_graph()`에 전달. `coordinator.py`에서 `storage_method_override="graph"`. GraphStore/검색 경로는 변경 없음 (entity_type은 자유 문자열).
+- **후속**: D-036에서 AST 기반으로 전환되어, git_code의 LLM 기반 그래프 추출은 더 이상 사용하지 않음.
+
+---
+
+## D-036: git_code를 LLM 기반에서 AST 기반 정적 추출로 전환
+
+- **일시**: 2026-04-16
+- **맥락**: D-035에서 git_code를 코드 전용 프롬프트로 graph-only 처리했으나, map-reduce 청크 처리 중 빈번한 타임아웃 발생. 코드는 토큰 밀도가 높아 LLM prefill 시간이 길고, `max_content_chars`를 32K→16K→8K→2K로 반복 축소해도 해결 불가. 근본적으로 코드는 구조화된 데이터이므로 LLM이 "추론"할 필요 없이 정적 분석으로 100% 정확한 추출이 가능.
+- **결정**: `ast_code_extractor.py` 신규 모듈을 만들어 git_code를 LLM 호출 없이 AST 기반 정적 분석으로 처리. `pipeline.py`에서 `source_type == "git_code"`이면 AST 경로로 분기하여 LLM 호출을 완전 우회. `coordinator.py`의 `storage_method_override`를 `"graph"` → `"hybrid"`로 변경하여 벡터 검색도 활성화.
+- **이유**:
+  - **정확도**: AST 파싱은 100% 정확 — LLM 환각(존재하지 않는 관계 생성) 불가
+  - **속도**: 파일당 수 ms (LLM: 수초~수십초)
+  - **비용**: LLM API 호출 제로
+  - **안정성**: 결정적(deterministic) — 서버 부하와 무관
+  - **재현성**: 같은 입력에 항상 동일한 결과
+  - **청킹 품질**: 구문 구조 기반 분할 — 함수/클래스 경계를 존중
+- **구현 상세**:
+  - Python: `ast` 모듈 기반 정확한 파싱
+  - Go, Java, TypeScript, JavaScript: 키워드 + 중괄호 매칭 (정규식)
+  - 기타 언어: 파일 전체를 단일 심볼로 반환 (fallback)
+  - 심볼 추출: 함수, 클래스, 메서드, struct, interface + 시그니처/docstring
+  - 그래프 추출: import 관계 + 클래스→메서드 contains 관계 (정적 분석으로 확실한 것만)
+  - 임베딩/저장 분리: 임베딩 텍스트(이름+시그니처+docstring)와 저장 문서(전체 코드)를 분리하여 검색 정확도 향상
+- **영향**: `ast_code_extractor.py` 신규 689줄. `pipeline.py`에 git_code AST 경로 분기. `coordinator.py` storage_method `"graph"` → `"hybrid"`. 기존 문서(Confluence 등)의 LLM 기반 그래프 추출은 변경 없음.
+
+---
+
+## D-037: 메서드 단위 청킹 + 부모 클래스 메타데이터
+
+- **일시**: 2026-04-16
+- **맥락**: D-036에서 AST 기반으로 전환한 후, 클래스를 통째로 하나의 청크로 만들면 메서드 4개짜리 클래스가 하나의 큰 청크가 되어 벡터 검색 시 정밀도(precision)가 떨어짐. "VPC 생성 함수"를 검색하면 관련 없는 메서드 3개도 함께 반환됨.
+- **결정**: 클래스 내부 메서드를 개별 청크로 분할하고, 부모 클래스 정보를 `CodeSymbol.parent_name`/`parent_signature` 필드와 청크 메타데이터(`section_path`, 헤더)로 보존.
+- **이유**:
+  - **검색 정밀도**: 메서드 단위 청크는 질의와 1:1 매칭 가능 — 불필요한 코드 노출 감소
+  - **컨텍스트 보존**: `section_path`에 `file > class > method` 계층 구조를 기록하여 소속 관계 유지
+  - **그래프 풍부화**: 클래스→메서드 `contains` 관계를 자동 생성하여 그래프 탐색 지원
+  - **예외 처리**: 메서드가 없는 클래스(데이터 클래스, 상수 클래스 등)는 기존처럼 단일 심볼 유지
+- **언어별 구현**:
+  - Python: `ast.iter_child_nodes(ClassDef)`로 메서드 추출, `parent_name=클래스명`
+  - Go: 리시버 메서드(`func (s *Type) Method`) 패턴 감지, `parent_name=리시버 타입`
+  - Java/TS/JS: `_extract_class_methods()`로 클래스 본문 내 메서드 개별 추출
+- **영향**: `CodeSymbol`에 `parent_name`/`parent_signature` 필드 추가. `to_chunks()`가 메서드 청크 헤더에 부모 클래스 시그니처 포함. `to_graph_data()`가 부모 클래스 엔티티 + contains 관계 생성. 테스트 33개.
