@@ -1,6 +1,7 @@
 """문서 처리 파이프라인 통합 모듈.
 
 LLM Classifier → 청킹/임베딩/그래프추출 → 저장의 전체 흐름을 조율한다.
+git_code는 AST 기반 정적 추출로 처리한다 (LLM 호출 없음).
 """
 
 from __future__ import annotations
@@ -11,6 +12,11 @@ from typing import Any
 
 from langchain_core.embeddings import Embeddings
 
+from context_loop.processor.ast_code_extractor import (
+    extract_code_symbols,
+    to_chunks,
+    to_graph_data,
+)
 from context_loop.processor.chunker import chunk_text
 from context_loop.processor.classifier import StorageMethod, classify_document
 from context_loop.processor.graph_extractor import extract_graph
@@ -93,36 +99,26 @@ async def process_document(
         content = doc["original_content"] or ""
         source_type = doc.get("source_type")
 
-        # 1. 저장 방식 결정 (오버라이드 또는 LLM 분류)
-        if storage_method_override is not None:
-            storage_method = storage_method_override
-            reason = "storage_method_override"
-        else:
-            storage_method, reason = await classify_document(llm_client, title, content)
-        logger.info(
-            "분류 결과 — document_id=%d, method=%s, reason=%s",
-            document_id,
-            storage_method,
-            reason,
-        )
-
         chunk_count = 0
         node_count = 0
         edge_count = 0
 
-        # 2. 청크 처리 (chunk or hybrid)
-        if storage_method in ("chunk", "hybrid"):
-            chunks = chunk_text(
-                content,
-                chunk_size=cfg.chunk_size,
-                chunk_overlap=cfg.chunk_overlap,
-                model=cfg.embedding_model,
+        # --- git_code: AST 기반 정적 추출 (LLM 호출 없음) ---
+        if source_type == "git_code":
+            storage_method = "hybrid"
+            logger.info(
+                "AST 코드 추출 시작 — document_id=%d, title=%s",
+                document_id, title,
             )
+
+            extraction = extract_code_symbols(content, title)
+
+            # 심볼 → 청크 → 벡터DB
+            chunks = to_chunks(extraction, title)
             if chunks:
                 texts = [c.content for c in chunks]
                 embeddings = await embedding_client.aembed_documents(texts)
 
-                # 벡터DB 저장
                 chunk_ids = [c.id for c in chunks]
                 metadatas = [
                     {
@@ -133,11 +129,9 @@ async def process_document(
                     }
                     for c in chunks
                 ]
-                # 기존 청크 삭제 후 추가 (reprocessor에서 이미 삭제했지만 안전하게)
                 vector_store.delete_by_document(document_id)
                 vector_store.add_chunks(chunk_ids, embeddings, texts, metadatas)
 
-                # SQLite 청크 메타데이터 저장
                 await meta_store.delete_chunks_by_document(document_id)
                 for chunk, cid in zip(chunks, chunk_ids):
                     await meta_store.create_chunk(
@@ -149,15 +143,76 @@ async def process_document(
                     )
                 chunk_count = len(chunks)
 
-        # 3. 그래프 처리 (graph or hybrid)
-        if storage_method in ("graph", "hybrid"):
-            graph_data = await extract_graph(llm_client, title, content, source_type=source_type)
+            # import 관계 → GraphStore
+            graph_data = to_graph_data(extraction, title)
             if graph_data.entities:
                 result = await graph_store.save_graph_data(document_id, graph_data)
                 node_count = result["nodes"]
                 edge_count = result["edges"]
 
-        # 4. 완료
+        # --- 일반 문서: 기존 LLM 기반 파이프라인 ---
+        else:
+            if storage_method_override is not None:
+                storage_method = storage_method_override
+                reason = "storage_method_override"
+            else:
+                storage_method, reason = await classify_document(
+                    llm_client, title, content,
+                )
+            logger.info(
+                "분류 결과 — document_id=%d, method=%s, reason=%s",
+                document_id, storage_method, reason,
+            )
+
+            # 청크 처리 (chunk or hybrid)
+            if storage_method in ("chunk", "hybrid"):
+                chunks = chunk_text(
+                    content,
+                    chunk_size=cfg.chunk_size,
+                    chunk_overlap=cfg.chunk_overlap,
+                    model=cfg.embedding_model,
+                )
+                if chunks:
+                    texts = [c.content for c in chunks]
+                    embeddings = await embedding_client.aembed_documents(texts)
+
+                    chunk_ids = [c.id for c in chunks]
+                    metadatas = [
+                        {
+                            "document_id": document_id,
+                            "chunk_index": c.index,
+                            "title": title,
+                            "section_path": c.section_path,
+                        }
+                        for c in chunks
+                    ]
+                    vector_store.delete_by_document(document_id)
+                    vector_store.add_chunks(chunk_ids, embeddings, texts, metadatas)
+
+                    await meta_store.delete_chunks_by_document(document_id)
+                    for chunk, cid in zip(chunks, chunk_ids):
+                        await meta_store.create_chunk(
+                            chunk_id=cid,
+                            document_id=document_id,
+                            chunk_index=chunk.index,
+                            content=chunk.content,
+                            token_count=chunk.token_count,
+                        )
+                    chunk_count = len(chunks)
+
+            # 그래프 처리 (graph or hybrid)
+            if storage_method in ("graph", "hybrid"):
+                graph_data = await extract_graph(
+                    llm_client, title, content, source_type=source_type,
+                )
+                if graph_data.entities:
+                    result = await graph_store.save_graph_data(
+                        document_id, graph_data,
+                    )
+                    node_count = result["nodes"]
+                    edge_count = result["edges"]
+
+        # 완료
         await complete_reprocessing(
             meta_store,
             document_id,
