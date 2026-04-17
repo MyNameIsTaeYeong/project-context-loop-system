@@ -590,6 +590,49 @@ async def test_cross_doc_entity_merge_same_entity(
 
 
 @pytest.mark.asyncio
+async def test_merged_node_visible_in_second_doc_graph_query(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """canonical 병합된 노드가 두 번째 문서의 그래프 조회에도 포함된다.
+
+    회귀 방지: 과거에는 `graph_nodes.document_id` 컬럼만 조회해 두 번째 import한
+    문서의 그래프 탭에서 공유 모듈 노드가 보이지 않는 버그가 있었다.
+    """
+    doc1 = await _create_doc_with_title(meta_store, "caller_a.py")
+    doc2 = await _create_doc_with_title(meta_store, "caller_b.py")
+
+    shared_module = "project.api.api_service.services"
+
+    data1 = GraphData(
+        entities=[
+            Entity(name="caller_a.py", entity_type="module"),
+            Entity(name=shared_module, entity_type="module"),
+        ],
+        relations=[
+            Relation(source="caller_a.py", target=shared_module, relation_type="imports"),
+        ],
+    )
+    await graph_store.save_graph_data(doc1, data1)
+
+    data2 = GraphData(
+        entities=[
+            Entity(name="caller_b.py", entity_type="module"),
+            Entity(name=shared_module, entity_type="module"),
+        ],
+        relations=[
+            Relation(source="caller_b.py", target=shared_module, relation_type="imports"),
+        ],
+    )
+    await graph_store.save_graph_data(doc2, data2)
+
+    # doc2 그래프 탭에서 공유 모듈 노드도 함께 반환되어야 한다
+    nodes_doc2 = await meta_store.get_graph_nodes_by_document(doc2)
+    names_doc2 = {n["entity_name"] for n in nodes_doc2}
+    assert "caller_b.py" in names_doc2
+    assert shared_module in names_doc2
+
+
+@pytest.mark.asyncio
 async def test_cross_doc_entity_merge_preserves_document_ids(
     graph_store: GraphStore, meta_store: MetadataStore,
 ) -> None:

@@ -267,9 +267,16 @@ class MetadataStore:
         return cursor.lastrowid  # type: ignore[return-value]
 
     async def get_graph_nodes_by_document(self, document_id: int) -> list[dict[str, Any]]:
-        """문서의 그래프 노드 목록을 조회한다."""
+        """문서의 그래프 노드 목록을 조회한다.
+
+        canonical 병합으로 다른 문서에서 먼저 생성된 노드도 `graph_node_documents`
+        링크 테이블을 통해 포함한다 (`graph_nodes.document_id`는 최초 생성자만 기록).
+        """
         cursor = await self.db.execute(
-            "SELECT * FROM graph_nodes WHERE document_id = ?", (document_id,)
+            """SELECT gn.* FROM graph_nodes gn
+               INNER JOIN graph_node_documents gnd ON gn.id = gnd.node_id
+               WHERE gnd.document_id = ?""",
+            (document_id,),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

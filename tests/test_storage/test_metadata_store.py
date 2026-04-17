@@ -118,9 +118,11 @@ async def test_graph_nodes_and_edges(store: MetadataStore) -> None:
     node1 = await store.create_graph_node(
         document_id=doc_id, entity_name="서비스A", entity_type="system"
     )
+    await store.add_node_document_link(node1, doc_id)
     node2 = await store.create_graph_node(
         document_id=doc_id, entity_name="서비스B", entity_type="system"
     )
+    await store.add_node_document_link(node2, doc_id)
     edge_id = await store.create_graph_edge(
         document_id=doc_id,
         source_node_id=node1,
