@@ -358,6 +358,11 @@ def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 imports.append(node.module)
+            elif node.level > 0:
+                # from . import x, from .. import y 같은 상대 import
+                prefix = "." * node.level
+                for alias in node.names:
+                    imports.append(prefix + alias.name)
 
     return symbols, imports
 
