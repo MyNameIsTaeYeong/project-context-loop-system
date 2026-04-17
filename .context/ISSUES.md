@@ -94,6 +94,16 @@
   - `_plural_variants()`: 복수형 변형 지원 (vpcs, policies, addresses 등)
   - `parse_product_scopes()`: paths 미정의 시 자동 탐지 연동 (기존 수동 paths와 하위 호환)
 
+### I-028: 오버로드 메서드 FQN 충돌
+- D-038의 파일 범위 FQN(`file::Class.method`)은 동일 이름·다른 시그니처 오버로드를 구분하지 못함 — Java/Kotlin 등에서 `foo(int)` / `foo(String)`이 단일 엔티티로 dedup됨
+- 해결 방향 후보: FQN에 시그니처 해시 접미사 추가, 또는 엔티티 properties에 overload index 저장
+- 현재는 상대적으로 드문 케이스라 우선순위 낮음
+
+### I-029: 그래프 스키마 프롬프트 FQN 노출 최적화
+- D-038 이후 LLM에게 제공되는 그래프 스키마 요약에 FQN(`file.py::Class.method`)이 그대로 노출되어 토큰 소모가 늘고, LLM이 FQN 그대로 응답하는 경향
+- `get_neighbors`의 짧은 이름 fallback이 동작을 보장하지만, 스키마 요약에서 짧은 이름만 노출하거나 FQN 표기 가이드를 프롬프트에 추가하면 품질/토큰 모두 개선 여지
+- 우선순위: 중간. 현재는 fallback으로 문제 없음.
+
 ## 해결됨
 
 ### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
