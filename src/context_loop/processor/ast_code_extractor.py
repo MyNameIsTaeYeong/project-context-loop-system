@@ -182,11 +182,34 @@ def to_chunks(
     return chunks, embed_texts
 
 
+def _symbol_fqn(file_title: str, parent_name: str, name: str) -> str:
+    """코드 심볼의 파일 범위 정규화 이름(FQN)을 생성한다.
+
+    예: "user_service.py::UserService.__init__", "reader.py::main".
+    """
+    if parent_name:
+        return f"{file_title}::{parent_name}.{name}"
+    return f"{file_title}::{name}"
+
+
+def _class_fqn(file_title: str, name: str) -> str:
+    """클래스/구조체의 파일 범위 정규화 이름(FQN)을 생성한다."""
+    return f"{file_title}::{name}"
+
+
 def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
     """CodeExtraction을 GraphData로 변환한다.
 
-    - 엔티티: 파일(module) + 각 심볼 (함수/클래스)
-    - 관계: import 관계만 (파일 → imports → 모듈)
+    - 엔티티: 파일(module) + 각 심볼 (함수/클래스) + import된 모듈
+    - 관계: import 관계 (파일 → imports → 모듈), contains (클래스 → 메서드)
+
+    엔티티 이름 규칙:
+    - 파일 엔티티: file_title (단순 이름) — 전역 고유
+    - import 모듈: 단순 이름 — 파일 간 canonical 병합 의도
+      (예: 여러 파일이 `logging`을 import하면 하나의 정규 노드로 병합)
+    - 코드 심볼(함수/메서드/클래스/구조체/인터페이스): 파일 범위 FQN
+      (예: `user_service.py::UserService.__init__`) — 서로 다른 파일/클래스의
+      동명 심볼이 graph_store의 canonical 병합으로 잘못 합쳐지는 것을 방지.
     """
     entities: list[Entity] = [
         Entity(
@@ -196,22 +219,47 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
         ),
     ]
 
-    # 부모 클래스 엔티티를 중복 없이 추가
-    parent_names: set[str] = set()
-    for sym in extraction.symbols:
-        if sym.parent_name and sym.parent_name not in parent_names:
-            parent_names.add(sym.parent_name)
-            entities.append(Entity(
-                name=sym.parent_name,
-                entity_type="class",
-                description=sym.parent_signature,
-            ))
-
-    for sym in extraction.symbols:
+    # import된 모듈을 엔티티로 등록 (관계 target resolve용)
+    # file_title과 이름이 겹치는 경우는 스킵하여 자기 자신 엔티티를 덮지 않는다.
+    seen_imports: set[str] = set()
+    for imp in extraction.imports:
+        if imp == file_title or imp in seen_imports:
+            continue
+        seen_imports.add(imp)
         entities.append(Entity(
-            name=sym.name,
+            name=imp,
+            entity_type="module",
+            description="",
+        ))
+
+    # 코드 심볼 엔티티 (FQN) — 실제 symbol_type을 우선 보존하기 위해
+    # parent_names 루프보다 먼저 수행한다. Go 구조체처럼 top-level 심볼로
+    # 존재하면서 동시에 메서드의 parent인 경우, "struct" 타입으로 먼저 등록되어
+    # 이후 parent_names 루프에서 "class" 타입으로 중복 등록되지 않는다.
+    added_fqns: set[str] = set()
+    for sym in extraction.symbols:
+        fqn = _symbol_fqn(file_title, sym.parent_name, sym.name)
+        if fqn in added_fqns:
+            continue
+        added_fqns.add(fqn)
+        entities.append(Entity(
+            name=fqn,
             entity_type=sym.symbol_type,
             description=sym.signature,
+        ))
+
+    # 부모 클래스 엔티티 (FQN) — 이미 top-level 심볼로 등록된 경우는 스킵
+    for sym in extraction.symbols:
+        if not sym.parent_name:
+            continue
+        parent_fqn = _class_fqn(file_title, sym.parent_name)
+        if parent_fqn in added_fqns:
+            continue
+        added_fqns.add(parent_fqn)
+        entities.append(Entity(
+            name=parent_fqn,
+            entity_type="class",
+            description=sym.parent_signature or f"class {sym.parent_name}",
         ))
 
     relations: list[Relation] = [
@@ -223,12 +271,12 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
         for imp in extraction.imports
     ]
 
-    # 메서드 → 클래스 contains 관계
+    # 메서드 → 클래스 contains 관계 (FQN 사용)
     for sym in extraction.symbols:
         if sym.parent_name:
             relations.append(Relation(
-                source=sym.parent_name,
-                target=sym.name,
+                source=_class_fqn(file_title, sym.parent_name),
+                target=_symbol_fqn(file_title, sym.parent_name, sym.name),
                 relation_type="contains",
             ))
 

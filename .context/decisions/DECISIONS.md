@@ -499,3 +499,21 @@
   - Go: 리시버 메서드(`func (s *Type) Method`) 패턴 감지, `parent_name=리시버 타입`
   - Java/TS/JS: `_extract_class_methods()`로 클래스 본문 내 메서드 개별 추출
 - **영향**: `CodeSymbol`에 `parent_name`/`parent_signature` 필드 추가. `to_chunks()`가 메서드 청크 헤더에 부모 클래스 시그니처 포함. `to_graph_data()`가 부모 클래스 엔티티 + contains 관계 생성. 테스트 33개.
+
+---
+
+## D-038: 코드 심볼 엔티티를 파일 범위 FQN으로 스코핑
+
+- **일시**: 2026-04-17
+- **맥락**: D-036/D-037로 AST 기반 그래프 추출을 도입한 뒤 두 가지 문제가 관찰됨.
+  1. `__init__`, `run`, `create` 같이 서로 다른 파일/클래스에 흔한 메서드 이름이 `graph_store.save_graph_data()`의 `(name_lower, type)` canonical 병합에서 단일 노드로 합쳐져, `contains` 엣지가 엉뚱한 심볼을 가리킴.
+  2. `imports` 관계의 target 모듈(`logging`, `datetime` 등)이 엔티티로 등록되지 않아 `name_to_node_id`에 없고, 엣지가 조용히 유실됨.
+- **결정**:
+  - 코드 심볼 엔티티 이름을 **파일 범위 FQN**으로 생성: `file.py::name` (top-level), `file.py::Class.method` (메서드).
+  - import target 모듈을 `entity_type="module"` 엔티티로 선등록하여 `imports` 엣지의 target을 해소 가능하게 함.
+  - `GraphStore.get_neighbors()`에 3단 fallback 매칭을 추가: 정확 매칭 → 스코프 이름(`::` 이후) 매칭 → 짧은 이름(마지막 `.` 세그먼트) 매칭. LLM이 짧은 이름으로 탐색해도 동작하도록 보장.
+- **이유**:
+  - **정확성**: 코드에서 "이름이 같다 = 같은 엔티티"는 거짓 명제. 스코프를 이름 자체에 포함시켜 canonical 병합 알고리즘을 수정하지 않고도 충돌 차단.
+  - **최소 변경**: `save_graph_data`의 병합 로직은 자연어 문서 처리에 그대로 적합 — 코드만 이름 구성 방식을 바꿔 우회.
+  - **역호환**: `get_neighbors` fallback으로 짧은 이름 기반 검색 경로(LLM 플래너)가 회귀 없이 동작.
+- **영향**: `ast_code_extractor.py`의 `to_graph_data()` 재작성(심볼 루프 → parent 루프 순서, FQN 헬퍼 `_symbol_fqn`/`_class_fqn`). `graph_store.py`에 `_extract_short_name`/`_extract_scoped_name` 헬퍼 + `get_neighbors` fallback. 테스트: ast_code_extractor 38개(+5), graph_store 34개(+4).

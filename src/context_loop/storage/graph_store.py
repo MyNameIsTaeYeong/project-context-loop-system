@@ -32,6 +32,38 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _extract_short_name(entity_name: str) -> str:
+    """FQN 엔티티 이름에서 짧은 이름을 추출한다.
+
+    코드 심볼 엔티티는 `file.py::Class.method` 형태의 FQN을 사용하므로
+    LLM이나 MCP 클라이언트가 짧은 이름으로 질의해도 매칭되도록
+    fallback 용으로 짧은 이름을 꺼낸다.
+
+    - "user_service.py::UserService.create"  → "create"
+    - "user_service.py::main"                 → "main"
+    - "UserService"                           → "UserService"
+    - "handler.go"                            → "handler.go"  (::가 없으면 그대로)
+    """
+    if "::" not in entity_name:
+        return entity_name
+    after_scope = entity_name.split("::", 1)[1]
+    if "." in after_scope:
+        return after_scope.rsplit(".", 1)[-1]
+    return after_scope
+
+
+def _extract_scoped_name(entity_name: str) -> str:
+    """FQN에서 파일 범위를 제거한 부분을 반환한다.
+
+    - "user_service.py::UserService.create" → "UserService.create"
+    - "user_service.py::main"               → "main"
+    - "UserService"                          → "UserService"
+    """
+    if "::" not in entity_name:
+        return entity_name
+    return entity_name.split("::", 1)[1]
+
+
 class GraphStore:
     """NetworkX + SQLite 기반 그래프 저장소.
 
@@ -279,6 +311,11 @@ class GraphStore:
         정규 노드 병합 덕분에 동명 엔티티는 하나의 노드이므로
         크로스-문서 관계가 자연스럽게 탐색된다.
 
+        코드 심볼은 `file.py::Class.method` 형태의 FQN으로 등록되므로,
+        LLM이 짧은 이름(예: "create_user")이나 부분 경로(예:
+        "UserService.create_user")로 요청해도 매칭되도록 단계별로
+        fallback 조회한다.
+
         Args:
             entity_name: 탐색 중심 엔티티 이름.
             depth: 탐색 깊이 (1 = 직접 연결만).
@@ -286,10 +323,28 @@ class GraphStore:
         Returns:
             관련 노드 정보 목록.
         """
+        query_lower = entity_name.lower()
+
+        # 1. 완전 일치 (기존 동작)
         center_nodes = [
             n for n, d in self._graph.nodes(data=True)
-            if d.get("entity_name", "").lower() == entity_name.lower()
+            if d.get("entity_name", "").lower() == query_lower
         ]
+
+        # 2. 파일 범위를 벗긴 부분 일치 (예: "UserService.create_user")
+        if not center_nodes:
+            center_nodes = [
+                n for n, d in self._graph.nodes(data=True)
+                if _extract_scoped_name(d.get("entity_name", "")).lower() == query_lower
+            ]
+
+        # 3. 짧은 이름 일치 (예: "create_user", "UserService")
+        if not center_nodes:
+            center_nodes = [
+                n for n, d in self._graph.nodes(data=True)
+                if _extract_short_name(d.get("entity_name", "")).lower() == query_lower
+            ]
+
         if not center_nodes:
             return []
 

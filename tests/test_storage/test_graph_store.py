@@ -8,8 +8,31 @@ from unittest.mock import AsyncMock
 import pytest
 
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
-from context_loop.storage.graph_store import GraphStore, _cosine_similarity
+from context_loop.storage.graph_store import (
+    GraphStore,
+    _cosine_similarity,
+    _extract_scoped_name,
+    _extract_short_name,
+)
 from context_loop.storage.metadata_store import MetadataStore
+
+
+def test_extract_short_name() -> None:
+    """FQN에서 짧은 이름 추출."""
+    assert _extract_short_name("user_service.py::UserService.create") == "create"
+    assert _extract_short_name("user_service.py::main") == "main"
+    assert _extract_short_name("UserService") == "UserService"
+    # ::가 없으면 그대로 반환 (파일/import 모듈 엔티티)
+    assert _extract_short_name("handler.go") == "handler.go"
+    assert _extract_short_name("logging") == "logging"
+
+
+def test_extract_scoped_name() -> None:
+    """FQN에서 파일 범위를 제거한 부분 반환."""
+    assert _extract_scoped_name("user_service.py::UserService.create") == "UserService.create"
+    assert _extract_scoped_name("user_service.py::main") == "main"
+    assert _extract_scoped_name("UserService") == "UserService"
+    assert _extract_scoped_name("handler.go") == "handler.go"
 
 
 @pytest.fixture
@@ -125,6 +148,86 @@ async def test_get_neighbors_nonexistent(graph_store: GraphStore) -> None:
     """존재하지 않는 엔티티는 빈 목록을 반환한다."""
     result = graph_store.get_neighbors("Nonexistent Entity")
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_short_name_fallback(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """FQN으로 등록된 코드 심볼은 짧은 이름으로도 매칭된다.
+
+    AST 코드 추출기는 `file.py::Class.method` 형태의 FQN으로 엔티티를 등록하므로,
+    LLM/클라이언트가 짧은 이름으로 질의해도 fallback 매칭이 동작해야 한다.
+    """
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="user_service.py", entity_type="module"),
+            Entity(name="user_service.py::UserService", entity_type="class"),
+            Entity(name="user_service.py::UserService.create_user", entity_type="method"),
+        ],
+        relations=[
+            Relation(
+                source="user_service.py::UserService",
+                target="user_service.py::UserService.create_user",
+                relation_type="contains",
+            ),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    # 1. FQN 완전 일치 (기본 경로)
+    by_fqn = graph_store.get_neighbors(
+        "user_service.py::UserService.create_user", depth=1,
+    )
+    assert any(
+        n["entity_name"] == "user_service.py::UserService.create_user"
+        for n in by_fqn
+    )
+
+    # 2. 파일 범위를 벗긴 부분 매칭 ("Class.method")
+    by_scoped = graph_store.get_neighbors("UserService.create_user", depth=1)
+    assert any(
+        n["entity_name"] == "user_service.py::UserService.create_user"
+        for n in by_scoped
+    )
+
+    # 3. 짧은 이름 매칭 ("create_user" 단일 토큰)
+    by_short = graph_store.get_neighbors("create_user", depth=1)
+    assert any(
+        n["entity_name"] == "user_service.py::UserService.create_user"
+        for n in by_short
+    )
+
+    # 4. 클래스 짧은 이름 매칭
+    by_class = graph_store.get_neighbors("UserService", depth=1)
+    assert any(
+        n["entity_name"] == "user_service.py::UserService" for n in by_class
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_exact_match_wins_over_short_name(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """완전 일치가 있으면 짧은 이름 fallback은 사용되지 않는다.
+
+    예: "UserService" 엔티티가 있고, FQN 엔티티 "file.py::UserService"도 있을 때
+    "UserService" 질의는 정확히 "UserService" 엔티티만 반환해야 한다.
+    """
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="UserService", entity_type="class"),
+            Entity(name="other.py::UserService", entity_type="class"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    result = graph_store.get_neighbors("UserService", depth=1)
+    names = {n["entity_name"] for n in result}
+    # 완전 일치 엔티티만 중심 노드가 되어야 함
+    assert names == {"UserService"}
 
 
 @pytest.mark.asyncio

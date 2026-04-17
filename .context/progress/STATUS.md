@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8++ AST 기반 정적 코드 추출 + 메서드 단위 청킹 (D-036, D-037)
-- **상태**: LLM 기반 코드 그래프 추출을 AST 기반 정적 분석으로 완전 전환. (1) D-036: `ast_code_extractor.py` 신규 — Python ast 모듈 + Go/Java/TS/JS 키워드+중괄호 매칭으로 심볼/import 추출. LLM 호출 제로, 파일당 수 ms. `pipeline.py`에서 `source_type == "git_code"` 시 AST 경로 분기. 임베딩 텍스트(이름+시그니처+docstring)와 저장 문서(전체 코드) 분리로 검색 정확도 향상. (2) D-037: 클래스 → 메서드 단위 청킹. `parent_name`/`parent_signature`로 소속 클래스 추적. 클래스→메서드 `contains` 관계 자동 생성. 전체 흐름: git clone → store git_code → AST 추출(extract_code_symbols) → 심볼 청크(to_chunks) + import 그래프(to_graph_data) → 벡터DB + GraphStore. 테스트 33개 + 기존 141개 통과. 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
+- **Step**: 9.8++ AST 기반 코드 그래프 품질 안정화 (D-038)
+- **상태**: AST 기반 코드 그래프 추출(D-036/D-037) 이후 실행에서 발견된 3건의 버그 수정. (1) imports 엣지의 target 모듈이 엔티티로 등록되지 않아 유실되던 문제: `to_graph_data()`에서 import 모듈을 `entity_type="module"`로 선등록. (2) 서로 다른 파일/클래스의 동일 이름 메서드(`__init__`, `run`, `create`)가 `save_graph_data`의 canonical 병합(name_lower, type)에서 단일 노드로 합쳐져 contains 엣지가 꼬이던 문제: 코드 심볼 엔티티 이름을 `file.py::name` / `file.py::Class.method` 형태의 파일 범위 FQN으로 스코핑. 심볼 루프를 parent 루프보다 먼저 실행하여 Go struct 같은 특수 타입 보존. (3) FQN 도입에 따른 `get_neighbors` 짧은 이름 검색 회귀: 3단 fallback(정확 → 스코프 이름 → 짧은 이름) 추가. 테스트: ast_code_extractor 38개(+5), graph_store 34개(+4). 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
 
 ## Phase별 진행률
 
@@ -82,8 +82,23 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-16
-- 내용: git_code를 LLM 기반에서 AST 기반 정적 추출로 전환 (D-036, D-037).
+- 일시: 2026-04-17
+- 내용: AST 기반 코드 그래프의 엔티티 병합 충돌 / imports 엣지 유실 수정 (D-038).
+  - **배경**: D-036/D-037 도입 후 git sync 실행에서 (a) 외래키 제약 실패로 일부 엣지 누락, (b) contains 엣지가 엉뚱한 파일의 동일 이름 심볼을 가리키는 현상 발생.
+  - **버그 1 — imports 엣지 target 유실** (commit 87a2784)
+    - `to_graph_data()`가 import 모듈을 엔티티로 등록하지 않아 `save_graph_data`의 `name_to_node_id`에 없음 → 엣지가 DEBUG 로그와 함께 조용히 버려짐
+    - 수정: `extraction.imports` 순회하며 `entity_type="module"` 엔티티 선등록 (파일 title과 동일/중복 제외)
+  - **버그 2 — 동일 이름 심볼의 canonical 병합 충돌** (commit a291c46)
+    - `save_graph_data`는 `(entity_name_lower, entity_type)` 기준으로 병합. `__init__`, `run`, `create` 같은 흔한 이름이 파일/클래스 간에 단일 노드로 합쳐짐
+    - 수정: 엔티티 이름을 `file.py::name` / `file.py::Class.method` 형태의 파일 범위 FQN으로 스코핑
+    - `_symbol_fqn()`/`_class_fqn()` 헬퍼. 심볼 루프를 parent 루프보다 먼저 실행해 Go `struct` 같은 특수 타입이 덮어써지지 않도록 보장. `seen_class_fqns`로 parent 중복 생성 차단
+  - **버그 3 — get_neighbors 짧은 이름 검색 회귀** (commit 305d810)
+    - FQN 도입으로 LLM이 반환한 짧은 이름(`create_user`)으로 탐색 시 결과 없음
+    - 수정: `get_neighbors`에 3단 fallback 매칭 — 정확 매칭 → 스코프 이름(`::` 이후) → 짧은 이름(마지막 `.` 세그먼트)
+    - 정확 매칭 우선으로 기존 사용처 무회귀
+  - **테스트**: ast_code_extractor 38개(신규 5), graph_store 34개(신규 4)
+  - **남은 제한**: Java/Kotlin 오버로드 메서드 dedup, LLM 스키마 프롬프트 최적화
+- 이전 (2026-04-16): git_code를 LLM 기반에서 AST 기반 정적 추출로 전환 (D-036, D-037).
   - **배경**: D-035의 LLM 기반 코드 그래프 추출에서 빈번한 타임아웃 발생. 코드는 구조화된 데이터이므로 LLM 추론이 불필요 — AST 정적 분석으로 100% 정확한 추출 가능.
   - **D-036**: `ast_code_extractor.py` 신규 모듈
     - Python: `ast` 모듈 기반 정확한 파싱
