@@ -541,6 +541,51 @@ class TestToGraphData:
             assert r.source == "handler.go"
             assert r.relation_type == "imports"
 
+    def test_creates_import_module_entities(self) -> None:
+        """import된 모듈이 엔티티로 등록되어 save_graph_data가 관계를 resolve할 수 있다."""
+        extraction = CodeExtraction(
+            file_path="handler.go",
+            language="go",
+            symbols=[],
+            imports=["context", "fmt", "context"],  # 중복 허용 입력
+        )
+        graph = to_graph_data(extraction, "handler.go")
+
+        entity_names = {e.name for e in graph.entities}
+        # 파일 엔티티와 각 import 모듈이 모두 엔티티로 등록되어야 한다
+        assert "handler.go" in entity_names
+        assert "context" in entity_names
+        assert "fmt" in entity_names
+
+        # import 모듈 엔티티는 type="module"
+        import_entities = [
+            e for e in graph.entities
+            if e.name in ("context", "fmt")
+        ]
+        assert all(e.entity_type == "module" for e in import_entities)
+
+        # 중복 import는 한 번만 엔티티로 추가된다
+        assert sum(1 for e in graph.entities if e.name == "context") == 1
+
+        # 모든 imports 관계의 source/target이 엔티티 이름에 존재한다
+        for r in graph.relations:
+            if r.relation_type == "imports":
+                assert r.source in entity_names
+                assert r.target in entity_names
+
+    def test_import_matching_file_title_not_duplicated(self) -> None:
+        """import 이름이 파일 타이틀과 같으면 자기 자신 엔티티를 덮지 않는다."""
+        extraction = CodeExtraction(
+            file_path="handler.go",
+            language="go",
+            symbols=[],
+            imports=["handler.go"],
+        )
+        graph = to_graph_data(extraction, "handler.go")
+
+        # handler.go 엔티티는 정확히 하나 (파일 엔티티)
+        assert sum(1 for e in graph.entities if e.name == "handler.go") == 1
+
     def test_contains_relations_for_methods(self) -> None:
         """메서드가 있으면 클래스 → 메서드 contains 관계가 생성된다."""
         extraction = CodeExtraction(
@@ -640,8 +685,8 @@ class TestEndToEnd:
         read_embed = next(t for t in embed_texts if "read" in t and "main" not in t)
         assert "FileReader" in read_embed
 
-        # 그래프: module + FileReader class + 2 symbols = 4 entities
-        assert len(graph.entities) == 4
+        # 그래프: module + pathlib import + FileReader class + 2 symbols = 5 entities
+        assert len(graph.entities) == 5
         # 1 import + 1 contains (FileReader→read)
         assert len(graph.relations) == 2
         assert any(r.target == "pathlib" for r in graph.relations)

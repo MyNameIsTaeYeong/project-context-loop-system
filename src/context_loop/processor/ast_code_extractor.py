@@ -185,8 +185,11 @@ def to_chunks(
 def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
     """CodeExtraction을 GraphData로 변환한다.
 
-    - 엔티티: 파일(module) + 각 심볼 (함수/클래스)
-    - 관계: import 관계만 (파일 → imports → 모듈)
+    - 엔티티: 파일(module) + 각 심볼 (함수/클래스) + import된 모듈
+    - 관계: import 관계 (파일 → imports → 모듈), contains (클래스 → 메서드)
+
+    import된 모듈은 타입 "module"의 엔티티로 등록해야
+    save_graph_data가 관계를 엔티티 맵에서 resolve할 수 있다.
     """
     entities: list[Entity] = [
         Entity(
@@ -195,6 +198,19 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
             description=f"{extraction.language} file, {len(extraction.symbols)} symbols",
         ),
     ]
+
+    # import된 모듈을 엔티티로 등록 (관계 target resolve용)
+    # file_title과 이름이 겹치는 경우는 스킵하여 자기 자신 엔티티를 덮지 않는다.
+    seen_imports: set[str] = set()
+    for imp in extraction.imports:
+        if imp == file_title or imp in seen_imports:
+            continue
+        seen_imports.add(imp)
+        entities.append(Entity(
+            name=imp,
+            entity_type="module",
+            description="",
+        ))
 
     # 부모 클래스 엔티티를 중복 없이 추가
     parent_names: set[str] = set()
