@@ -520,7 +520,10 @@ class TestToGraphData:
         graph = to_graph_data(extraction, "handler.go")
 
         assert len(graph.entities) == 2  # module + function
-        func_entity = next(e for e in graph.entities if e.name == "HandleRequest")
+        # 심볼은 파일 범위 FQN으로 등록된다
+        func_entity = next(
+            e for e in graph.entities if e.name == "handler.go::HandleRequest"
+        )
         assert func_entity.entity_type == "function"
         assert func_entity.description == "func HandleRequest()"
 
@@ -586,8 +589,123 @@ class TestToGraphData:
         # handler.go 엔티티는 정확히 하나 (파일 엔티티)
         assert sum(1 for e in graph.entities if e.name == "handler.go") == 1
 
+    def test_same_method_name_in_different_files_has_distinct_fqn(self) -> None:
+        """서로 다른 파일의 동명 메서드는 FQN으로 구분되어야 한다.
+
+        __init__처럼 흔한 메서드명이 graph_store의 canonical 병합으로
+        전역 단일 노드로 합쳐지는 것을 방지하기 위함.
+        """
+        def make_extraction(file: str, class_name: str) -> CodeExtraction:
+            return CodeExtraction(
+                file_path=file,
+                language="python",
+                symbols=[
+                    CodeSymbol(
+                        name="__init__", symbol_type="method",
+                        signature="def __init__(self)", body="...",
+                        line_start=2, line_end=3,
+                        parent_name=class_name,
+                        parent_signature=f"class {class_name}",
+                    ),
+                ],
+                imports=[],
+            )
+
+        graph_a = to_graph_data(
+            make_extraction("user_service.py", "UserService"),
+            "user_service.py",
+        )
+        graph_b = to_graph_data(
+            make_extraction("order_service.py", "OrderService"),
+            "order_service.py",
+        )
+
+        names_a = {e.name for e in graph_a.entities}
+        names_b = {e.name for e in graph_b.entities}
+
+        # FQN이 파일/클래스를 포함하므로 서로 겹치지 않아야 한다
+        method_fqns = {n for n in names_a | names_b if "__init__" in n}
+        assert method_fqns == {
+            "user_service.py::UserService.__init__",
+            "order_service.py::OrderService.__init__",
+        }
+        # 두 그래프의 심볼 엔티티 교집합은 비어 있어야 한다 (canonical 병합 차단)
+        assert (names_a & names_b) - {""} == set()
+
+    def test_same_method_name_in_different_classes_same_file(self) -> None:
+        """같은 파일 내 서로 다른 클래스가 동명 메서드를 가질 때 구분된다."""
+        extraction = CodeExtraction(
+            file_path="service.py",
+            language="python",
+            symbols=[
+                CodeSymbol(
+                    name="run", symbol_type="method",
+                    signature="def run(self)", body="...",
+                    line_start=3, line_end=4,
+                    parent_name="Worker", parent_signature="class Worker",
+                ),
+                CodeSymbol(
+                    name="run", symbol_type="method",
+                    signature="def run(self)", body="...",
+                    line_start=7, line_end=8,
+                    parent_name="Scheduler", parent_signature="class Scheduler",
+                ),
+            ],
+            imports=[],
+        )
+        graph = to_graph_data(extraction, "service.py")
+
+        entity_names = {e.name for e in graph.entities}
+        assert "service.py::Worker.run" in entity_names
+        assert "service.py::Scheduler.run" in entity_names
+
+        # contains 관계도 각각 올바른 parent에 연결된다
+        contains_pairs = {
+            (r.source, r.target)
+            for r in graph.relations
+            if r.relation_type == "contains"
+        }
+        assert ("service.py::Worker", "service.py::Worker.run") in contains_pairs
+        assert ("service.py::Scheduler", "service.py::Scheduler.run") in contains_pairs
+
+    def test_go_struct_and_parent_dedup(self) -> None:
+        """Go struct가 top-level symbol과 parent로 동시에 등장해도 엔티티 중복 없음."""
+        extraction = CodeExtraction(
+            file_path="handler.go",
+            language="go",
+            symbols=[
+                CodeSymbol(
+                    name="Server", symbol_type="struct",
+                    signature="type Server struct", body="...",
+                    line_start=1, line_end=3,
+                ),
+                CodeSymbol(
+                    name="Handle", symbol_type="method",
+                    signature="func (s *Server) Handle()", body="...",
+                    line_start=5, line_end=7,
+                    parent_name="Server",
+                    parent_signature="type Server struct",
+                ),
+            ],
+            imports=[],
+        )
+        graph = to_graph_data(extraction, "handler.go")
+
+        # Server는 정확히 한 번만 엔티티로 등록되고, symbol_type은 "struct" 유지
+        server_entities = [
+            e for e in graph.entities if e.name == "handler.go::Server"
+        ]
+        assert len(server_entities) == 1
+        assert server_entities[0].entity_type == "struct"
+
+        # contains 관계는 struct → method FQN으로 연결된다
+        contains = [r for r in graph.relations if r.relation_type == "contains"]
+        assert len(contains) == 1
+        assert contains[0].source == "handler.go::Server"
+        assert contains[0].target == "handler.go::Server.Handle"
+
     def test_contains_relations_for_methods(self) -> None:
-        """메서드가 있으면 클래스 → 메서드 contains 관계가 생성된다."""
+        """메서드가 있으면 클래스 → 메서드 contains 관계가 FQN으로 생성된다."""
         extraction = CodeExtraction(
             file_path="service.py",
             language="python",
@@ -613,8 +731,13 @@ class TestToGraphData:
         assert "contains" in relation_types
 
         contains_rel = next(r for r in graph.relations if r.relation_type == "contains")
-        assert contains_rel.source == "MyClass"
-        assert contains_rel.target == "run"
+        assert contains_rel.source == "service.py::MyClass"
+        assert contains_rel.target == "service.py::MyClass.run"
+
+        # 관계의 source/target은 반드시 엔티티 이름으로 resolve되어야 한다
+        entity_names = {e.name for e in graph.entities}
+        assert contains_rel.source in entity_names
+        assert contains_rel.target in entity_names
 
     def test_no_calls_relations(self) -> None:
         """calls 등 LLM 전용 관계는 생성하지 않는다."""
@@ -691,7 +814,9 @@ class TestEndToEnd:
         assert len(graph.relations) == 2
         assert any(r.target == "pathlib" for r in graph.relations)
         assert any(
-            r.source == "FileReader" and r.target == "read" and r.relation_type == "contains"
+            r.source == "reader.py::FileReader"
+            and r.target == "reader.py::FileReader.read"
+            and r.relation_type == "contains"
             for r in graph.relations
         )
 
