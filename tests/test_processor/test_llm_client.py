@@ -18,12 +18,30 @@ def _make_client() -> tuple[EndpointLLMClient, AsyncMock]:
     return client, mock_inner
 
 
+def _make_chunk(content: str | None) -> MagicMock:
+    """delta.content를 가진 스트림 청크 mock을 만든다."""
+    chunk = MagicMock()
+    choice = MagicMock()
+    choice.delta.content = content
+    chunk.choices = [choice]
+    return chunk
+
+
+async def _async_iter(chunks: list[MagicMock]):
+    """주어진 청크 리스트를 비동기 이터레이터로 변환한다."""
+    for chunk in chunks:
+        yield chunk
+
+
+def _setup_stream(mock_inner: AsyncMock, deltas: list[str | None]) -> None:
+    """스트리밍 응답을 설정한다 (delta.content 시퀀스)."""
+    chunks = [_make_chunk(d) for d in deltas]
+    mock_inner.chat.completions.create.return_value = _async_iter(chunks)
+
+
 def _setup_response(mock_inner: AsyncMock, text: str) -> None:
-    """일반 응답을 설정한다."""
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = text
-    mock_inner.chat.completions.create.return_value = mock_response
+    """단일 텍스트로 스트리밍 응답을 설정한다 (헬퍼)."""
+    _setup_stream(mock_inner, [text])
 
 
 # --- Tests ---
@@ -96,3 +114,30 @@ class TestEndpointLLMClient:
 
         call_kwargs = mock_openai.call_args.kwargs
         assert "default_headers" not in call_kwargs
+
+    async def test_stream_flag_passed(self) -> None:
+        """stream=True가 항상 요청에 포함된다."""
+        client, mock = _make_client()
+        _setup_stream(mock, ["x"])
+
+        await client.complete("테스트")
+
+        assert mock.chat.completions.create.call_args.kwargs["stream"] is True
+
+    async def test_stream_aggregates_deltas(self) -> None:
+        """여러 delta 청크가 순서대로 누적되어 반환된다."""
+        client, mock = _make_client()
+        _setup_stream(mock, ["안녕", "하세", "요"])
+
+        result = await client.complete("테스트")
+
+        assert result == "안녕하세요"
+
+    async def test_stream_skips_none_and_empty_deltas(self) -> None:
+        """content가 None이거나 빈 문자열인 청크는 무시된다."""
+        client, mock = _make_client()
+        _setup_stream(mock, ["a", None, "", "b"])
+
+        result = await client.complete("테스트")
+
+        assert result == "ab"

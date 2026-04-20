@@ -167,12 +167,23 @@ class EndpointLLMClient(LLMClient):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "stream": True,
         }
         if "extra_body" in kwargs:
             api_kwargs["extra_body"] = kwargs["extra_body"]
 
-        response = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
-        return response.choices[0].message.content or ""
+        # 스트리밍 수신: 토큰이 지속적으로 흐르므로 중간 프록시/서버의
+        # idle timeout에 걸리지 않고 긴 응답도 안전하게 수신할 수 있다.
+        stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
+        parts: list[str] = []
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None)
+            if content:
+                parts.append(content)
+        return "".join(parts)
 
 
 def extract_json(text: str) -> Any:
