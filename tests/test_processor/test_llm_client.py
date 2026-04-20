@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from context_loop.processor.llm_client import EndpointLLMClient
 
@@ -65,3 +65,34 @@ class TestEndpointLLMClient:
         assert call_kwargs["extra_body"] == {
             "chat_template_kwargs": {"enable_thinking": False}
         }
+
+    def test_headers_passed_to_openai_client(self) -> None:
+        """headers가 AsyncOpenAI의 default_headers로 전달된다."""
+        with patch("openai.AsyncOpenAI") as mock_openai:
+            EndpointLLMClient(
+                "http://test/v1",
+                "model-a",
+                headers={"X-Org-Id": "abc", "X-Trace": "1"},
+            )
+
+        call_kwargs = mock_openai.call_args.kwargs
+        assert call_kwargs["default_headers"] == {
+            "X-Org-Id": "abc",
+            "X-Trace": "1",
+        }
+
+    def test_headers_omitted_when_none(self) -> None:
+        """headers가 None이면 default_headers를 전달하지 않는다."""
+        with patch("openai.AsyncOpenAI") as mock_openai:
+            EndpointLLMClient("http://test/v1", "model-a")
+
+        call_kwargs = mock_openai.call_args.kwargs
+        assert "default_headers" not in call_kwargs
+
+    def test_headers_omitted_when_empty(self) -> None:
+        """headers가 빈 dict면 default_headers를 전달하지 않는다."""
+        with patch("openai.AsyncOpenAI") as mock_openai:
+            EndpointLLMClient("http://test/v1", "model-a", headers={})
+
+        call_kwargs = mock_openai.call_args.kwargs
+        assert "default_headers" not in call_kwargs

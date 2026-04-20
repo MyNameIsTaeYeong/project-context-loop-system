@@ -49,6 +49,18 @@ class TestLLMEndpointConfig:
         cfg = LLMEndpointConfig()
         assert cfg.is_configured is False
 
+    def test_headers_default_empty(self) -> None:
+        cfg = LLMEndpointConfig()
+        assert cfg.headers == {}
+
+    def test_headers_preserved(self) -> None:
+        cfg = LLMEndpointConfig(
+            endpoint="http://localhost:8080/v1",
+            model="m",
+            headers={"X-Org-Id": "abc"},
+        )
+        assert cfg.headers == {"X-Org-Id": "abc"}
+
 
 # --- CategoryConfig ---
 
@@ -256,6 +268,35 @@ class TestLoadGitSourceConfig:
         # 글로벌 LLM 폴백
         assert git_cfg._global_llm.endpoint == "http://global:8080/v1"
         assert git_cfg._global_llm.model == "global-model"
+
+    def test_load_agent_headers(self, tmp_path: Path) -> None:
+        """에이전트별/글로벌 headers가 파싱된다."""
+        config = _make_config(tmp_path, {
+            "sources": {
+                "git": {
+                    "processing": {
+                        "worker": {
+                            "endpoint": "http://haiku:8080/v1",
+                            "model": "haiku",
+                            "headers": {"X-Agent": "worker"},
+                        },
+                    },
+                },
+            },
+            "llm": {
+                "endpoint": "http://global:8080/v1",
+                "model": "global-model",
+                "headers": {"X-Org-Id": "abc"},
+            },
+        })
+        git_cfg = load_git_source_config(config)
+
+        assert git_cfg.processing.worker.headers == {"X-Agent": "worker"}
+        assert git_cfg._global_llm.headers == {"X-Org-Id": "abc"}
+
+        # 에이전트 설정이 없으면 글로벌로 폴백되어 글로벌 headers 사용
+        resolved = git_cfg.resolve_endpoint("synthesizer")
+        assert resolved.headers == {"X-Org-Id": "abc"}
 
     def test_load_agent_endpoints(self, tmp_path: Path) -> None:
         """에이전트별 엔드포인트가 파싱되는지 확인."""

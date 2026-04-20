@@ -26,6 +26,7 @@ class LLMEndpointConfig:
     endpoint: str = ""
     model: str = ""
     api_key: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_configured(self) -> bool:
@@ -155,6 +156,7 @@ class GitSourceConfig:
             model=cfg.model,
             api_key=cfg.api_key or "none",
             timeout=timeout,
+            headers=cfg.headers or None,
         )
 
     def validate(self) -> list[str]:
@@ -208,10 +210,13 @@ def _parse_endpoint_config(raw: dict[str, Any] | None) -> LLMEndpointConfig:
     """dict에서 LLMEndpointConfig를 파싱한다."""
     if not raw or not isinstance(raw, dict):
         return LLMEndpointConfig()
+    headers_raw = raw.get("headers") or {}
+    headers = {str(k): str(v) for k, v in headers_raw.items()} if isinstance(headers_raw, dict) else {}
     return LLMEndpointConfig(
         endpoint=raw.get("endpoint", "") or "",
         model=raw.get("model", "") or "",
         api_key=raw.get("api_key", "") or "",
+        headers=headers,
     )
 
 
@@ -271,10 +276,17 @@ def load_git_source_config(config: Config) -> GitSourceConfig:
     ]
 
     # 글로벌 LLM 폴백
+    global_headers_raw = config.get("llm.headers") or {}
+    global_headers = (
+        {str(k): str(v) for k, v in global_headers_raw.items()}
+        if isinstance(global_headers_raw, dict)
+        else {}
+    )
     global_llm = LLMEndpointConfig(
         endpoint=config.get("llm.endpoint", "") or "",
         model=config.get("llm.model", "") or "",
         api_key=config.get("llm.api_key", "") or "",
+        headers=global_headers,
     )
 
     return GitSourceConfig(

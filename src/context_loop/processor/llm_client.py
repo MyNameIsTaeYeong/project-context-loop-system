@@ -125,6 +125,7 @@ class EndpointLLMClient(LLMClient):
         model: 사용할 모델 ID.
         api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
         timeout: HTTP 요청 타임아웃(초). 대형 입력 처리 시 충분히 높게 설정.
+        headers: 모든 요청에 추가할 커스텀 헤더. None 또는 빈 dict이면 미사용.
     """
 
     def __init__(
@@ -133,15 +134,19 @@ class EndpointLLMClient(LLMClient):
         model: str,
         api_key: str = "none",
         timeout: float = 600.0,
+        headers: dict[str, str] | None = None,
     ) -> None:
         import httpx  # noqa: PLC0415
         from openai import AsyncOpenAI  # noqa: PLC0415
 
-        self._client = AsyncOpenAI(
-            api_key=api_key or "none",
-            base_url=endpoint,
-            timeout=httpx.Timeout(timeout, connect=10.0),
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key or "none",
+            "base_url": endpoint,
+            "timeout": httpx.Timeout(timeout, connect=10.0),
+        }
+        if headers:
+            client_kwargs["default_headers"] = dict(headers)
+        self._client = AsyncOpenAI(**client_kwargs)
         self._model = model
 
     async def complete(
