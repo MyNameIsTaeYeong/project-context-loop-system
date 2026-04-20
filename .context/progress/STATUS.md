@@ -2,8 +2,8 @@
 
 ## 현재 단계
 - **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8++ AST 기반 코드 그래프 품질 안정화 (D-038)
-- **상태**: AST 기반 코드 그래프 추출(D-036/D-037) 이후 실행에서 발견된 3건의 버그 수정. (1) imports 엣지의 target 모듈이 엔티티로 등록되지 않아 유실되던 문제: `to_graph_data()`에서 import 모듈을 `entity_type="module"`로 선등록. (2) 서로 다른 파일/클래스의 동일 이름 메서드(`__init__`, `run`, `create`)가 `save_graph_data`의 canonical 병합(name_lower, type)에서 단일 노드로 합쳐져 contains 엣지가 꼬이던 문제: 코드 심볼 엔티티 이름을 `file.py::name` / `file.py::Class.method` 형태의 파일 범위 FQN으로 스코핑. 심볼 루프를 parent 루프보다 먼저 실행하여 Go struct 같은 특수 타입 보존. (3) FQN 도입에 따른 `get_neighbors` 짧은 이름 검색 회귀: 3단 fallback(정확 → 스코프 이름 → 짧은 이름) 추가. 테스트: ast_code_extractor 38개(+5), graph_store 34개(+4). 다음: 증분 처리(9.9) — git diff 기반 변경 파일만 재처리.
+- **Step**: 9.8++ Python import 추출 누락 및 문서별 그래프 조회 버그 수정
+- **상태**: 사용자 리포트("git sync 그래프에서 Python import 관계 일부가 보이지 않음")를 기점으로 두 건의 버그 수정. (1) `_extract_python()`이 `ast.ImportFrom.node.module`만 검사해 `from . import x`, `from .. import y` 같은 상대 import (`node.module=None, node.level>0`)가 imports 리스트에 전혀 들어가지 않던 문제: `node.level > 0`일 때 `"." * level + alias.name` 형태로 수집하도록 추가. (2) `get_graph_nodes_by_document()`가 legacy 컬럼 `graph_nodes.document_id`(최초 생성자만 기록)만 참조해, canonical 병합으로 현재 문서에 연결된 공유 모듈 노드가 두 번째 이후 import한 파일의 그래프 탭에서 누락되던 문제: `graph_node_documents` 링크 테이블 INNER JOIN으로 전환. 기존 `test_graph_nodes_and_edges`에 `add_node_document_link()` 호출을 추가해 실제 `save_graph_data` 플로우와 정합성 확보. 테스트: ast_code_extractor +1, graph_store +1, metadata_store 기존 수정. 부가 논의: import 대상이 디렉토리 경로까지만 연결되는 구조적 한계(`from X import Y`의 `Y`가 파일/클래스/심볼로 resolve되지 않음)를 확인, 레포 인덱스 기반 2-pass resolve 설계를 문서화하고 별도 phase로 분리. 다음: import resolve phase 또는 증분 처리(9.9).
 
 ## Phase별 진행률
 

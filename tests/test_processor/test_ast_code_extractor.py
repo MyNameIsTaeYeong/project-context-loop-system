@@ -77,6 +77,20 @@ class TestPythonExtraction:
         assert "os" in result.imports
         assert "pathlib" in result.imports
 
+    def test_extracts_relative_imports(self) -> None:
+        """from . / from .. 같은 상대 import도 추출한다."""
+        code = textwrap.dedent("""\
+            from . import utils
+            from .. import parent
+            from . import a, b
+        """)
+        result = extract_code_symbols(code, "handler.py")
+
+        assert ".utils" in result.imports
+        assert "..parent" in result.imports
+        assert ".a" in result.imports
+        assert ".b" in result.imports
+
     def test_function_signature(self) -> None:
         """함수 시그니처가 올바르게 생성된다."""
         result = extract_code_symbols(self._PYTHON_CODE, "service.py")
