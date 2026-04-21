@@ -12,6 +12,10 @@ from typing import Any
 
 from langchain_core.embeddings import Embeddings
 
+from context_loop.ingestion.confluence_extractor import (
+    ExtractedDocument,
+    extract as extract_confluence,
+)
 from context_loop.processor.ast_code_extractor import (
     extract_code_symbols,
     to_chunks,
@@ -85,6 +89,9 @@ async def process_document(
           - chunk_count: int
           - node_count: int
           - edge_count: int
+          - extraction: Confluence 소스에서 ``raw_content``가 있을 때만 dict,
+            아니면 ``None``. 키: sections, outbound_links, code_blocks,
+            tables, mentions (각 개수).
     """
     cfg = config or PipelineConfig()
 
@@ -102,6 +109,7 @@ async def process_document(
         chunk_count = 0
         node_count = 0
         edge_count = 0
+        extracted: ExtractedDocument | None = None  # Confluence 경로에서만 채워짐
 
         # --- git_code: AST 기반 정적 추출 (LLM 호출 없음) ---
         if source_type == "git_code":
@@ -154,6 +162,24 @@ async def process_document(
 
         # --- 일반 문서: 기존 LLM 기반 파이프라인 ---
         else:
+            # Confluence 소스면 원본 HTML에서 구조화 추출.
+            # 하류(청킹/분류/그래프)는 여전히 plain_text(마크다운)를 소비하므로
+            # 동작 호환을 유지하고, extracted는 메트릭/추후 소비용으로 보존한다.
+            raw_html = doc.get("raw_content")
+            if source_type in ("confluence", "confluence_mcp") and raw_html:
+                extracted = extract_confluence(raw_html)
+                content = extracted.plain_text
+                logger.info(
+                    "Confluence 추출 — doc_id=%d, sections=%d, links=%d, "
+                    "code=%d, tables=%d, mentions=%d",
+                    document_id,
+                    len(extracted.sections),
+                    len(extracted.outbound_links),
+                    len(extracted.code_blocks),
+                    len(extracted.tables),
+                    len(extracted.mentions),
+                )
+
             if storage_method_override is not None:
                 storage_method = storage_method_override
                 reason = "storage_method_override"
@@ -228,6 +254,17 @@ async def process_document(
             "chunk_count": chunk_count,
             "node_count": node_count,
             "edge_count": edge_count,
+            "extraction": (
+                {
+                    "sections": len(extracted.sections),
+                    "outbound_links": len(extracted.outbound_links),
+                    "code_blocks": len(extracted.code_blocks),
+                    "tables": len(extracted.tables),
+                    "mentions": len(extracted.mentions),
+                }
+                if extracted is not None
+                else None
+            ),
         }
 
     except Exception as exc:
