@@ -1,17 +1,18 @@
-"""pipeline.process_document 테스트 — Confluence 추출기 + 링크 그래프 주입.
+"""pipeline.process_document 테스트 — Confluence 추출기 + 링크 그래프.
 
-Step 1.5에서 추가된 아래 동작을 검증한다:
-  - source_type이 confluence/confluence_mcp이고 raw_content가 있으면
-    confluence_extractor.extract()가 호출되어 반환 dict에 extraction 메트릭이 노출됨
-  - raw_content가 None인 Confluence 문서는 기존 경로(original_content만 사용) 유지
-  - 다른 source_type(manual/upload)은 추출기 미호출
+검증 대상 동작:
+  - Confluence(REST/MCP) + raw_content → extract()가 호출되고 extraction 메트릭
+    이 반환 dict에 노출된다.
+  - raw_content=None인 Confluence 문서는 추출기를 건너뛴다(extraction=None).
+  - Confluence가 아닌 source_type(upload/manual)은 추출기·링크 그래프 모두 건
+    너뛴다.
+  - outbound_links가 있으면 build_link_graph로 그래프가 GraphStore에 저장되고
+    link_node_count / link_edge_count 메트릭이 노출된다.
+  - outbound_links가 비어 있으면 링크 그래프 저장은 호출되지 않는다.
+  - 추출기가 만든 plain_text가 청커(chunk_text)에 전달된다.
 
-Step 2에서 추가된 아래 동작도 검증한다:
-  - extracted.outbound_links가 있으면 build_link_graph → save_graph_data가
-    호출되어 link_node_count/link_edge_count 메트릭이 노출됨
-  - outbound_links가 비어 있으면 링크 그래프 호출 없음
-
-파이프라인의 LLM/벡터/그래프 호출은 mock으로 대체해 격리한다.
+벡터/그래프 호출은 mock으로 격리한다. LLM classifier / graph_extractor가 제거
+되어 파이프라인에는 llm_client 파라미터가 없다.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ async def store(tmp_path: Path) -> MetadataStore:  # type: ignore[misc]
     await s.close()
 
 
-def _make_stores() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+def _make_stores() -> tuple[MagicMock, MagicMock, MagicMock]:
     """파이프라인 외부 의존 객체들의 최소 mock 세트를 생성한다."""
     vector_store = MagicMock()
     vector_store.delete_by_document = MagicMock()
@@ -43,10 +44,9 @@ def _make_stores() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
     graph_store = MagicMock()
     graph_store.save_graph_data = AsyncMock(return_value={"nodes": 0, "edges": 0})
 
-    llm_client = MagicMock()
     embedding_client = MagicMock()
     embedding_client.aembed_documents = AsyncMock(return_value=[[0.1, 0.2]])
-    return vector_store, graph_store, llm_client, embedding_client
+    return vector_store, graph_store, embedding_client
 
 
 async def _create_confluence_doc(
@@ -89,13 +89,9 @@ async def test_confluence_with_raw_content_runs_extractor(
 ) -> None:
     """Confluence 문서 + raw_content가 있으면 extract()가 호출되고 메트릭이 노출된다."""
     doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ):
@@ -104,7 +100,6 @@ async def test_confluence_with_raw_content_runs_extractor(
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
@@ -122,13 +117,9 @@ async def test_confluence_without_raw_content_skips_extractor(
 ) -> None:
     """Confluence 문서라도 raw_content가 비어 있으면 추출기는 건너뛰고 extraction=None."""
     doc_id = await _create_confluence_doc(store, raw_content=None)
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ), patch(
@@ -139,7 +130,6 @@ async def test_confluence_without_raw_content_skips_extractor(
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
@@ -158,13 +148,9 @@ async def test_non_confluence_source_skips_extractor(store: MetadataStore) -> No
         content_hash="h",
         raw_content="<h1>ignored</h1>",
     )
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ), patch(
@@ -175,7 +161,6 @@ async def test_non_confluence_source_skips_extractor(store: MetadataStore) -> No
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
@@ -194,13 +179,9 @@ async def test_confluence_rest_source_type_also_triggers_extractor(
         raw_content="<h1>간단</h1><p>본문</p>",
         source_type="confluence",
     )
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ):
@@ -209,7 +190,6 @@ async def test_confluence_rest_source_type_also_triggers_extractor(
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
@@ -224,16 +204,12 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
 ) -> None:
     """Confluence 문서에 outbound_links가 있으면 링크 그래프가 GraphStore에 저장된다."""
     doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
     graph_store.save_graph_data = AsyncMock(return_value={
         "nodes": 2, "edges": 1, "merged": 0,
     })
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ):
@@ -242,12 +218,11 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
 
-    # storage_method='chunk'이므로 LLM graph 블록은 skip, 링크 그래프만 저장됨
+    # AST graph/LLM graph가 제거된 상태이므로 save_graph_data는 링크 그래프 1회만 호출된다.
     graph_store.save_graph_data.assert_awaited_once()
     saved_doc_id, saved_graph = graph_store.save_graph_data.await_args.args
     assert saved_doc_id == doc_id
@@ -260,6 +235,8 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
 
     assert result["link_node_count"] == 2
     assert result["link_edge_count"] == 1
+    # 청크는 모두 mock되어 비어 있으므로 graph만 존재 → storage_method="graph"
+    assert result["storage_method"] == "graph"
 
 
 @pytest.mark.asyncio
@@ -271,13 +248,9 @@ async def test_link_graph_skipped_when_no_outbound_links(
         store,
         raw_content="<h1>제목</h1><p>링크 없는 본문</p>",
     )
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ):
@@ -286,7 +259,6 @@ async def test_link_graph_skipped_when_no_outbound_links(
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
@@ -308,13 +280,9 @@ async def test_link_graph_skipped_for_non_confluence_source(
         content_hash="h",
         raw_content="<h1>ignored</h1>",
     )
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
         return_value=[],
     ):
@@ -323,7 +291,6 @@ async def test_link_graph_skipped_for_non_confluence_source(
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
@@ -334,82 +301,41 @@ async def test_link_graph_skipped_for_non_confluence_source(
 
 
 @pytest.mark.asyncio
-async def test_link_graph_runs_even_when_storage_method_is_chunk(
+async def test_extractor_output_replaces_content_for_chunker(
     store: MetadataStore,
 ) -> None:
-    """storage_method='chunk'이어도 링크 그래프는 실행된다 (LLM classifier와 무관)."""
-    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
-    graph_store.save_graph_data = AsyncMock(return_value={
-        "nodes": 2, "edges": 1, "merged": 0,
-    })
-
-    with patch(
-        "context_loop.processor.pipeline.classify_document",
-        new_callable=AsyncMock,
-        return_value=("chunk", "테스트"),
-    ), patch(
-        "context_loop.processor.pipeline.chunk_text",
-        return_value=[],
-    ), patch(
-        "context_loop.processor.pipeline.extract_graph",
-        new_callable=AsyncMock,
-    ) as mock_extract_graph:
-        await process_document(
-            doc_id,
-            meta_store=store,
-            vector_store=vector_store,
-            graph_store=graph_store,
-            llm_client=llm_client,
-            embedding_client=embedding_client,
-            config=PipelineConfig(),
-        )
-
-    # storage_method='chunk'이면 LLM graph 추출은 호출되지 않는다
-    mock_extract_graph.assert_not_awaited()
-    # 그래도 링크 그래프는 실행되어 save_graph_data가 한 번 호출
-    graph_store.save_graph_data.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_extractor_output_replaces_content_for_classifier(
-    store: MetadataStore,
-) -> None:
-    """추출기가 실행되면 classifier에 전달되는 content가 plain_text로 교체된다.
+    """추출기가 실행되면 chunk_text에 전달되는 content가 plain_text로 교체된다.
 
     original_content에는 "본문"만 있지만 추출기는 HTML을 마크다운으로 변환해
-    헤딩 마크업 등이 포함된 더 풍부한 텍스트를 만든다. 이 텍스트가 classifier에
-    전달되는지 검증한다.
+    "# 결제 시스템" 같은 헤딩 마크업이 포함된 텍스트를 만든다. 이 텍스트가
+    청커에 전달되는지 확인한다.
     """
     doc_id = await _create_confluence_doc(
         store,
         raw_content="<h1>결제 시스템</h1><p>본문 텍스트</p>",
     )
-    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    vector_store, graph_store, embedding_client = _make_stores()
 
     captured: dict[str, Any] = {}
 
-    async def fake_classify(_llm: Any, title: str, content: str) -> tuple[str, str]:
-        captured["title"] = title
+    def fake_chunk_text(
+        content: str, *, chunk_size: int, chunk_overlap: int, model: str,
+    ) -> list[Any]:
         captured["content"] = content
-        return "chunk", "테스트"
+        return []
 
     with patch(
-        "context_loop.processor.pipeline.classify_document",
-        side_effect=fake_classify,
-    ), patch(
         "context_loop.processor.pipeline.chunk_text",
-        return_value=[],
+        side_effect=fake_chunk_text,
     ):
         await process_document(
             doc_id,
             meta_store=store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=PipelineConfig(),
         )
 
-    # 추출기 결과가 classifier에 전달됨: 마크다운 헤딩 "# 결제 시스템"이 포함되어야 함
+    # 추출기 결과(마크다운 "# 결제 시스템")가 청커에 전달되어야 한다.
     assert "# 결제 시스템" in captured["content"]

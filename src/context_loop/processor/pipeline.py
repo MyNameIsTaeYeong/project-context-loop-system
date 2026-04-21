@@ -1,7 +1,19 @@
 """문서 처리 파이프라인 통합 모듈.
 
-LLM Classifier → 청킹/임베딩/그래프추출 → 저장의 전체 흐름을 조율한다.
-git_code는 AST 기반 정적 추출로 처리한다 (LLM 호출 없음).
+결정론적 파이프라인: 청킹/임베딩 + 구조 기반 그래프(AST 코드 심볼,
+Confluence outbound_links)까지 저장한다. LLM 호출은 없다.
+
+소스 타입별 처리
+    - ``git_code``           : AST 기반 청크 + import 그래프
+    - ``confluence``         : 구조화 추출 + plain_text 청크 + 링크 그래프
+    - ``confluence_mcp``     : 위와 동일
+    - 그 외 (``upload`` 등)   : 청크만
+
+``storage_method``
+    과거에는 LLM classifier가 결정했으나 현재는 처리 결과에서 파생한다:
+    ``chunks`` 와 ``graph data`` 가 모두 생기면 ``hybrid``,
+    한쪽만 있으면 각 ``chunk``/``graph``, 아무것도 없으면 ``chunk``(기본).
+    스키마·UI 표시 용도로만 의미를 갖는다.
 """
 
 from __future__ import annotations
@@ -22,10 +34,7 @@ from context_loop.processor.ast_code_extractor import (
     to_graph_data,
 )
 from context_loop.processor.chunker import chunk_text
-from context_loop.processor.classifier import StorageMethod, classify_document
-from context_loop.processor.graph_extractor import extract_graph
 from context_loop.processor.link_graph_builder import build_link_graph
-from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
     start_reprocessing,
@@ -58,38 +67,33 @@ async def process_document(
     meta_store: MetadataStore,
     vector_store: VectorStore,
     graph_store: GraphStore,
-    llm_client: LLMClient,
     embedding_client: Embeddings,
     config: PipelineConfig | None = None,
-    storage_method_override: StorageMethod | None = None,
 ) -> dict[str, Any]:
     """단일 문서를 전체 파이프라인으로 처리한다.
 
     처리 순서:
-    1. 문서 로드 및 재처리 시작 (파생 데이터 삭제 + status='processing')
-    2. LLM Classifier로 저장 방식 판정 (storage_method_override 시 건너뜀)
-    3. chunk 또는 hybrid → 청킹 + 임베딩 + 벡터DB 저장
-    4. graph 또는 hybrid → 그래프 추출 + GraphStore 저장
-    5. SQLite에 청크 메타데이터 저장
-    6. 처리 완료 기록
+        1. 문서 로드 및 재처리 시작 (파생 데이터 삭제 + status='processing')
+        2. 소스별 추출: git_code=AST, confluence=구조화 HTML, 그 외=원문
+        3. 청킹 + 임베딩 + 벡터DB 저장 (빈 본문이 아니면 항상)
+        4. 그래프 저장: git_code=AST import, confluence=링크 그래프
+        5. storage_method 파생 + 처리 완료 기록
 
     Args:
         document_id: 처리할 문서 ID.
         meta_store: MetadataStore 인스턴스.
         vector_store: VectorStore 인스턴스 (초기화됨).
         graph_store: GraphStore 인스턴스.
-        llm_client: LLMClient 인스턴스.
         embedding_client: EmbeddingClient 인스턴스.
         config: PipelineConfig. None이면 기본값 사용.
-        storage_method_override: 저장 방식을 직접 지정. 설정 시 LLM Classifier를 건너뛴다.
 
     Returns:
         처리 결과 dict:
           - document_id: int
-          - storage_method: str
+          - storage_method: str ("chunk" | "graph" | "hybrid") — 결과에서 파생
           - chunk_count: int
-          - node_count: int (LLM 추출 + 링크 그래프 합계)
-          - edge_count: int (LLM 추출 + 링크 그래프 합계)
+          - node_count: int
+          - edge_count: int
           - link_node_count: int — 링크 그래프로 생성된 노드 수
           - link_edge_count: int — 링크 그래프로 생성된 엣지 수
           - extraction: Confluence 소스에서 ``raw_content``가 있을 때만 dict,
@@ -116,9 +120,8 @@ async def process_document(
         link_edge_count = 0
         extracted: ExtractedDocument | None = None  # Confluence 경로에서만 채워짐
 
-        # --- git_code: AST 기반 정적 추출 (LLM 호출 없음) ---
         if source_type == "git_code":
-            storage_method = "hybrid"
+            # --- git_code: AST 기반 정적 추출 ---
             logger.info(
                 "AST 코드 추출 시작 — document_id=%d, title=%s",
                 document_id, title,
@@ -165,11 +168,11 @@ async def process_document(
                 node_count = result["nodes"]
                 edge_count = result["edges"]
 
-        # --- 일반 문서: 기존 LLM 기반 파이프라인 ---
         else:
+            # --- 일반 문서: 청크 + (Confluence일 때) 링크 그래프 ---
             # Confluence 소스면 원본 HTML에서 구조화 추출.
-            # 하류(청킹/분류/그래프)는 여전히 plain_text(마크다운)를 소비하므로
-            # 동작 호환을 유지하고, extracted는 메트릭/추후 소비용으로 보존한다.
+            # 청커는 plain_text(마크다운)를 소비하므로 content를 교체하고,
+            # extracted는 링크 그래프 / 반환 메트릭 용도로 보존한다.
             raw_html = doc.get("raw_content")
             if source_type in ("confluence", "confluence_mcp") and raw_html:
                 extracted = extract_confluence(raw_html)
@@ -185,68 +188,42 @@ async def process_document(
                     len(extracted.mentions),
                 )
 
-            if storage_method_override is not None:
-                storage_method = storage_method_override
-                reason = "storage_method_override"
-            else:
-                storage_method, reason = await classify_document(
-                    llm_client, title, content,
-                )
-            logger.info(
-                "분류 결과 — document_id=%d, method=%s, reason=%s",
-                document_id, storage_method, reason,
+            # 청크 (항상 실행; 본문이 비어 있으면 chunk_text가 빈 리스트 반환)
+            chunks = chunk_text(
+                content,
+                chunk_size=cfg.chunk_size,
+                chunk_overlap=cfg.chunk_overlap,
+                model=cfg.embedding_model,
             )
+            if chunks:
+                texts = [c.content for c in chunks]
+                embeddings = await embedding_client.aembed_documents(texts)
 
-            # 청크 처리 (chunk or hybrid)
-            if storage_method in ("chunk", "hybrid"):
-                chunks = chunk_text(
-                    content,
-                    chunk_size=cfg.chunk_size,
-                    chunk_overlap=cfg.chunk_overlap,
-                    model=cfg.embedding_model,
-                )
-                if chunks:
-                    texts = [c.content for c in chunks]
-                    embeddings = await embedding_client.aembed_documents(texts)
+                chunk_ids = [c.id for c in chunks]
+                metadatas = [
+                    {
+                        "document_id": document_id,
+                        "chunk_index": c.index,
+                        "title": title,
+                        "section_path": c.section_path,
+                    }
+                    for c in chunks
+                ]
+                vector_store.delete_by_document(document_id)
+                vector_store.add_chunks(chunk_ids, embeddings, texts, metadatas)
 
-                    chunk_ids = [c.id for c in chunks]
-                    metadatas = [
-                        {
-                            "document_id": document_id,
-                            "chunk_index": c.index,
-                            "title": title,
-                            "section_path": c.section_path,
-                        }
-                        for c in chunks
-                    ]
-                    vector_store.delete_by_document(document_id)
-                    vector_store.add_chunks(chunk_ids, embeddings, texts, metadatas)
-
-                    await meta_store.delete_chunks_by_document(document_id)
-                    for chunk, cid in zip(chunks, chunk_ids):
-                        await meta_store.create_chunk(
-                            chunk_id=cid,
-                            document_id=document_id,
-                            chunk_index=chunk.index,
-                            content=chunk.content,
-                            token_count=chunk.token_count,
-                        )
-                    chunk_count = len(chunks)
-
-            # 그래프 처리 (graph or hybrid)
-            if storage_method in ("graph", "hybrid"):
-                graph_data = await extract_graph(
-                    llm_client, title, content, source_type=source_type,
-                )
-                if graph_data.entities:
-                    result = await graph_store.save_graph_data(
-                        document_id, graph_data,
+                await meta_store.delete_chunks_by_document(document_id)
+                for chunk, cid in zip(chunks, chunk_ids):
+                    await meta_store.create_chunk(
+                        chunk_id=cid,
+                        document_id=document_id,
+                        chunk_index=chunk.index,
+                        content=chunk.content,
+                        token_count=chunk.token_count,
                     )
-                    node_count = result["nodes"]
-                    edge_count = result["edges"]
+                chunk_count = len(chunks)
 
-            # Confluence 링크 그래프 (LLM 호출 없음): outbound_links 기반.
-            # LLM classifier 결과(storage_method)와 무관하게 항상 실행한다.
+            # Confluence 링크 그래프 (LLM 호출 없음)
             if extracted is not None and extracted.outbound_links:
                 link_graph = build_link_graph(extracted, doc_title=title)
                 if link_graph.entities:
@@ -265,7 +242,11 @@ async def process_document(
                         link_result.get("merged", 0),
                     )
 
-        # 완료
+        storage_method = _derive_storage_method(
+            has_chunks=chunk_count > 0,
+            has_graph=node_count > 0,
+        )
+
         await complete_reprocessing(
             meta_store,
             document_id,
@@ -303,3 +284,12 @@ async def process_document(
             error_message=str(exc),
         )
         raise
+
+
+def _derive_storage_method(*, has_chunks: bool, has_graph: bool) -> str:
+    """실제 저장된 산출물로부터 ``storage_method`` 레이블을 파생한다."""
+    if has_chunks and has_graph:
+        return "hybrid"
+    if has_graph:
+        return "graph"
+    return "chunk"
