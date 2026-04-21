@@ -33,7 +33,7 @@ from context_loop.processor.ast_code_extractor import (
     to_chunks,
     to_graph_data,
 )
-from context_loop.processor.chunker import chunk_text
+from context_loop.processor.chunker import chunk_extracted_document, chunk_text
 from context_loop.processor.link_graph_builder import build_link_graph
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
@@ -144,6 +144,7 @@ async def process_document(
                         "chunk_index": c.index,
                         "title": title,
                         "section_path": c.section_path,
+                        "section_anchor": c.section_anchor,
                     }
                     for c in chunks
                 ]
@@ -171,12 +172,12 @@ async def process_document(
         else:
             # --- 일반 문서: 청크 + (Confluence일 때) 링크 그래프 ---
             # Confluence 소스면 원본 HTML에서 구조화 추출.
-            # 청커는 plain_text(마크다운)를 소비하므로 content를 교체하고,
-            # extracted는 링크 그래프 / 반환 메트릭 용도로 보존한다.
+            # 청커는 extracted의 sections/anchor를 그대로 소비하고,
+            # 코드블록/테이블이 중간에서 잘리지 않도록 원자 단위로 보호한다.
+            # extracted는 링크 그래프 / 반환 메트릭 용도로도 보존한다.
             raw_html = doc.get("raw_content")
             if source_type in ("confluence", "confluence_mcp") and raw_html:
                 extracted = extract_confluence(raw_html)
-                content = extracted.plain_text
                 logger.info(
                     "Confluence 추출 — doc_id=%d, sections=%d, links=%d, "
                     "code=%d, tables=%d, mentions=%d",
@@ -188,13 +189,21 @@ async def process_document(
                     len(extracted.mentions),
                 )
 
-            # 청크 (항상 실행; 본문이 비어 있으면 chunk_text가 빈 리스트 반환)
-            chunks = chunk_text(
-                content,
-                chunk_size=cfg.chunk_size,
-                chunk_overlap=cfg.chunk_overlap,
-                model=cfg.embedding_model,
-            )
+            # 청크 (항상 실행; 본문이 비어 있으면 청커가 빈 리스트 반환)
+            if extracted is not None:
+                chunks = chunk_extracted_document(
+                    extracted,
+                    chunk_size=cfg.chunk_size,
+                    chunk_overlap=cfg.chunk_overlap,
+                    model=cfg.embedding_model,
+                )
+            else:
+                chunks = chunk_text(
+                    content,
+                    chunk_size=cfg.chunk_size,
+                    chunk_overlap=cfg.chunk_overlap,
+                    model=cfg.embedding_model,
+                )
             if chunks:
                 texts = [c.content for c in chunks]
                 embeddings = await embedding_client.aembed_documents(texts)
@@ -206,6 +215,7 @@ async def process_document(
                         "chunk_index": c.index,
                         "title": title,
                         "section_path": c.section_path,
+                        "section_anchor": c.section_anchor,
                     }
                     for c in chunks
                 ]

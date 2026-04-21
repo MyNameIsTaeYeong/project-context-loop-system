@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from context_loop.processor.chunker import Chunk, chunk_text, count_tokens
+from context_loop.ingestion.confluence_extractor import (
+    ExtractedDocument,
+    Section,
+)
+from context_loop.processor.chunker import (
+    Chunk,
+    chunk_extracted_document,
+    chunk_text,
+    count_tokens,
+)
 
 
 def test_count_tokens_basic() -> None:
@@ -169,3 +178,120 @@ def test_index_sequential_with_sections() -> None:
     chunks = chunk_text(text, chunk_size=512)
     for i, chunk in enumerate(chunks):
         assert chunk.index == i
+
+
+# --- 원자 블록 보호 (코드블록/테이블) ---
+
+
+def test_fenced_code_block_not_split_mid_block() -> None:
+    """펜스 코드블록은 chunk_size를 초과해도 중간에서 잘리지 않는다."""
+    code_body = "\n".join(f"    line_{i} = do_something({i})" for i in range(200))
+    text = f"# Code Section\n\nIntro.\n\n```python\n{code_body}\n```\n\n후속 문단."
+    chunks = chunk_text(text, chunk_size=100, chunk_overlap=10)
+
+    code_chunks = [c for c in chunks if "```python" in c.content]
+    assert len(code_chunks) == 1
+    assert "```python" in code_chunks[0].content
+    assert code_chunks[0].content.rstrip().endswith("```")
+    assert "line_0" in code_chunks[0].content
+    assert "line_199" in code_chunks[0].content
+
+
+def test_markdown_table_not_split_mid_block() -> None:
+    """마크다운 테이블은 중간에서 잘리지 않고 통째로 한 청크에 들어간다."""
+    rows = "\n".join(f"| r{i}c1 extra words | r{i}c2 extra words |" for i in range(60))
+    text = (
+        "# Tables\n\n"
+        "앞 문단.\n\n"
+        "| col1 | col2 |\n"
+        "|------|------|\n"
+        f"{rows}\n\n"
+        "뒤 문단."
+    )
+    chunks = chunk_text(text, chunk_size=80, chunk_overlap=5)
+
+    table_chunks = [c for c in chunks if "|------|" in c.content]
+    assert len(table_chunks) == 1
+    assert "| col1 | col2 |" in table_chunks[0].content
+    assert "| r0c1 extra words | r0c2 extra words |" in table_chunks[0].content
+    assert "| r59c1 extra words | r59c2 extra words |" in table_chunks[0].content
+
+
+# --- chunk_extracted_document ---
+
+
+def _make_section(level: int, title: str, body: str, path: list[str] | None = None) -> Section:
+    return Section(
+        level=level,
+        title=title,
+        anchor=title.lower().replace(" ", "-"),
+        path=path or [title],
+        md_content=body,
+    )
+
+
+def test_chunk_extracted_document_uses_section_path_and_anchor() -> None:
+    """추출된 섹션의 path와 anchor가 청크 메타에 그대로 전달된다."""
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[
+            _make_section(1, "결제 시스템", "개요 문단.", path=["결제 시스템"]),
+            _make_section(
+                2,
+                "엔드포인트",
+                "POST /v1/payments 설명.",
+                path=["결제 시스템", "엔드포인트"],
+            ),
+        ],
+    )
+    chunks = chunk_extracted_document(extracted, chunk_size=512)
+
+    by_path = {c.section_path: c for c in chunks}
+    assert "결제 시스템" in by_path
+    assert "결제 시스템 > 엔드포인트" in by_path
+    assert by_path["결제 시스템"].section_anchor == "결제-시스템"
+    assert by_path["결제 시스템 > 엔드포인트"].section_anchor == "엔드포인트"
+
+
+def test_chunk_extracted_document_includes_heading_in_content() -> None:
+    """청크 본문에 해당 섹션의 헤딩이 포함된다."""
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[_make_section(2, "Overview", "본문 텍스트.", path=["Overview"])],
+    )
+    chunks = chunk_extracted_document(extracted, chunk_size=512)
+    assert len(chunks) >= 1
+    assert "## Overview" in chunks[0].content
+    assert "본문 텍스트" in chunks[0].content
+
+
+def test_chunk_extracted_document_protects_code_block() -> None:
+    """추출된 섹션 내부의 펜스 코드블록은 원자 단위로 보존된다."""
+    code_body = "\n".join(f"    stmt_{i} = {i}" for i in range(200))
+    section_body = f"코드 예:\n\n```python\n{code_body}\n```\n\n끝."
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[_make_section(1, "Code", section_body, path=["Code"])],
+    )
+    chunks = chunk_extracted_document(extracted, chunk_size=100, chunk_overlap=10)
+    code_chunks = [c for c in chunks if "```python" in c.content]
+    assert len(code_chunks) == 1
+    assert "stmt_0" in code_chunks[0].content
+    assert "stmt_199" in code_chunks[0].content
+    # 모든 청크에 section_path / anchor가 유지된다
+    for c in chunks:
+        assert c.section_path == "Code"
+        assert c.section_anchor == "code"
+
+
+def test_chunk_extracted_document_empty_sections_falls_back_to_plain_text() -> None:
+    """sections가 비어 있으면 plain_text 기반 청킹으로 폴백한다."""
+    extracted = ExtractedDocument(
+        plain_text="# 제목\n\n본문 텍스트.",
+        sections=[],
+    )
+    chunks = chunk_extracted_document(extracted, chunk_size=512)
+    assert len(chunks) >= 1
+    assert chunks[0].section_path == "제목"
+    # 폴백 경로에서는 anchor가 비어 있다 (ExtractedDocument 섹션을 쓰지 않으므로)
+    assert chunks[0].section_anchor == ""

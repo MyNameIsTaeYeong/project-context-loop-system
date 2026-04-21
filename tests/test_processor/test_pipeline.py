@@ -92,7 +92,7 @@ async def test_confluence_with_raw_content_runs_extractor(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_text",
+        "context_loop.processor.pipeline.chunk_extracted_document",
         return_value=[],
     ):
         result = await process_document(
@@ -182,7 +182,7 @@ async def test_confluence_rest_source_type_also_triggers_extractor(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_text",
+        "context_loop.processor.pipeline.chunk_extracted_document",
         return_value=[],
     ):
         result = await process_document(
@@ -210,7 +210,7 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
     })
 
     with patch(
-        "context_loop.processor.pipeline.chunk_text",
+        "context_loop.processor.pipeline.chunk_extracted_document",
         return_value=[],
     ):
         result = await process_document(
@@ -251,7 +251,7 @@ async def test_link_graph_skipped_when_no_outbound_links(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_text",
+        "context_loop.processor.pipeline.chunk_extracted_document",
         return_value=[],
     ):
         result = await process_document(
@@ -301,14 +301,13 @@ async def test_link_graph_skipped_for_non_confluence_source(
 
 
 @pytest.mark.asyncio
-async def test_extractor_output_replaces_content_for_chunker(
+async def test_extracted_document_passed_to_structured_chunker(
     store: MetadataStore,
 ) -> None:
-    """추출기가 실행되면 chunk_text에 전달되는 content가 plain_text로 교체된다.
+    """Confluence 경로에서는 chunk_extracted_document에 ExtractedDocument가 전달된다.
 
-    original_content에는 "본문"만 있지만 추출기는 HTML을 마크다운으로 변환해
-    "# 결제 시스템" 같은 헤딩 마크업이 포함된 텍스트를 만든다. 이 텍스트가
-    청커에 전달되는지 확인한다.
+    원본 HTML이 추출기를 거쳐 나온 ``ExtractedDocument`` 가 그대로 청커에 전달
+    되어야 하며, 생성된 청크에는 섹션 제목/앵커 메타가 실려야 한다.
     """
     doc_id = await _create_confluence_doc(
         store,
@@ -318,15 +317,15 @@ async def test_extractor_output_replaces_content_for_chunker(
 
     captured: dict[str, Any] = {}
 
-    def fake_chunk_text(
-        content: str, *, chunk_size: int, chunk_overlap: int, model: str,
+    def fake_chunker(
+        extracted: Any, *, chunk_size: int, chunk_overlap: int, model: str,
     ) -> list[Any]:
-        captured["content"] = content
+        captured["extracted"] = extracted
         return []
 
     with patch(
-        "context_loop.processor.pipeline.chunk_text",
-        side_effect=fake_chunk_text,
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        side_effect=fake_chunker,
     ):
         await process_document(
             doc_id,
@@ -337,5 +336,9 @@ async def test_extractor_output_replaces_content_for_chunker(
             config=PipelineConfig(),
         )
 
-    # 추출기 결과(마크다운 "# 결제 시스템")가 청커에 전달되어야 한다.
-    assert "# 결제 시스템" in captured["content"]
+    extracted = captured["extracted"]
+    assert extracted is not None
+    # 추출기는 h1 하나짜리 섹션을 만들어야 하고, 청커는 그 sections를 소비한다.
+    assert len(extracted.sections) == 1
+    assert extracted.sections[0].title == "결제 시스템"
+    assert extracted.sections[0].level == 1
