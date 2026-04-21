@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS documents (
     source_id TEXT,
     title TEXT NOT NULL,
     original_content TEXT,
+    raw_content TEXT,
     content_hash TEXT,
     storage_method TEXT,
     status TEXT DEFAULT 'pending',
@@ -112,7 +113,15 @@ class MetadataStore:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA_SQL)
+        await self._migrate_schema()
         await self._db.commit()
+
+    async def _migrate_schema(self) -> None:
+        """기존 DB에 누락된 컬럼을 idempotent하게 추가한다."""
+        cursor = await self.db.execute("PRAGMA table_info(documents)")
+        existing_columns = {row["name"] for row in await cursor.fetchall()}
+        if "raw_content" not in existing_columns:
+            await self.db.execute("ALTER TABLE documents ADD COLUMN raw_content TEXT")
 
     async def close(self) -> None:
         """DB 연결을 닫는다."""
@@ -138,13 +147,22 @@ class MetadataStore:
         source_id: str | None = None,
         url: str | None = None,
         author: str | None = None,
+        raw_content: str | None = None,
     ) -> int:
-        """문서를 생성하고 ID를 반환한다."""
+        """문서를 생성하고 ID를 반환한다.
+
+        ``raw_content``는 소스 원본 (예: Confluence Storage Format HTML).
+        하류에서 구조화 추출기가 재파싱할 수 있도록 보존한다. 없으면 NULL.
+        """
         cursor = await self.db.execute(
             """INSERT INTO documents
-               (source_type, source_id, title, original_content, content_hash, url, author)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (source_type, source_id, title, original_content, content_hash, url, author),
+               (source_type, source_id, title, original_content, raw_content,
+                content_hash, url, author)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source_type, source_id, title, original_content, raw_content,
+                content_hash, url, author,
+            ),
         )
         await self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
@@ -200,15 +218,31 @@ class MetadataStore:
         document_id: int,
         original_content: str,
         content_hash: str,
+        raw_content: str | None = None,
     ) -> None:
-        """문서 원본 내용과 해시를 갱신한다."""
-        await self.db.execute(
-            """UPDATE documents
-               SET original_content = ?, content_hash = ?, version = version + 1,
-                   updated_at = CURRENT_TIMESTAMP
-               WHERE id = ?""",
-            (original_content, content_hash, document_id),
-        )
+        """문서 원본 내용과 해시를 갱신한다.
+
+        ``raw_content``가 ``None``이 아니면 함께 갱신한다. ``None``이면
+        기존 ``raw_content`` 값을 유지한다 (마크다운만 수정되는 케이스 지원).
+        """
+        if raw_content is None:
+            await self.db.execute(
+                """UPDATE documents
+                   SET original_content = ?, content_hash = ?,
+                       version = version + 1,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (original_content, content_hash, document_id),
+            )
+        else:
+            await self.db.execute(
+                """UPDATE documents
+                   SET original_content = ?, raw_content = ?, content_hash = ?,
+                       version = version + 1,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (original_content, raw_content, content_hash, document_id),
+            )
         await self.db.commit()
 
     async def delete_document(self, document_id: int) -> None:

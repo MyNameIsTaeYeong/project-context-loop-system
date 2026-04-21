@@ -361,11 +361,11 @@ async def import_page_via_mcp(
           - "changed" (bool): True면 내용이 변경됨.
     """
     page_data = await get_page(session, page_id)
-    raw_content = _extract_page_content(page_data)
+    html_body = _extract_page_content(page_data)
     title = _extract_page_title(page_data, page_id)
 
     # HTML → 마크다운 변환
-    content = convert_html_to_markdown(raw_content) if raw_content else raw_content
+    content = convert_html_to_markdown(html_body) if html_body else html_body
 
     content_hash = compute_content_hash(content)
 
@@ -380,6 +380,7 @@ async def import_page_via_mcp(
             title=title,
             original_content=content,
             content_hash=content_hash,
+            raw_content=html_body or None,
         )
         await store.add_processing_history(
             document_id=doc_id,
@@ -398,6 +399,7 @@ async def import_page_via_mcp(
         existing["id"],
         original_content=content,
         content_hash=content_hash,
+        raw_content=html_body or None,
     )
     await store.update_document_status(existing["id"], status="changed")
     await store.add_processing_history(

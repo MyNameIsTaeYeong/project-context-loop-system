@@ -73,6 +73,127 @@ async def test_update_document_content(store: MetadataStore) -> None:
     assert doc["status"] == "pending"  # status는 호출자가 별도로 설정
 
 
+async def test_create_document_persists_raw_content(store: MetadataStore) -> None:
+    """``raw_content``를 지정해 생성하면 DB에 그대로 저장된다."""
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="페이지",
+        original_content="# 페이지",
+        content_hash="h",
+        raw_content="<h1>페이지</h1>",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] == "<h1>페이지</h1>"
+
+
+async def test_create_document_without_raw_content_is_null(store: MetadataStore) -> None:
+    """``raw_content``를 생략하면 NULL."""
+    doc_id = await store.create_document(
+        source_type="manual",
+        title="문서",
+        original_content="x",
+        content_hash="h",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] is None
+
+
+async def test_update_document_content_updates_raw_content(store: MetadataStore) -> None:
+    """``raw_content``를 넘기면 함께 갱신된다."""
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="old",
+        content_hash="h1",
+        raw_content="<p>old</p>",
+    )
+    await store.update_document_content(
+        doc_id,
+        "new content",
+        "h2",
+        raw_content="<p>new</p>",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] == "<p>new</p>"
+    assert doc["original_content"] == "new content"
+
+
+async def test_update_document_content_preserves_raw_content_when_omitted(
+    store: MetadataStore,
+) -> None:
+    """``raw_content=None``이면 기존 값을 유지한다."""
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="old",
+        content_hash="h1",
+        raw_content="<p>original</p>",
+    )
+    await store.update_document_content(doc_id, "new content", "h2")
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] == "<p>original</p>"
+    assert doc["original_content"] == "new content"
+
+
+async def test_migration_adds_raw_content_to_legacy_db(tmp_path: Path) -> None:
+    """구버전 스키마 DB(raw_content 컬럼 없음)를 열면 ALTER TABLE로 컬럼이 추가된다."""
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.db"
+
+    # 구버전 스키마: raw_content 없는 documents 테이블
+    async with aiosqlite.connect(db_path) as legacy:
+        await legacy.execute(
+            """CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                title TEXT NOT NULL,
+                original_content TEXT,
+                content_hash TEXT,
+                storage_method TEXT,
+                status TEXT DEFAULT 'pending',
+                version INTEGER DEFAULT 1,
+                url TEXT,
+                author TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_type, source_id)
+            )"""
+        )
+        await legacy.execute(
+            "INSERT INTO documents (source_type, title, original_content, content_hash)"
+            " VALUES (?, ?, ?, ?)",
+            ("manual", "legacy", "legacy content", "h"),
+        )
+        await legacy.commit()
+
+    # 새 MetadataStore로 열면 마이그레이션이 실행되어야 함
+    store = MetadataStore(db_path)
+    await store.initialize()
+    try:
+        cursor = await store.db.execute("PRAGMA table_info(documents)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        assert "raw_content" in columns
+
+        # 기존 row는 raw_content가 NULL
+        cursor = await store.db.execute(
+            "SELECT raw_content FROM documents WHERE title = ?", ("legacy",)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["raw_content"] is None
+    finally:
+        await store.close()
+
+
 async def test_delete_document_cascades(store: MetadataStore) -> None:
     doc_id = await store.create_document(
         source_type="manual", title="문서", original_content="x", content_hash="h"

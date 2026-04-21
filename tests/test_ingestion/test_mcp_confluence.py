@@ -394,3 +394,39 @@ async def test_import_page_via_mcp_converts_html(meta_store: MetadataStore) -> N
     # HTML 태그가 아닌 마크다운 형식으로 저장됨
     assert "<h1>" not in doc["original_content"]
     assert "Title" in doc["original_content"]
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_persists_raw_html(meta_store: MetadataStore) -> None:
+    """임포트 시 원본 HTML이 ``raw_content``에 보존된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "p11", "title": "HTML Page", "content": "<h1>Title</h1><p>Body</p>"}'
+    )
+
+    result = await import_page_via_mcp(session, meta_store, "p11")
+    doc = await meta_store.get_document(result["id"])
+    assert doc is not None
+    assert doc["raw_content"] == "<h1>Title</h1><p>Body</p>"
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_update_refreshes_raw_html(
+    meta_store: MetadataStore,
+) -> None:
+    """내용이 바뀌면 ``raw_content``도 새 HTML로 갱신된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "p12", "title": "Page", "content": "<p>v1</p>"}'
+    )
+    await import_page_via_mcp(session, meta_store, "p12")
+
+    session.call_tool.return_value = _make_result(
+        '{"id": "p12", "title": "Page", "content": "<p>v2</p>"}'
+    )
+    result2 = await import_page_via_mcp(session, meta_store, "p12")
+    assert result2["changed"] is True
+
+    doc = await meta_store.get_document(result2["id"])
+    assert doc is not None
+    assert doc["raw_content"] == "<p>v2</p>"

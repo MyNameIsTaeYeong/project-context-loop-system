@@ -179,10 +179,21 @@ class ConfluenceClient:
             (마크다운 문자열, 페이지 메타데이터 dict) 튜플.
             메타데이터 dict에는 id, title, version, authorId, createdAt 등이 포함된다.
         """
+        markdown, _html, page = await self.get_page_content_with_html(page_id)
+        return markdown, page
+
+    async def get_page_content_with_html(
+        self, page_id: str,
+    ) -> tuple[str, str, dict[str, Any]]:
+        """페이지 본문을 마크다운과 원본 HTML 양쪽으로 반환한다.
+
+        Returns:
+            (마크다운 문자열, 원본 Storage Format HTML, 페이지 메타데이터 dict).
+        """
         page = await self.get_page(page_id)
         html_body = page.get("body", {}).get("storage", {}).get("value", "")
         markdown = _html_to_markdown(html_body)
-        return markdown, page
+        return markdown, html_body, page
 
 
 async def import_page(
@@ -208,7 +219,7 @@ async def import_page(
           - "created" (bool): True면 새로 생성됨.
           - "changed" (bool): True면 내용이 변경됨.
     """
-    markdown, page_meta = await client.get_page_content_as_markdown(page_id)
+    markdown, html_body, page_meta = await client.get_page_content_with_html(page_id)
     content_hash = compute_content_hash(markdown)
     title = page_meta.get("title", f"Confluence Page {page_id}")
     author_id = page_meta.get("authorId") or page_meta.get("createdBy", {}).get("accountId")
@@ -227,6 +238,7 @@ async def import_page(
             content_hash=content_hash,
             url=page_url,
             author=author_id,
+            raw_content=html_body or None,
         )
         await store.add_processing_history(
             document_id=doc_id,
@@ -245,6 +257,7 @@ async def import_page(
         existing["id"],
         original_content=markdown,
         content_hash=content_hash,
+        raw_content=html_body or None,
     )
     await store.update_document_status(existing["id"], status="changed")
     await store.add_processing_history(
