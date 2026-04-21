@@ -24,6 +24,7 @@ from context_loop.processor.ast_code_extractor import (
 from context_loop.processor.chunker import chunk_text
 from context_loop.processor.classifier import StorageMethod, classify_document
 from context_loop.processor.graph_extractor import extract_graph
+from context_loop.processor.link_graph_builder import build_link_graph
 from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
@@ -87,8 +88,10 @@ async def process_document(
           - document_id: int
           - storage_method: str
           - chunk_count: int
-          - node_count: int
-          - edge_count: int
+          - node_count: int (LLM 추출 + 링크 그래프 합계)
+          - edge_count: int (LLM 추출 + 링크 그래프 합계)
+          - link_node_count: int — 링크 그래프로 생성된 노드 수
+          - link_edge_count: int — 링크 그래프로 생성된 엣지 수
           - extraction: Confluence 소스에서 ``raw_content``가 있을 때만 dict,
             아니면 ``None``. 키: sections, outbound_links, code_blocks,
             tables, mentions (각 개수).
@@ -109,6 +112,8 @@ async def process_document(
         chunk_count = 0
         node_count = 0
         edge_count = 0
+        link_node_count = 0
+        link_edge_count = 0
         extracted: ExtractedDocument | None = None  # Confluence 경로에서만 채워짐
 
         # --- git_code: AST 기반 정적 추출 (LLM 호출 없음) ---
@@ -240,6 +245,26 @@ async def process_document(
                     node_count = result["nodes"]
                     edge_count = result["edges"]
 
+            # Confluence 링크 그래프 (LLM 호출 없음): outbound_links 기반.
+            # LLM classifier 결과(storage_method)와 무관하게 항상 실행한다.
+            if extracted is not None and extracted.outbound_links:
+                link_graph = build_link_graph(extracted, doc_title=title)
+                if link_graph.entities:
+                    link_result = await graph_store.save_graph_data(
+                        document_id, link_graph,
+                    )
+                    link_node_count = link_result["nodes"]
+                    link_edge_count = link_result["edges"]
+                    node_count += link_node_count
+                    edge_count += link_edge_count
+                    logger.info(
+                        "링크 그래프 저장 — doc_id=%d, nodes=%d, edges=%d, merged=%d",
+                        document_id,
+                        link_node_count,
+                        link_edge_count,
+                        link_result.get("merged", 0),
+                    )
+
         # 완료
         await complete_reprocessing(
             meta_store,
@@ -254,6 +279,8 @@ async def process_document(
             "chunk_count": chunk_count,
             "node_count": node_count,
             "edge_count": edge_count,
+            "link_node_count": link_node_count,
+            "link_edge_count": link_edge_count,
             "extraction": (
                 {
                     "sections": len(extracted.sections),

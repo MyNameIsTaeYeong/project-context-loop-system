@@ -1,10 +1,15 @@
-"""pipeline.process_document 테스트 — Confluence 추출기 주입 위주.
+"""pipeline.process_document 테스트 — Confluence 추출기 + 링크 그래프 주입.
 
 Step 1.5에서 추가된 아래 동작을 검증한다:
   - source_type이 confluence/confluence_mcp이고 raw_content가 있으면
     confluence_extractor.extract()가 호출되어 반환 dict에 extraction 메트릭이 노출됨
   - raw_content가 None인 Confluence 문서는 기존 경로(original_content만 사용) 유지
   - 다른 source_type(manual/upload)은 추출기 미호출
+
+Step 2에서 추가된 아래 동작도 검증한다:
+  - extracted.outbound_links가 있으면 build_link_graph → save_graph_data가
+    호출되어 link_node_count/link_edge_count 메트릭이 노출됨
+  - outbound_links가 비어 있으면 링크 그래프 호출 없음
 
 파이프라인의 LLM/벡터/그래프 호출은 mock으로 대체해 격리한다.
 """
@@ -211,6 +216,159 @@ async def test_confluence_rest_source_type_also_triggers_extractor(
 
     assert result["extraction"] is not None
     assert result["extraction"]["sections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_link_graph_saved_for_confluence_with_outbound_links(
+    store: MetadataStore,
+) -> None:
+    """Confluence 문서에 outbound_links가 있으면 링크 그래프가 GraphStore에 저장된다."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    graph_store.save_graph_data = AsyncMock(return_value={
+        "nodes": 2, "edges": 1, "merged": 0,
+    })
+
+    with patch(
+        "context_loop.processor.pipeline.classify_document",
+        new_callable=AsyncMock,
+        return_value=("chunk", "테스트"),
+    ), patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=[],
+    ):
+        result = await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            llm_client=llm_client,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # storage_method='chunk'이므로 LLM graph 블록은 skip, 링크 그래프만 저장됨
+    graph_store.save_graph_data.assert_awaited_once()
+    saved_doc_id, saved_graph = graph_store.save_graph_data.await_args.args
+    assert saved_doc_id == doc_id
+    # CONFLUENCE_HTML은 page link 1개를 포함 → self + target 2 엔티티, 1 관계
+    entity_types = {e.entity_type for e in saved_graph.entities}
+    assert entity_types == {"document"}
+    assert len(saved_graph.entities) == 2
+    assert len(saved_graph.relations) == 1
+    assert saved_graph.relations[0].relation_type == "references"
+
+    assert result["link_node_count"] == 2
+    assert result["link_edge_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_link_graph_skipped_when_no_outbound_links(
+    store: MetadataStore,
+) -> None:
+    """outbound_links가 비어 있으면 링크 그래프 save가 호출되지 않는다."""
+    doc_id = await _create_confluence_doc(
+        store,
+        raw_content="<h1>제목</h1><p>링크 없는 본문</p>",
+    )
+    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+
+    with patch(
+        "context_loop.processor.pipeline.classify_document",
+        new_callable=AsyncMock,
+        return_value=("chunk", "테스트"),
+    ), patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=[],
+    ):
+        result = await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            llm_client=llm_client,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    graph_store.save_graph_data.assert_not_awaited()
+    assert result["link_node_count"] == 0
+    assert result["link_edge_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_link_graph_skipped_for_non_confluence_source(
+    store: MetadataStore,
+) -> None:
+    """upload 등 Confluence가 아닌 소스는 추출기·링크 그래프 모두 건너뛴다."""
+    doc_id = await store.create_document(
+        source_type="upload",
+        title="문서",
+        original_content="본문",
+        content_hash="h",
+        raw_content="<h1>ignored</h1>",
+    )
+    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+
+    with patch(
+        "context_loop.processor.pipeline.classify_document",
+        new_callable=AsyncMock,
+        return_value=("chunk", "테스트"),
+    ), patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=[],
+    ):
+        result = await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            llm_client=llm_client,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    graph_store.save_graph_data.assert_not_awaited()
+    assert result["link_node_count"] == 0
+    assert result["link_edge_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_link_graph_runs_even_when_storage_method_is_chunk(
+    store: MetadataStore,
+) -> None:
+    """storage_method='chunk'이어도 링크 그래프는 실행된다 (LLM classifier와 무관)."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, llm_client, embedding_client = _make_stores()
+    graph_store.save_graph_data = AsyncMock(return_value={
+        "nodes": 2, "edges": 1, "merged": 0,
+    })
+
+    with patch(
+        "context_loop.processor.pipeline.classify_document",
+        new_callable=AsyncMock,
+        return_value=("chunk", "테스트"),
+    ), patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=[],
+    ), patch(
+        "context_loop.processor.pipeline.extract_graph",
+        new_callable=AsyncMock,
+    ) as mock_extract_graph:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            llm_client=llm_client,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # storage_method='chunk'이면 LLM graph 추출은 호출되지 않는다
+    mock_extract_graph.assert_not_awaited()
+    # 그래도 링크 그래프는 실행되어 save_graph_data가 한 번 호출
+    graph_store.save_graph_data.assert_awaited_once()
 
 
 @pytest.mark.asyncio
