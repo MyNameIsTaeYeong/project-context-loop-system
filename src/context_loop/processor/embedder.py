@@ -32,6 +32,7 @@ class EndpointEmbeddingClient(Embeddings):
         model: 사용할 임베딩 모델 ID.
         api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
         timeout: HTTP 요청 타임아웃(초). 기본 60초.
+        headers: 모든 요청에 추가할 커스텀 헤더. None 또는 빈 dict이면 미사용.
     """
 
     def __init__(
@@ -40,6 +41,7 @@ class EndpointEmbeddingClient(Embeddings):
         model: str,
         api_key: str = "",
         timeout: float = 60.0,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._url = endpoint
         self._model = model
@@ -47,6 +49,8 @@ class EndpointEmbeddingClient(Embeddings):
         self._headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             self._headers["Authorization"] = f"Bearer {api_key}"
+        if headers:
+            self._headers.update(headers)
 
     def _parse_response(self, data: dict) -> list[list[float]]:
         """응답 JSON에서 임베딩 벡터 목록을 인덱스 순으로 반환한다."""

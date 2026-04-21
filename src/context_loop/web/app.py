@@ -32,6 +32,7 @@ def _build_llm_client(config: Config):
             endpoint=config.get("llm.endpoint", ""),
             model=config.get("llm.model", ""),
             api_key=config.get("llm.api_key", ""),
+            headers=config.get("llm.headers") or None,
         )
     if provider == "anthropic":
         api_key = get_token("anthropic", "api_key")
@@ -51,6 +52,7 @@ def _build_embedding_client(config: Config):
             endpoint=config.get("processor.embedding_endpoint", ""),
             model=config.get("processor.embedding_model", ""),
             api_key=config.get("processor.embedding_api_key", ""),
+            headers=config.get("processor.embedding_headers") or None,
         )
     if embed_provider == "local":
         return LocalEmbeddingClient(

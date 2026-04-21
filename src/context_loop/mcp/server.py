@@ -55,6 +55,7 @@ async def _initialize() -> None:
             endpoint=_config.get("processor.embedding_endpoint", ""),
             model=_config.get("processor.embedding_model", "text-embedding-3-small"),
             api_key=_config.get("processor.embedding_api_key", ""),
+            headers=_config.get("processor.embedding_headers") or None,
         )
     else:
         _embedding_client = LocalEmbeddingClient(
