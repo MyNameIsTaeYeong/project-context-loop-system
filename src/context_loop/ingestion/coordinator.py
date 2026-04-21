@@ -33,7 +33,6 @@ from context_loop.storage.metadata_store import MetadataStore
 if TYPE_CHECKING:
     from langchain_core.embeddings import Embeddings
 
-    from context_loop.processor.llm_client import LLMClient
     from context_loop.storage.graph_store import GraphStore
     from context_loop.storage.vector_store import VectorStore
 
@@ -78,7 +77,6 @@ class CoordinatorAgent:
         git_config: 파싱된 GitSourceConfig. None이면 config에서 로드.
         vector_store: VectorStore 인스턴스 (파이프라인용, optional).
         graph_store: GraphStore 인스턴스 (파이프라인용, optional).
-        pipeline_llm_client: LLM 클라이언트 (파이프라인용, optional).
         embedding_client: 임베딩 클라이언트 (파이프라인용, optional).
     """
 
@@ -90,7 +88,6 @@ class CoordinatorAgent:
         *,
         vector_store: VectorStore | None = None,
         graph_store: GraphStore | None = None,
-        pipeline_llm_client: LLMClient | None = None,
         embedding_client: Embeddings | None = None,
     ) -> None:
         self._store = store
@@ -99,7 +96,6 @@ class CoordinatorAgent:
         # 기존 처리 파이프라인 의존성
         self._vector_store = vector_store
         self._graph_store = graph_store
-        self._pipeline_llm_client = pipeline_llm_client
         self._embedding_client = embedding_client
 
     # --- Public API ---
@@ -273,7 +269,6 @@ class CoordinatorAgent:
         return all([
             self._vector_store is not None,
             self._graph_store is not None,
-            self._pipeline_llm_client is not None,
             self._embedding_client is not None,
         ])
 
@@ -306,10 +301,8 @@ class CoordinatorAgent:
                 meta_store=self._store,
                 vector_store=self._vector_store,  # type: ignore[arg-type]
                 graph_store=self._graph_store,  # type: ignore[arg-type]
-                llm_client=self._pipeline_llm_client,  # type: ignore[arg-type]
                 embedding_client=self._embedding_client,  # type: ignore[arg-type]
                 config=pipeline_config,
-                storage_method_override="hybrid",
             )
             logger.info(
                 "파이프라인 처리 완료: document_id=%d, method=%s, chunks=%d, nodes=%d",

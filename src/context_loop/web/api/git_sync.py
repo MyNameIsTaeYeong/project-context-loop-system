@@ -13,7 +13,6 @@ from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.git_config import GitSourceConfig, load_git_source_config
-from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -21,7 +20,6 @@ from context_loop.web.dependencies import (
     get_config,
     get_embedding_client,
     get_graph_store,
-    get_llm_client,
     get_meta_store,
     get_templates,
     get_vector_store,
@@ -154,7 +152,6 @@ async def start_sync(
     meta_store: MetadataStore = Depends(get_meta_store),
     vector_store: VectorStore = Depends(get_vector_store),
     graph_store: GraphStore = Depends(get_graph_store),
-    llm_client: LLMClient = Depends(get_llm_client),
     embedding_client: Embeddings = Depends(get_embedding_client),
 ):
     """Git 동기화를 백그라운드로 시작한다."""
@@ -182,7 +179,6 @@ async def start_sync(
         config, meta_store, git_config,
         vector_store=vector_store,
         graph_store=graph_store,
-        llm_client=llm_client,
         embedding_client=embedding_client,
     ))
 
@@ -196,7 +192,6 @@ async def _run_sync(
     *,
     vector_store: VectorStore | None = None,
     graph_store: GraphStore | None = None,
-    llm_client: LLMClient | None = None,
     embedding_client: Embeddings | None = None,
 ) -> None:
     """백그라운드에서 Git 동기화 파이프라인을 실행한다."""
@@ -211,7 +206,6 @@ async def _run_sync(
             git_config=git_config,
             vector_store=vector_store,
             graph_store=graph_store,
-            pipeline_llm_client=llm_client,
             embedding_client=embedding_client,
         )
 
