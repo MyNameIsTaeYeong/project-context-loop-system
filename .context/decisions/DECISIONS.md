@@ -569,3 +569,25 @@
   - **재파싱 제거**: 추출기가 이미 만든 구조를 그대로 소비 — 헤딩 텍스트와 HTML 헤딩이 다를 때 생기는 불일치 제거.
   - **역호환**: `sections`가 빈 `ExtractedDocument`는 `plain_text` 기반 `chunk_text()` 폴백 → 기존 동작 보존.
 - **영향**: `chunker.py`에 `chunk_extracted_document` + `_split_markdown_blocks` + `_chunk_blocks` 추가, `chunk_text`도 새 블록 분리기를 공유하도록 리팩터. `pipeline.py`의 Confluence 분기 교체 + VectorStore metadata에 `section_anchor` 필드. 테스트: chunker +4(코드블록 원자성/테이블 원자성/section path·anchor 전파/빈 sections 폴백), pipeline 테스트 4건 패치 대상 갱신. 커밋: 10b23d6.
+
+---
+
+## D-042: 멀티뷰 임베딩 — 청크당 body + meta 두 벡터 (Phase 1)
+
+- **일시**: 2026-04-22
+- **맥락**: D-041 이후 청크의 `section_path`·`title`은 **메타데이터**에만 남고 임베딩 텍스트에는 포함되지 않았다. 본문에 경로 키워드가 없는 청크(예: 표 행만 들어있는 청크)는 "운영 챕터", "배포 가이드"처럼 **섹션 명칭으로 묻는 질의**에 리콜이 약했다. D-036의 "임베딩 텍스트 ≠ 저장 텍스트" 원칙을 Confluence 청크에도 일반화하되, 기존 본문 임베딩의 강점(본문 키워드 직접 매칭)을 해치지 않는 방식이 필요했다.
+- **결정**:
+  - 한 논리 청크당 **두 ChromaDB 엔트리**를 저장한다.
+    - `{chunk.id}#body` : 임베딩=본문, document=본문
+    - `{chunk.id}#meta` : 임베딩=`title + section_path`, document=본문(동일)
+  - 두 엔트리는 metadata에 `logical_chunk_id`, `view ∈ {body, meta}`를 공유한다. SQLite `chunks` 테이블은 여전히 논리 청크당 1행.
+  - 검색 시 `_search_chunks` 에서 `n_results = max_chunks * 2`로 over-fetch한 뒤 `logical_chunk_id`로 dedup, 거리 오름차순이 유지되므로 먼저 등장한(최소 distance) 항목을 채택.
+  - `title`/`section_path`가 모두 비어 있으면 meta 뷰 엔트리를 생성하지 않음(호출 낭비 방지).
+  - Phase 1 범위: 일반 문서 경로(Confluence, upload, manual). `git_code`는 이미 D-036의 embed/store 분리 패턴을 쓰고 있어 별도 조치 없음.
+- **이유**:
+  - **리콜↑, 프리시전 유지**: 본문 뷰는 그대로 유지되므로 본문 중심 질의는 기존 성능. meta 뷰는 path/title 기반 질의에서 **추가로** 걸림.
+  - **자동 질의 적응**: "kubectl 명령어" 같은 본문 친화 질의는 body 뷰가 이김, "운영 챕터 보여줘" 같은 경로 친화 질의는 meta 뷰가 이김. 라우팅 로직 불필요.
+  - **비용**: meta 텍스트는 20~50 토큰 수준이라 임베딩 토큰 총량은 +5~10%. 호출은 같은 `aembed_documents` 1회로 배치 합침(body + 활성 meta를 이어붙여 1회 호출).
+  - **확장성**: 이 패턴에 `view=summary`, `view=signature` 등 미래 뷰를 더하면 그대로 재사용 가능.
+- **영향**: `processor/pipeline.py` 일반 분기 20여 줄 재작성 + `_build_meta_view_text` 헬퍼 추가. `mcp/context_assembler.py::_search_chunks` 에 over-fetch + dedup 로직. 테스트 +3(pipeline 2건: 멀티뷰 저장/meta 비어있을 때 생략, context_assembler 1건: dedup). 기존 문서는 재처리 전까지 body 뷰만 존재 — 호환성 이슈 없음(검색은 동일하게 동작).
+

@@ -371,6 +371,51 @@ async def test_search_chunks_no_threshold_returns_all(stores) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_chunks_dedupes_multi_view_entries(stores) -> None:
+    """D-042: 동일 논리 청크의 body/meta 뷰 중복을 dedup하여 1건만 반환.
+
+    두 엔트리가 같은 ``logical_chunk_id`` 를 공유하면 더 가까운 쪽의
+    distance가 유지되고, 본문은 한 번만 노출되어야 한다.
+    """
+    meta_store, vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="Doc", original_content="c", content_hash="hdup",
+    )
+    # 동일 logical_chunk_id 를 공유하는 body + meta 두 엔트리.
+    # meta 쪽이 쿼리와 더 가깝다(distance ↓).
+    vector_store.add_chunks(
+        chunk_ids=["c1#body", "c1#meta", "c2#body"],
+        embeddings=[[0.5, 0.5], [0.9, 0.1], [0.1, 0.9]],
+        documents=["본문 A", "본문 A", "본문 B"],
+        metadatas=[
+            {"document_id": doc_id, "chunk_index": 0,
+             "logical_chunk_id": "c1", "view": "body"},
+            {"document_id": doc_id, "chunk_index": 0,
+             "logical_chunk_id": "c1", "view": "meta"},
+            {"document_id": doc_id, "chunk_index": 1,
+             "logical_chunk_id": "c2", "view": "body"},
+        ],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    query_embedding = await embed_client.aembed_query("test")
+
+    results = await _search_chunks(
+        query_embedding, vector_store, max_chunks=10,
+        similarity_threshold=0.0,
+    )
+
+    logical_ids = [r["metadata"]["logical_chunk_id"] for r in results]
+    assert len(logical_ids) == 2
+    assert logical_ids.count("c1") == 1
+    assert logical_ids.count("c2") == 1
+    # 먼저 등장한(최소 distance) meta 뷰가 남아야 한다
+    c1 = next(r for r in results if r["metadata"]["logical_chunk_id"] == "c1")
+    assert c1["metadata"]["view"] == "meta"
+
+
+@pytest.mark.asyncio
 async def test_assemble_context_with_reranking(stores) -> None:
     """리랭킹이 활성화되면 LLM 기반으로 결과가 재정렬된다."""
     meta_store, vector_store, graph_store = stores

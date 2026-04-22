@@ -158,6 +158,12 @@ async def _search_chunks(
 ) -> list[dict[str, Any]]:
     """벡터 유사도 검색을 수행하고 threshold 이하 결과를 제외한다.
 
+    멀티뷰 임베딩(D-042)을 사용하므로 한 논리 청크가 ``body``/``meta`` 두
+    엔트리로 존재할 수 있다. 과잉 인출(over-fetch)한 뒤
+    ``logical_chunk_id`` 로 dedup하여 동일 본문이 중복 반환되지 않게 한다.
+    거리 오름차순으로 도착하므로 먼저 등장하는 항목이 해당 청크의 최소
+    distance이며, 그 값을 유지한다.
+
     Args:
         query_embedding: 쿼리 임베딩 벡터.
         vector_store: 벡터 저장소.
@@ -168,13 +174,25 @@ async def _search_chunks(
     try:
         if vector_store.count() == 0 or query_embedding is None:
             return []
-        results = vector_store.search(query_embedding, n_results=max_chunks)
+        # 뷰 수(최대 2)를 고려해 over-fetch 후 dedup.
+        raw = vector_store.search(query_embedding, n_results=max_chunks * 2)
+        seen: set[Any] = set()
+        deduped: list[dict[str, Any]] = []
+        for r in raw:
+            meta = r.get("metadata") or {}
+            key = meta.get("logical_chunk_id") or r.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+            if len(deduped) >= max_chunks:
+                break
         if similarity_threshold > 0:
-            results = [
-                r for r in results
+            deduped = [
+                r for r in deduped
                 if (1 - r.get("distance", 1.0)) >= similarity_threshold
             ]
-        return results
+        return deduped
     except Exception:
         logger.warning("벡터 검색 실패", exc_info=True)
         return []
