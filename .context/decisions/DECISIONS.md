@@ -591,3 +591,15 @@
   - **확장성**: 이 패턴에 `view=summary`, `view=signature` 등 미래 뷰를 더하면 그대로 재사용 가능.
 - **영향**: `processor/pipeline.py` 일반 분기 20여 줄 재작성 + `_build_meta_view_text` 헬퍼 추가. `mcp/context_assembler.py::_search_chunks` 에 over-fetch + dedup 로직. 테스트 +3(pipeline 2건: 멀티뷰 저장/meta 비어있을 때 생략, context_assembler 1건: dedup). 기존 문서는 재처리 전까지 body 뷰만 존재 — 호환성 이슈 없음(검색은 동일하게 동작).
 
+### D-042 후속 (2026-04-22): 대시보드 청크 탭에 meta 뷰 노출 + chunks 테이블 스키마 보강
+
+운영자가 "이 청크가 무엇으로 임베딩됐는지"를 브라우저에서 확인하기 위한 가시성 추가.
+
+- **스키마 변경**: `chunks` 테이블에 `section_path TEXT DEFAULT ''`, `section_anchor TEXT DEFAULT ''` 컬럼 추가. `_migrate_schema()` 에 idempotent ALTER 로직 — 구버전 DB의 기존 row는 빈 문자열로 채워짐.
+- **저장 경로**: `metadata_store.create_chunk()` 시그니처에 두 파라미터 추가, 파이프라인의 두 분기(git_code/일반)가 모두 `chunk.section_path`/`chunk.section_anchor` 를 전달.
+- **재구성 함수 공개**: `pipeline._build_meta_view_text` → `pipeline.build_meta_view_text(title, section_path)` 로 시그니처 변경 + public 화. 파이프라인 저장 시점과 대시보드 조회 시점이 같은 결정론적 함수로 동일한 meta 텍스트를 산출.
+- **API**: `web/api/documents.py::tab_chunks` 가 청크 목록에 `meta_text` 필드를 합성해 템플릿에 전달. 별도 저장 없이 매 요청마다 재구성(D2-A 채택 — 규칙이 진화해도 마이그레이션 불필요).
+- **템플릿**: `tab_chunks.html` 이 각 청크에 대해 `<details>` 두 개(Body 기본 펼침, Meta 접힘)를 렌더, 헤더에 `section_path` 와 "body + meta"/"body only" 뱃지 표시.
+- **테스트 +3**: 청크 마이그레이션(구버전 DB 열기 → 컬럼 추가 + 빈 값 채움), `test_chunks_crud` 에 section_path/anchor 왕복 검증, `build_meta_view_text` 조합 단위 테스트(title only / path only / 둘 다 / 둘 다 없음 / 공백 트리밍).
+- **수동 UI 검증**: 임시 DB로 enrichment 로직만 분리 호출하여 출력 형태 확인(템플릿 렌더는 선재 Jinja2 캐시 이슈로 자동 테스트 불가, 데이터 경로는 검증).
+

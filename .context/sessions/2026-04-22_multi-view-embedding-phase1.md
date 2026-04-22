@@ -54,3 +54,42 @@ tests/ (test_web 제외): 450 passed
 - Phase 3: LLM 생성 요약 뷰 (비쌈, A/B 측정 후).
 - 기존 문서는 재처리 전까지 body 뷰만 존재 — 일괄 재처리 기능이 있다면 운영 단계에서 1회 트리거하면 전체 인덱스가 멀티뷰로 업그레이드됨.
 - meta 뷰 유사도 과잉 획득이 측정되면 `view == "meta"`에 가중 페널티(예: 0.85) 후처리 옵션 검토.
+
+---
+
+## 후속: 대시보드 청크 탭에 meta 뷰 노출 (같은 날, 옵션 3)
+
+운영자가 "이 청크가 무엇으로 임베딩됐는지"를 브라우저에서 직접 확인할 수 있도록 대시보드에 노출.
+
+### 변경
+
+**Phase A — 데이터 레이어**
+- `chunks` 테이블에 `section_path TEXT DEFAULT ''` + `section_anchor TEXT DEFAULT ''` 컬럼 추가.
+- `_migrate_schema()` 에 idempotent ALTER. 구버전 DB는 `PRAGMA table_info(chunks)` 검사 후 컬럼이 없을 때만 추가, 기존 row는 빈 문자열로 채워짐 (D3-A 정책).
+- `create_chunk()` 시그니처에 두 파라미터(기본값 `""`) 추가.
+- `processor/pipeline.py` 두 분기(git_code 분기 L155, 일반 분기 L253) 모두 `chunk.section_path`/`chunk.section_anchor` 를 전달.
+
+**Phase B — API**
+- `pipeline._build_meta_view_text` → `pipeline.build_meta_view_text(title, section_path)` 로 시그니처 변경 + public.
+- `web/api/documents.py::tab_chunks` 가 각 청크에 `meta_text` 필드를 합성해 템플릿에 전달. 매 요청마다 결정론적 재구성(별도 저장 없음, D2-A).
+
+**Phase C — 템플릿**
+- `tab_chunks.html` 재작성: 청크별로 `<details open>` Body + `<details>` Meta 두 섹션. 헤더에 `section_path` 와 `body + meta` / `body only` 뱃지 표시.
+- 기존 Pico CSS 컨벤션(article/header/details/summary) 유지.
+
+### 테스트
+
+- `test_metadata_store.py` +2:
+  - `test_migration_adds_section_columns_to_legacy_chunks`: 구버전 DB에서 컬럼 추가 + 기존 row는 빈 문자열로 채워짐.
+  - `test_chunks_crud` 확장: section_path/anchor 왕복 + 기본값 `""` 검증.
+- `test_pipeline.py` +1:
+  - `test_build_meta_view_text_combinations`: title-only / path-only / 둘 다 / 둘 다 없음 / 공백 트리밍.
+  - 기존 `test_multi_view_embeddings_stored_for_chunks` 에 SQLite 청크의 section_path/anchor 보존 검증 추가.
+- 비-web 전체: 452건 통과.
+- **수동 UI 자동화 한계**: 선재 Jinja2 캐시 이슈로 `test_web/` 가 14건 깨져있어 청크 탭 템플릿 렌더 검증을 자동화하지 못함. 대신 임시 DB + `build_meta_view_text` 직접 호출 스모크 테스트로 데이터 경로(섹션 정보 → enrichment → meta_text)를 검증.
+
+### 결정 정합성 (D-042 후속)
+
+- D1-A: SQLite 컬럼 추가 채택 (조회 단순, 향후 deep-link/검색 결과에도 재사용)
+- D2-A: meta 텍스트 재구성 (저장 안 함, 규칙 변경 시 마이그레이션 불요)
+- D3-A: 구버전 청크는 그대로 두고 신규 처리만 채움 (재처리는 사용자 트리거)
