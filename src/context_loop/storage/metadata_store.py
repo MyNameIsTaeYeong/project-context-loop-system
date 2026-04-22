@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER,
     content TEXT,
-    token_count INTEGER
+    token_count INTEGER,
+    section_path TEXT DEFAULT '',
+    section_anchor TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -122,6 +124,17 @@ class MetadataStore:
         existing_columns = {row["name"] for row in await cursor.fetchall()}
         if "raw_content" not in existing_columns:
             await self.db.execute("ALTER TABLE documents ADD COLUMN raw_content TEXT")
+
+        cursor = await self.db.execute("PRAGMA table_info(chunks)")
+        chunk_columns = {row["name"] for row in await cursor.fetchall()}
+        if "section_path" not in chunk_columns:
+            await self.db.execute(
+                "ALTER TABLE chunks ADD COLUMN section_path TEXT DEFAULT ''",
+            )
+        if "section_anchor" not in chunk_columns:
+            await self.db.execute(
+                "ALTER TABLE chunks ADD COLUMN section_anchor TEXT DEFAULT ''",
+            )
 
     async def close(self) -> None:
         """DB 연결을 닫는다."""
@@ -260,11 +273,19 @@ class MetadataStore:
         chunk_index: int,
         content: str,
         token_count: int,
+        section_path: str = "",
+        section_anchor: str = "",
     ) -> None:
         """청크를 저장한다."""
         await self.db.execute(
-            "INSERT INTO chunks (id, document_id, chunk_index, content, token_count) VALUES (?, ?, ?, ?, ?)",
-            (chunk_id, document_id, chunk_index, content, token_count),
+            "INSERT INTO chunks "
+            "(id, document_id, chunk_index, content, token_count, "
+            " section_path, section_anchor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                chunk_id, document_id, chunk_index, content, token_count,
+                section_path, section_anchor,
+            ),
         )
         await self.db.commit()
 
