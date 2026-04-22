@@ -603,3 +603,20 @@
 - **테스트 +3**: 청크 마이그레이션(구버전 DB 열기 → 컬럼 추가 + 빈 값 채움), `test_chunks_crud` 에 section_path/anchor 왕복 검증, `build_meta_view_text` 조합 단위 테스트(title only / path only / 둘 다 / 둘 다 없음 / 공백 트리밍).
 - **수동 UI 검증**: 임시 DB로 enrichment 로직만 분리 호출하여 출력 형태 확인(템플릿 렌더는 선재 Jinja2 캐시 이슈로 자동 테스트 불가, 데이터 경로는 검증).
 
+### D-042 후속 (2026-04-22) 보강: git_code 청크 표시 정정 + embed_text 영속화
+
+운영자 리뷰에서 "git_code 청크의 body가 임베딩 대상으로 표시되는데 실제로는 임베딩 대상이 아니다, meta 정보도 맞는지 확인 필요"는 지적이 들어옴. 코드 확인 결과:
+
+- git_code 분기는 D-036 패턴(`embed_texts` 임베딩, `chunk.content` 저장)을 그대로 유지하며, D-042 멀티뷰의 `#body`/`#meta` 접미사도 붙이지 않음 — ChromaDB에 청크당 1엔트리.
+- 그럼에도 대시보드는 모든 source_type에 동일 템플릿을 적용해 `chunk.content` 를 "Body (임베딩 대상)"로, `build_meta_view_text(title, section_path)` 를 "Meta (추가 임베딩 대상)"로 표시 → **두 표시 모두 git_code에서는 거짓**.
+- `embed_texts` 는 임베딩 직후 버려져 어디에도 영속화되지 않았음 → 정확한 표시를 위해 저장이 필요.
+
+**수정**:
+- `chunks` 테이블에 `embed_text TEXT DEFAULT ''` 컬럼 추가 + `_migrate_schema()` 에 idempotent ALTER. `create_chunk()` 시그니처에 `embed_text: str = ""` 추가.
+- 파이프라인 git_code 분기가 `create_chunk(..., embed_text=embed_texts[i])` 로 임베딩 입력을 영속화. 일반 분기는 인자 생략(빈 문자열, 본문 자체가 임베딩 입력이라 별도 저장 불필요).
+- `web/api/documents.py::tab_chunks` 가 `doc.source_type` 을 조회해 git_code일 때 meta_text 합성을 생략하고 `source_type` 을 템플릿에 전달.
+- `tab_chunks.html` 이 source_type으로 분기:
+  - **git_code**: "Stored Content (검색 결과 반환용 — 임베딩 대상 아님)" + "Embedding Text (이름+시그니처+docstring — 실제 임베딩 입력)" 두 `<details>`. 뱃지 `code · single vector`. 기존(컬럼 추가 전 처리) 청크는 embed_text가 비어 있으면 안내 문구 표시.
+  - **그 외**: 기존 "Body (임베딩 대상)" + "Meta (추가 임베딩 대상)" 유지.
+- 테스트 +1: `test_git_code_pipeline_persists_embed_text` — embed_text가 SQLite에 영속화되며 본문(`content`)과 다른 값임(D-036 분리 원칙). 기존 마이그레이션·CRUD 테스트에 `embed_text` 컬럼 검증 추가.
+

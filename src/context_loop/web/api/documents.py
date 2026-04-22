@@ -137,24 +137,39 @@ async def tab_chunks(
 ):
     """청크 탭 HTML 파셜.
 
-    각 청크에 대해 본문(``content``)과 함께 멀티뷰 임베딩(D-042)의
-    ``meta_text`` 를 함께 전달한다. ``meta_text`` 는 ``title`` +
-    ``section_path`` 결정론적 재구성이므로 별도 저장 없이 같은 값을 복원한다.
-    빈 문자열이면 해당 청크는 body 뷰만 가진다.
+    소스 타입에 따라 청크의 임베딩 표현이 다르므로 가시성도 분기한다:
+
+      - ``git_code``: D-036에 따라 임베딩 입력은 ``embed_text``
+        (이름+시그니처+docstring), 저장 본문은 ``content`` (전체 코드).
+        ChromaDB 엔트리는 청크당 1개 — meta 뷰 없음.
+      - 그 외(Confluence/upload/manual): D-042 멀티뷰. 임베딩 입력은
+        ``content`` 자체(body 뷰) + ``build_meta_view_text(title,
+        section_path)`` (meta 뷰). ChromaDB 엔트리는 청크당 최대 2개.
+
+    템플릿이 ``source_type`` 으로 분기하여 운영자가 실제 임베딩된 텍스트를
+    오인하지 않도록 표시한다.
     """
     chunks = await meta_store.get_chunks_by_document(document_id)
     doc = await meta_store.get_document(document_id)
     title = doc["title"] if doc else ""
+    source_type = doc["source_type"] if doc else ""
 
     enriched = []
     for chunk in chunks:
-        meta_text = build_meta_view_text(title, chunk.get("section_path", ""))
-        enriched.append({**chunk, "meta_text": meta_text})
+        if source_type == "git_code":
+            # body는 임베딩 대상이 아님 — meta_text 합성 금지
+            enriched.append({**chunk, "meta_text": ""})
+        else:
+            meta_text = build_meta_view_text(
+                title, chunk.get("section_path", ""),
+            )
+            enriched.append({**chunk, "meta_text": meta_text})
 
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_chunks.html", {
         "request": request,
         "chunks": enriched,
+        "source_type": source_type,
     })
 
 

@@ -93,3 +93,54 @@ tests/ (test_web 제외): 450 passed
 - D1-A: SQLite 컬럼 추가 채택 (조회 단순, 향후 deep-link/검색 결과에도 재사용)
 - D2-A: meta 텍스트 재구성 (저장 안 함, 규칙 변경 시 마이그레이션 불요)
 - D3-A: 구버전 청크는 그대로 두고 신규 처리만 채움 (재처리는 사용자 트리거)
+
+---
+
+## 후속 보강: git_code 청크 표시 정정 (같은 날)
+
+### 발견된 버그
+
+대시보드 청크 탭이 모든 source_type에 같은 템플릿을 적용해, git_code 문서의 청크에도:
+- `chunk.content` 를 "Body (임베딩 대상)"로 표시 → **거짓** (실제 임베딩 입력은 `embed_texts`)
+- `build_meta_view_text(...)` 결과를 "Meta (추가 임베딩 대상)"로 표시 → **거짓** (git_code는 ChromaDB에 `#meta` 엔트리 자체가 없음)
+
+원인: D-036의 임베딩/저장 분리 패턴(git_code)과 D-042 멀티뷰(일반 분기)는 다른 구조인데, 청크 탭이 이를 구분하지 않았음.
+
+### 수정
+
+**스키마**: `chunks.embed_text TEXT DEFAULT ''` 컬럼 추가 + idempotent ALTER 마이그레이션.
+
+**파이프라인**: git_code 분기에서 `create_chunk(embed_text=embed_texts[i])` 로 임베딩 입력 영속화. 일반 분기는 빈 문자열(본문 자체가 임베딩 입력이라 저장 불요).
+
+**API**: `tab_chunks` 가 `doc.source_type` 조회 후 git_code면 meta_text 합성을 생략하고 source_type을 템플릿에 전달.
+
+**템플릿**: source_type 분기.
+- git_code: "Stored Content (반환용 — 임베딩 대상 아님)" + "Embedding Text (이름+시그니처+docstring — 실제 입력)". 뱃지 `code · single vector`.
+- 그 외: 기존 "Body" + "Meta" 유지.
+
+기존 git_code 청크는 embed_text가 비어있으면 "재처리 시 채워집니다" 안내 표시.
+
+### 테스트
+
+- `test_metadata_store.py`:
+  - 마이그레이션 테스트가 `embed_text` 컬럼도 검증.
+  - `test_chunks_crud` 에 embed_text 왕복 + 기본값 검증.
+- `test_pipeline.py`:
+  - 신규 `test_git_code_pipeline_persists_embed_text`: 실제 Python 코드를 입력으로 process_document 실행, ChromaDB add_chunks가 #body/#meta 접미사를 안 붙이는지 검증, SQLite에 embed_text가 채워지고 본문과 다른 값(D-036 분리)인지 검증.
+- 비-web 전체: 453건 통과 (+1).
+
+### 데이터 경로 스모크 검증
+
+git_code 문서와 Confluence 문서를 한 DB에 만들고 청크 탭 enrichment 로직을 직접 호출:
+
+```
+=== git_code ===
+  [Stored Content] '# File: src/x.py\n# function: def hello\n...'
+  [Embedding Text] 'src/x.py\nhello\ndef hello()'
+
+=== confluence ===
+  [Body] '| prod | 이운영 |'
+  [Meta] '배포 가이드\n배포 가이드 > 운영'
+```
+
+두 source_type이 의도대로 다른 표시 경로를 탐.

@@ -8,13 +8,38 @@
             {% if chunk.section_path %}
             <small>· 섹션: {{ chunk.section_path }}</small>
             {% endif %}
-            {% if chunk.meta_text %}
+
+            {% if source_type == "git_code" %}
+            <small><mark>code · single vector</mark></small>
+            {% elif chunk.meta_text %}
             <small><mark>body + meta</mark></small>
             {% else %}
             <small><mark>body only</mark></small>
             {% endif %}
         </header>
 
+        {% if source_type == "git_code" %}
+        {# D-036: 임베딩 입력과 저장 본문이 다름. body는 임베딩 대상이 아님. #}
+        <details>
+            <summary><strong>Stored Content</strong>
+                <small>(검색 결과로 반환되는 본문 — <em>임베딩 대상 아님</em>)</small>
+            </summary>
+            <pre><code>{{ chunk.content }}</code></pre>
+        </details>
+
+        <details open>
+            <summary><strong>Embedding Text</strong>
+                <small>(이름 + 시그니처 + docstring — <em>실제 임베딩 입력</em>)</small>
+            </summary>
+            {% if chunk.embed_text %}
+            <pre><code>{{ chunk.embed_text }}</code></pre>
+            {% else %}
+            <p><em>저장되지 않음. 이 청크는 embed_text 컬럼 추가 이전에 처리되었으며, 재처리하면 채워집니다.</em></p>
+            {% endif %}
+        </details>
+
+        {% else %}
+        {# D-042 멀티뷰: body 본문 + meta(title + section_path) #}
         <details open>
             <summary><strong>Body</strong> <small>(임베딩 대상 — 본문)</small></summary>
             <pre><code>{{ chunk.content }}</code></pre>
@@ -22,9 +47,12 @@
 
         {% if chunk.meta_text %}
         <details>
-            <summary><strong>Meta</strong> <small>(추가 임베딩 대상 — title + section_path)</small></summary>
+            <summary><strong>Meta</strong>
+                <small>(추가 임베딩 대상 — title + section_path)</small>
+            </summary>
             <pre><code>{{ chunk.meta_text }}</code></pre>
         </details>
+        {% endif %}
         {% endif %}
     </article>
     {% endfor %}
