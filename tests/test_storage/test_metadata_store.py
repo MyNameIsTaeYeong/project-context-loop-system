@@ -197,7 +197,7 @@ async def test_migration_adds_raw_content_to_legacy_db(tmp_path: Path) -> None:
 async def test_migration_adds_section_columns_to_legacy_chunks(
     tmp_path: Path,
 ) -> None:
-    """구버전 chunks 테이블(section_path/section_anchor 없음)을 열면 ALTER로 컬럼이 추가된다."""
+    """구버전 chunks 테이블(section_path/section_anchor/embed_text 없음)을 열면 ALTER로 컬럼이 추가된다."""
     import aiosqlite
 
     db_path = tmp_path / "legacy_chunks.db"
@@ -226,16 +226,18 @@ async def test_migration_adds_section_columns_to_legacy_chunks(
         columns = {row["name"] for row in await cursor.fetchall()}
         assert "section_path" in columns
         assert "section_anchor" in columns
+        assert "embed_text" in columns
 
         # 기존 row는 빈 문자열로 채워짐 (DEFAULT '')
         cursor = await store.db.execute(
-            "SELECT section_path, section_anchor FROM chunks WHERE id = ?",
+            "SELECT section_path, section_anchor, embed_text FROM chunks WHERE id = ?",
             ("legacy-c1",),
         )
         row = await cursor.fetchone()
         assert row is not None
         assert row["section_path"] == ""
         assert row["section_anchor"] == ""
+        assert row["embed_text"] == ""
     finally:
         await store.close()
 
@@ -266,6 +268,7 @@ async def test_chunks_crud(store: MetadataStore) -> None:
         chunk_id="c1", document_id=doc_id, chunk_index=0,
         content="첫 번째 청크", token_count=10,
         section_path="문서 > 개요", section_anchor="개요",
+        embed_text="hello\nfoo()\nDocstring",
     )
     await store.create_chunk(
         chunk_id="c2", document_id=doc_id, chunk_index=1,
@@ -277,10 +280,12 @@ async def test_chunks_crud(store: MetadataStore) -> None:
     assert chunks[0]["chunk_index"] == 0
     assert chunks[0]["section_path"] == "문서 > 개요"
     assert chunks[0]["section_anchor"] == "개요"
+    assert chunks[0]["embed_text"] == "hello\nfoo()\nDocstring"
     assert chunks[1]["chunk_index"] == 1
     # 선택 인자 생략 시 기본값 ''
     assert chunks[1]["section_path"] == ""
     assert chunks[1]["section_anchor"] == ""
+    assert chunks[1]["embed_text"] == ""
 
     await store.delete_chunks_by_document(doc_id)
     assert await store.get_chunks_by_document(doc_id) == []
