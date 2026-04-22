@@ -10,6 +10,7 @@ from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.editor import save_document
+from context_loop.processor.pipeline import build_meta_view_text
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -134,12 +135,26 @@ async def tab_chunks(
     document_id: int,
     meta_store: MetadataStore = Depends(get_meta_store),
 ):
-    """청크 탭 HTML 파셜."""
+    """청크 탭 HTML 파셜.
+
+    각 청크에 대해 본문(``content``)과 함께 멀티뷰 임베딩(D-042)의
+    ``meta_text`` 를 함께 전달한다. ``meta_text`` 는 ``title`` +
+    ``section_path`` 결정론적 재구성이므로 별도 저장 없이 같은 값을 복원한다.
+    빈 문자열이면 해당 청크는 body 뷰만 가진다.
+    """
     chunks = await meta_store.get_chunks_by_document(document_id)
+    doc = await meta_store.get_document(document_id)
+    title = doc["title"] if doc else ""
+
+    enriched = []
+    for chunk in chunks:
+        meta_text = build_meta_view_text(title, chunk.get("section_path", ""))
+        enriched.append({**chunk, "meta_text": meta_text})
+
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_chunks.html", {
         "request": request,
-        "chunks": chunks,
+        "chunks": enriched,
     })
 
 

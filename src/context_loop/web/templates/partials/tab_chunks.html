@@ -5,8 +5,27 @@
         <header>
             <strong>Chunk #{{ chunk.chunk_index }}</strong>
             <small>{{ chunk.token_count }} tokens</small>
+            {% if chunk.section_path %}
+            <small>· 섹션: {{ chunk.section_path }}</small>
+            {% endif %}
+            {% if chunk.meta_text %}
+            <small><mark>body + meta</mark></small>
+            {% else %}
+            <small><mark>body only</mark></small>
+            {% endif %}
         </header>
-        <pre><code>{{ chunk.content }}</code></pre>
+
+        <details open>
+            <summary><strong>Body</strong> <small>(임베딩 대상 — 본문)</small></summary>
+            <pre><code>{{ chunk.content }}</code></pre>
+        </details>
+
+        {% if chunk.meta_text %}
+        <details>
+            <summary><strong>Meta</strong> <small>(추가 임베딩 대상 — title + section_path)</small></summary>
+            <pre><code>{{ chunk.meta_text }}</code></pre>
+        </details>
+        {% endif %}
     </article>
     {% endfor %}
 </div>
