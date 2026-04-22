@@ -4,6 +4,11 @@ tiktoken을 사용하여 텍스트를 토큰 기준으로 분할한다.
 마크다운 헤딩 구조를 인식하여 섹션별로 분할하고,
 각 청크에 상위 헤딩 경로(section_path)를 첨부한다.
 tiktoken을 사용할 수 없는 경우 문자 기반 폴백을 사용한다.
+
+``chunk_extracted_document`` 는 ``confluence_extractor.ExtractedDocument`` 를
+입력으로 받아 이미 구조화된 섹션을 그대로 활용한다(헤딩 재파싱 없음).
+동시에 펜스 코드블록(```)과 마크다운 테이블을 원자 단위로 보호하여
+청크 경계에서 잘리지 않도록 한다.
 """
 
 from __future__ import annotations
@@ -12,6 +17,10 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from context_loop.ingestion.confluence_extractor import ExtractedDocument
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +41,8 @@ class Chunk:
         content: 청크 텍스트.
         token_count: 청크의 토큰 수.
         section_path: 상위 헤딩 경로 (예: "프로젝트 개요 > 아키텍처 > 백엔드").
+        section_anchor: 해당 섹션 헤딩의 URL fragment용 앵커.
+            Confluence 구조화 추출 경로에서만 채워지고, 그 외에는 빈 문자열.
     """
 
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -39,6 +50,7 @@ class Chunk:
     content: str = ""
     token_count: int = 0
     section_path: str = ""
+    section_anchor: str = ""
 
 
 def _get_tokenizer(model: str = "cl100k_base") -> object | None:
@@ -157,6 +169,91 @@ def _split_into_sections(text: str) -> list[_Section]:
 
 
 # ---------------------------------------------------------------------------
+# 원자 블록 분리 (코드블록/테이블 보호)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Block:
+    """청킹 단위 블록.
+
+    ``atomic=True`` 이면 chunk_size를 초과해도 내부에서 자르지 않고 단독 청크로
+    방출한다. 펜스 코드블록과 마크다운 테이블이 여기 해당한다.
+    """
+
+    content: str
+    atomic: bool
+
+
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+
+def _split_markdown_blocks(text: str) -> list[_Block]:
+    """마크다운 텍스트를 블록 목록으로 분리한다.
+
+    - 펜스 코드블록(```) : 시작~종료 펜스를 통째로 ``atomic`` 블록으로.
+    - 마크다운 테이블     : 헤더 + 구분자(``|---|``) 행을 포함한 연속 파이프
+      행을 통째로 ``atomic`` 블록으로.
+    - 그 외               : 빈 줄 기준으로 단락을 나누어 ``atomic=False`` 블록으로.
+    """
+    lines = text.split("\n")
+    blocks: list[_Block] = []
+    buf: list[str] = []
+
+    def flush_regular() -> None:
+        if not buf:
+            return
+        combined = "\n".join(buf).strip()
+        buf.clear()
+        if not combined:
+            return
+        for para in combined.split("\n\n"):
+            stripped = para.strip()
+            if stripped:
+                blocks.append(_Block(content=stripped, atomic=False))
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # 펜스 코드블록
+        if stripped.startswith("```"):
+            flush_regular()
+            fence_lines = [line]
+            i += 1
+            while i < len(lines):
+                fence_lines.append(lines[i])
+                if lines[i].lstrip().startswith("```"):
+                    i += 1
+                    break
+                i += 1
+            blocks.append(_Block(content="\n".join(fence_lines), atomic=True))
+            continue
+
+        # 마크다운 테이블: 현재 줄에 "|"가 있고 다음 줄이 구분자
+        if (
+            "|" in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            flush_regular()
+            table_lines = [line, lines[i + 1]]
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                table_lines.append(lines[i])
+                i += 1
+            blocks.append(_Block(content="\n".join(table_lines), atomic=True))
+            continue
+
+        buf.append(line)
+        i += 1
+
+    flush_regular()
+    return blocks
+
+
+# ---------------------------------------------------------------------------
 # 메인 청킹 함수
 # ---------------------------------------------------------------------------
 
@@ -193,8 +290,9 @@ def chunk_text(
     all_chunks: list[Chunk] = []
     for section in sections:
         section_path = " > ".join(section.path) if section.path else ""
-        section_chunks = _chunk_section(
-            section.content,
+        blocks = _split_markdown_blocks(section.content)
+        section_chunks = _chunk_blocks(
+            blocks,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             model=model,
@@ -207,19 +305,76 @@ def chunk_text(
     return all_chunks
 
 
-def _chunk_section(
-    text: str,
+def chunk_extracted_document(
+    extracted: ExtractedDocument,
     *,
     chunk_size: int = 512,
     chunk_overlap: int = 50,
     model: str = "cl100k_base",
 ) -> list[Chunk]:
-    """단일 섹션을 토큰 기반으로 청크로 분할한다.
+    """``ExtractedDocument`` 를 구조 기반으로 청크로 분할한다.
 
-    단락(\\n\\n) 경계를 우선하여 자연스럽게 분할하고,
-    chunk_size를 초과하면 강제로 분할한다.
+    ``chunk_text`` 와 달리 마크다운을 헤딩 정규식으로 재파싱하지 않고
+    추출기가 이미 만들어둔 ``extracted.sections`` 를 그대로 소비한다.
+    각 섹션 내부에서는 펜스 코드블록과 마크다운 테이블이 청크 경계에서
+    잘리지 않도록 원자 단위로 보호한다. 청크에는 섹션 제목/경로에 더해
+    ``section_anchor`` 가 첨부되어 벡터 검색 결과에서 Confluence 내부
+    deep-link를 구성할 수 있다.
+
+    Args:
+        extracted: Confluence 추출기 결과.
+        chunk_size: 청크당 최대 토큰 수.
+        chunk_overlap: 인접 청크 간 겹치는 토큰 수.
+        model: 토큰화에 사용할 모델/인코딩 이름.
+
+    Returns:
+        Chunk 목록. ``extracted.sections`` 가 비어 있으면 ``plain_text`` 에
+        대해 ``chunk_text`` 를 적용한 결과를 반환한다.
     """
-    if not text.strip():
+    if not extracted.sections:
+        return chunk_text(
+            extracted.plain_text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            model=model,
+        )
+
+    all_chunks: list[Chunk] = []
+    for section in extracted.sections:
+        heading_line = "#" * section.level + " " + section.title
+        body = section.md_content.strip()
+        section_text = heading_line + "\n\n" + body if body else heading_line
+        section_path = " > ".join(section.path) if section.path else section.title
+
+        blocks = _split_markdown_blocks(section_text)
+        section_chunks = _chunk_blocks(
+            blocks,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            model=model,
+        )
+        for chunk in section_chunks:
+            chunk.index = len(all_chunks)
+            chunk.section_path = section_path
+            chunk.section_anchor = section.anchor
+            all_chunks.append(chunk)
+
+    return all_chunks
+
+
+def _chunk_blocks(
+    blocks: list[_Block],
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+    model: str,
+) -> list[Chunk]:
+    """블록 목록을 토큰 기반으로 청크로 합친다.
+
+    - 일반 블록: chunk_size를 초과하면 강제 분할.
+    - atomic 블록: chunk_size를 초과하면 자르지 않고 단독 청크로 방출.
+    """
+    if not blocks:
         return []
 
     enc = _get_tokenizer(model)
@@ -229,8 +384,10 @@ def _chunk_section(
             return list(enc.encode(s))  # type: ignore[union-attr]
         return list(range(len(s)))
 
-    # 단락으로 먼저 분리
-    paragraphs = text.split("\n\n")
+    def decode(tokens: list[int], fallback: str) -> str:
+        if enc is not None:
+            return enc.decode(tokens)  # type: ignore[union-attr]
+        return fallback
 
     chunks: list[Chunk] = []
     current_tokens: list[int] = []
@@ -240,13 +397,10 @@ def _chunk_section(
         nonlocal current_tokens, current_text_parts
         if not current_tokens:
             return
-        if enc is not None:
-            content = enc.decode(current_tokens)  # type: ignore[union-attr]
-        else:
-            content = "\n\n".join(current_text_parts)
+        content = decode(current_tokens, "\n\n".join(current_text_parts))
         chunks.append(
             Chunk(
-                index=0,  # caller가 재설정함
+                index=0,
                 content=content.strip(),
                 token_count=len(current_tokens),
             )
@@ -254,48 +408,52 @@ def _chunk_section(
         current_tokens = overlap_tokens[:]
         current_text_parts = []
 
-    for para in paragraphs:
-        if not para.strip():
-            continue
-        para_tokens = encode(para)
-        para_token_count = len(para_tokens)
+    for block in blocks:
+        block_tokens = encode(block.content)
+        block_token_count = len(block_tokens)
 
-        # 단락 자체가 chunk_size를 초과하면 강제 분할
-        if para_token_count > chunk_size:
+        if block_token_count > chunk_size:
             if current_tokens:
                 overlap = current_tokens[-chunk_overlap:] if chunk_overlap else []
                 flush(overlap)
-            start = 0
-            while start < len(para_tokens):
-                end = min(start + chunk_size, len(para_tokens))
-                sub_tokens = para_tokens[start:end]
-                if enc is not None:
-                    sub_text = enc.decode(sub_tokens)  # type: ignore[union-attr]
-                else:
-                    sub_text = para[start * _CHARS_PER_TOKEN : end * _CHARS_PER_TOKEN]
+
+            if block.atomic:
+                # atomic은 내부에서 자르지 않고 통째로 1 청크 (oversized 허용)
                 chunks.append(
                     Chunk(
                         index=0,
-                        content=sub_text.strip(),
-                        token_count=len(sub_tokens),
+                        content=block.content.strip(),
+                        token_count=block_token_count,
                     )
                 )
-                start += chunk_size - chunk_overlap
+            else:
+                start = 0
+                while start < len(block_tokens):
+                    end = min(start + chunk_size, len(block_tokens))
+                    sub_tokens = block_tokens[start:end]
+                    sub_fallback = block.content[
+                        start * _CHARS_PER_TOKEN : end * _CHARS_PER_TOKEN
+                    ]
+                    sub_text = decode(sub_tokens, sub_fallback)
+                    chunks.append(
+                        Chunk(
+                            index=0,
+                            content=sub_text.strip(),
+                            token_count=len(sub_tokens),
+                        )
+                    )
+                    start += chunk_size - chunk_overlap
             continue
 
-        if len(current_tokens) + para_token_count > chunk_size:
+        if len(current_tokens) + block_token_count > chunk_size:
             overlap = current_tokens[-chunk_overlap:] if chunk_overlap else []
             flush(overlap)
 
-        current_tokens.extend(para_tokens)
-        current_text_parts.append(para)
+        current_tokens.extend(block_tokens)
+        current_text_parts.append(block.content)
 
-    # 남은 버퍼 처리
     if current_tokens:
-        if enc is not None:
-            content = enc.decode(current_tokens)  # type: ignore[union-attr]
-        else:
-            content = "\n\n".join(current_text_parts)
+        content = decode(current_tokens, "\n\n".join(current_text_parts))
         if content.strip():
             chunks.append(
                 Chunk(

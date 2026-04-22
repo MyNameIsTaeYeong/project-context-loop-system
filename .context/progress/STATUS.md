@@ -1,9 +1,9 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 9 — 추가 컨텍스트 소스 (Git 코드 기반 컨텍스트 구축)
-- **Step**: 9.8++ Python import 추출 누락 및 문서별 그래프 조회 버그 수정
-- **상태**: 사용자 리포트("git sync 그래프에서 Python import 관계 일부가 보이지 않음")를 기점으로 두 건의 버그 수정. (1) `_extract_python()`이 `ast.ImportFrom.node.module`만 검사해 `from . import x`, `from .. import y` 같은 상대 import (`node.module=None, node.level>0`)가 imports 리스트에 전혀 들어가지 않던 문제: `node.level > 0`일 때 `"." * level + alias.name` 형태로 수집하도록 추가. (2) `get_graph_nodes_by_document()`가 legacy 컬럼 `graph_nodes.document_id`(최초 생성자만 기록)만 참조해, canonical 병합으로 현재 문서에 연결된 공유 모듈 노드가 두 번째 이후 import한 파일의 그래프 탭에서 누락되던 문제: `graph_node_documents` 링크 테이블 INNER JOIN으로 전환. 기존 `test_graph_nodes_and_edges`에 `add_node_document_link()` 호출을 추가해 실제 `save_graph_data` 플로우와 정합성 확보. 테스트: ast_code_extractor +1, graph_store +1, metadata_store 기존 수정. 부가 논의: import 대상이 디렉토리 경로까지만 연결되는 구조적 한계(`from X import Y`의 `Y`가 파일/클래스/심볼로 resolve되지 않음)를 확인, 레포 인덱스 기반 2-pass resolve 설계를 문서화하고 별도 phase로 분리. 다음: import resolve phase 또는 증분 처리(9.9).
+- **Phase**: Phase 7++ — Confluence 컨텍스트 추출 고도화 + LLM 의존 제거
+- **Step**: Confluence Storage Format 구조화 추출 → 결정론적 링크 그래프 + 구조 기반 청킹
+- **상태**: 3단계로 완료. (1) **Step 1** — `ingestion/confluence_extractor.py` 신설 (ExtractedDocument: sections/outbound_links/code_blocks/tables/mentions), `documents.raw_content` 컬럼 추가 및 REST/MCP 수집 경로에서 원본 HTML 보존, 파이프라인 Confluence 분기가 추출기를 호출하도록 주입 (D-039). (2) **Step 2** — `processor/link_graph_builder.py` 신설: `OutLink` → `GraphData` 결정론적 변환 (`page/user/jira/attachment` → 각각 entity_type + relation, `url`은 병합 키 불안정 이슈로 제외). self-entity 패턴으로 GraphStore의 `(name, type)` 병합을 통한 인접 문서 간 엣지 수렴. 파이프라인 Confluence 분기에 통합 (D-039). (3) **LLM classifier/graph_extractor 전면 제거** — 결정론적 대체(AST + 링크 그래프)가 모든 소스를 커버하므로 `classifier.py` 삭제, `graph_extractor.py`에서 Entity/Relation/GraphData 스키마만 남기고 LLM 프롬프트·extract_graph·맵리듀스 제거. `process_document()`에서 `llm_client`/`storage_method_override` 파라미터 제거, `storage_method`는 실제 저장 산출물에서 파생(chunks only=`chunk`, graph only=`graph`, 둘 다=`hybrid`). coordinator/documents/git_sync 호출 경로 정리 (D-040). (4) **Step 3** — `Chunk.section_anchor` 필드 추가, `chunk_extracted_document()` 신설로 `extracted.sections`를 그대로 소비(헤딩 재파싱 제거). `_split_markdown_blocks()`이 펜스 코드블록(```)과 마크다운 테이블을 `atomic=True`로 묶어 청크 경계 중간 분할 금지, 일반 블록은 기존처럼 강제 분할. `section_anchor`를 VectorStore metadata까지 전파 (D-041). 테스트: confluence_extractor 28건, link_graph_builder 13건, chunker +4건(코드블록/테이블 원자성 + anchor 전파 + 빈 sections 폴백), pipeline 8건 전면 재작성, coordinator/documents/git_sync 호출 정합성 확보. 총 회귀 없음 (440+건). 다음: (a) section_anchor를 UI 청크 탭/검색 결과 deep-link에 노출, (b) `extracted.code_blocks`/`tables`를 별도 구조화 메타로 검색에 활용, (c) Phase 9.9(증분 처리) 또는 9.10(GitHub webhook).
 
 ## Phase별 진행률
 
@@ -54,10 +54,14 @@
 - [x] 7.1 HTML→Markdown 변환기 개선 — 테이블, 매크로, 중첩 목록 지원 (I-012)
 - [x] 7.2 헤딩 기반 계층적 청킹 + 섹션 메타데이터 첨부 (I-013)
 - [x] 7.3 Cross-encoder Reranker 추가 + 유사도 threshold 도입 (I-015)
-- [x] 7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)
+- [x] ~~7.4 그래프 추출 시 전체 문서 처리 — map-reduce 방식 (I-014)~~ — LLM graph_extractor 전면 제거 (D-040)
 - [x] 7.5 쿼리 확장(Query Expansion) — HyDE 적용 (I-016)
-- [x] 7.6 문서 분류기 입력 범위 확대 (I-017)
+- [x] ~~7.6 문서 분류기 입력 범위 확대 (I-017)~~ — classifier 전면 제거 (D-040)
 - [x] 7.7 크로스-문서 엔티티 병합 (I-018, I-003)
+- [x] 7.8 Confluence Storage Format 구조화 추출기 (D-039)
+- [x] 7.9 Confluence outbound_links → 결정론적 링크 그래프 (D-039)
+- [x] 7.10 LLM classifier/graph_extractor 제거 — 결정론적 파이프라인 확정 (D-040)
+- [x] 7.11 구조화 추출 → 청커 직결 + 코드블록/테이블 원자 보호 (D-041)
 
 ### Phase 8: 배포
 - [ ] 8.1 패키징 및 사내 배포
@@ -82,8 +86,44 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-17
-- 내용: AST 기반 코드 그래프의 엔티티 병합 충돌 / imports 엣지 유실 수정 (D-038).
+- 일시: 2026-04-21
+- 내용: Confluence 컨텍스트 추출 고도화 + LLM 기반 분류/추출 제거 (D-039, D-040, D-041).
+  - **배경**: Confluence 문서는 Storage Format으로 섹션/링크/코드블록/테이블이 이미 기계 판독 가능한 구조로 들어온다. 그럼에도 파이프라인은 이 구조를 `html_to_markdown()`으로 평탄화해 버리고, 그래프 엣지는 LLM(`graph_extractor`)으로 다시 "추출"해 왔음 — 정보 손실 + 환각 + 토큰 비용의 3중 낭비.
+  - **Step 1 — 구조화 추출기** (commits 24e376c, 6c92dad, aae3ca7; D-039)
+    - `ingestion/confluence_extractor.py` 신설. BeautifulSoup 단일 파싱으로 `ExtractedDocument(plain_text, sections, outbound_links, code_blocks, tables, mentions)` 반환
+    - `sections`: 헤딩 스택 기반 path + anchor(slugify) + md_content
+    - `outbound_links`: `ac:link` → page/user/attachment, 일반 `<a>` → url, Jira macro → jira
+    - `code_blocks`: `ac:structured-macro[name=code/noformat]` + 표준 `<pre><code class="language-*">`
+    - `tables`: 헤더 + 행 구조화
+    - `documents` 테이블에 `raw_content` 컬럼 추가, REST/MCP 수집 경로가 원본 HTML을 그대로 저장
+    - 파이프라인 Confluence 분기에서 `extract()` 호출 + 반환 dict에 extraction 메트릭 노출
+    - 테스트: confluence_extractor 28건
+  - **Step 2 — 결정론적 링크 그래프** (commits 20eb4ed, e03848c; D-039)
+    - `processor/link_graph_builder.py` 신설. `OutLink` → `GraphData` 순수 함수 변환
+    - 매핑: `page → document/references`, `user → person/mentions_user`, `jira → ticket/mentions_ticket`, `attachment → attachment/has_attachment`
+    - `url`은 제외 — 병합 키 불안정(쿼리/프래그먼트/슬래시 변종), 내부 지식망 탐색에서 확장 대상 없음, 외부 URL은 `extracted.outbound_links`에 메타로 잔존
+    - self-entity(`Entity(doc_title, "document")`) 패턴으로 GraphStore의 `(name_lower, type)` 병합 활용 — 다른 문서에서 들어오는 references가 동일 노드로 수렴
+    - 엔티티/관계 중복 제거: 동일 타겟 반복 시 1회만 생성, `(source, target, relation_type)` 3-튜플로 관계 dedup
+    - 테스트: link_graph_builder 13건
+  - **LLM classifier/graph_extractor 전면 제거** (commits 6c70d20, 76e9082, 359ce55, 1e9a127; D-040)
+    - AST 기반 git_code(D-036) + 결정론적 Confluence 링크 그래프(D-039)로 모든 소스 커버 → LLM 의존 경로 코드만 남은 상태
+    - `processor/classifier.py` 삭제, `graph_extractor.py`에서 LLM 프롬프트·`extract_graph`·맵리듀스·파서 제거, `Entity`/`Relation`/`GraphData` dataclass만 남김 (graph_store, ast_code_extractor, link_graph_builder 공유 스키마)
+    - `process_document()`에서 `llm_client`/`storage_method_override` 파라미터 제거. `storage_method`는 실제 저장 산출물에서 파생 — chunks only=`chunk`, graph only=`graph`, 둘 다=`hybrid`
+    - 호출 경로 정리: `CoordinatorAgent`(pipeline_llm_client 제거), `web/api/documents.py`(`_run_pipeline` 시그니처/의존성), `web/api/git_sync.py` 4개 파일. chat/rerank/HyDE 등 **검색 시점** LLM 경로는 그대로 유지
+    - 테스트: `test_classifier.py`/`test_graph_extractor.py` 삭제, `test_pipeline.py` 8건 재작성, `test_coordinator.py`의 `pipeline_llm_client`/`storage_method_override` 어설션 제거
+  - **Step 3 — 구조화 추출 → 청커 직결 + 원자 블록 보호** (commit 10b23d6; D-041)
+    - `Chunk.section_anchor: str = ""` 필드 추가 (기본값으로 하위 호환)
+    - `chunk_extracted_document(extracted, ...)` 신설 — `extracted.sections`를 그대로 순회, 헤딩 재파싱 제거. `section_path` + `section_anchor`를 청크 메타에 기록
+    - `_split_markdown_blocks()`: 펜스 코드블록(```)과 마크다운 테이블(헤더+`|---|` 구분자) 연속 파이프 행을 `_Block(atomic=True)`로 묶음. 일반 텍스트는 기존처럼 빈 줄 단락으로 분리
+    - `_chunk_blocks()`: 일반 블록은 기존처럼 `chunk_size` 초과 시 강제 분할, atomic 블록은 **자르지 않고** 단독 청크로 방출(oversized 허용)
+    - 파이프라인 Confluence 분기가 `chunk_extracted_document` 호출. `section_anchor`를 VectorStore metadata(Confluence + git_code 양쪽)에 전파 — 검색 결과에서 Confluence 섹션 deep-link 구성 가능
+    - 테스트: chunker +4건(코드블록 원자성/테이블 원자성/section path·anchor 전파/빈 sections → plain_text 폴백), pipeline 테스트 4건 패치 대상 갱신
+  - **검증**: `test_processor/` + `test_ingestion/` 353건, `test_mcp/` + `test_storage/` 87건 통과. 회귀 없음.
+  - **남은 제한 / 다음 작업**
+    - `section_anchor` UI 활용 — 청크 탭의 섹션 딥링크, 검색 결과 "이 섹션 열기" 버튼
+    - `extracted.code_blocks`/`extracted.tables`를 독립 검색 가능한 구조화 메타로 노출 (현재는 청크 본문에만 포함)
+    - Phase 9.9(증분 처리) 또는 9.10(GitHub webhook)
+- 이전 (2026-04-17): AST 기반 코드 그래프의 엔티티 병합 충돌 / imports 엣지 유실 수정 (D-038).
   - **배경**: D-036/D-037 도입 후 git sync 실행에서 (a) 외래키 제약 실패로 일부 엣지 누락, (b) contains 엣지가 엉뚱한 파일의 동일 이름 심볼을 가리키는 현상 발생.
   - **버그 1 — imports 엣지 target 유실** (commit 87a2784)
     - `to_graph_data()`가 import 모듈을 엔티티로 등록하지 않아 `save_graph_data`의 `name_to_node_id`에 없음 → 엣지가 DEBUG 로그와 함께 조용히 버려짐

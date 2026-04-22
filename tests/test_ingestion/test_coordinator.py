@@ -213,7 +213,6 @@ class TestPipelineProcessing:
             store, config, git_config=git_cfg,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
-            pipeline_llm_client=MagicMock(),
             embedding_client=MagicMock(),
         )
         assert coord._pipeline_available is True
@@ -243,7 +242,7 @@ class TestPipelineProcessing:
     async def test_process_through_pipeline_calls_process_document(
         self, store: MetadataStore, tmp_path: Path,
     ) -> None:
-        """파이프라인 호출 시 storage_method_override='graph'가 전달된다."""
+        """파이프라인 의존성이 설정되면 process_document가 올바른 인자로 호출된다."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         config = Config(config_path=tmp_path / "config.yaml")
@@ -251,14 +250,12 @@ class TestPipelineProcessing:
 
         mock_vs = MagicMock()
         mock_gs = MagicMock()
-        mock_llm = MagicMock()
         mock_emb = MagicMock()
 
         coord = CoordinatorAgent(
             store, config, git_config=git_cfg,
             vector_store=mock_vs,
             graph_store=mock_gs,
-            pipeline_llm_client=mock_llm,
             embedding_client=mock_emb,
         )
 
@@ -272,8 +269,8 @@ class TestPipelineProcessing:
 
         expected_result = {
             "document_id": doc_id,
-            "storage_method": "graph",
-            "chunk_count": 0,
+            "storage_method": "hybrid",
+            "chunk_count": 1,
             "node_count": 2,
             "edge_count": 1,
         }
@@ -290,7 +287,12 @@ class TestPipelineProcessing:
         call_kwargs = mock_pd.call_args
         assert call_kwargs[0][0] == doc_id
         assert call_kwargs[1]["meta_store"] is store
-        assert call_kwargs[1]["storage_method_override"] == "graph"
+        assert call_kwargs[1]["vector_store"] is mock_vs
+        assert call_kwargs[1]["graph_store"] is mock_gs
+        assert call_kwargs[1]["embedding_client"] is mock_emb
+        # llm_client / storage_method_override는 더 이상 전달되지 않는다
+        assert "llm_client" not in call_kwargs[1]
+        assert "storage_method_override" not in call_kwargs[1]
 
     async def test_process_through_pipeline_handles_error(
         self, store: MetadataStore, tmp_path: Path,
@@ -303,7 +305,6 @@ class TestPipelineProcessing:
             store, config, git_config=git_cfg,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
-            pipeline_llm_client=MagicMock(),
             embedding_client=MagicMock(),
         )
 
@@ -359,7 +360,6 @@ class TestPipelineProcessing:
             store, config, git_config=git_cfg,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
-            pipeline_llm_client=MagicMock(),
             embedding_client=MagicMock(),
         )
 
@@ -368,11 +368,13 @@ class TestPipelineProcessing:
         async def mock_process_document(document_id, **kwargs):
             nonlocal call_count
             call_count += 1
-            assert kwargs.get("storage_method_override") == "graph"
+            # llm_client / storage_method_override는 더 이상 전달되지 않는다
+            assert "llm_client" not in kwargs
+            assert "storage_method_override" not in kwargs
             return {
                 "document_id": document_id,
-                "storage_method": "graph",
-                "chunk_count": 0,
+                "storage_method": "hybrid",
+                "chunk_count": 1,
                 "node_count": 2,
                 "edge_count": 1,
             }
@@ -405,7 +407,6 @@ class TestPipelineProcessing:
             store, config, git_config=git_cfg,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
-            pipeline_llm_client=MagicMock(),
             embedding_client=MagicMock(),
         )
 
@@ -454,7 +455,6 @@ class TestPipelineProcessing:
             store, config, git_config=git_cfg,
             vector_store=MagicMock(),
             graph_store=MagicMock(),
-            pipeline_llm_client=MagicMock(),
             embedding_client=MagicMock(),
         )
 
