@@ -21,6 +21,27 @@ logger = logging.getLogger(__name__)
 _WEB_DIR = Path(__file__).resolve().parent
 
 
+def _configure_logging(config: Config) -> None:
+    """config의 app.log_level을 context_loop 로거에 적용한다.
+
+    uvicorn은 자체 로거만 INFO로 설정하므로 context_loop.* 로거들은
+    기본 WARNING을 상속한다. 이 함수가 호출되어야 INFO 로그가 출력된다.
+    """
+    level_name = str(config.get("app.log_level", "INFO")).upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+    pkg_logger = logging.getLogger("context_loop")
+    pkg_logger.setLevel(level)
+    if not pkg_logger.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"),
+        )
+        pkg_logger.addHandler(handler)
+        pkg_logger.propagate = False
+
+
 def _build_llm_client(config: Config):
     """설정에 따라 LLM 클라이언트를 생성한다."""
     from context_loop.auth import get_token
@@ -73,6 +94,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
     config = Config()
     data_dir = config.data_dir
+
+    _configure_logging(config)
 
     meta_store = MetadataStore(data_dir / "metadata.db")
     await meta_store.initialize()
