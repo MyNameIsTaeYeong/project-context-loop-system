@@ -164,15 +164,22 @@ class _MCPConnection:
 
 
 async def list_available_tools(session: ClientSession) -> list[dict[str, Any]]:
-    """MCP 서버에서 사용 가능한 도구 목록을 반환한다."""
+    """MCP 서버에서 사용 가능한 도구 목록을 반환한다.
+
+    조회된 도구 이름과 설명을 INFO 레벨 로그로 기록한다.
+    """
     result = await session.list_tools()
-    return [
+    tools = [
         {
             "name": tool.name,
             "description": getattr(tool, "description", ""),
         }
         for tool in result.tools
     ]
+    logger.info("Confluence MCP 서버에서 사용 가능한 도구 %d개 조회됨", len(tools))
+    for tool in tools:
+        logger.info("  - %s: %s", tool["name"], tool["description"])
+    return tools
 
 
 def _is_cql(query: str) -> bool:

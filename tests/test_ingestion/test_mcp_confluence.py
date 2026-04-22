@@ -146,6 +146,28 @@ async def test_list_available_tools() -> None:
     assert tools[0]["name"] == "searchContent"
 
 
+@pytest.mark.asyncio
+async def test_list_available_tools_logs_tools(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    session = AsyncMock()
+    tool1 = MagicMock()
+    tool1.name = "searchContent"
+    tool1.description = "Search Confluence content"
+    tool2 = MagicMock()
+    tool2.name = "getPageByID"
+    tool2.description = "Get page by id"
+    session.list_tools.return_value = MagicMock(tools=[tool1, tool2])
+
+    with caplog.at_level(logging.INFO, logger="context_loop.ingestion.mcp_confluence"):
+        await list_available_tools(session)
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("도구 2개 조회됨" in msg for msg in messages)
+    assert any("searchContent" in msg for msg in messages)
+    assert any("getPageByID" in msg for msg in messages)
+
+
 # --- build_cql / _is_cql 테스트 ---
 
 
