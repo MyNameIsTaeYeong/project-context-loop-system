@@ -152,13 +152,16 @@ async def process_document(
                 vector_store.add_chunks(chunk_ids, embeddings, documents, metadatas)
 
                 await meta_store.delete_chunks_by_document(document_id)
-                for chunk, cid in zip(chunks, chunk_ids):
+                for chunk, cid, embed_text in zip(chunks, chunk_ids, embed_texts):
                     await meta_store.create_chunk(
                         chunk_id=cid,
                         document_id=document_id,
                         chunk_index=chunk.index,
                         content=chunk.content,
                         token_count=chunk.token_count,
+                        section_path=chunk.section_path,
+                        section_anchor=chunk.section_anchor,
+                        embed_text=embed_text,
                     )
                 chunk_count = len(chunks)
 
@@ -205,31 +208,60 @@ async def process_document(
                     model=cfg.embedding_model,
                 )
             if chunks:
-                texts = [c.content for c in chunks]
-                embeddings = await embedding_client.aembed_documents(texts)
-
-                chunk_ids = [c.id for c in chunks]
-                metadatas = [
-                    {
-                        "document_id": document_id,
-                        "chunk_index": c.index,
-                        "title": title,
-                        "section_path": c.section_path,
-                        "section_anchor": c.section_anchor,
-                    }
-                    for c in chunks
+                # 멀티뷰 임베딩: body(본문) + meta(title + section_path).
+                # 두 뷰는 같은 본문(document)을 가리키며 ChromaDB에는 별도 엔트리로
+                # 저장된다. 검색 단계에서 logical_chunk_id로 dedup한다.
+                body_texts = [c.content for c in chunks]
+                meta_texts = [
+                    build_meta_view_text(title, c.section_path) for c in chunks
                 ]
+                meta_mask = [bool(t) for t in meta_texts]
+
+                to_embed = body_texts + [t for t, keep in zip(meta_texts, meta_mask) if keep]
+                embeddings = await embedding_client.aembed_documents(to_embed)
+                body_embeddings = embeddings[: len(body_texts)]
+                meta_embeddings_iter = iter(embeddings[len(body_texts):])
+
+                vec_ids: list[str] = []
+                vec_embeddings: list[list[float]] = []
+                vec_documents: list[str] = []
+                vec_metadatas: list[dict[str, Any]] = []
+
+                for i, chunk in enumerate(chunks):
+                    base_meta = {
+                        "document_id": document_id,
+                        "chunk_index": chunk.index,
+                        "title": title,
+                        "section_path": chunk.section_path,
+                        "section_anchor": chunk.section_anchor,
+                        "logical_chunk_id": chunk.id,
+                    }
+                    vec_ids.append(f"{chunk.id}#body")
+                    vec_embeddings.append(body_embeddings[i])
+                    vec_documents.append(chunk.content)
+                    vec_metadatas.append({**base_meta, "view": "body"})
+
+                    if meta_mask[i]:
+                        vec_ids.append(f"{chunk.id}#meta")
+                        vec_embeddings.append(next(meta_embeddings_iter))
+                        vec_documents.append(chunk.content)
+                        vec_metadatas.append({**base_meta, "view": "meta"})
+
                 vector_store.delete_by_document(document_id)
-                vector_store.add_chunks(chunk_ids, embeddings, texts, metadatas)
+                vector_store.add_chunks(
+                    vec_ids, vec_embeddings, vec_documents, vec_metadatas,
+                )
 
                 await meta_store.delete_chunks_by_document(document_id)
-                for chunk, cid in zip(chunks, chunk_ids):
+                for chunk in chunks:
                     await meta_store.create_chunk(
-                        chunk_id=cid,
+                        chunk_id=chunk.id,
                         document_id=document_id,
                         chunk_index=chunk.index,
                         content=chunk.content,
                         token_count=chunk.token_count,
+                        section_path=chunk.section_path,
+                        section_anchor=chunk.section_anchor,
                     )
                 chunk_count = len(chunks)
 
@@ -303,3 +335,24 @@ def _derive_storage_method(*, has_chunks: bool, has_graph: bool) -> str:
     if has_graph:
         return "graph"
     return "chunk"
+
+
+def build_meta_view_text(title: str, section_path: str) -> str:
+    """멀티뷰 임베딩의 meta 뷰 텍스트를 생성한다.
+
+    제목과 ``section_path`` 로 구성되며, 둘 다 비어 있으면 빈 문자열을
+    반환하여 meta 뷰 생성을 건너뛰게 한다. 본문(body)과 섹션 경로가
+    언어적으로 이질적일 때 경로 키워드 질의의 리콜을 끌어올리는 것이
+    목적이다 (D-042).
+
+    파이프라인 저장 시점뿐 아니라 대시보드/CLI에서 "이 청크가 무엇으로
+    임베딩되었는가"를 보여주기 위해 호출될 수 있어 결정론적 순수 함수로
+    유지한다.
+    """
+    title_part = (title or "").strip()
+    path_part = (section_path or "").strip()
+    if not title_part and not path_part:
+        return ""
+    if title_part and path_part:
+        return f"{title_part}\n{path_part}"
+    return title_part or path_part

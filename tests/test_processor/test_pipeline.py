@@ -23,7 +23,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from context_loop.processor.pipeline import PipelineConfig, process_document
+from context_loop.processor.chunker import Chunk
+from context_loop.processor.pipeline import (
+    PipelineConfig,
+    build_meta_view_text,
+    process_document,
+)
 from context_loop.storage.metadata_store import MetadataStore
 
 
@@ -45,7 +50,11 @@ def _make_stores() -> tuple[MagicMock, MagicMock, MagicMock]:
     graph_store.save_graph_data = AsyncMock(return_value={"nodes": 0, "edges": 0})
 
     embedding_client = MagicMock()
-    embedding_client.aembed_documents = AsyncMock(return_value=[[0.1, 0.2]])
+
+    async def _fake_embed(texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2] for _ in texts]
+
+    embedding_client.aembed_documents = AsyncMock(side_effect=_fake_embed)
     return vector_store, graph_store, embedding_client
 
 
@@ -342,3 +351,176 @@ async def test_extracted_document_passed_to_structured_chunker(
     assert len(extracted.sections) == 1
     assert extracted.sections[0].title == "결제 시스템"
     assert extracted.sections[0].level == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_view_embeddings_stored_for_chunks(
+    store: MetadataStore,
+) -> None:
+    """D-042: 각 청크는 body + meta 두 벡터로 저장되고 같은 본문을 가리킨다.
+
+    meta 뷰 텍스트는 ``title`` 과 ``section_path`` 를 결합하며, 논리 청크 ID는
+    ChromaDB ID 접미사(``#body``/``#meta``)와 metadata.logical_chunk_id 로
+    구분된다. 두 엔트리는 같은 본문(``document``) 문자열을 공유한다.
+    SQLite chunks 테이블에는 여전히 논리 청크 1행만 저장된다.
+    """
+    doc_id = await _create_confluence_doc(
+        store, raw_content="<h1>결제 시스템</h1><p>본문</p>",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    fake_chunks = [
+        Chunk(
+            id="c-abc",
+            index=0,
+            content="결제 본문 내용",
+            token_count=5,
+            section_path="결제 시스템",
+            section_anchor="결제-시스템",
+        ),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=fake_chunks,
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # body 텍스트 1건 + meta 텍스트 1건 = 2건 임베딩
+    embed_call = embedding_client.aembed_documents.await_args
+    assert embed_call is not None
+    texts = embed_call.args[0]
+    assert texts == ["결제 본문 내용", "결제 시스템\n결제 시스템"]
+
+    # add_chunks 호출 검증
+    vector_store.add_chunks.assert_called_once()
+    ids, _embs, docs, metas = vector_store.add_chunks.call_args.args
+    assert ids == ["c-abc#body", "c-abc#meta"]
+    # 두 뷰가 같은 본문을 반환하도록 document 문자열이 동일해야 한다
+    assert docs[0] == docs[1] == "결제 본문 내용"
+    assert metas[0]["view"] == "body"
+    assert metas[1]["view"] == "meta"
+    assert metas[0]["logical_chunk_id"] == metas[1]["logical_chunk_id"] == "c-abc"
+    assert metas[0]["section_anchor"] == "결제-시스템"
+
+    # SQLite chunks는 여전히 논리 청크당 1행이며, section_path/anchor가 보존된다.
+    stored = await store.get_chunks_by_document(doc_id)
+    assert len(stored) == 1
+    assert stored[0]["id"] == "c-abc"
+    assert stored[0]["section_path"] == "결제 시스템"
+    assert stored[0]["section_anchor"] == "결제-시스템"
+
+
+@pytest.mark.asyncio
+async def test_meta_view_skipped_when_title_and_path_empty(
+    store: MetadataStore,
+) -> None:
+    """title과 section_path가 모두 비어 있으면 meta 뷰 엔트리를 생성하지 않는다."""
+    doc_id = await store.create_document(
+        source_type="upload",
+        title="",
+        original_content="some content",
+        content_hash="h",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    fake_chunks = [
+        Chunk(
+            id="c-xyz",
+            index=0,
+            content="본문",
+            token_count=2,
+            section_path="",
+            section_anchor="",
+        ),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=fake_chunks,
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    ids, _embs, _docs, metas = vector_store.add_chunks.call_args.args
+    assert ids == ["c-xyz#body"]
+    assert metas[0]["view"] == "body"
+
+
+def test_build_meta_view_text_combinations() -> None:
+    """meta 뷰 텍스트는 title + section_path 결합. 결정론적 순수 함수.
+
+    파이프라인 저장과 대시보드 청크 탭이 같은 함수를 호출하므로 두 곳에서
+    동일한 값이 나와야 한다.
+    """
+    assert build_meta_view_text("배포 가이드", "배포 가이드 > 운영") == (
+        "배포 가이드\n배포 가이드 > 운영"
+    )
+    assert build_meta_view_text("문서", "") == "문서"
+    assert build_meta_view_text("", "경로") == "경로"
+    assert build_meta_view_text("", "") == ""
+    assert build_meta_view_text("  공백 제거  ", "  경로  ") == "공백 제거\n경로"
+
+
+@pytest.mark.asyncio
+async def test_git_code_pipeline_persists_embed_text(
+    store: MetadataStore,
+) -> None:
+    """git_code 분기에서 embed_text(이름+시그니처+docstring)가 SQLite에 저장된다.
+
+    임베딩 입력은 ``embed_texts``(생성된 단축 텍스트), 저장 본문은
+    ``chunk.content``(전체 코드). 두 값이 다르므로 대시보드가 실제 임베딩
+    대상을 보여주려면 embed_text가 영속화되어야 한다.
+    """
+    code = '''def hello(name: str) -> str:
+    """Greet a person."""
+    return f"Hello {name}"
+'''
+    doc_id = await store.create_document(
+        source_type="git_code",
+        source_id="src/greet.py",
+        title="src/greet.py",
+        original_content=code,
+        content_hash="h-git",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    await process_document(
+        doc_id,
+        meta_store=store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embedding_client,
+        config=PipelineConfig(),
+    )
+
+    # ChromaDB add_chunks: 청크당 1엔트리(멀티뷰 아님). 임베딩 입력은 본문이 아닌
+    # 짧은 시그니처 텍스트 — 본문(전체 코드)보다 토큰이 적어야 한다.
+    vector_store.add_chunks.assert_called_once()
+    ids, _embs, docs, _metas = vector_store.add_chunks.call_args.args
+    # #body/#meta 접미사가 붙지 않아야 함
+    assert all("#" not in cid for cid in ids)
+    # document(반환 본문)에는 함수 본문이 들어 있어야 함
+    assert any("Hello {name}" in d for d in docs)
+
+    # SQLite에 embed_text가 채워져 있어야 함
+    stored = await store.get_chunks_by_document(doc_id)
+    assert len(stored) == 1
+    chunk = stored[0]
+    assert chunk["embed_text"] != ""
+    assert "hello" in chunk["embed_text"]  # 심볼 이름
+    # 본문(전체 코드)와 다른 값이어야 함 — 임베딩과 저장의 분리(D-036)
+    assert chunk["embed_text"] != chunk["content"]

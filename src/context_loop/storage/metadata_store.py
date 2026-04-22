@@ -36,7 +36,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER,
     content TEXT,
-    token_count INTEGER
+    token_count INTEGER,
+    section_path TEXT DEFAULT '',
+    section_anchor TEXT DEFAULT '',
+    embed_text TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -122,6 +125,21 @@ class MetadataStore:
         existing_columns = {row["name"] for row in await cursor.fetchall()}
         if "raw_content" not in existing_columns:
             await self.db.execute("ALTER TABLE documents ADD COLUMN raw_content TEXT")
+
+        cursor = await self.db.execute("PRAGMA table_info(chunks)")
+        chunk_columns = {row["name"] for row in await cursor.fetchall()}
+        if "section_path" not in chunk_columns:
+            await self.db.execute(
+                "ALTER TABLE chunks ADD COLUMN section_path TEXT DEFAULT ''",
+            )
+        if "section_anchor" not in chunk_columns:
+            await self.db.execute(
+                "ALTER TABLE chunks ADD COLUMN section_anchor TEXT DEFAULT ''",
+            )
+        if "embed_text" not in chunk_columns:
+            await self.db.execute(
+                "ALTER TABLE chunks ADD COLUMN embed_text TEXT DEFAULT ''",
+            )
 
     async def close(self) -> None:
         """DB 연결을 닫는다."""
@@ -260,11 +278,26 @@ class MetadataStore:
         chunk_index: int,
         content: str,
         token_count: int,
+        section_path: str = "",
+        section_anchor: str = "",
+        embed_text: str = "",
     ) -> None:
-        """청크를 저장한다."""
+        """청크를 저장한다.
+
+        ``embed_text`` 는 git_code 분기처럼 임베딩 입력이 본문(``content``)과
+        다른 경우(이름+시그니처+docstring)에 채운다. 일반 분기는 본문 자체가
+        임베딩 입력이므로 빈 문자열로 둔다 — 대시보드/감사 시점에 ChromaDB
+        엔트리의 임베딩 입력을 그대로 보여주기 위한 영속화 용도.
+        """
         await self.db.execute(
-            "INSERT INTO chunks (id, document_id, chunk_index, content, token_count) VALUES (?, ?, ?, ?, ?)",
-            (chunk_id, document_id, chunk_index, content, token_count),
+            "INSERT INTO chunks "
+            "(id, document_id, chunk_index, content, token_count, "
+            " section_path, section_anchor, embed_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                chunk_id, document_id, chunk_index, content, token_count,
+                section_path, section_anchor, embed_text,
+            ),
         )
         await self.db.commit()
 

@@ -569,3 +569,54 @@
   - **재파싱 제거**: 추출기가 이미 만든 구조를 그대로 소비 — 헤딩 텍스트와 HTML 헤딩이 다를 때 생기는 불일치 제거.
   - **역호환**: `sections`가 빈 `ExtractedDocument`는 `plain_text` 기반 `chunk_text()` 폴백 → 기존 동작 보존.
 - **영향**: `chunker.py`에 `chunk_extracted_document` + `_split_markdown_blocks` + `_chunk_blocks` 추가, `chunk_text`도 새 블록 분리기를 공유하도록 리팩터. `pipeline.py`의 Confluence 분기 교체 + VectorStore metadata에 `section_anchor` 필드. 테스트: chunker +4(코드블록 원자성/테이블 원자성/section path·anchor 전파/빈 sections 폴백), pipeline 테스트 4건 패치 대상 갱신. 커밋: 10b23d6.
+
+---
+
+## D-042: 멀티뷰 임베딩 — 청크당 body + meta 두 벡터 (Phase 1)
+
+- **일시**: 2026-04-22
+- **맥락**: D-041 이후 청크의 `section_path`·`title`은 **메타데이터**에만 남고 임베딩 텍스트에는 포함되지 않았다. 본문에 경로 키워드가 없는 청크(예: 표 행만 들어있는 청크)는 "운영 챕터", "배포 가이드"처럼 **섹션 명칭으로 묻는 질의**에 리콜이 약했다. D-036의 "임베딩 텍스트 ≠ 저장 텍스트" 원칙을 Confluence 청크에도 일반화하되, 기존 본문 임베딩의 강점(본문 키워드 직접 매칭)을 해치지 않는 방식이 필요했다.
+- **결정**:
+  - 한 논리 청크당 **두 ChromaDB 엔트리**를 저장한다.
+    - `{chunk.id}#body` : 임베딩=본문, document=본문
+    - `{chunk.id}#meta` : 임베딩=`title + section_path`, document=본문(동일)
+  - 두 엔트리는 metadata에 `logical_chunk_id`, `view ∈ {body, meta}`를 공유한다. SQLite `chunks` 테이블은 여전히 논리 청크당 1행.
+  - 검색 시 `_search_chunks` 에서 `n_results = max_chunks * 2`로 over-fetch한 뒤 `logical_chunk_id`로 dedup, 거리 오름차순이 유지되므로 먼저 등장한(최소 distance) 항목을 채택.
+  - `title`/`section_path`가 모두 비어 있으면 meta 뷰 엔트리를 생성하지 않음(호출 낭비 방지).
+  - Phase 1 범위: 일반 문서 경로(Confluence, upload, manual). `git_code`는 이미 D-036의 embed/store 분리 패턴을 쓰고 있어 별도 조치 없음.
+- **이유**:
+  - **리콜↑, 프리시전 유지**: 본문 뷰는 그대로 유지되므로 본문 중심 질의는 기존 성능. meta 뷰는 path/title 기반 질의에서 **추가로** 걸림.
+  - **자동 질의 적응**: "kubectl 명령어" 같은 본문 친화 질의는 body 뷰가 이김, "운영 챕터 보여줘" 같은 경로 친화 질의는 meta 뷰가 이김. 라우팅 로직 불필요.
+  - **비용**: meta 텍스트는 20~50 토큰 수준이라 임베딩 토큰 총량은 +5~10%. 호출은 같은 `aembed_documents` 1회로 배치 합침(body + 활성 meta를 이어붙여 1회 호출).
+  - **확장성**: 이 패턴에 `view=summary`, `view=signature` 등 미래 뷰를 더하면 그대로 재사용 가능.
+- **영향**: `processor/pipeline.py` 일반 분기 20여 줄 재작성 + `_build_meta_view_text` 헬퍼 추가. `mcp/context_assembler.py::_search_chunks` 에 over-fetch + dedup 로직. 테스트 +3(pipeline 2건: 멀티뷰 저장/meta 비어있을 때 생략, context_assembler 1건: dedup). 기존 문서는 재처리 전까지 body 뷰만 존재 — 호환성 이슈 없음(검색은 동일하게 동작).
+
+### D-042 후속 (2026-04-22): 대시보드 청크 탭에 meta 뷰 노출 + chunks 테이블 스키마 보강
+
+운영자가 "이 청크가 무엇으로 임베딩됐는지"를 브라우저에서 확인하기 위한 가시성 추가.
+
+- **스키마 변경**: `chunks` 테이블에 `section_path TEXT DEFAULT ''`, `section_anchor TEXT DEFAULT ''` 컬럼 추가. `_migrate_schema()` 에 idempotent ALTER 로직 — 구버전 DB의 기존 row는 빈 문자열로 채워짐.
+- **저장 경로**: `metadata_store.create_chunk()` 시그니처에 두 파라미터 추가, 파이프라인의 두 분기(git_code/일반)가 모두 `chunk.section_path`/`chunk.section_anchor` 를 전달.
+- **재구성 함수 공개**: `pipeline._build_meta_view_text` → `pipeline.build_meta_view_text(title, section_path)` 로 시그니처 변경 + public 화. 파이프라인 저장 시점과 대시보드 조회 시점이 같은 결정론적 함수로 동일한 meta 텍스트를 산출.
+- **API**: `web/api/documents.py::tab_chunks` 가 청크 목록에 `meta_text` 필드를 합성해 템플릿에 전달. 별도 저장 없이 매 요청마다 재구성(D2-A 채택 — 규칙이 진화해도 마이그레이션 불필요).
+- **템플릿**: `tab_chunks.html` 이 각 청크에 대해 `<details>` 두 개(Body 기본 펼침, Meta 접힘)를 렌더, 헤더에 `section_path` 와 "body + meta"/"body only" 뱃지 표시.
+- **테스트 +3**: 청크 마이그레이션(구버전 DB 열기 → 컬럼 추가 + 빈 값 채움), `test_chunks_crud` 에 section_path/anchor 왕복 검증, `build_meta_view_text` 조합 단위 테스트(title only / path only / 둘 다 / 둘 다 없음 / 공백 트리밍).
+- **수동 UI 검증**: 임시 DB로 enrichment 로직만 분리 호출하여 출력 형태 확인(템플릿 렌더는 선재 Jinja2 캐시 이슈로 자동 테스트 불가, 데이터 경로는 검증).
+
+### D-042 후속 (2026-04-22) 보강: git_code 청크 표시 정정 + embed_text 영속화
+
+운영자 리뷰에서 "git_code 청크의 body가 임베딩 대상으로 표시되는데 실제로는 임베딩 대상이 아니다, meta 정보도 맞는지 확인 필요"는 지적이 들어옴. 코드 확인 결과:
+
+- git_code 분기는 D-036 패턴(`embed_texts` 임베딩, `chunk.content` 저장)을 그대로 유지하며, D-042 멀티뷰의 `#body`/`#meta` 접미사도 붙이지 않음 — ChromaDB에 청크당 1엔트리.
+- 그럼에도 대시보드는 모든 source_type에 동일 템플릿을 적용해 `chunk.content` 를 "Body (임베딩 대상)"로, `build_meta_view_text(title, section_path)` 를 "Meta (추가 임베딩 대상)"로 표시 → **두 표시 모두 git_code에서는 거짓**.
+- `embed_texts` 는 임베딩 직후 버려져 어디에도 영속화되지 않았음 → 정확한 표시를 위해 저장이 필요.
+
+**수정**:
+- `chunks` 테이블에 `embed_text TEXT DEFAULT ''` 컬럼 추가 + `_migrate_schema()` 에 idempotent ALTER. `create_chunk()` 시그니처에 `embed_text: str = ""` 추가.
+- 파이프라인 git_code 분기가 `create_chunk(..., embed_text=embed_texts[i])` 로 임베딩 입력을 영속화. 일반 분기는 인자 생략(빈 문자열, 본문 자체가 임베딩 입력이라 별도 저장 불필요).
+- `web/api/documents.py::tab_chunks` 가 `doc.source_type` 을 조회해 git_code일 때 meta_text 합성을 생략하고 `source_type` 을 템플릿에 전달.
+- `tab_chunks.html` 이 source_type으로 분기:
+  - **git_code**: "Stored Content (검색 결과 반환용 — 임베딩 대상 아님)" + "Embedding Text (이름+시그니처+docstring — 실제 임베딩 입력)" 두 `<details>`. 뱃지 `code · single vector`. 기존(컬럼 추가 전 처리) 청크는 embed_text가 비어 있으면 안내 문구 표시.
+  - **그 외**: 기존 "Body (임베딩 대상)" + "Meta (추가 임베딩 대상)" 유지.
+- 테스트 +1: `test_git_code_pipeline_persists_embed_text` — embed_text가 SQLite에 영속화되며 본문(`content`)과 다른 값임(D-036 분리 원칙). 기존 마이그레이션·CRUD 테스트에 `embed_text` 컬럼 검증 추가.
+
