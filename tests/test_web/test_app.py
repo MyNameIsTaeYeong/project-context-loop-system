@@ -2,7 +2,52 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
+
+from context_loop.config import Config
+from context_loop.web.app import _configure_logging
+
+
+def test_configure_logging_sets_context_loop_level(tmp_path) -> None:
+    """app.log_level이 context_loop 로거에 적용된다."""
+    pkg_logger = logging.getLogger("context_loop")
+    original_level = pkg_logger.level
+    original_handlers = list(pkg_logger.handlers)
+    original_propagate = pkg_logger.propagate
+    try:
+        user_cfg = tmp_path / "config.yaml"
+        user_cfg.write_text("app:\n  log_level: DEBUG\n", encoding="utf-8")
+        config = Config(config_path=user_cfg)
+
+        _configure_logging(config)
+
+        assert pkg_logger.level == logging.DEBUG
+    finally:
+        pkg_logger.setLevel(original_level)
+        pkg_logger.handlers = original_handlers
+        pkg_logger.propagate = original_propagate
+
+
+def test_configure_logging_defaults_to_info_on_invalid(tmp_path) -> None:
+    """잘못된 로그 레벨 문자열은 INFO로 폴백한다."""
+    pkg_logger = logging.getLogger("context_loop")
+    original_level = pkg_logger.level
+    original_handlers = list(pkg_logger.handlers)
+    original_propagate = pkg_logger.propagate
+    try:
+        user_cfg = tmp_path / "config.yaml"
+        user_cfg.write_text("app:\n  log_level: NOPE\n", encoding="utf-8")
+        config = Config(config_path=user_cfg)
+
+        _configure_logging(config)
+
+        assert pkg_logger.level == logging.INFO
+    finally:
+        pkg_logger.setLevel(original_level)
+        pkg_logger.handlers = original_handlers
+        pkg_logger.propagate = original_propagate
 
 
 @pytest.mark.asyncio
