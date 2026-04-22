@@ -330,6 +330,48 @@ def _extract_page_title(page_data: dict[str, Any], page_id: str) -> str:
     return page_data.get("title") or page_data.get("name") or f"Confluence Page {page_id}"
 
 
+def _extract_owner_id(page_data: dict[str, Any]) -> str | None:
+    """페이지 데이터에서 소유자 account ID를 추출한다.
+
+    MCP 서버 구현에 따라 필드 위치가 달라 여러 경로를 시도한다.
+    """
+    for key in ("ownerId", "owner_id"):
+        val = page_data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    owner = page_data.get("owner")
+    if isinstance(owner, dict):
+        for key in ("accountId", "id"):
+            val = owner.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+    return None
+
+
+def _extract_source_updated_at(page_data: dict[str, Any]) -> str | None:
+    """페이지 데이터에서 원본 마지막 수정 시각(ISO-8601)을 추출한다.
+
+    Confluence MCP 서버 구현에 따라 필드 위치가 달라 여러 경로를 시도한다.
+    """
+    version = page_data.get("version")
+    if isinstance(version, dict):
+        when = version.get("createdAt") or version.get("when")
+        if isinstance(when, str) and when.strip():
+            return when
+    history = page_data.get("history")
+    if isinstance(history, dict):
+        last = history.get("lastUpdated")
+        if isinstance(last, dict):
+            when = last.get("when")
+            if isinstance(when, str) and when.strip():
+                return when
+    for key in ("lastModifiedDate", "updated_at", "updatedAt"):
+        val = page_data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return None
+
+
 def convert_html_to_markdown(html: str) -> str:
     """HTML 콘텐츠를 마크다운으로 변환한다.
 
@@ -370,6 +412,8 @@ async def import_page_via_mcp(
     page_data = await get_page(session, page_id)
     html_body = _extract_page_content(page_data)
     title = _extract_page_title(page_data, page_id)
+    source_updated_at = _extract_source_updated_at(page_data)
+    owner_id = _extract_owner_id(page_data)
 
     # HTML → 마크다운 변환
     content = convert_html_to_markdown(html_body) if html_body else html_body
@@ -388,6 +432,8 @@ async def import_page_via_mcp(
             original_content=content,
             content_hash=content_hash,
             raw_content=html_body or None,
+            source_updated_at=source_updated_at,
+            owner_id=owner_id,
         )
         await store.add_processing_history(
             document_id=doc_id,
@@ -407,6 +453,7 @@ async def import_page_via_mcp(
         original_content=content,
         content_hash=content_hash,
         raw_content=html_body or None,
+        source_updated_at=source_updated_at,
     )
     await store.update_document_status(existing["id"], status="changed")
     await store.add_processing_history(

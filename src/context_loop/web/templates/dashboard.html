@@ -10,6 +10,11 @@
     <p aria-busy="true">Loading stats...</p>
 </section>
 
+<!-- Sync 상태 -->
+<section id="sync-status-area" hx-get="/partials/sync-status" hx-trigger="load" hx-swap="innerHTML" style="margin-top: 1rem;">
+    <p aria-busy="true">Loading sync status...</p>
+</section>
+
 <!-- 필터 + 업로드 -->
 <section x-data="{ sourceType: '', status: '' }" style="margin-top: 1.5rem;">
     <div class="grid" style="grid-template-columns: 1fr 1fr 1fr auto; align-items: end;">

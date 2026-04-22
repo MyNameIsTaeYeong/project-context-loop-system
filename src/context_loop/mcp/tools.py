@@ -6,6 +6,7 @@ search_context, list_documents, get_document, get_graph_context 도구를 등록
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -25,17 +26,20 @@ def register_tools(mcp: FastMCP) -> None:
         """질의 문자열로 관련 사내 지식 컨텍스트를 검색·조립하여 반환한다.
 
         벡터 유사도 검색과 그래프 탐색을 결합하여 관련 컨텍스트를 조립한다.
+        어떤 문서가 인용되는지 ``search_logs``/``search_citations`` 테이블에
+        관측 신호로 기록한다.
 
         Args:
             query: 검색 질의 문자열.
             max_chunks: 반환할 최대 청크 수.
             include_graph: 그래프 컨텍스트 포함 여부.
         """
-        from context_loop.mcp.context_assembler import assemble_context
+        from context_loop.mcp.context_assembler import assemble_context_with_sources
         from context_loop.mcp.server import _config, _embedding_client, _get_stores, _llm_client
 
         meta_store, vector_store, graph_store = _get_stores()
-        return await assemble_context(
+        started = time.perf_counter()
+        assembled = await assemble_context_with_sources(
             query=query,
             meta_store=meta_store,
             vector_store=vector_store,
@@ -50,6 +54,29 @@ def register_tools(mcp: FastMCP) -> None:
             rerank_score_threshold=_config.get("search.reranker_score_threshold", 0.0) if _config else 0.0,
             hyde_enabled=_config.get("search.hyde_enabled", False) if _config else False,
         )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+
+        try:
+            citations = [
+                {
+                    "document_id": s.document_id,
+                    "rank": idx,
+                    "similarity": s.similarity,
+                    "retrieval": "vector" if s.similarity > 0 else "graph",
+                }
+                for idx, s in enumerate(assembled.sources)
+            ]
+            await meta_store.log_search(
+                query=query,
+                source="mcp",
+                result_count=len(assembled.sources),
+                latency_ms=latency_ms,
+                citations=citations,
+            )
+        except Exception:
+            logger.warning("검색 로그 기록 실패", exc_info=True)
+
+        return assembled.context_text or "관련 컨텍스트를 찾을 수 없습니다."
 
     @mcp.tool()
     async def list_documents(
@@ -58,11 +85,17 @@ def register_tools(mcp: FastMCP) -> None:
     ) -> list[dict[str, Any]]:
         """등록된 문서 목록을 조회한다.
 
+        각 항목에 ``source_updated_at`` (원본 시스템의 마지막 수정 시각)과
+        ``staleness`` (``fresh``/``aging``/``stale``/``unknown`` 버킷 및
+        ``age_days``)를 포함하여 소비 측에서 오래된 정보 여부를 판단할 수
+        있도록 한다.
+
         Args:
             source_type: 소스 유형으로 필터링 ("confluence", "upload", "manual").
             status: 상태로 필터링 ("pending", "processing", "completed", "failed").
         """
         from context_loop.mcp.server import _get_stores
+        from context_loop.storage.metadata_store import classify_staleness
 
         meta_store, _, _ = _get_stores()
         docs = await meta_store.list_documents(
@@ -77,6 +110,10 @@ def register_tools(mcp: FastMCP) -> None:
                 "status": doc["status"],
                 "storage_method": doc.get("storage_method"),
                 "updated_at": doc.get("updated_at"),
+                "source_updated_at": doc.get("source_updated_at"),
+                "staleness": classify_staleness(doc.get("source_updated_at")),
+                "author": doc.get("author"),
+                "owner_id": doc.get("owner_id"),
             }
             for doc in docs
         ]

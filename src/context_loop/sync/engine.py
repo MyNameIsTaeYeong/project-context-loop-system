@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -70,6 +71,7 @@ async def sync_space(
         SyncResult — 생성/갱신/변경없음/오류 집계.
     """
     result = SyncResult()
+    started_at = datetime.now(tz=timezone.utc)
     pages = await client.list_pages(space_id)
 
     for page in pages:
@@ -112,6 +114,23 @@ async def sync_space(
         except Exception as exc:  # noqa: BLE001
             logger.error("페이지 동기화 실패 page_id=%s: %s", page_id, exc)
             result.errors.append({"page_id": page_id, "error": str(exc)})
+
+    # 영속화: 대시보드에서 마지막 sync 상태·오류 건수를 조회할 수 있도록
+    try:
+        await store.record_sync_run(
+            source_type="confluence",
+            space_id=space_id,
+            started_at=started_at,
+            completed_at=datetime.now(tz=timezone.utc),
+            created_count=len(result.created),
+            updated_count=len(result.updated),
+            unchanged_count=len(result.unchanged),
+            error_count=len(result.errors),
+            errors=json.dumps(result.errors) if result.errors else None,
+            status="completed",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("sync 실행 이력 기록 실패", exc_info=True)
 
     return result
 

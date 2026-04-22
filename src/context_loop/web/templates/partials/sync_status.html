@@ -1,0 +1,34 @@
+<article>
+    <header><strong>Confluence Sync</strong></header>
+    {% if last_confluence %}
+        <p>
+            마지막 실행: <code>{{ last_confluence.completed_at or last_confluence.started_at }}</code>
+            {% if last_confluence.space_id %}
+                / space <code>{{ last_confluence.space_id }}</code>
+            {% endif %}
+        </p>
+        <div class="grid">
+            <small>신규 <strong>{{ last_confluence.created_count }}</strong></small>
+            <small>갱신 <strong>{{ last_confluence.updated_count }}</strong></small>
+            <small>미변경 <strong>{{ last_confluence.unchanged_count }}</strong></small>
+            <small>
+                오류
+                <strong{% if last_confluence.error_count > 0 %} style="color:#c0392b"{% endif %}>
+                    {{ last_confluence.error_count }}
+                </strong>
+            </small>
+        </div>
+        {% if last_confluence.errors %}
+            <details>
+                <summary>오류 상세 ({{ last_confluence.errors|length }}건)</summary>
+                <ul>
+                    {% for err in last_confluence.errors %}
+                        <li><code>{{ err.page_id }}</code> — {{ err.error }}</li>
+                    {% endfor %}
+                </ul>
+            </details>
+        {% endif %}
+    {% else %}
+        <p><em>아직 동기화가 실행되지 않았습니다.</em></p>
+    {% endif %}
+</article>

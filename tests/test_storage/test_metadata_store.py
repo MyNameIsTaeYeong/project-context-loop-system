@@ -1,10 +1,11 @@
 """MetadataStore 테스트."""
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from context_loop.storage.metadata_store import MetadataStore
+from context_loop.storage.metadata_store import MetadataStore, classify_staleness
 
 
 @pytest.fixture
@@ -442,3 +443,258 @@ async def test_get_stats(store: MetadataStore) -> None:
     assert stats["chunk_count"] == 1
     assert stats["node_count"] == 1
     assert stats["edge_count"] == 0
+
+
+async def test_log_search_persists_query_and_citations(store: MetadataStore) -> None:
+    doc_id = await store.create_document(
+        source_type="confluence", title="doc", original_content="x", content_hash="h"
+    )
+    log_id = await store.log_search(
+        query="인증 플로우",
+        source="mcp",
+        result_count=1,
+        latency_ms=42,
+        citations=[
+            {"document_id": doc_id, "rank": 0, "similarity": 0.87, "retrieval": "vector"},
+        ],
+    )
+
+    logs = await store.get_search_logs()
+    assert len(logs) == 1
+    assert logs[0]["id"] == log_id
+    assert logs[0]["query"] == "인증 플로우"
+    assert logs[0]["source"] == "mcp"
+    assert logs[0]["result_count"] == 1
+    assert logs[0]["latency_ms"] == 42
+
+    citations = await store.get_search_citations(log_id)
+    assert len(citations) == 1
+    assert citations[0]["document_id"] == doc_id
+    assert citations[0]["rank"] == 0
+    assert citations[0]["similarity"] == 0.87
+    assert citations[0]["retrieval"] == "vector"
+
+
+async def test_log_search_without_citations(store: MetadataStore) -> None:
+    log_id = await store.log_search(query="empty", source="web")
+    citations = await store.get_search_citations(log_id)
+    assert citations == []
+
+
+async def test_get_search_logs_filters_by_source(store: MetadataStore) -> None:
+    await store.log_search(query="q1", source="mcp")
+    await store.log_search(query="q2", source="web")
+    await store.log_search(query="q3", source="web")
+
+    web_logs = await store.get_search_logs(source="web")
+    assert len(web_logs) == 2
+    assert {log["query"] for log in web_logs} == {"q2", "q3"}
+
+
+async def test_get_document_citation_counts_ranks_by_frequency(
+    store: MetadataStore,
+) -> None:
+    doc_a = await store.create_document(
+        source_type="confluence", title="A", original_content="a", content_hash="ha"
+    )
+    doc_b = await store.create_document(
+        source_type="confluence", title="B", original_content="b", content_hash="hb"
+    )
+
+    # doc_a 2회 인용, doc_b 1회 인용
+    for _ in range(2):
+        await store.log_search(
+            query="q", source="mcp",
+            citations=[{"document_id": doc_a, "rank": 0, "similarity": 0.9}],
+        )
+    await store.log_search(
+        query="q2", source="mcp",
+        citations=[{"document_id": doc_b, "rank": 0, "similarity": 0.8}],
+    )
+
+    counts = await store.get_document_citation_counts()
+    assert counts[0]["document_id"] == doc_a
+    assert counts[0]["citation_count"] == 2
+    assert counts[1]["document_id"] == doc_b
+    assert counts[1]["citation_count"] == 1
+
+
+async def test_create_document_persists_owner_id(store: MetadataStore) -> None:
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="x",
+        content_hash="h",
+        author="editor-42",
+        owner_id="owner-7",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["author"] == "editor-42"
+    assert doc["owner_id"] == "owner-7"
+
+
+async def test_create_document_persists_source_updated_at(
+    store: MetadataStore,
+) -> None:
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="x",
+        content_hash="h",
+        source_updated_at="2026-01-15T10:00:00Z",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["source_updated_at"] == "2026-01-15T10:00:00Z"
+
+
+async def test_update_document_content_updates_source_updated_at(
+    store: MetadataStore,
+) -> None:
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="old",
+        content_hash="h1",
+        source_updated_at="2026-01-01T00:00:00Z",
+    )
+    await store.update_document_content(
+        doc_id,
+        "new",
+        "h2",
+        source_updated_at="2026-04-01T00:00:00Z",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["source_updated_at"] == "2026-04-01T00:00:00Z"
+
+
+async def test_update_document_content_preserves_source_updated_at_when_omitted(
+    store: MetadataStore,
+) -> None:
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="old",
+        content_hash="h1",
+        source_updated_at="2026-01-01T00:00:00Z",
+    )
+    await store.update_document_content(doc_id, "new", "h2")
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["source_updated_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_classify_staleness_fresh() -> None:
+    now = datetime(2026, 4, 22, tzinfo=timezone.utc)
+    result = classify_staleness(
+        (now - timedelta(days=10)).isoformat(),
+        now=now,
+    )
+    assert result["bucket"] == "fresh"
+    assert result["age_days"] == 10
+
+
+def test_classify_staleness_aging() -> None:
+    now = datetime(2026, 4, 22, tzinfo=timezone.utc)
+    result = classify_staleness(
+        (now - timedelta(days=120)).isoformat(),
+        now=now,
+    )
+    assert result["bucket"] == "aging"
+    assert result["age_days"] == 120
+
+
+def test_classify_staleness_stale() -> None:
+    now = datetime(2026, 4, 22, tzinfo=timezone.utc)
+    result = classify_staleness(
+        (now - timedelta(days=400)).isoformat(),
+        now=now,
+    )
+    assert result["bucket"] == "stale"
+    assert result["age_days"] == 400
+
+
+def test_classify_staleness_unknown_when_missing() -> None:
+    assert classify_staleness(None) == {"bucket": "unknown", "age_days": None}
+
+
+def test_classify_staleness_unknown_when_unparseable() -> None:
+    assert classify_staleness("not-a-date") == {"bucket": "unknown", "age_days": None}
+
+
+def test_classify_staleness_handles_z_suffix() -> None:
+    now = datetime(2026, 4, 22, tzinfo=timezone.utc)
+    result = classify_staleness("2026-04-12T00:00:00Z", now=now)
+    assert result["bucket"] == "fresh"
+    assert result["age_days"] == 10
+
+
+async def test_record_sync_run_persists_summary(store: MetadataStore) -> None:
+    started = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc)
+    completed = datetime(2026, 4, 22, 10, 5, tzinfo=timezone.utc)
+    run_id = await store.record_sync_run(
+        source_type="confluence",
+        space_id="SPC",
+        started_at=started,
+        completed_at=completed,
+        created_count=2,
+        updated_count=3,
+        unchanged_count=10,
+        error_count=1,
+        errors='[{"page_id": "p1", "error": "timeout"}]',
+    )
+    assert run_id is not None
+
+    runs = await store.get_recent_sync_runs()
+    assert len(runs) == 1
+    assert runs[0]["source_type"] == "confluence"
+    assert runs[0]["space_id"] == "SPC"
+    assert runs[0]["created_count"] == 2
+    assert runs[0]["error_count"] == 1
+
+
+async def test_get_last_sync_run_filters_by_source_and_space(
+    store: MetadataStore,
+) -> None:
+    now = datetime(2026, 4, 22, tzinfo=timezone.utc)
+    await store.record_sync_run(
+        source_type="confluence", space_id="A",
+        started_at=now, completed_at=now,
+        created_count=1, updated_count=0, unchanged_count=0, error_count=0,
+    )
+    await store.record_sync_run(
+        source_type="confluence", space_id="B",
+        started_at=now + timedelta(minutes=5), completed_at=now + timedelta(minutes=5),
+        created_count=5, updated_count=0, unchanged_count=0, error_count=0,
+    )
+
+    last_any = await store.get_last_sync_run("confluence")
+    assert last_any is not None
+    assert last_any["space_id"] == "B"
+    assert last_any["created_count"] == 5
+
+    last_a = await store.get_last_sync_run("confluence", space_id="A")
+    assert last_a is not None
+    assert last_a["space_id"] == "A"
+
+
+async def test_log_search_cascades_on_log_deletion(store: MetadataStore) -> None:
+    """search_logs 삭제 시 citations도 CASCADE 삭제된다."""
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h"
+    )
+    log_id = await store.log_search(
+        query="q", source="mcp",
+        citations=[{"document_id": doc_id, "rank": 0, "similarity": 0.5}],
+    )
+    await store.db.execute("DELETE FROM search_logs WHERE id = ?", (log_id,))
+    await store.db.commit()
+
+    citations = await store.get_search_citations(log_id)
+    assert citations == []

@@ -138,9 +138,11 @@ def create_app() -> FastAPI:
     from context_loop.web.api.documents import router as documents_router
     from context_loop.web.api.git_sync import router as git_sync_router
     from context_loop.web.api.stats import router as stats_router
+    from context_loop.web.api.sync_status import router as sync_status_router
     from context_loop.web.api.upload import router as upload_router
 
     app.include_router(stats_router)
+    app.include_router(sync_status_router)
     app.include_router(upload_router)
     app.include_router(confluence_router)
     app.include_router(confluence_mcp_router)

@@ -223,7 +223,12 @@ async def import_page(
     content_hash = compute_content_hash(markdown)
     title = page_meta.get("title", f"Confluence Page {page_id}")
     author_id = page_meta.get("authorId") or page_meta.get("createdBy", {}).get("accountId")
+    owner_id = page_meta.get("ownerId") or page_meta.get("owner", {}).get("accountId")
     page_url = f"{base_url.rstrip('/')}/wiki/spaces/_/pages/{page_id}"
+    source_updated_at = (
+        page_meta.get("version", {}).get("createdAt")
+        or page_meta.get("lastModifiedDate")
+    )
 
     # 기존 문서 확인
     existing_docs = await store.list_documents(source_type="confluence")
@@ -239,6 +244,8 @@ async def import_page(
             url=page_url,
             author=author_id,
             raw_content=html_body or None,
+            source_updated_at=source_updated_at,
+            owner_id=owner_id,
         )
         await store.add_processing_history(
             document_id=doc_id,
@@ -258,6 +265,7 @@ async def import_page(
         original_content=markdown,
         content_hash=content_hash,
         raw_content=html_body or None,
+        source_updated_at=source_updated_at,
     )
     await store.update_document_status(existing["id"], status="changed")
     await store.add_processing_history(

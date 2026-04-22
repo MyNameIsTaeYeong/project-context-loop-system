@@ -6,11 +6,46 @@ document_sources 테이블을 관리한다.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+# staleness 기본 임계값 (일 단위). 90일 미만은 fresh, 180일 미만은 aging, 그 외 stale.
+FRESH_THRESHOLD_DAYS = 90
+AGING_THRESHOLD_DAYS = 180
+
+
+def classify_staleness(
+    source_updated_at: str | None,
+    *,
+    now: datetime | None = None,
+    fresh_days: int = FRESH_THRESHOLD_DAYS,
+    aging_days: int = AGING_THRESHOLD_DAYS,
+) -> dict[str, Any]:
+    """원본 마지막 수정 시각으로 staleness 등급을 판정한다.
+
+    Returns:
+        ``{"bucket": "fresh"|"aging"|"stale"|"unknown", "age_days": int|None}``.
+    """
+    if not source_updated_at:
+        return {"bucket": "unknown", "age_days": None}
+    try:
+        ts = datetime.fromisoformat(source_updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return {"bucket": "unknown", "age_days": None}
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(tz=timezone.utc)
+    age_days = max((current - ts).days, 0)
+    if age_days < fresh_days:
+        bucket = "fresh"
+    elif age_days < aging_days:
+        bucket = "aging"
+    else:
+        bucket = "stale"
+    return {"bucket": bucket, "age_days": age_days}
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -26,6 +61,8 @@ CREATE TABLE IF NOT EXISTS documents (
     version INTEGER DEFAULT 1,
     url TEXT,
     author TEXT,
+    owner_id TEXT,
+    source_updated_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(source_type, source_id)
@@ -84,6 +121,38 @@ CREATE TABLE IF NOT EXISTS document_sources (
     PRIMARY KEY (doc_id, source_doc_id)
 );
 
+CREATE TABLE IF NOT EXISTS search_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    source TEXT NOT NULL,
+    result_count INTEGER DEFAULT 0,
+    latency_ms INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS search_citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_log_id INTEGER NOT NULL REFERENCES search_logs(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL,
+    rank INTEGER NOT NULL,
+    similarity REAL,
+    retrieval TEXT NOT NULL DEFAULT 'vector'
+);
+
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL,
+    space_id TEXT,
+    created_count INTEGER DEFAULT 0,
+    updated_count INTEGER DEFAULT 0,
+    unchanged_count INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    errors TEXT,
+    started_at TIMESTAMP NOT NULL,
+    completed_at TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'completed'
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type, source_id);
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
@@ -94,6 +163,10 @@ CREATE INDEX IF NOT EXISTS idx_graph_node_documents_document ON graph_node_docum
 CREATE INDEX IF NOT EXISTS idx_processing_history_document ON processing_history(document_id);
 CREATE INDEX IF NOT EXISTS idx_document_sources_doc ON document_sources(doc_id);
 CREATE INDEX IF NOT EXISTS idx_document_sources_source ON document_sources(source_doc_id);
+CREATE INDEX IF NOT EXISTS idx_search_logs_created ON search_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_search_citations_log ON search_citations(search_log_id);
+CREATE INDEX IF NOT EXISTS idx_search_citations_document ON search_citations(document_id);
+CREATE INDEX IF NOT EXISTS idx_sync_runs_source ON sync_runs(source_type, started_at);
 """
 
 
@@ -125,6 +198,12 @@ class MetadataStore:
         existing_columns = {row["name"] for row in await cursor.fetchall()}
         if "raw_content" not in existing_columns:
             await self.db.execute("ALTER TABLE documents ADD COLUMN raw_content TEXT")
+        if "source_updated_at" not in existing_columns:
+            await self.db.execute(
+                "ALTER TABLE documents ADD COLUMN source_updated_at TIMESTAMP"
+            )
+        if "owner_id" not in existing_columns:
+            await self.db.execute("ALTER TABLE documents ADD COLUMN owner_id TEXT")
 
         cursor = await self.db.execute("PRAGMA table_info(chunks)")
         chunk_columns = {row["name"] for row in await cursor.fetchall()}
@@ -166,20 +245,29 @@ class MetadataStore:
         url: str | None = None,
         author: str | None = None,
         raw_content: str | None = None,
+        source_updated_at: str | None = None,
+        owner_id: str | None = None,
     ) -> int:
         """문서를 생성하고 ID를 반환한다.
 
         ``raw_content``는 소스 원본 (예: Confluence Storage Format HTML).
         하류에서 구조화 추출기가 재파싱할 수 있도록 보존한다. 없으면 NULL.
+
+        ``source_updated_at``은 원본 시스템(Confluence 등)의 마지막 수정 시각
+        ISO-8601 문자열. ``updated_at``(시스템 반영 시각)과 구분하여 staleness
+        판단에 사용한다.
+
+        ``author``는 마지막 수정자 ID, ``owner_id``는 원본 시스템의 문서 소유자
+        ID로 의미가 다르다. stale 알림·리뷰 요청의 수신자 경로로 활용한다.
         """
         cursor = await self.db.execute(
             """INSERT INTO documents
                (source_type, source_id, title, original_content, raw_content,
-                content_hash, url, author)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                content_hash, url, author, owner_id, source_updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 source_type, source_id, title, original_content, raw_content,
-                content_hash, url, author,
+                content_hash, url, author, owner_id, source_updated_at,
             ),
         )
         await self.db.commit()
@@ -237,30 +325,30 @@ class MetadataStore:
         original_content: str,
         content_hash: str,
         raw_content: str | None = None,
+        source_updated_at: str | None = None,
     ) -> None:
         """문서 원본 내용과 해시를 갱신한다.
 
         ``raw_content``가 ``None``이 아니면 함께 갱신한다. ``None``이면
         기존 ``raw_content`` 값을 유지한다 (마크다운만 수정되는 케이스 지원).
+
+        ``source_updated_at``이 주어지면 원본 시스템의 마지막 수정 시각도
+        함께 갱신한다 (staleness 관측용).
         """
-        if raw_content is None:
-            await self.db.execute(
-                """UPDATE documents
-                   SET original_content = ?, content_hash = ?,
-                       version = version + 1,
-                       updated_at = CURRENT_TIMESTAMP
-                   WHERE id = ?""",
-                (original_content, content_hash, document_id),
-            )
-        else:
-            await self.db.execute(
-                """UPDATE documents
-                   SET original_content = ?, raw_content = ?, content_hash = ?,
-                       version = version + 1,
-                       updated_at = CURRENT_TIMESTAMP
-                   WHERE id = ?""",
-                (original_content, raw_content, content_hash, document_id),
-            )
+        sets = ["original_content = ?", "content_hash = ?",
+                "version = version + 1", "updated_at = CURRENT_TIMESTAMP"]
+        params: list[Any] = [original_content, content_hash]
+        if raw_content is not None:
+            sets.insert(1, "raw_content = ?")
+            params.insert(1, raw_content)
+        if source_updated_at is not None:
+            sets.append("source_updated_at = ?")
+            params.append(source_updated_at)
+        params.append(document_id)
+        await self.db.execute(
+            f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",  # noqa: S608
+            params,
+        )
         await self.db.commit()
 
     async def delete_document(self, document_id: int) -> None:
@@ -602,6 +690,194 @@ class MetadataStore:
             "DELETE FROM document_sources WHERE doc_id = ?", (doc_id,)
         )
         await self.db.commit()
+
+    # --- Search Logs ---
+
+    async def log_search(
+        self,
+        *,
+        query: str,
+        source: str,
+        result_count: int = 0,
+        latency_ms: int | None = None,
+        citations: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """검색 질의와 인용된 문서 ID를 기록한다.
+
+        SSOT로서 "어떤 문서가 실제로 사용되는가"를 관측하기 위한 신호.
+        stale/owner 판단 루프의 기초 데이터로 활용한다.
+
+        Args:
+            query: 원본 질의 문자열.
+            source: 호출 경로 ("mcp", "web" 등).
+            result_count: 인용된 문서 수.
+            latency_ms: 검색·조립 소요 시간(ms).
+            citations: 인용 문서 리스트. 각 항목은
+                ``{"document_id", "rank", "similarity", "retrieval"}``.
+
+        Returns:
+            생성된 search_logs 레코드 ID.
+        """
+        cursor = await self.db.execute(
+            """INSERT INTO search_logs (query, source, result_count, latency_ms)
+               VALUES (?, ?, ?, ?)""",
+            (query, source, result_count, latency_ms),
+        )
+        log_id = cursor.lastrowid
+        assert log_id is not None
+
+        if citations:
+            await self.db.executemany(
+                """INSERT INTO search_citations
+                   (search_log_id, document_id, rank, similarity, retrieval)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (
+                        log_id,
+                        c["document_id"],
+                        c["rank"],
+                        c.get("similarity"),
+                        c.get("retrieval", "vector"),
+                    )
+                    for c in citations
+                ],
+            )
+        await self.db.commit()
+        return log_id
+
+    async def get_search_logs(
+        self,
+        *,
+        limit: int = 100,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """최근 검색 로그를 조회한다."""
+        query = "SELECT * FROM search_logs"
+        params: list[Any] = []
+        if source:
+            query += " WHERE source = ?"
+            params.append(source)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self.db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_search_citations(self, search_log_id: int) -> list[dict[str, Any]]:
+        """특정 검색 로그의 인용 문서 목록을 조회한다."""
+        cursor = await self.db.execute(
+            """SELECT * FROM search_citations
+               WHERE search_log_id = ? ORDER BY rank""",
+            (search_log_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_document_citation_counts(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """문서별 인용 횟수를 내림차순으로 반환한다.
+
+        hot/cold 문서 분류와 품질 리뷰 우선순위 지정을 위한 집계.
+
+        Returns:
+            ``{"document_id", "citation_count", "last_cited_at"}`` 목록.
+        """
+        cursor = await self.db.execute(
+            """SELECT
+                   sc.document_id,
+                   COUNT(*) AS citation_count,
+                   MAX(sl.created_at) AS last_cited_at
+               FROM search_citations sc
+               JOIN search_logs sl ON sc.search_log_id = sl.id
+               GROUP BY sc.document_id
+               ORDER BY citation_count DESC, last_cited_at DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Sync Runs ---
+
+    async def record_sync_run(
+        self,
+        *,
+        source_type: str,
+        space_id: str | None,
+        started_at: datetime,
+        completed_at: datetime,
+        created_count: int,
+        updated_count: int,
+        unchanged_count: int,
+        error_count: int,
+        errors: str | None = None,
+        status: str = "completed",
+    ) -> int:
+        """단일 스페이스 동기화 결과를 기록한다.
+
+        ``errors``는 직렬화된 JSON 문자열(선택). 대시보드에서 마지막 sync
+        시각·실패 건수·변경 건수를 표시하는 신호 원천.
+        """
+        cursor = await self.db.execute(
+            """INSERT INTO sync_runs
+               (source_type, space_id, created_count, updated_count,
+                unchanged_count, error_count, errors, started_at,
+                completed_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source_type, space_id,
+                created_count, updated_count, unchanged_count, error_count,
+                errors,
+                started_at.isoformat(),
+                completed_at.isoformat(),
+                status,
+            ),
+        )
+        await self.db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    async def get_recent_sync_runs(
+        self,
+        *,
+        limit: int = 20,
+        source_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """최근 sync 실행 이력을 반환한다."""
+        query = "SELECT * FROM sync_runs"
+        params: list[Any] = []
+        if source_type:
+            query += " WHERE source_type = ?"
+            params.append(source_type)
+        query += " ORDER BY started_at DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self.db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_last_sync_run(
+        self,
+        source_type: str,
+        space_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """특정 소스(+스페이스)의 가장 최근 sync 실행을 반환한다."""
+        if space_id is None:
+            cursor = await self.db.execute(
+                """SELECT * FROM sync_runs WHERE source_type = ?
+                   ORDER BY started_at DESC LIMIT 1""",
+                (source_type,),
+            )
+        else:
+            cursor = await self.db.execute(
+                """SELECT * FROM sync_runs
+                   WHERE source_type = ? AND space_id = ?
+                   ORDER BY started_at DESC LIMIT 1""",
+                (source_type, space_id),
+            )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     # --- Statistics ---
 
