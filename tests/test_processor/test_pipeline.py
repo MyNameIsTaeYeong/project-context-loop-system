@@ -24,7 +24,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from context_loop.processor.chunker import Chunk
-from context_loop.processor.pipeline import PipelineConfig, process_document
+from context_loop.processor.pipeline import (
+    PipelineConfig,
+    build_meta_view_text,
+    process_document,
+)
 from context_loop.storage.metadata_store import MetadataStore
 
 
@@ -406,10 +410,12 @@ async def test_multi_view_embeddings_stored_for_chunks(
     assert metas[0]["logical_chunk_id"] == metas[1]["logical_chunk_id"] == "c-abc"
     assert metas[0]["section_anchor"] == "결제-시스템"
 
-    # SQLite chunks는 여전히 논리 청크당 1행
+    # SQLite chunks는 여전히 논리 청크당 1행이며, section_path/anchor가 보존된다.
     stored = await store.get_chunks_by_document(doc_id)
     assert len(stored) == 1
     assert stored[0]["id"] == "c-abc"
+    assert stored[0]["section_path"] == "결제 시스템"
+    assert stored[0]["section_anchor"] == "결제-시스템"
 
 
 @pytest.mark.asyncio
@@ -452,3 +458,18 @@ async def test_meta_view_skipped_when_title_and_path_empty(
     ids, _embs, _docs, metas = vector_store.add_chunks.call_args.args
     assert ids == ["c-xyz#body"]
     assert metas[0]["view"] == "body"
+
+
+def test_build_meta_view_text_combinations() -> None:
+    """meta 뷰 텍스트는 title + section_path 결합. 결정론적 순수 함수.
+
+    파이프라인 저장과 대시보드 청크 탭이 같은 함수를 호출하므로 두 곳에서
+    동일한 값이 나와야 한다.
+    """
+    assert build_meta_view_text("배포 가이드", "배포 가이드 > 운영") == (
+        "배포 가이드\n배포 가이드 > 운영"
+    )
+    assert build_meta_view_text("문서", "") == "문서"
+    assert build_meta_view_text("", "경로") == "경로"
+    assert build_meta_view_text("", "") == ""
+    assert build_meta_view_text("  공백 제거  ", "  경로  ") == "공백 제거\n경로"
