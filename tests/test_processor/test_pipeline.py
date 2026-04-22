@@ -473,3 +473,54 @@ def test_build_meta_view_text_combinations() -> None:
     assert build_meta_view_text("", "경로") == "경로"
     assert build_meta_view_text("", "") == ""
     assert build_meta_view_text("  공백 제거  ", "  경로  ") == "공백 제거\n경로"
+
+
+@pytest.mark.asyncio
+async def test_git_code_pipeline_persists_embed_text(
+    store: MetadataStore,
+) -> None:
+    """git_code 분기에서 embed_text(이름+시그니처+docstring)가 SQLite에 저장된다.
+
+    임베딩 입력은 ``embed_texts``(생성된 단축 텍스트), 저장 본문은
+    ``chunk.content``(전체 코드). 두 값이 다르므로 대시보드가 실제 임베딩
+    대상을 보여주려면 embed_text가 영속화되어야 한다.
+    """
+    code = '''def hello(name: str) -> str:
+    """Greet a person."""
+    return f"Hello {name}"
+'''
+    doc_id = await store.create_document(
+        source_type="git_code",
+        source_id="src/greet.py",
+        title="src/greet.py",
+        original_content=code,
+        content_hash="h-git",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    await process_document(
+        doc_id,
+        meta_store=store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embedding_client,
+        config=PipelineConfig(),
+    )
+
+    # ChromaDB add_chunks: 청크당 1엔트리(멀티뷰 아님). 임베딩 입력은 본문이 아닌
+    # 짧은 시그니처 텍스트 — 본문(전체 코드)보다 토큰이 적어야 한다.
+    vector_store.add_chunks.assert_called_once()
+    ids, _embs, docs, _metas = vector_store.add_chunks.call_args.args
+    # #body/#meta 접미사가 붙지 않아야 함
+    assert all("#" not in cid for cid in ids)
+    # document(반환 본문)에는 함수 본문이 들어 있어야 함
+    assert any("Hello {name}" in d for d in docs)
+
+    # SQLite에 embed_text가 채워져 있어야 함
+    stored = await store.get_chunks_by_document(doc_id)
+    assert len(stored) == 1
+    chunk = stored[0]
+    assert chunk["embed_text"] != ""
+    assert "hello" in chunk["embed_text"]  # 심볼 이름
+    # 본문(전체 코드)와 다른 값이어야 함 — 임베딩과 저장의 분리(D-036)
+    assert chunk["embed_text"] != chunk["content"]

@@ -152,7 +152,7 @@ async def process_document(
                 vector_store.add_chunks(chunk_ids, embeddings, documents, metadatas)
 
                 await meta_store.delete_chunks_by_document(document_id)
-                for chunk, cid in zip(chunks, chunk_ids):
+                for chunk, cid, embed_text in zip(chunks, chunk_ids, embed_texts):
                     await meta_store.create_chunk(
                         chunk_id=cid,
                         document_id=document_id,
@@ -161,6 +161,7 @@ async def process_document(
                         token_count=chunk.token_count,
                         section_path=chunk.section_path,
                         section_anchor=chunk.section_anchor,
+                        embed_text=embed_text,
                     )
                 chunk_count = len(chunks)
 
