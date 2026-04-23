@@ -633,6 +633,26 @@ async def enumerate_space_pages(
         start += page_size
 
 
+async def get_space_info(
+    session: ClientSession, space_key: str,
+) -> dict[str, Any]:
+    """MCP 서버의 getSpaceInfo 도구로 단일 공간 정보를 가져온다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키 (예: ``"ENG"``).
+
+    Returns:
+        공간 정보 dict. 일반적으로 ``key``, ``name``, ``id`` 등이 포함된다.
+        MCP 서버가 dict가 아닌 응답을 주면 ``{"key": space_key}`` 를 반환한다.
+    """
+    result = await session.call_tool("getSpaceInfo", {"spaceKey": space_key})
+    parsed = _parse_json_result(result)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"key": space_key}
+
+
 async def get_all_spaces(session: ClientSession) -> list[dict[str, Any]]:
     """MCP 서버의 getSpaceInfoAll 도구로 스페이스 목록을 가져온다."""
     result = await session.call_tool("getSpaceInfoAll", {})

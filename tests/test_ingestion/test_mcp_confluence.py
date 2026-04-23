@@ -26,6 +26,7 @@ from context_loop.ingestion.mcp_confluence import (
     get_child_pages,
     get_page,
     get_page_with_ancestors,
+    get_space_info,
     get_user_contributed_pages,
     import_page_via_mcp,
     list_available_tools,
@@ -918,6 +919,28 @@ async def test_get_all_spaces() -> None:
     spaces = await get_all_spaces(session)
     session.call_tool.assert_called_once_with("getSpaceInfoAll", {})
     assert spaces[0]["key"] == "DEV"
+
+
+@pytest.mark.asyncio
+async def test_get_space_info_returns_dict() -> None:
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"key": "ENG", "name": "Engineering", "id": "42"}',
+    )
+
+    info = await get_space_info(session, "ENG")
+
+    session.call_tool.assert_called_once_with("getSpaceInfo", {"spaceKey": "ENG"})
+    assert info["name"] == "Engineering"
+
+
+@pytest.mark.asyncio
+async def test_get_space_info_falls_back_to_key_on_non_dict_response() -> None:
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result("opaque text response")
+
+    info = await get_space_info(session, "ENG")
+    assert info == {"key": "ENG"}
 
 
 @pytest.mark.asyncio
