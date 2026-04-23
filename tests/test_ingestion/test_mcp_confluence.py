@@ -16,8 +16,11 @@ from context_loop.ingestion.mcp_confluence import (
     _extract_text,
     _is_cql,
     _parse_json_result,
+    _space_cql,
     build_cql,
     convert_html_to_markdown,
+    enumerate_space_pages,
+    estimate_space_page_count,
     format_breadcrumb,
     get_all_spaces,
     get_child_pages,
@@ -715,6 +718,196 @@ async def test_walk_subtree_deduplicates_siblings_pointing_to_same_id() -> None:
     nodes = await walk_subtree(session, "r")
     ids = [n["id"] for n in nodes]
     assert ids == ["r", "x", "y"]
+
+
+# --- _space_cql 테스트 ---
+
+
+def test_space_cql_basic() -> None:
+    assert _space_cql("ENG") == 'space = "ENG" AND type = "page"'
+
+
+def test_space_cql_escapes_double_quote() -> None:
+    assert _space_cql('AB"C') == 'space = "AB\\"C" AND type = "page"'
+
+
+def test_space_cql_escapes_backslash() -> None:
+    assert _space_cql("AB\\C") == 'space = "AB\\\\C" AND type = "page"'
+
+
+# --- estimate_space_page_count / enumerate_space_pages 테스트 ---
+
+
+def _make_search_session(
+    pages: list[list[dict[str, Any]]],
+    *,
+    total_size: int | None = None,
+    record_calls: list[dict[str, Any]] | None = None,
+) -> Any:
+    """``searchContent`` 호출마다 연속 페이지를 돌려주는 가짜 세션.
+
+    ``pages[0]`` 은 첫 호출, ``pages[1]`` 은 두 번째 호출… 범위를 넘어가면
+    빈 results 를 반환한다. ``record_calls`` 가 주어지면 호출 인자를 누적 기록.
+    """
+    call_idx = {"i": 0}
+
+    class FakeSession:
+        async def call_tool(self, tool_name: str, args: dict[str, Any]):
+            if tool_name != "searchContent":
+                raise AssertionError(f"Unexpected tool: {tool_name}")
+            if record_calls is not None:
+                record_calls.append(args)
+            i = call_idx["i"]
+            call_idx["i"] += 1
+            results = pages[i] if i < len(pages) else []
+            envelope: dict[str, Any] = {
+                "results": results,
+                "size": len(results),
+                "start": args.get("start", 0),
+                "limit": args.get("limit", 25),
+            }
+            if total_size is not None:
+                envelope["totalSize"] = total_size
+            return _make_result(json.dumps(envelope))
+
+    return FakeSession()
+
+
+@pytest.mark.asyncio
+async def test_estimate_space_page_count_returns_total_size() -> None:
+    """totalSize가 있으면 그대로 반환한다."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [[{"id": "1"}]], total_size=342, record_calls=calls,
+    )
+
+    count = await estimate_space_page_count(session, "ENG")
+
+    assert count == 342
+    assert calls[0] == {
+        "cql": 'space = "ENG" AND type = "page"', "limit": 1, "start": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_estimate_space_page_count_returns_none_when_server_omits() -> None:
+    """서버가 totalSize를 내려주지 않으면 None."""
+    session = _make_search_session([[{"id": "1"}]], total_size=None)
+    assert await estimate_space_page_count(session, "ENG") is None
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_single_page_completion() -> None:
+    """totalSize에 맞게 한 페이지만에 모두 소진."""
+    session = _make_search_session(
+        [[{"id": "1"}, {"id": "2"}, {"id": "3"}]],
+        total_size=3,
+    )
+
+    collected = [p async for p in enumerate_space_pages(session, "ENG", page_size=100)]
+
+    assert [p["id"] for p in collected] == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_multiple_pages_with_total_size() -> None:
+    """여러 페이지에 걸친 요청이 올바른 start로 이어진다."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [
+            [{"id": "1"}, {"id": "2"}],
+            [{"id": "3"}],
+        ],
+        total_size=3,
+        record_calls=calls,
+    )
+
+    collected = [p async for p in enumerate_space_pages(session, "ENG", page_size=2)]
+
+    assert [p["id"] for p in collected] == ["1", "2", "3"]
+    # 두 번의 searchContent: start=0 → start=2
+    assert [c["start"] for c in calls] == [0, 2]
+    assert all(c["limit"] == 2 for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_terminates_on_short_page_without_total_size() -> None:
+    """totalSize가 없을 때 size < page_size 응답이 오면 종료한다."""
+    session = _make_search_session(
+        [
+            [{"id": "1"}, {"id": "2"}],
+            [{"id": "3"}],   # size=1 < page_size=2 → 종료
+        ],
+        total_size=None,
+    )
+
+    collected = [p async for p in enumerate_space_pages(session, "ENG", page_size=2)]
+    assert [p["id"] for p in collected] == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_terminates_on_empty_response() -> None:
+    """totalSize 없고 size가 page_size와 같을 때는 추가 호출로 빈 응답을 확인해 종료."""
+    session = _make_search_session(
+        [
+            [{"id": "1"}, {"id": "2"}],
+            [{"id": "3"}, {"id": "4"}],
+            [],   # 빈 응답 → 종료
+        ],
+        total_size=None,
+    )
+
+    collected = [p async for p in enumerate_space_pages(session, "ENG", page_size=2)]
+    assert [p["id"] for p in collected] == ["1", "2", "3", "4"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_empty_space() -> None:
+    """페이지가 0개인 공간은 아무것도 yield 하지 않는다."""
+    session = _make_search_session([[]], total_size=0)
+    collected = [p async for p in enumerate_space_pages(session, "ENG")]
+    assert collected == []
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_respects_max_pages_cap() -> None:
+    """max_pages 상한에 도달하면 중단한다."""
+    session = _make_search_session(
+        [[{"id": str(i)} for i in range(10)]],
+        total_size=100,   # 실제 100개라 주장
+    )
+
+    collected = [
+        p async for p in enumerate_space_pages(
+            session, "ENG", page_size=10, max_pages=3,
+        )
+    ]
+    assert [p["id"] for p in collected] == ["0", "1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_skips_non_dict_items() -> None:
+    """results 배열에 dict가 아닌 항목이 섞이면 건너뛴다."""
+    session = _make_search_session(
+        [[{"id": "1"}, "unexpected string", {"id": "2"}]],
+        total_size=3,   # 2개만 yield하므로 다음 페이지 시도할 수 있지만 빈 응답으로 종료
+    )
+
+    collected = [p async for p in enumerate_space_pages(session, "ENG", page_size=100)]
+    assert [p["id"] for p in collected] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_cql_is_correct() -> None:
+    """CQL에 space와 type 필터가 함께 들어간다."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [[]], total_size=0, record_calls=calls,
+    )
+
+    _ = [p async for p in enumerate_space_pages(session, "OPS")]
+
+    assert calls[0]["cql"] == 'space = "OPS" AND type = "page"'
 
 
 @pytest.mark.asyncio

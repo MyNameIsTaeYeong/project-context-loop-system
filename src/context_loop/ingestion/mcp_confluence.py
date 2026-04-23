@@ -18,6 +18,7 @@ import json
 import logging
 import re
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -533,6 +534,103 @@ async def walk_subtree(
             queue.append((child_id, current_depth + 1))
 
     return nodes
+
+
+def _space_cql(space_key: str) -> str:
+    """공간 내 모든 페이지를 매치하는 CQL을 만든다.
+
+    ``space_key`` 의 ``\\`` 와 ``"`` 는 CQL 문자열 리터럴 규칙에 따라 escape 한다.
+    """
+    escaped = space_key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'space = "{escaped}" AND type = "page"'
+
+
+async def estimate_space_page_count(
+    session: ClientSession, space_key: str,
+) -> int | None:
+    """공간에 속한 페이지 수를 추정한다.
+
+    ``searchContent`` 를 ``limit=1`` 로 호출해 envelope의 ``totalSize`` 만
+    확인한다. 공간 전체 싱크 확인 다이얼로그의 "예상 페이지 수" 표기에 쓴다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키 (예: ``"ENG"``).
+
+    Returns:
+        ``totalSize`` 값. MCP 서버가 해당 메타를 내려주지 않으면 ``None``.
+    """
+    env = await search_content_envelope(
+        session, _space_cql(space_key), limit=1, start=0,
+    )
+    return env.total_size
+
+
+async def enumerate_space_pages(
+    session: ClientSession,
+    space_key: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 10000,
+) -> AsyncIterator[dict[str, Any]]:
+    """공간의 모든 페이지를 CQL 페이지네이션으로 순회하며 하나씩 yield 한다.
+
+    ``searchContent`` 를 ``space = "KEY" AND type = "page"`` 로 호출하고
+    ``limit``/``start`` 를 증가시키며 반복한다. 결과 수가 많은 스페이스에
+    대비해 메모리 부담을 줄이려 async generator로 구현한다.
+
+    종료 조건:
+      - envelope의 ``total_size`` 가 있으면 yield한 개수가 그 값에 도달했을 때.
+      - ``total_size`` 가 없으면 응답의 ``size`` 가 ``page_size`` 보다 작을 때.
+      - 응답의 ``results`` 가 비어 있으면 즉시 종료.
+      - ``max_pages`` 에 도달하면 경고 로그를 남기고 조기 반환.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키.
+        page_size: 한 번에 요청할 결과 수.
+        max_pages: yield할 수 있는 최대 페이지 수 (안전 상한).
+
+    Yields:
+        ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
+        ``type`` 등을 포함한다.
+    """
+    cql = _space_cql(space_key)
+    start = 0
+    emitted = 0
+    total_size: int | None = None
+
+    while emitted < max_pages:
+        env = await search_content_envelope(
+            session, cql, limit=page_size, start=start,
+        )
+
+        if not env.results:
+            break
+
+        for page in env.results:
+            if not isinstance(page, dict):
+                continue
+            yield page
+            emitted += 1
+            if emitted >= max_pages:
+                logger.warning(
+                    "enumerate_space_pages max_pages(%d) 도달 — space=%s",
+                    max_pages, space_key,
+                )
+                return
+
+        # 첫 응답에서 totalSize를 고정한다 (서버가 값을 바꾸지는 않지만 방어적).
+        if total_size is None and env.total_size is not None:
+            total_size = env.total_size
+
+        if total_size is not None and emitted >= total_size:
+            break
+        if env.size < page_size:
+            # 마지막 페이지 (envelope의 size가 요청 limit보다 작음).
+            break
+
+        start += page_size
 
 
 async def get_all_spaces(session: ClientSession) -> list[dict[str, Any]]:
