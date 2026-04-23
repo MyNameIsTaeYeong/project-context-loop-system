@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -439,6 +440,99 @@ async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str
     if isinstance(parsed, dict) and "results" in parsed:
         return parsed["results"]
     return []
+
+
+async def walk_subtree(
+    session: ClientSession,
+    root_page_id: str,
+    *,
+    max_depth: int = 20,
+    max_pages: int = 5000,
+) -> list[dict[str, Any]]:
+    """서브트리의 모든 페이지를 BFS로 전개해 평탄화한 목록을 반환한다.
+
+    루트부터 :func:`get_child_pages` 를 재귀 호출하여 하위 전체를 훑는다.
+    본문은 페치하지 않고 ``{id, parent_id, depth, title}`` 만 수집한다.
+    루트 자신도 첫 항목으로 포함된다(``parent_id=None, depth=0``).
+    루트의 ``title`` 은 walker가 별도로 조회하지 않으므로 빈 문자열이 들어간다 —
+    호출측이 이미 알고 있다면 결과의 첫 항목을 후처리할 수 있다.
+
+    안전 장치:
+      - ``type != "page"`` 인 자식은 건너뛴다(blogpost, attachment 등 무시).
+        ``type`` 필드가 없으면 page로 간주한다.
+      - 방문 집합으로 사이클과 중복 참조를 차단한다.
+      - ``max_depth`` 를 초과하는 깊이로는 확장하지 않는다(루트는 깊이 0).
+      - ``max_pages`` 에 도달하면 즉시 반환하고 경고 로그를 남긴다.
+      - 특정 노드의 ``getChild`` 호출이 실패해도 warning만 남기고 다른 가지를 계속 탐색한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        root_page_id: 루트 페이지 ID.
+        max_depth: 허용할 최대 깊이(루트=0). 기본 20.
+        max_pages: 수집할 최대 페이지 수. 기본 5000.
+
+    Returns:
+        각 항목은 ``{"id": str, "parent_id": str | None, "depth": int,
+        "title": str}`` 형태. BFS 순서로 정렬되며 루트가 첫 항목.
+    """
+    root_id_str = str(root_page_id)
+    visited: set[str] = {root_id_str}
+    nodes: list[dict[str, Any]] = [
+        {"id": root_id_str, "parent_id": None, "depth": 0, "title": ""},
+    ]
+
+    # BFS 큐: (page_id, depth)
+    queue: deque[tuple[str, int]] = deque([(root_id_str, 0)])
+
+    while queue:
+        current_id, current_depth = queue.popleft()
+
+        # max_depth에 도달했으면 더 내려가지 않는다 (이미 수집된 노드는 유지).
+        if current_depth >= max_depth:
+            continue
+
+        try:
+            children = await get_child_pages(session, current_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "하위 페이지 조회 실패 page_id=%s: %s", current_id, exc,
+            )
+            continue
+
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+
+            # type 필터: 명시된 경우에만 page 이외를 스킵한다.
+            child_type = child.get("type")
+            if child_type is not None and child_type != "page":
+                continue
+
+            child_id_raw = child.get("id")
+            if not child_id_raw:
+                continue
+            child_id = str(child_id_raw)
+
+            if child_id in visited:
+                continue
+
+            if len(nodes) >= max_pages:
+                logger.warning(
+                    "walk_subtree max_pages(%d) 도달 — root=%s",
+                    max_pages, root_id_str,
+                )
+                return nodes
+
+            visited.add(child_id)
+            nodes.append({
+                "id": child_id,
+                "parent_id": current_id,
+                "depth": current_depth + 1,
+                "title": str(child.get("title", "")),
+            })
+            queue.append((child_id, current_depth + 1))
+
+    return nodes
 
 
 async def get_all_spaces(session: ClientSession) -> list[dict[str, Any]]:

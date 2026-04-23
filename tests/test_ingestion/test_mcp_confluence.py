@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -27,6 +28,7 @@ from context_loop.ingestion.mcp_confluence import (
     list_available_tools,
     search_content,
     search_content_envelope,
+    walk_subtree,
 )
 from context_loop.storage.metadata_store import MetadataStore
 
@@ -523,6 +525,196 @@ async def test_get_child_pages() -> None:
     children = await get_child_pages(session, "1")
     session.call_tool.assert_called_once_with("getChild", {"pageId": "1"})
     assert len(children) == 1
+
+
+# --- walk_subtree 테스트 ---
+
+
+def _make_tree_session(
+    child_map: dict[str, list[dict[str, Any]]],
+    *,
+    raise_for: set[str] | None = None,
+) -> Any:
+    """``getChild`` 호출 인자에 따라 자식 목록을 돌려주는 가짜 세션.
+
+    ``raise_for`` 에 포함된 ``pageId`` 로 호출되면 예외를 던진다 — 에러 격리
+    동작 검증용.
+    """
+    raise_for = raise_for or set()
+
+    class FakeSession:
+        async def call_tool(self, tool_name: str, args: dict[str, Any]):
+            if tool_name != "getChild":
+                raise AssertionError(f"Unexpected tool: {tool_name}")
+            pid = str(args.get("pageId"))
+            if pid in raise_for:
+                raise RuntimeError(f"simulated failure for {pid}")
+            return _make_result(json.dumps(child_map.get(pid, [])))
+
+    return FakeSession()
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_bfs_order_and_metadata() -> None:
+    """BFS 순서로 전개되고 parent_id/depth/title이 정확히 채워진다."""
+    tree = {
+        "root": [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}],
+        "a": [{"id": "a1", "title": "A1"}],
+        "b": [{"id": "b1", "title": "B1"}],
+        "a1": [],
+        "b1": [],
+    }
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "root")
+
+    assert [n["id"] for n in nodes] == ["root", "a", "b", "a1", "b1"]
+    assert nodes[0] == {"id": "root", "parent_id": None, "depth": 0, "title": ""}
+    a = next(n for n in nodes if n["id"] == "a")
+    assert a == {"id": "a", "parent_id": "root", "depth": 1, "title": "A"}
+    a1 = next(n for n in nodes if n["id"] == "a1")
+    assert a1 == {"id": "a1", "parent_id": "a", "depth": 2, "title": "A1"}
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_leaf_root_returns_only_root() -> None:
+    """자식이 없는 루트는 본인만 반환."""
+    session = _make_tree_session({"solo": []})
+    nodes = await walk_subtree(session, "solo")
+    assert nodes == [{"id": "solo", "parent_id": None, "depth": 0, "title": ""}]
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_cycle_is_broken() -> None:
+    """A → B → A 사이클이 있어도 무한루프 없이 각 노드를 1회만 방문한다."""
+    tree = {
+        "a": [{"id": "b", "title": "B"}],
+        "b": [{"id": "a", "title": "A-again"}],
+    }
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "a")
+
+    ids = [n["id"] for n in nodes]
+    assert ids == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_respects_max_depth() -> None:
+    """max_depth=1 이면 루트 + 직계 자식까지만 수집한다."""
+    tree = {
+        "r": [{"id": "c1"}, {"id": "c2"}],
+        "c1": [{"id": "g1"}],
+        "c2": [{"id": "g2"}],
+    }
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "r", max_depth=1)
+
+    assert sorted(n["id"] for n in nodes) == ["c1", "c2", "r"]
+    assert all(n["depth"] <= 1 for n in nodes)
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_respects_max_pages() -> None:
+    """max_pages 도달 시 더 수집하지 않고 조기 반환한다."""
+    tree = {
+        "r": [{"id": f"c{i}"} for i in range(10)],
+    }
+    for i in range(10):
+        tree[f"c{i}"] = []
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "r", max_pages=3)
+
+    assert len(nodes) == 3
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_filters_non_page_types() -> None:
+    """type != 'page' 인 자식은 건너뛴다. type 필드 없으면 page로 간주."""
+    tree = {
+        "r": [
+            {"id": "p1", "title": "Page", "type": "page"},
+            {"id": "bp1", "title": "Blog", "type": "blogpost"},
+            {"id": "at1", "title": "Attach", "type": "attachment"},
+            {"id": "p2", "title": "No Type"},   # type 필드 없음 → 통과
+        ],
+        "p1": [],
+        "p2": [],
+    }
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "r")
+
+    ids = {n["id"] for n in nodes}
+    assert ids == {"r", "p1", "p2"}
+    assert "bp1" not in ids
+    assert "at1" not in ids
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_skips_children_without_id() -> None:
+    """id 필드가 없는 자식은 스킵한다."""
+    tree = {
+        "r": [
+            {"id": "c1", "title": "A"},
+            {"title": "orphan-no-id"},
+            {"id": "", "title": "empty-id"},
+        ],
+        "c1": [],
+    }
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "r")
+    ids = [n["id"] for n in nodes]
+    assert ids == ["r", "c1"]
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_isolates_branch_errors() -> None:
+    """특정 노드의 getChild 가 실패해도 다른 가지는 계속 진행된다."""
+    tree = {
+        "r": [{"id": "a"}, {"id": "b"}],
+        "a": [{"id": "a1"}],   # 정상
+        "b": [{"id": "b1"}],   # 호출 자체가 실패할 예정
+        "a1": [],
+        "b1": [],
+    }
+    session = _make_tree_session(tree, raise_for={"b"})
+
+    nodes = await walk_subtree(session, "r")
+
+    ids = {n["id"] for n in nodes}
+    # b는 자식 탐색 실패했지만 본인은 수집됨, b1만 누락
+    assert {"r", "a", "b", "a1"}.issubset(ids)
+    assert "b1" not in ids
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_missing_title_defaults_to_empty() -> None:
+    """자식에 title이 없으면 빈 문자열로 채워진다."""
+    tree = {"r": [{"id": "c1"}], "c1": []}
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "r")
+    c1 = next(n for n in nodes if n["id"] == "c1")
+    assert c1["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_walk_subtree_deduplicates_siblings_pointing_to_same_id() -> None:
+    """동일 ID가 자식 목록에 중복 등장해도 한 번만 수집된다."""
+    tree = {
+        "r": [{"id": "x"}, {"id": "x"}, {"id": "y"}],
+        "x": [],
+        "y": [],
+    }
+    session = _make_tree_session(tree)
+
+    nodes = await walk_subtree(session, "r")
+    ids = [n["id"] for n in nodes]
+    assert ids == ["r", "x", "y"]
 
 
 @pytest.mark.asyncio
