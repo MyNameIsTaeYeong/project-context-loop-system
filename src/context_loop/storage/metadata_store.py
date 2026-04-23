@@ -84,6 +84,37 @@ CREATE TABLE IF NOT EXISTS document_sources (
     PRIMARY KEY (doc_id, source_doc_id)
 );
 
+-- Confluence 싱크 대상 (page | subtree | space 3-scope)
+CREATE TABLE IF NOT EXISTS confluence_sync_targets (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope             TEXT NOT NULL CHECK (scope IN ('page','subtree','space')),
+    space_key         TEXT NOT NULL,
+    page_id           TEXT,
+    name              TEXT NOT NULL,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_sync_at      TIMESTAMP,
+    last_result_json  TEXT
+);
+
+-- scope+space_key+page_id 조합의 유일성. page_id NULL(=space scope)도
+-- 동일 space_key 에서 한 건만 허용되도록 COALESCE 로 collapse 한다.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_targets_unique
+    ON confluence_sync_targets (scope, space_key, COALESCE(page_id, ''));
+
+-- 싱크 대상 ↔ 페이지 소유권. documents 수명은 이 테이블의 행 수에
+-- 의해 결정된다 (참조 카운트 0 시 cascade로 삭제). target 삭제 시
+-- FK CASCADE 로 이 테이블의 행도 같이 사라진다.
+CREATE TABLE IF NOT EXISTS confluence_sync_membership (
+    target_id       INTEGER NOT NULL
+                    REFERENCES confluence_sync_targets(id) ON DELETE CASCADE,
+    page_id         TEXT NOT NULL,
+    space_key       TEXT NOT NULL,
+    parent_page_id  TEXT,
+    depth           INTEGER,
+    last_seen_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (target_id, page_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type, source_id);
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
@@ -94,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_graph_node_documents_document ON graph_node_docum
 CREATE INDEX IF NOT EXISTS idx_processing_history_document ON processing_history(document_id);
 CREATE INDEX IF NOT EXISTS idx_document_sources_doc ON document_sources(doc_id);
 CREATE INDEX IF NOT EXISTS idx_document_sources_source ON document_sources(source_doc_id);
+CREATE INDEX IF NOT EXISTS idx_sync_membership_page ON confluence_sync_membership(page_id);
+CREATE INDEX IF NOT EXISTS idx_sync_membership_space ON confluence_sync_membership(space_key);
 """
 
 
