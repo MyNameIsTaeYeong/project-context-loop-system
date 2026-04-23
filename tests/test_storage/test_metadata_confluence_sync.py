@@ -276,3 +276,326 @@ async def test_reinitialize_is_idempotent(tmp_path: Path) -> None:
     assert row is not None
     assert row["name"] == "Root"
     await s2.close()
+
+
+# --- sync_targets CRUD ---
+
+
+async def test_upsert_sync_target_inserts_and_returns_full_row(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    assert t["id"] > 0
+    assert t["scope"] == "subtree"
+    assert t["space_key"] == "ENG"
+    assert t["page_id"] == "100"
+    assert t["name"] == "Root"
+    assert t["created_at"] is not None
+    assert t["last_sync_at"] is None
+
+
+async def test_upsert_sync_target_updates_name_when_exists(
+    store: MetadataStore,
+) -> None:
+    first = await store.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Old",
+    )
+    second = await store.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="New",
+    )
+    assert first["id"] == second["id"]
+    assert second["name"] == "New"
+
+    # 중복 레코드가 생기지 않았는지 확인
+    all_targets = await store.list_sync_targets()
+    assert len(all_targets) == 1
+
+
+async def test_get_sync_target_found_and_not_found(store: MetadataStore) -> None:
+    t = await store.upsert_sync_target(
+        scope="page", space_key="ENG", page_id="200", name="P",
+    )
+    got = await store.get_sync_target(t["id"])
+    assert got is not None and got["id"] == t["id"]
+
+    missing = await store.get_sync_target(9999)
+    assert missing is None
+
+
+async def test_list_sync_targets_orders_newest_first(
+    store: MetadataStore,
+) -> None:
+    """같은 초에 삽입되어 created_at 이 동일해도 id 로 tie-break 되어
+    나중에 추가된 것이 먼저 온다."""
+    await store.upsert_sync_target(
+        scope="page", space_key="ENG", page_id="1", name="First",
+    )
+    await store.upsert_sync_target(
+        scope="page", space_key="ENG", page_id="2", name="Second",
+    )
+    targets = await store.list_sync_targets()
+    assert [t["name"] for t in targets] == ["Second", "First"]
+
+
+async def test_update_sync_result_sets_timestamp_and_json(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="page", space_key="ENG", page_id="1", name="P",
+    )
+    assert t["last_sync_at"] is None
+
+    await store.update_sync_result(t["id"], '{"created": 1}')
+
+    refreshed = await store.get_sync_target(t["id"])
+    assert refreshed is not None
+    assert refreshed["last_sync_at"] is not None
+    assert refreshed["last_result_json"] == '{"created": 1}'
+
+
+async def test_delete_sync_target_returns_true_and_empty_orphans_when_no_docs(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    deleted, orphans = await store.delete_sync_target(t["id"])
+    assert deleted is True
+    assert orphans == []
+    assert await store.get_sync_target(t["id"]) is None
+
+
+async def test_delete_sync_target_returns_false_for_missing(
+    store: MetadataStore,
+) -> None:
+    deleted, orphans = await store.delete_sync_target(9999)
+    assert deleted is False
+    assert orphans == []
+
+
+async def test_delete_sync_target_cascades_membership(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await store.upsert_membership(
+        target_id=t["id"], page_id="100", space_key="ENG",
+    )
+    await store.upsert_membership(
+        target_id=t["id"], page_id="101", space_key="ENG", depth=1,
+    )
+    assert await store.list_membership_page_ids(t["id"]) == {"100", "101"}
+
+    await store.delete_sync_target(t["id"])
+
+    assert await store.list_membership_page_ids(t["id"]) == set()
+
+
+# --- membership CRUD ---
+
+
+async def test_upsert_membership_single_insert_and_update(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await store.upsert_membership(
+        target_id=t["id"], page_id="200", space_key="ENG",
+        parent_page_id="100", depth=1,
+    )
+    # 같은 (target_id, page_id) 재호출로 parent/depth 를 변경
+    await store.upsert_membership(
+        target_id=t["id"], page_id="200", space_key="ENG",
+        parent_page_id="999", depth=5,
+    )
+
+    cur = await store.db.execute(
+        "SELECT parent_page_id, depth FROM confluence_sync_membership "
+        "WHERE target_id = ? AND page_id = ?",
+        (t["id"], "200"),
+    )
+    row = await cur.fetchone()
+    assert row["parent_page_id"] == "999"
+    assert row["depth"] == 5
+
+
+async def test_upsert_membership_batch_inserts_multiple_and_skips_missing_id(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await store.upsert_membership_batch(
+        t["id"],
+        "ENG",
+        [
+            {"id": "100", "parent_id": None, "depth": 0},
+            {"id": "200", "parent_id": "100", "depth": 1},
+            {"id": "", "parent_id": "100", "depth": 1},      # 스킵
+            {"parent_id": "100", "depth": 1},                # 스킵 (id 없음)
+            {"id": "300", "parent_id": "100", "depth": 1},
+        ],
+    )
+    assert await store.list_membership_page_ids(t["id"]) == {"100", "200", "300"}
+
+
+async def test_upsert_membership_batch_empty_does_nothing(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await store.upsert_membership_batch(t["id"], "ENG", [])
+    assert await store.list_membership_page_ids(t["id"]) == set()
+
+
+async def test_list_membership_page_ids_scoped_to_target(
+    store: MetadataStore,
+) -> None:
+    t1 = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="A",
+    )
+    t2 = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="200", name="B",
+    )
+    await store.upsert_membership(target_id=t1["id"], page_id="1", space_key="ENG")
+    await store.upsert_membership(target_id=t1["id"], page_id="2", space_key="ENG")
+    await store.upsert_membership(target_id=t2["id"], page_id="2", space_key="ENG")
+
+    assert await store.list_membership_page_ids(t1["id"]) == {"1", "2"}
+    assert await store.list_membership_page_ids(t2["id"]) == {"2"}
+
+
+# --- orphan detection via remove_memberships / delete_sync_target ---
+
+
+async def _create_mcp_doc(store: MetadataStore, page_id: str) -> int:
+    return await store.create_document(
+        source_type="confluence_mcp",
+        source_id=page_id,
+        title=f"Page {page_id}",
+        original_content="content",
+        content_hash=f"hash-{page_id}",
+    )
+
+
+async def test_remove_memberships_flags_orphan_docs(
+    store: MetadataStore,
+) -> None:
+    """다른 target이 소유하지 않는 페이지의 문서 ID가 반환된다."""
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    doc_id = await _create_mcp_doc(store, "200")
+    await store.upsert_membership(target_id=t["id"], page_id="200", space_key="ENG")
+
+    orphans = await store.remove_memberships(t["id"], ["200"])
+
+    assert orphans == [doc_id]
+    # membership row가 실제로 사라졌는지 확인
+    assert await store.list_membership_page_ids(t["id"]) == set()
+
+
+async def test_remove_memberships_keeps_doc_when_other_target_owns(
+    store: MetadataStore,
+) -> None:
+    """다른 target이 동일 page_id를 소유하면 orphan으로 분류되지 않는다."""
+    t_subtree = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Subtree",
+    )
+    t_space = await store.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Space",
+    )
+    await _create_mcp_doc(store, "200")
+    await store.upsert_membership(
+        target_id=t_subtree["id"], page_id="200", space_key="ENG",
+    )
+    await store.upsert_membership(
+        target_id=t_space["id"], page_id="200", space_key="ENG",
+    )
+
+    orphans = await store.remove_memberships(t_subtree["id"], ["200"])
+    assert orphans == []
+
+    # subtree의 membership은 제거됐지만 space의 것은 남음
+    assert await store.list_membership_page_ids(t_subtree["id"]) == set()
+    assert await store.list_membership_page_ids(t_space["id"]) == {"200"}
+
+
+async def test_remove_memberships_ignores_pages_without_documents(
+    store: MetadataStore,
+) -> None:
+    """페이지에 대응하는 confluence_mcp 문서가 없으면 orphan 목록에 포함되지 않는다."""
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await store.upsert_membership(target_id=t["id"], page_id="999", space_key="ENG")
+
+    orphans = await store.remove_memberships(t["id"], ["999"])
+    assert orphans == []
+
+
+async def test_remove_memberships_empty_page_list_is_noop(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await store.upsert_membership(target_id=t["id"], page_id="200", space_key="ENG")
+
+    orphans = await store.remove_memberships(t["id"], [])
+    assert orphans == []
+    assert await store.list_membership_page_ids(t["id"]) == {"200"}
+
+
+async def test_delete_sync_target_returns_orphan_doc_ids(
+    store: MetadataStore,
+) -> None:
+    """해제 시, 이 target 에만 소속된 page의 문서 id가 반환된다."""
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    doc_100 = await _create_mcp_doc(store, "100")
+    doc_101 = await _create_mcp_doc(store, "101")
+    await store.upsert_membership(target_id=t["id"], page_id="100", space_key="ENG")
+    await store.upsert_membership(target_id=t["id"], page_id="101", space_key="ENG")
+
+    deleted, orphans = await store.delete_sync_target(t["id"])
+    assert deleted is True
+    assert sorted(orphans) == sorted([doc_100, doc_101])
+
+
+async def test_delete_sync_target_skips_orphans_shared_with_other_target(
+    store: MetadataStore,
+) -> None:
+    """공간 전체와 서브트리가 공유하는 페이지는 해제 시 orphan이 아니다."""
+    t_subtree = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Subtree",
+    )
+    t_space = await store.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Space",
+    )
+    shared_doc = await _create_mcp_doc(store, "200")
+    private_doc = await _create_mcp_doc(store, "201")
+
+    for pid in ("200", "201"):
+        await store.upsert_membership(
+            target_id=t_subtree["id"], page_id=pid, space_key="ENG",
+        )
+    await store.upsert_membership(
+        target_id=t_space["id"], page_id="200", space_key="ENG",
+    )
+
+    deleted, orphans = await store.delete_sync_target(t_subtree["id"])
+    assert deleted is True
+    assert orphans == [private_doc]
+    # space target의 membership은 유지
+    assert await store.list_membership_page_ids(t_space["id"]) == {"200"}
+    # 문서 본체는 remove_memberships/delete_sync_target가 삭제하지 않는다
+    # (caller의 책임). 존재 여부 확인:
+    assert await store.get_document(shared_doc) is not None
+    assert await store.get_document(private_doc) is not None
