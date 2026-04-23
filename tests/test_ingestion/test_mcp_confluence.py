@@ -17,9 +17,11 @@ from context_loop.ingestion.mcp_confluence import (
     _parse_json_result,
     build_cql,
     convert_html_to_markdown,
+    format_breadcrumb,
     get_all_spaces,
     get_child_pages,
     get_page,
+    get_page_with_ancestors,
     get_user_contributed_pages,
     import_page_via_mcp,
     list_available_tools,
@@ -376,6 +378,141 @@ async def test_get_page_text_result() -> None:
     page = await get_page(session, "456")
     assert page["content"] == "Just plain text content"
     assert page["id"] == "456"
+
+
+# --- get_page_with_ancestors 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_get_page_with_ancestors_calls_tool_with_ancestors_expand() -> None:
+    """expand 파라미터에 ancestors/space가 포함된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "100", "title": "Overview",'
+        ' "space": {"key": "ENG", "name": "Engineering"},'
+        ' "ancestors": [{"id": "10", "title": "Docs"}]}'
+    )
+
+    page = await get_page_with_ancestors(session, "100")
+
+    session.call_tool.assert_called_once_with(
+        "getPageByID",
+        {"pageId": "100", "expand": "ancestors,space,version"},
+    )
+    assert page["title"] == "Overview"
+    assert page["space"]["name"] == "Engineering"
+    assert page["ancestors"][0]["title"] == "Docs"
+
+
+@pytest.mark.asyncio
+async def test_get_page_with_ancestors_text_fallback() -> None:
+    """응답이 dict가 아니면 최소한 id만 포함한 dict를 반환한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result("plain text")
+
+    page = await get_page_with_ancestors(session, "999")
+
+    assert page == {"id": "999"}
+
+
+# --- format_breadcrumb 테스트 ---
+
+
+def test_format_breadcrumb_full_path() -> None:
+    """space + ancestors + title 이 모두 있는 일반 케이스."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "space": {"key": "ENG", "name": "Engineering"},
+        "ancestors": [
+            {"id": "1", "title": "Docs"},
+            {"id": "2", "title": "Architecture"},
+        ],
+    }
+    assert format_breadcrumb(page) == "Engineering / Docs / Architecture / Overview"
+
+
+def test_format_breadcrumb_no_ancestors() -> None:
+    """root 페이지 — ancestors가 비어 있으면 space + title만 결합."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "space": {"name": "Engineering"},
+        "ancestors": [],
+    }
+    assert format_breadcrumb(page) == "Engineering / Overview"
+
+
+def test_format_breadcrumb_without_space() -> None:
+    """space 정보가 없으면 생략한다."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "ancestors": [{"title": "Docs"}],
+    }
+    assert format_breadcrumb(page) == "Docs / Overview"
+
+
+def test_format_breadcrumb_title_only() -> None:
+    """space/ancestors가 전혀 없으면 title만 반환."""
+    page = {"id": "100", "title": "Overview"}
+    assert format_breadcrumb(page) == "Overview"
+
+
+def test_format_breadcrumb_space_key_fallback() -> None:
+    """space.name 이 없으면 space.key로 폴백한다."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "space": {"key": "ENG"},
+    }
+    assert format_breadcrumb(page) == "ENG / Overview"
+
+
+def test_format_breadcrumb_ancestor_name_fallback() -> None:
+    """ancestor에 title이 없으면 name으로 폴백한다."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "ancestors": [{"name": "Docs"}],
+    }
+    assert format_breadcrumb(page) == "Docs / Overview"
+
+
+def test_format_breadcrumb_skips_empty_items() -> None:
+    """빈 제목의 ancestor는 건너뛴다."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "space": {"name": "Engineering"},
+        "ancestors": [
+            {"title": ""},
+            {"title": "Docs"},
+            {},
+        ],
+    }
+    assert format_breadcrumb(page) == "Engineering / Docs / Overview"
+
+
+def test_format_breadcrumb_id_fallback() -> None:
+    """title/space/ancestors가 모두 없으면 id 문자열을 반환한다."""
+    assert format_breadcrumb({"id": "123456"}) == "123456"
+
+
+def test_format_breadcrumb_empty_dict_returns_empty_string() -> None:
+    """완전 빈 dict는 빈 문자열."""
+    assert format_breadcrumb({}) == ""
+
+
+def test_format_breadcrumb_malformed_ancestors() -> None:
+    """ancestors가 list가 아닌 경우에도 예외 없이 처리한다."""
+    page = {
+        "id": "100",
+        "title": "Overview",
+        "space": {"name": "Engineering"},
+        "ancestors": "not-a-list",
+    }
+    assert format_breadcrumb(page) == "Engineering / Overview"
 
 
 @pytest.mark.asyncio

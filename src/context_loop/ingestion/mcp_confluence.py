@@ -357,6 +357,79 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     return {"content": _extract_text(result), "id": page_id}
 
 
+async def get_page_with_ancestors(
+    session: ClientSession, page_id: str,
+) -> dict[str, Any]:
+    """페이지를 조회하되 breadcrumb 구성에 필요한 ``ancestors``/``space`` 를 포함한다.
+
+    싱크 대상 등록 시점에 사용자에게 보여줄 계층형 이름
+    (예: ``"Engineering / Docs / Architecture / Overview"``)을 해석하기 위한
+    경량 호출 경로. 본문(``body.storage``)은 포함하지 않아 :func:`get_page` 보다
+    페이로드가 가볍다. 일반 임포트 흐름은 그대로 :func:`get_page` 를 사용한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        page_id: 페이지 ID.
+
+    Returns:
+        페이지 정보 dict. ``ancestors`` (root→parent 순 배열) 와 ``space`` (dict)
+        가 포함된다. 서버가 텍스트만 반환하면 ``{"id": page_id}`` 를 반환한다.
+    """
+    result = await session.call_tool(
+        "getPageByID",
+        {
+            "pageId": page_id,
+            "expand": "ancestors,space,version",
+        },
+    )
+    parsed = _parse_json_result(result)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"id": page_id}
+
+
+def format_breadcrumb(page: dict[str, Any]) -> str:
+    """페이지 dict에서 ``"공간 / 조상 / ... / 제목"`` breadcrumb를 생성한다.
+
+    :func:`get_page_with_ancestors` 응답을 그대로 받아 사용할 수 있다.
+
+    구성 규칙:
+      1. ``page["space"]["name"]`` 이 있으면 맨 앞에 붙임. 없으면
+         ``page["space"]["key"]`` 로 폴백.
+      2. ``page["ancestors"]`` 는 root→parent 순으로 전제, 각 항목의
+         ``title`` (없으면 ``name``) 을 순서대로 이어 붙임.
+      3. 마지막으로 ``page["title"]`` (없으면 ``name``) 을 붙임.
+      4. 어느 것도 없으면 ``page["id"]`` 를 문자열로 반환. id마저 없으면 빈 문자열.
+
+    구분자는 ``" / "``. 빈 제목 등 falsy 값은 건너뛴다.
+    """
+    parts: list[str] = []
+
+    space = page.get("space")
+    if isinstance(space, dict):
+        space_label = space.get("name") or space.get("key")
+        if space_label:
+            parts.append(str(space_label))
+
+    ancestors = page.get("ancestors")
+    if isinstance(ancestors, list):
+        for ancestor in ancestors:
+            if isinstance(ancestor, dict):
+                label = ancestor.get("title") or ancestor.get("name")
+                if label:
+                    parts.append(str(label))
+
+    title = page.get("title") or page.get("name")
+    if title:
+        parts.append(str(title))
+
+    if parts:
+        return " / ".join(parts)
+
+    page_id = page.get("id")
+    return str(page_id) if page_id else ""
+
+
 async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str, Any]]:
     """MCP 서버의 getChild 도구로 하위 페이지 목록을 가져온다."""
     result = await session.call_tool("getChild", {"pageId": page_id})
