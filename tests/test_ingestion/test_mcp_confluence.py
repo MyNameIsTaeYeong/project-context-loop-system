@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from context_loop.ingestion.mcp_confluence import (
+    SearchEnvelope,
     _extract_page_content,
     _extract_page_title,
     _extract_text,
@@ -23,6 +24,7 @@ from context_loop.ingestion.mcp_confluence import (
     import_page_via_mcp,
     list_available_tools,
     search_content,
+    search_content_envelope,
 )
 from context_loop.storage.metadata_store import MetadataStore
 
@@ -242,6 +244,115 @@ async def test_search_content_dict_result() -> None:
 
     results = await search_content(session, 'type = "page"')
     assert results[0]["id"] == "2"
+
+
+# --- search_content_envelope 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_full_envelope() -> None:
+    """totalSize/size/start/limit 메타가 전부 담긴 envelope을 파싱한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "1"}, {"id": "2"}],'
+        ' "start": 0, "limit": 25, "size": 2, "totalSize": 342}'
+    )
+
+    env = await search_content_envelope(session, "test", limit=25, start=0)
+
+    assert isinstance(env, SearchEnvelope)
+    assert len(env.results) == 2
+    assert env.total_size == 342
+    assert env.size == 2
+    assert env.start == 0
+    assert env.limit == 25
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_passes_cql_and_paging() -> None:
+    """CQL 변환과 start/limit 파라미터가 MCP 호출에 그대로 전달된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [], "size": 0, "totalSize": 0,'
+        ' "start": 100, "limit": 50}'
+    )
+
+    await search_content_envelope(session, "결제", limit=50, start=100)
+
+    session.call_tool.assert_called_once_with(
+        "searchContent",
+        {"cql": 'type = "page" AND text ~ "결제"', "limit": 50, "start": 100},
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_list_only_response() -> None:
+    """envelope 없이 결과 배열만 오면 total_size=None, size=len(results)."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result('[{"id": "1"}, {"id": "2"}]')
+
+    env = await search_content_envelope(session, "q", limit=25, start=0)
+
+    assert env.total_size is None
+    assert env.size == 2
+    assert len(env.results) == 2
+    assert env.start == 0
+    assert env.limit == 25
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_total_field_variants() -> None:
+    """서버 변종 — totalSize 대신 total 필드를 사용하는 경우도 허용한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "1"}], "size": 1, "total": 999}'
+    )
+
+    env = await search_content_envelope(session, "q")
+
+    assert env.total_size == 999
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_missing_total_size() -> None:
+    """envelope은 있지만 totalSize가 빠진 응답은 total_size=None."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "1"}], "size": 1, "start": 0, "limit": 25}'
+    )
+
+    env = await search_content_envelope(session, "q")
+
+    assert env.total_size is None
+    assert env.size == 1
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_empty_response() -> None:
+    """결과가 전혀 없거나 텍스트 응답이면 빈 envelope을 반환한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result("no matches")
+
+    env = await search_content_envelope(session, "q", limit=25, start=0)
+
+    assert env.results == []
+    assert env.size == 0
+    assert env.total_size is None
+    assert env.start == 0
+    assert env.limit == 25
+
+
+@pytest.mark.asyncio
+async def test_search_content_envelope_size_derived_when_missing() -> None:
+    """envelope에 size 필드가 없으면 results 길이로 대체한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "1"}, {"id": "2"}, {"id": "3"}]}'
+    )
+
+    env = await search_content_envelope(session, "q")
+
+    assert env.size == 3
 
 
 @pytest.mark.asyncio

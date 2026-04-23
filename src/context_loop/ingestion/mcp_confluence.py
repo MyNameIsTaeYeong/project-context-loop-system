@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from mcp import ClientSession
@@ -243,6 +244,94 @@ async def search_content(
         return parsed["results"]
     # 텍스트 결과인 경우 그대로 반환
     return [{"content": parsed}] if parsed else []
+
+
+@dataclass(frozen=True)
+class SearchEnvelope:
+    """``searchContent`` 응답의 envelope 메타를 보존하는 DTO.
+
+    Confluence CQL 검색 응답은 ``{results, start, limit, size, totalSize}``
+    형태로 내려오는데 기존 :func:`search_content` 는 ``results`` 만 반환하여
+    전체 건수 등 메타가 유실된다. 공간 전체 싱크의 예상 페이지 수 표시,
+    페이지네이션 커서 관리 등에 쓰려면 envelope 원형이 필요하므로 이 DTO를
+    사용한다.
+
+    Attributes:
+        results: 이 응답 페이지에 포함된 결과 배열.
+        total_size: CQL 매치 전체 건수. 서버가 내려주지 않으면 ``None``.
+        size: 이 응답에 실제 담긴 건수. envelope이 없으면 ``len(results)``.
+        start: 요청한 오프셋.
+        limit: 요청한 페이지 크기.
+    """
+
+    results: list[dict[str, Any]]
+    total_size: int | None
+    size: int
+    start: int
+    limit: int
+
+
+async def search_content_envelope(
+    session: ClientSession,
+    query: str,
+    limit: int = 25,
+    start: int = 0,
+) -> SearchEnvelope:
+    """:func:`search_content` 와 동일하게 검색하되 envelope 메타를 보존한다.
+
+    응답 형태 3가지에 대응한다:
+
+    1. envelope dict (``{results, totalSize, size, start, limit}``) — 기본 케이스.
+    2. 결과만 배열로 — envelope 없이 ``[{id, title}, ...]`` 만 오는 경우.
+       ``total_size`` 는 ``None`` 이 된다.
+    3. 빈/텍스트 응답 — 빈 envelope을 반환한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        query: 검색 키워드 또는 CQL 쿼리.
+        limit: 요청 페이지 크기.
+        start: 요청 오프셋.
+
+    Returns:
+        :class:`SearchEnvelope` 인스턴스.
+    """
+    cql = build_cql(query)
+    result = await session.call_tool(
+        "searchContent", {"cql": cql, "limit": limit, "start": start},
+    )
+    parsed = _parse_json_result(result)
+
+    if isinstance(parsed, dict) and "results" in parsed:
+        results = parsed["results"] or []
+        # 서버 변종에 따라 total/totalSize/_totalSize 중 하나로 내려올 수 있다.
+        total_size_val = (
+            parsed.get("totalSize")
+            if parsed.get("totalSize") is not None
+            else parsed.get("total")
+            if parsed.get("total") is not None
+            else parsed.get("_totalSize")
+        )
+        total_size = int(total_size_val) if total_size_val is not None else None
+        return SearchEnvelope(
+            results=results,
+            total_size=total_size,
+            size=int(parsed.get("size", len(results))),
+            start=int(parsed.get("start", start)),
+            limit=int(parsed.get("limit", limit)),
+        )
+
+    if isinstance(parsed, list):
+        return SearchEnvelope(
+            results=parsed,
+            total_size=None,
+            size=len(parsed),
+            start=start,
+            limit=limit,
+        )
+
+    return SearchEnvelope(
+        results=[], total_size=None, size=0, start=start, limit=limit,
+    )
 
 
 async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
