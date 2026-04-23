@@ -1,9 +1,10 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 7++ — Confluence 컨텍스트 추출 고도화 + LLM 의존 제거 + 멀티뷰 임베딩
-- **Step**: 멀티뷰 임베딩 Phase 1 (D-042) — 청크당 body + meta 두 벡터, 검색 시 dedup
-- **최신(2026-04-22)**: 멀티뷰 임베딩 Phase 1 도입 (D-042). 일반 문서 분기에서 청크당 ChromaDB 엔트리 2개 저장 — `{id}#body`(임베딩=본문) + `{id}#meta`(임베딩=title+section_path), 두 엔트리 document 동일, `logical_chunk_id`로 dedup. `context_assembler._search_chunks`에 over-fetch(×2) + dedup 로직 추가. 기존 body 뷰는 그대로 유지되므로 본문 친화 질의는 손해 없고, 경로/제목 친화 질의는 meta 뷰로 리콜 상승. SQLite `chunks`는 논리 청크 1행 유지. title/section_path 모두 비면 meta 뷰 생략. 테스트 +3 (pipeline 2, context_assembler 1) — 전체 450건 통과(web 제외).
+- **Phase**: Phase 2.6–2.8 — Confluence MCP Client 3-scope 싱크 백엔드
+- **Step**: 백엔드 전체 완성, UI 잔여 (I-030)
+- **최신(2026-04-23)**: Confluence MCP 3-scope(page/subtree/space) 싱크 백엔드 9단계 완성 (D-043). 브랜치 `claude/confluence-continuous-fetch-aOGCB`. 사내 Confluence REST 차단(I-011) 환경에서 "특정 페이지만 / 특정 페이지 하위 전체 / 공간 전체" 3가지 범위를 동일한 디스패처(`execute_sync_target`)로 처리. 참조 카운팅 membership 모델(`confluence_sync_membership`)로 공유 페이지(subtree+space 동시 등록) 안전성을 확보 — 한쪽 해제 시 다른 소유자가 있으면 문서 보존, 양쪽 모두 해제 시 `delete_document_cascade` 로 완전 삭제. 두 핵심 안전 속성을 테스트로 고정: (1) walker/enumerate 실패 시 membership 보존(일시 장애가 cascade 삭제로 번지지 않음), (2) 개별 import 실패가 stale 삭제로 번지지 않음(walker 가 확인한 페이지는 import 성공 여부 무관하게 current_ids 포함). 웹 API 7종 + target_id 별 asyncio.Lock + BackgroundTasks 기반 비동기 실행. 테스트 +110건 전부 통과 (cascade 4, 스키마/CRUD 31, MCP 유틸 +42, 디스패처 14, 웹 API 19). UI (검색박스/3버튼 카드/확인 다이얼로그/등록카드+폴링 진행률)는 I-030 으로 분리.
+- **이전(2026-04-22)**: 멀티뷰 임베딩 Phase 1 도입 (D-042). 일반 문서 분기에서 청크당 ChromaDB 엔트리 2개 저장 — `{id}#body`(임베딩=본문) + `{id}#meta`(임베딩=title+section_path), 두 엔트리 document 동일, `logical_chunk_id`로 dedup. `context_assembler._search_chunks`에 over-fetch(×2) + dedup 로직 추가. 기존 body 뷰는 그대로 유지되므로 본문 친화 질의는 손해 없고, 경로/제목 친화 질의는 meta 뷰로 리콜 상승. SQLite `chunks`는 논리 청크 1행 유지. title/section_path 모두 비면 meta 뷰 생략. 테스트 +3 (pipeline 2, context_assembler 1) — 전체 450건 통과(web 제외).
 - **이전 상태**: 3단계로 완료. (1) **Step 1** — `ingestion/confluence_extractor.py` 신설 (ExtractedDocument: sections/outbound_links/code_blocks/tables/mentions), `documents.raw_content` 컬럼 추가 및 REST/MCP 수집 경로에서 원본 HTML 보존, 파이프라인 Confluence 분기가 추출기를 호출하도록 주입 (D-039). (2) **Step 2** — `processor/link_graph_builder.py` 신설: `OutLink` → `GraphData` 결정론적 변환 (`page/user/jira/attachment` → 각각 entity_type + relation, `url`은 병합 키 불안정 이슈로 제외). self-entity 패턴으로 GraphStore의 `(name, type)` 병합을 통한 인접 문서 간 엣지 수렴. 파이프라인 Confluence 분기에 통합 (D-039). (3) **LLM classifier/graph_extractor 전면 제거** — 결정론적 대체(AST + 링크 그래프)가 모든 소스를 커버하므로 `classifier.py` 삭제, `graph_extractor.py`에서 Entity/Relation/GraphData 스키마만 남기고 LLM 프롬프트·extract_graph·맵리듀스 제거. `process_document()`에서 `llm_client`/`storage_method_override` 파라미터 제거, `storage_method`는 실제 저장 산출물에서 파생(chunks only=`chunk`, graph only=`graph`, 둘 다=`hybrid`). coordinator/documents/git_sync 호출 경로 정리 (D-040). (4) **Step 3** — `Chunk.section_anchor` 필드 추가, `chunk_extracted_document()` 신설로 `extracted.sections`를 그대로 소비(헤딩 재파싱 제거). `_split_markdown_blocks()`이 펜스 코드블록(```)과 마크다운 테이블을 `atomic=True`로 묶어 청크 경계 중간 분할 금지, 일반 블록은 기존처럼 강제 분할. `section_anchor`를 VectorStore metadata까지 전파 (D-041). 테스트: confluence_extractor 28건, link_graph_builder 13건, chunker +4건(코드블록/테이블 원자성 + anchor 전파 + 빈 sections 폴백), pipeline 8건 전면 재작성, coordinator/documents/git_sync 호출 정합성 확보. 총 회귀 없음 (440+건). 다음: (a) section_anchor를 UI 청크 탭/검색 결과 deep-link에 노출, (b) `extracted.code_blocks`/`tables`를 별도 구조화 메타로 검색에 활용, (c) Phase 9.9(증분 처리) 또는 9.10(GitHub webhook).
 
 ## Phase별 진행률
@@ -20,9 +21,9 @@
 - [x] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
 - [x] 2.4 Confluence 증분 동기화
 - [x] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
-- [ ] 2.6 Confluence MCP Client 연동 — 검색 기반 임포트 (D-016, I-010)
-- [ ] 2.7 Confluence MCP Client 연동 — 트리 탐색 임포트
-- [ ] 2.8 Confluence MCP Client 연동 — 내 문서 임포트
+- [x] 2.6 Confluence MCP Client — 3-scope 싱크 백엔드 (page/subtree/space, D-043). **UI 잔여(I-030)**
+- [ ] 2.7 Confluence MCP Client — 탐색형 UI (검색 진입 + 서브트리 트리 뷰) (I-030)
+- [ ] 2.8 Confluence MCP Client — 내 문서 임포트 (`getUserContributedPages` 백엔드는 존재, UI 미구현)
 
 ### Phase 3: LLM 저장 방식 판단 + 처리
 - [x] 3.1 LLM Classifier 구현 (문서 분석 → chunk/graph/hybrid 판정)
@@ -87,8 +88,26 @@
 - [ ] 10.3 API 명세 (OpenAPI/Swagger) 자동 파싱
 
 ## 마지막 업데이트
-- 일시: 2026-04-21
-- 내용: Confluence 컨텍스트 추출 고도화 + LLM 기반 분류/추출 제거 (D-039, D-040, D-041).
+- 일시: 2026-04-23
+- 내용: Confluence MCP 3-scope 싱크 백엔드 9단계 완성 (D-043, 세션 로그 `2026-04-23_confluence-mcp-3scope-sync-backend.md`).
+  - **배경**: 사내 Confluence REST 차단(I-011) 환경에서 "특정 공간 일부 문서를 지속적으로 가져오기" 를 요구. 범위는 3가지(페이지 단건 / 서브트리 / 공간 전체) + 검색 진입 + 버튼 트리거로 합의. 기존 `SyncEngine`(REST) 은 MCP 세션 수명·도구 셋이 달라 확장 불가. 동시에 "해제 시 임포트된 문서도 삭제" + "공간 전체 + 서브트리 동시 등록 허용" 두 정책 충돌(공유 페이지 오삭제)을 참조 카운팅 membership 으로 해결.
+  - **구현된 9단계 (각 단계 단일 커밋 + 테스트)**:
+    1. `storage/cascade.py::delete_document_cascade(doc_id, *, meta_store, vector_store, graph_store) -> bool` — web/api/documents.py 에 인라인되어 있던 vector→graph→meta 삭제 순서를 facade 로 추출. 해제 경로와 문서 API 가 공유. (commit 2410a80)
+    2. `ingestion/mcp_confluence::SearchEnvelope` + `search_content_envelope` — `searchContent` envelope 의 `totalSize`/`size`/`start`/`limit` 보존. `total`/`totalSize`/`_totalSize` 변종 + list-only + 빈 응답 3경로 처리. (commit 3b908ac)
+    3. `get_page_with_ancestors(session, page_id)` + 순수 함수 `format_breadcrumb(page)` — `space.name → ancestors[].title → page.title` 을 " / " 로 결합, key/name 폴백, 빈 항목 스킵, id 최후 폴백. (commit fc20735)
+    4. `walk_subtree(session, root_id, *, max_depth=20, max_pages=5000)` — `getChild` BFS, 방문 집합(사이클 차단), type != "page" 필터, 가지별 실패 격리. 루트는 `parent_id=None, depth=0, title=""` 로 첫 항목. (commit d564eec)
+    5. `estimate_space_page_count` + `enumerate_space_pages` — CQL `space="KEY" AND type="page"` 페이지네이션 async generator. 종료 3중(totalSize 도달 / 짧은 페이지 / 빈 응답) + max_pages 상한. `_space_cql` 이 `\`/`"` escape. (commit 30e0e6a)
+    6. 스키마: `confluence_sync_targets(scope CHECK IN (page|subtree|space))` + `UNIQUE(scope, space_key, COALESCE(page_id, ''))` — SQLite 기본 UNIQUE 가 NULL 을 distinct 로 취급하는 문제를 COALESCE 표현식 인덱스로 우회. `confluence_sync_membership(target_id FK CASCADE, page_id, ...)` PK `(target_id, page_id)` — 같은 page 가 여러 target 에 공존 허용. (commit 899b5f6)
+    7. MetadataStore CRUD 8종: targets `upsert/get/list(created_at DESC, id DESC 타이브레이크)/update_sync_result/delete_sync_target`, membership `upsert/upsert_batch/list_page_ids/remove_memberships`. 핵심은 `_find_orphans_if_membership_dropped` — 가상 삭제 시 "다른 target 이 소유하지 않는 page" 만 선정해 cascade 대상 doc_id 반환. 실제 cascade 는 호출측(delete_document_cascade) 책임. (commit 6d15192)
+    8. `sync/mcp_sync.py::execute_sync_target` 디스패처 + scope 별 3핸들러. **두 안전 속성 명시적 구현**: (a) 열거(walker/enumerate) 실패 시 membership 수정 안 함 — 일시 장애로 cascade 삭제 유발 방지, (b) `current_ids.add()` 를 import try 블록 앞에 두어 개별 import 실패가 stale 삭제로 번지지 않음. (commit a7d94cc)
+    9. 웹 API 7개: `GET /search`(spaces+pages 병합 + totalSize), `GET /spaces/{key}/estimate`, `POST/GET/DELETE /sync-targets`, `POST /sync-targets/{id}/sync`. target_id 별 `asyncio.Lock` + `_target_status` dict + BackgroundTasks 로 비동기 실행. `get_space_info` MCP 래퍼도 추가. (commit 2b233b0)
+  - **테스트**: +110건 전부 통과 (cascade 4, 스키마 13 + CRUD 18, MCP 유틸 +42, 디스패처 14, 웹 API 19). 기존 실패 14건은 사전 Jinja2 환경 문제로 회귀 아님.
+  - **아키텍처 성질**: `execute_sync_target` 은 session/stores 만 받으면 돌아가는 순수 함수 — BackgroundTasks / 주기 루프 / CLI / 테스트 어디서든 재사용. MetadataStore 는 diff 만 계산, cross-store cascade 는 facade 가 담당 — 두 계층 분리로 재시도·복구 로직 삽입 여지.
+  - **남은 작업**
+    - I-030: UI 구현 — 검색 박스 + 3버튼(📄 페이지만 / 🌿 하위 포함 / 🏢 공간 전체) 카드 + 확인 다이얼로그(하위 포함 / 공간 전체 / 해제) + 등록된 대상 카드 목록 + 폴링 진행률. `web/templates/confluence_mcp.html` 확장 + vanilla JS.
+    - 자동 주기 실행 — 현재 버튼 트리거만. `MCPSyncEngine` + `auto_sync_enabled` 토글 기반 백그라운드 루프는 후순위. (기존 REST `SyncEngine` 과 별도 클래스, execute_sync_target 재사용)
+    - SSE 진행률 — 현재 폴링. 수천 페이지 공간 싱크 UX 개선에 유용하나 필수 아님.
+- 이전 (2026-04-21): Confluence 컨텍스트 추출 고도화 + LLM 기반 분류/추출 제거 (D-039, D-040, D-041).
   - **배경**: Confluence 문서는 Storage Format으로 섹션/링크/코드블록/테이블이 이미 기계 판독 가능한 구조로 들어온다. 그럼에도 파이프라인은 이 구조를 `html_to_markdown()`으로 평탄화해 버리고, 그래프 엣지는 LLM(`graph_extractor`)으로 다시 "추출"해 왔음 — 정보 손실 + 환각 + 토큰 비용의 3중 낭비.
   - **Step 1 — 구조화 추출기** (commits 24e376c, 6c92dad, aae3ca7; D-039)
     - `ingestion/confluence_extractor.py` 신설. BeautifulSoup 단일 파싱으로 `ExtractedDocument(plain_text, sections, outbound_links, code_blocks, tables, mentions)` 반환

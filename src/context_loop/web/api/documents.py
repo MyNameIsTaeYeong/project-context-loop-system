@@ -11,6 +11,7 @@ from langchain_core.embeddings import Embeddings
 from context_loop.config import Config
 from context_loop.ingestion.editor import save_document
 from context_loop.processor.pipeline import build_meta_view_text
+from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -302,13 +303,14 @@ async def delete_document_api(
     graph_store: GraphStore = Depends(get_graph_store),
 ):
     """문서와 관련 데이터를 모두 삭제한다."""
-    doc = await meta_store.get_document(document_id)
-    if not doc:
+    deleted = await delete_document_cascade(
+        document_id,
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+    )
+    if not deleted:
         raise HTTPException(404)
-
-    vector_store.delete_by_document(document_id)
-    await graph_store.delete_document_graph(document_id)
-    await meta_store.delete_document(document_id)
 
     response = Response(status_code=204)
     response.headers["HX-Redirect"] = "/"

@@ -17,6 +17,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import deque
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 from mcp import ClientSession
@@ -245,6 +248,94 @@ async def search_content(
     return [{"content": parsed}] if parsed else []
 
 
+@dataclass(frozen=True)
+class SearchEnvelope:
+    """``searchContent`` 응답의 envelope 메타를 보존하는 DTO.
+
+    Confluence CQL 검색 응답은 ``{results, start, limit, size, totalSize}``
+    형태로 내려오는데 기존 :func:`search_content` 는 ``results`` 만 반환하여
+    전체 건수 등 메타가 유실된다. 공간 전체 싱크의 예상 페이지 수 표시,
+    페이지네이션 커서 관리 등에 쓰려면 envelope 원형이 필요하므로 이 DTO를
+    사용한다.
+
+    Attributes:
+        results: 이 응답 페이지에 포함된 결과 배열.
+        total_size: CQL 매치 전체 건수. 서버가 내려주지 않으면 ``None``.
+        size: 이 응답에 실제 담긴 건수. envelope이 없으면 ``len(results)``.
+        start: 요청한 오프셋.
+        limit: 요청한 페이지 크기.
+    """
+
+    results: list[dict[str, Any]]
+    total_size: int | None
+    size: int
+    start: int
+    limit: int
+
+
+async def search_content_envelope(
+    session: ClientSession,
+    query: str,
+    limit: int = 25,
+    start: int = 0,
+) -> SearchEnvelope:
+    """:func:`search_content` 와 동일하게 검색하되 envelope 메타를 보존한다.
+
+    응답 형태 3가지에 대응한다:
+
+    1. envelope dict (``{results, totalSize, size, start, limit}``) — 기본 케이스.
+    2. 결과만 배열로 — envelope 없이 ``[{id, title}, ...]`` 만 오는 경우.
+       ``total_size`` 는 ``None`` 이 된다.
+    3. 빈/텍스트 응답 — 빈 envelope을 반환한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        query: 검색 키워드 또는 CQL 쿼리.
+        limit: 요청 페이지 크기.
+        start: 요청 오프셋.
+
+    Returns:
+        :class:`SearchEnvelope` 인스턴스.
+    """
+    cql = build_cql(query)
+    result = await session.call_tool(
+        "searchContent", {"cql": cql, "limit": limit, "start": start},
+    )
+    parsed = _parse_json_result(result)
+
+    if isinstance(parsed, dict) and "results" in parsed:
+        results = parsed["results"] or []
+        # 서버 변종에 따라 total/totalSize/_totalSize 중 하나로 내려올 수 있다.
+        total_size_val = (
+            parsed.get("totalSize")
+            if parsed.get("totalSize") is not None
+            else parsed.get("total")
+            if parsed.get("total") is not None
+            else parsed.get("_totalSize")
+        )
+        total_size = int(total_size_val) if total_size_val is not None else None
+        return SearchEnvelope(
+            results=results,
+            total_size=total_size,
+            size=int(parsed.get("size", len(results))),
+            start=int(parsed.get("start", start)),
+            limit=int(parsed.get("limit", limit)),
+        )
+
+    if isinstance(parsed, list):
+        return SearchEnvelope(
+            results=parsed,
+            total_size=None,
+            size=len(parsed),
+            start=start,
+            limit=limit,
+        )
+
+    return SearchEnvelope(
+        results=[], total_size=None, size=0, start=start, limit=limit,
+    )
+
+
 async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     """MCP 서버의 getPageByID 도구로 페이지를 가져온다.
 
@@ -268,6 +359,79 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     return {"content": _extract_text(result), "id": page_id}
 
 
+async def get_page_with_ancestors(
+    session: ClientSession, page_id: str,
+) -> dict[str, Any]:
+    """페이지를 조회하되 breadcrumb 구성에 필요한 ``ancestors``/``space`` 를 포함한다.
+
+    싱크 대상 등록 시점에 사용자에게 보여줄 계층형 이름
+    (예: ``"Engineering / Docs / Architecture / Overview"``)을 해석하기 위한
+    경량 호출 경로. 본문(``body.storage``)은 포함하지 않아 :func:`get_page` 보다
+    페이로드가 가볍다. 일반 임포트 흐름은 그대로 :func:`get_page` 를 사용한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        page_id: 페이지 ID.
+
+    Returns:
+        페이지 정보 dict. ``ancestors`` (root→parent 순 배열) 와 ``space`` (dict)
+        가 포함된다. 서버가 텍스트만 반환하면 ``{"id": page_id}`` 를 반환한다.
+    """
+    result = await session.call_tool(
+        "getPageByID",
+        {
+            "pageId": page_id,
+            "expand": "ancestors,space,version",
+        },
+    )
+    parsed = _parse_json_result(result)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"id": page_id}
+
+
+def format_breadcrumb(page: dict[str, Any]) -> str:
+    """페이지 dict에서 ``"공간 / 조상 / ... / 제목"`` breadcrumb를 생성한다.
+
+    :func:`get_page_with_ancestors` 응답을 그대로 받아 사용할 수 있다.
+
+    구성 규칙:
+      1. ``page["space"]["name"]`` 이 있으면 맨 앞에 붙임. 없으면
+         ``page["space"]["key"]`` 로 폴백.
+      2. ``page["ancestors"]`` 는 root→parent 순으로 전제, 각 항목의
+         ``title`` (없으면 ``name``) 을 순서대로 이어 붙임.
+      3. 마지막으로 ``page["title"]`` (없으면 ``name``) 을 붙임.
+      4. 어느 것도 없으면 ``page["id"]`` 를 문자열로 반환. id마저 없으면 빈 문자열.
+
+    구분자는 ``" / "``. 빈 제목 등 falsy 값은 건너뛴다.
+    """
+    parts: list[str] = []
+
+    space = page.get("space")
+    if isinstance(space, dict):
+        space_label = space.get("name") or space.get("key")
+        if space_label:
+            parts.append(str(space_label))
+
+    ancestors = page.get("ancestors")
+    if isinstance(ancestors, list):
+        for ancestor in ancestors:
+            if isinstance(ancestor, dict):
+                label = ancestor.get("title") or ancestor.get("name")
+                if label:
+                    parts.append(str(label))
+
+    title = page.get("title") or page.get("name")
+    if title:
+        parts.append(str(title))
+
+    if parts:
+        return " / ".join(parts)
+
+    page_id = page.get("id")
+    return str(page_id) if page_id else ""
+
+
 async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str, Any]]:
     """MCP 서버의 getChild 도구로 하위 페이지 목록을 가져온다."""
     result = await session.call_tool("getChild", {"pageId": page_id})
@@ -277,6 +441,216 @@ async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str
     if isinstance(parsed, dict) and "results" in parsed:
         return parsed["results"]
     return []
+
+
+async def walk_subtree(
+    session: ClientSession,
+    root_page_id: str,
+    *,
+    max_depth: int = 20,
+    max_pages: int = 5000,
+) -> list[dict[str, Any]]:
+    """서브트리의 모든 페이지를 BFS로 전개해 평탄화한 목록을 반환한다.
+
+    루트부터 :func:`get_child_pages` 를 재귀 호출하여 하위 전체를 훑는다.
+    본문은 페치하지 않고 ``{id, parent_id, depth, title}`` 만 수집한다.
+    루트 자신도 첫 항목으로 포함된다(``parent_id=None, depth=0``).
+    루트의 ``title`` 은 walker가 별도로 조회하지 않으므로 빈 문자열이 들어간다 —
+    호출측이 이미 알고 있다면 결과의 첫 항목을 후처리할 수 있다.
+
+    안전 장치:
+      - ``type != "page"`` 인 자식은 건너뛴다(blogpost, attachment 등 무시).
+        ``type`` 필드가 없으면 page로 간주한다.
+      - 방문 집합으로 사이클과 중복 참조를 차단한다.
+      - ``max_depth`` 를 초과하는 깊이로는 확장하지 않는다(루트는 깊이 0).
+      - ``max_pages`` 에 도달하면 즉시 반환하고 경고 로그를 남긴다.
+      - 특정 노드의 ``getChild`` 호출이 실패해도 warning만 남기고 다른 가지를 계속 탐색한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        root_page_id: 루트 페이지 ID.
+        max_depth: 허용할 최대 깊이(루트=0). 기본 20.
+        max_pages: 수집할 최대 페이지 수. 기본 5000.
+
+    Returns:
+        각 항목은 ``{"id": str, "parent_id": str | None, "depth": int,
+        "title": str}`` 형태. BFS 순서로 정렬되며 루트가 첫 항목.
+    """
+    root_id_str = str(root_page_id)
+    visited: set[str] = {root_id_str}
+    nodes: list[dict[str, Any]] = [
+        {"id": root_id_str, "parent_id": None, "depth": 0, "title": ""},
+    ]
+
+    # BFS 큐: (page_id, depth)
+    queue: deque[tuple[str, int]] = deque([(root_id_str, 0)])
+
+    while queue:
+        current_id, current_depth = queue.popleft()
+
+        # max_depth에 도달했으면 더 내려가지 않는다 (이미 수집된 노드는 유지).
+        if current_depth >= max_depth:
+            continue
+
+        try:
+            children = await get_child_pages(session, current_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "하위 페이지 조회 실패 page_id=%s: %s", current_id, exc,
+            )
+            continue
+
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+
+            # type 필터: 명시된 경우에만 page 이외를 스킵한다.
+            child_type = child.get("type")
+            if child_type is not None and child_type != "page":
+                continue
+
+            child_id_raw = child.get("id")
+            if not child_id_raw:
+                continue
+            child_id = str(child_id_raw)
+
+            if child_id in visited:
+                continue
+
+            if len(nodes) >= max_pages:
+                logger.warning(
+                    "walk_subtree max_pages(%d) 도달 — root=%s",
+                    max_pages, root_id_str,
+                )
+                return nodes
+
+            visited.add(child_id)
+            nodes.append({
+                "id": child_id,
+                "parent_id": current_id,
+                "depth": current_depth + 1,
+                "title": str(child.get("title", "")),
+            })
+            queue.append((child_id, current_depth + 1))
+
+    return nodes
+
+
+def _space_cql(space_key: str) -> str:
+    """공간 내 모든 페이지를 매치하는 CQL을 만든다.
+
+    ``space_key`` 의 ``\\`` 와 ``"`` 는 CQL 문자열 리터럴 규칙에 따라 escape 한다.
+    """
+    escaped = space_key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'space = "{escaped}" AND type = "page"'
+
+
+async def estimate_space_page_count(
+    session: ClientSession, space_key: str,
+) -> int | None:
+    """공간에 속한 페이지 수를 추정한다.
+
+    ``searchContent`` 를 ``limit=1`` 로 호출해 envelope의 ``totalSize`` 만
+    확인한다. 공간 전체 싱크 확인 다이얼로그의 "예상 페이지 수" 표기에 쓴다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키 (예: ``"ENG"``).
+
+    Returns:
+        ``totalSize`` 값. MCP 서버가 해당 메타를 내려주지 않으면 ``None``.
+    """
+    env = await search_content_envelope(
+        session, _space_cql(space_key), limit=1, start=0,
+    )
+    return env.total_size
+
+
+async def enumerate_space_pages(
+    session: ClientSession,
+    space_key: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 10000,
+) -> AsyncIterator[dict[str, Any]]:
+    """공간의 모든 페이지를 CQL 페이지네이션으로 순회하며 하나씩 yield 한다.
+
+    ``searchContent`` 를 ``space = "KEY" AND type = "page"`` 로 호출하고
+    ``limit``/``start`` 를 증가시키며 반복한다. 결과 수가 많은 스페이스에
+    대비해 메모리 부담을 줄이려 async generator로 구현한다.
+
+    종료 조건:
+      - envelope의 ``total_size`` 가 있으면 yield한 개수가 그 값에 도달했을 때.
+      - ``total_size`` 가 없으면 응답의 ``size`` 가 ``page_size`` 보다 작을 때.
+      - 응답의 ``results`` 가 비어 있으면 즉시 종료.
+      - ``max_pages`` 에 도달하면 경고 로그를 남기고 조기 반환.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키.
+        page_size: 한 번에 요청할 결과 수.
+        max_pages: yield할 수 있는 최대 페이지 수 (안전 상한).
+
+    Yields:
+        ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
+        ``type`` 등을 포함한다.
+    """
+    cql = _space_cql(space_key)
+    start = 0
+    emitted = 0
+    total_size: int | None = None
+
+    while emitted < max_pages:
+        env = await search_content_envelope(
+            session, cql, limit=page_size, start=start,
+        )
+
+        if not env.results:
+            break
+
+        for page in env.results:
+            if not isinstance(page, dict):
+                continue
+            yield page
+            emitted += 1
+            if emitted >= max_pages:
+                logger.warning(
+                    "enumerate_space_pages max_pages(%d) 도달 — space=%s",
+                    max_pages, space_key,
+                )
+                return
+
+        # 첫 응답에서 totalSize를 고정한다 (서버가 값을 바꾸지는 않지만 방어적).
+        if total_size is None and env.total_size is not None:
+            total_size = env.total_size
+
+        if total_size is not None and emitted >= total_size:
+            break
+        if env.size < page_size:
+            # 마지막 페이지 (envelope의 size가 요청 limit보다 작음).
+            break
+
+        start += page_size
+
+
+async def get_space_info(
+    session: ClientSession, space_key: str,
+) -> dict[str, Any]:
+    """MCP 서버의 getSpaceInfo 도구로 단일 공간 정보를 가져온다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키 (예: ``"ENG"``).
+
+    Returns:
+        공간 정보 dict. 일반적으로 ``key``, ``name``, ``id`` 등이 포함된다.
+        MCP 서버가 dict가 아닌 응답을 주면 ``{"key": space_key}`` 를 반환한다.
+    """
+    result = await session.call_tool("getSpaceInfo", {"spaceKey": space_key})
+    parsed = _parse_json_result(result)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"key": space_key}
 
 
 async def get_all_spaces(session: ClientSession) -> list[dict[str, Any]]:

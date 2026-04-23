@@ -620,3 +620,35 @@
   - **그 외**: 기존 "Body (임베딩 대상)" + "Meta (추가 임베딩 대상)" 유지.
 - 테스트 +1: `test_git_code_pipeline_persists_embed_text` — embed_text가 SQLite에 영속화되며 본문(`content`)과 다른 값임(D-036 분리 원칙). 기존 마이그레이션·CRUD 테스트에 `embed_text` 컬럼 검증 추가.
 
+---
+
+## D-043: Confluence MCP 3-scope 싱크 + membership 참조 카운팅
+
+- **일시**: 2026-04-23
+- **맥락**: 사내 Confluence REST API 차단(I-011)으로 MCP Client 경로만 사용 가능. 사용자 요구는 "특정 공간 일부 문서를 지속적으로 가져오기" 였고, 실제 요청 범위는 3가지로 수렴: (1) 특정 페이지 단건, (2) 특정 페이지부터 하위 전체(서브트리), (3) 특정 공간 전체. 기존 `SyncEngine`(REST, `ingestion/confluence.py` 기반)은 MCP 세션 수명·도구 셋이 달라 그대로 확장할 수 없었다. 또한 "해제 시 임포트된 문서도 삭제" + "공간 전체 + 서브트리 동시 등록 허용" 두 정책이 동시에 성립해야 했는데, 단순 `(target_id) → 1:N 문서` 모델은 공유 페이지에서 오삭제가 발생한다.
+- **결정**: MCP 전용 3-scope 싱크 서브시스템을 새로 구축한다.
+  - **대상 모델** — `confluence_sync_targets(scope ∈ {page, subtree, space}, space_key, page_id)` + `UNIQUE(scope, space_key, COALESCE(page_id, ''))`. COALESCE 를 쓰는 이유: SQLite 기본 UNIQUE 가 NULL 을 distinct 로 취급해 space scope(page_id NULL) 중복이 허용되기 때문.
+  - **참조 카운팅 membership** — `confluence_sync_membership(target_id FK CASCADE, page_id, space_key, parent_page_id, depth, last_seen_at)`, PK `(target_id, page_id)`. 같은 page_id 가 여러 target 에 속할 수 있음. **문서 수명은 membership 행 수에 의해 결정** — target 해제 / sync 단계의 stale 제거로 어떤 page 의 membership 이 0 이 되면 그때 비로소 `delete_document_cascade` 로 실제 문서 삭제.
+  - **열거 전략** — scope 별로 다름:
+    - subtree: `walk_subtree` (getChild BFS + visited 집합 + max_depth/max_pages 상한 + 가지별 실패 격리)
+    - space: `enumerate_space_pages` (CQL `space="KEY" AND type="page"` 페이지네이션 async generator, `totalSize` 도달 / 짧은 페이지 / 빈 응답 3중 종료)
+    - page: 열거 생략
+  - **디스패처** `execute_sync_target(session, target, *, meta_store, vector_store, graph_store)` 가 scope 로 분기. session/stores 만 받으면 돌아가는 순수 함수 → 웹 API BackgroundTasks / 주기 루프 / CLI / 테스트 어디서든 재사용.
+  - **두 가지 안전 속성 명시적 구현**:
+    1. **열거 단계 실패 시 membership 보존** — walker/enumerate 가 예외를 던지면 membership 을 수정하지 않고 `errors` 만 기록 후 반환. 일시적 Confluence 장애가 cascade 삭제로 번지지 않음.
+    2. **개별 import 실패가 stale 삭제를 유발하지 않음** — `current_ids.add(page_id)` 를 import try 블록 **앞**에 두어, walker 가 확인한 페이지는 import 성공 여부와 무관하게 stale 판정에서 제외됨. 기존 membership 은 다음 sync 까지 유지.
+  - **웹 API**: `GET /search`(spaces+pages 병합, totalSize 포함), `GET /spaces/{key}/estimate`, `POST/GET/DELETE /sync-targets`, `POST /sync-targets/{id}/sync`. `target_id` 별 `asyncio.Lock` + `_target_status` dict 로 중복 실행 방지 + 폴링 응답. BackgroundTasks 로 응답 후 실제 sync.
+- **이유**:
+  - **3가지 요구를 단일 추상으로 통합**: scope 컬럼 하나만으로 구분되며, 디스패처가 분기해 공통 증분 로직(membership diff → stale prune → cascade)을 재사용한다. 3개 경로를 별도 엔드포인트로 쪼개면 UI 와 배선이 3배로 늘어나 유지보수가 어렵다.
+  - **membership 기반 참조 카운팅이 공유 페이지 문제를 수학적으로 해결**: subtree 와 space target 이 같은 page 를 공유할 때 어느 한쪽 해제 → 다른 쪽이 여전히 소유 → 문서 보존. 양쪽 모두 해제 → 0 membership → 삭제. 삭제 정책이 scope 개수에 선형 확장 가능(추후 `user` scope 추가해도 동일 규칙).
+  - **MCP 전용 스택이 REST 스택을 오염시키지 않음**: 기존 `SyncEngine`(REST)은 그대로 두고 `sync/mcp_sync.py` 에 별도 모듈. 세션 수명(MCP 는 context manager), 도구 셋(getChild/searchContent/getPageByID vs `/rest/api/content`), 에러 타입이 달라 공통화 비용이 분리 비용보다 큼.
+  - **트랜잭션 안전**: MetadataStore 는 membership diff 만 계산하고 orphan doc_id 를 반환, 실제 cross-store cascade(vector/graph/meta)는 `delete_document_cascade` 가 담당. 두 계층 분리로 중간 실패 시 재시도·복구 로직을 나중에 끼워 넣기 쉬움.
+- **영향**:
+  - 신규 모듈: `storage/cascade.py`, `sync/mcp_sync.py`
+  - 스키마: `confluence_sync_targets`, `confluence_sync_membership` 두 테이블 + UNIQUE 표현식 인덱스
+  - `ingestion/mcp_confluence.py` 에 5개 공개 함수 추가 (`SearchEnvelope`/`search_content_envelope`, `get_page_with_ancestors`, `format_breadcrumb`, `walk_subtree`, `estimate_space_page_count`/`enumerate_space_pages`, `get_space_info`)
+  - `MetadataStore` 에 8개 CRUD 메서드 + private orphan 감지
+  - `web/api/confluence_mcp.py` 에 7개 신규 엔드포인트 + 동시성 상태 + 백그라운드 러너
+  - 테스트 +110건 전부 통과 (cascade 4, 스키마/CRUD 31, MCP 유틸 +42, 디스패처 14, 웹 API 19). 회귀 없음.
+  - UI 미구현(검색 박스, 3버튼 카드, 확인 다이얼로그, 등록 카드 + 폴링 진행률) — I-030 으로 별도 추적.
+
