@@ -522,13 +522,61 @@ def test_format_breadcrumb_malformed_ancestors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_child_pages() -> None:
+async def test_get_child_pages_list_response() -> None:
+    """envelope 없이 list 만 오는 서버 변종 — 한 번에 전부 반환."""
     session = AsyncMock()
     session.call_tool.return_value = _make_result('[{"id": "10", "title": "Child"}]')
 
     children = await get_child_pages(session, "1")
-    session.call_tool.assert_called_once_with("getChild", {"pageId": "1"})
+
+    assert session.call_tool.call_count == 1
+    # pageId 뿐 아니라 start/limit/expand 를 반드시 같이 넘겨야 한다.
+    args, _ = session.call_tool.call_args
+    assert args[0] == "getChild"
+    assert args[1]["pageId"] == "1"
+    assert args[1]["start"] == 0
+    assert "limit" in args[1]
+    assert "expand" in args[1]
     assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_paginates_until_total_size() -> None:
+    """envelope 응답이면 totalSize 에 도달할 때까지 페이지네이션."""
+    session = AsyncMock()
+    session.call_tool.side_effect = [
+        _make_result(
+            '{"results":[{"id":"1"},{"id":"2"}],'
+            ' "start":0, "limit":2, "size":2, "totalSize":3}',
+        ),
+        _make_result(
+            '{"results":[{"id":"3"}],'
+            ' "start":2, "limit":2, "size":1, "totalSize":3}',
+        ),
+    ]
+
+    children = await get_child_pages(session, "root", page_size=2)
+
+    assert [c["id"] for c in children] == ["1", "2", "3"]
+    assert session.call_tool.call_count == 2
+    first_args = session.call_tool.call_args_list[0].args[1]
+    second_args = session.call_tool.call_args_list[1].args[1]
+    assert first_args["start"] == 0 and first_args["limit"] == 2
+    assert second_args["start"] == 2 and second_args["limit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_stops_when_size_less_than_page_size() -> None:
+    """totalSize 가 없으면 size < page_size 로 마지막 페이지 판정."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results":[{"id":"1"}], "start":0, "limit":10, "size":1}',
+    )
+
+    children = await get_child_pages(session, "root", page_size=10)
+
+    assert [c["id"] for c in children] == ["1"]
+    assert session.call_tool.call_count == 1
 
 
 # --- walk_subtree 테스트 ---

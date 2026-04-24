@@ -432,15 +432,84 @@ def format_breadcrumb(page: dict[str, Any]) -> str:
     return str(page_id) if page_id else ""
 
 
-async def get_child_pages(session: ClientSession, page_id: str) -> list[dict[str, Any]]:
-    """MCP 서버의 getChild 도구로 하위 페이지 목록을 가져온다."""
-    result = await session.call_tool("getChild", {"pageId": page_id})
-    parsed = _parse_json_result(result)
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict) and "results" in parsed:
-        return parsed["results"]
-    return []
+async def get_child_pages(
+    session: ClientSession,
+    page_id: str,
+    *,
+    page_size: int = 100,
+    max_children: int = 5000,
+    expand: str = "",
+) -> list[dict[str, Any]]:
+    """MCP 서버의 ``getChild`` 도구로 하위 페이지 목록을 가져온다.
+
+    ``getChild`` 는 ``pageId`` 뿐 아니라 ``start``/``limit``/``expand`` 를
+    필수 인자로 요구한다. envelope 응답(``{results, start, limit, size,
+    totalSize}``) 인 경우 페이지네이션으로 전체를 수집하고, envelope 없이
+    list 로 오는 변종은 한 번에 처리한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        page_id: 부모 페이지 ID.
+        page_size: 한 번에 요청할 결과 수.
+        max_children: 수집 상한(안전장치).
+        expand: ``getChild`` 의 필수 파라미터. 기본값 ``""`` 는 최소 필드만.
+    """
+    children: list[dict[str, Any]] = []
+    start = 0
+    total_size: int | None = None
+
+    while len(children) < max_children:
+        result = await session.call_tool(
+            "getChild",
+            {
+                "pageId": page_id,
+                "start": start,
+                "limit": page_size,
+                "expand": expand,
+            },
+        )
+        parsed = _parse_json_result(result)
+
+        # envelope 없이 list 로 오는 서버 변종 — 전부 반환 후 종료.
+        if isinstance(parsed, list):
+            children.extend(c for c in parsed if isinstance(c, dict))
+            break
+
+        if not isinstance(parsed, dict) or "results" not in parsed:
+            break
+
+        results = parsed.get("results") or []
+        if not results:
+            break
+        children.extend(c for c in results if isinstance(c, dict))
+        size = int(parsed.get("size", len(results)))
+
+        if total_size is None:
+            ts_val = (
+                parsed.get("totalSize")
+                if parsed.get("totalSize") is not None
+                else parsed.get("total")
+                if parsed.get("total") is not None
+                else parsed.get("_totalSize")
+            )
+            if ts_val is not None:
+                try:
+                    total_size = int(ts_val)
+                except (TypeError, ValueError):
+                    total_size = None
+
+        if total_size is not None and len(children) >= total_size:
+            break
+        if size < page_size:
+            break
+        start += page_size
+    else:
+        logger.warning(
+            "get_child_pages max_children(%d) 도달 — page_id=%s",
+            max_children, page_id,
+        )
+
+    return children[:max_children]
 
 
 async def walk_subtree(
