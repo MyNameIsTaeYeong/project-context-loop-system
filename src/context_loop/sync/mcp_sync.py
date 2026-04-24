@@ -26,6 +26,7 @@ from mcp import ClientSession
 from context_loop.ingestion.mcp_confluence import (
     enumerate_space_pages,
     enumerate_subtree_pages,
+    estimate_subtree_page_count,
     import_page_via_mcp,
 )
 from context_loop.storage.cascade import delete_document_cascade
@@ -184,6 +185,18 @@ async def _sync_subtree(
     target_id = target["id"]
 
     try:
+        expected_descendants: int | None = await estimate_subtree_page_count(
+            session, root_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 예상치 확인은 정보성이므로 실패해도 본 열거를 계속 시도한다.
+        logger.debug(
+            "estimate_subtree_page_count 실패 target_id=%s root=%s: %s",
+            target_id, root_id, exc,
+        )
+        expected_descendants = None
+
+    try:
         descendants: list[dict[str, Any]] = [
             p async for p in enumerate_subtree_pages(session, root_id)
         ]
@@ -197,6 +210,17 @@ async def _sync_subtree(
             {"page_id": root_id, "error": f"enumerate_subtree_pages: {exc}"},
         )
         return result
+
+    # 서버 totalSize 대비 실제 열거 수 비교 — 누락 탐지 관측성.
+    if (
+        expected_descendants is not None
+        and len(descendants) != expected_descendants
+    ):
+        logger.warning(
+            "서브트리 열거 개수 불일치 target_id=%s root=%s: "
+            "expected=%d actual=%d",
+            target_id, root_id, expected_descendants, len(descendants),
+        )
 
     # 루트 + 후손. CQL 결과에는 parent_id/depth 가 없으므로 hierarchy 저장은 안 함.
     nodes: list[dict[str, Any]] = [{"id": root_id}]

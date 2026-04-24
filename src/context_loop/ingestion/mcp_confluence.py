@@ -671,36 +671,33 @@ async def estimate_space_page_count(
     return env.total_size
 
 
-async def enumerate_space_pages(
+async def _paginate_cql(
     session: ClientSession,
-    space_key: str,
+    cql: str,
     *,
-    page_size: int = 100,
-    max_pages: int = 10000,
+    page_size: int,
+    max_pages: int,
+    label: str,
 ) -> AsyncIterator[dict[str, Any]]:
-    """공간의 모든 페이지를 CQL 페이지네이션으로 순회하며 하나씩 yield 한다.
-
-    ``searchContent`` 를 ``space = "KEY" AND type = "page"`` 로 호출하고
-    ``limit``/``start`` 를 증가시키며 반복한다. 결과 수가 많은 스페이스에
-    대비해 메모리 부담을 줄이려 async generator로 구현한다.
+    """CQL ``searchContent`` 를 페이지네이션하며 dict 결과만 yield 하는 공통 헬퍼.
 
     종료 조건:
-      - envelope의 ``total_size`` 가 있으면 yield한 개수가 그 값에 도달했을 때.
-      - ``total_size`` 가 없으면 응답의 ``size`` 가 ``page_size`` 보다 작을 때.
-      - 응답의 ``results`` 가 비어 있으면 즉시 종료.
-      - ``max_pages`` 에 도달하면 경고 로그를 남기고 조기 반환.
+      - envelope 의 ``total_size`` 가 알려지면 yield 누적이 그 값에 도달했을 때
+      - ``total_size`` 가 알려지지 않은 상태에서 응답의 ``size`` 가 ``page_size``
+        보다 작으면 "마지막 페이지" 휴리스틱으로 종료
+      - 빈 응답 → 즉시 종료
+      - ``max_pages`` 도달 → 경고 로그 후 조기 반환
 
-    Args:
-        session: 초기화된 ClientSession.
-        space_key: 공간 키.
-        page_size: 한 번에 요청할 결과 수.
-        max_pages: yield할 수 있는 최대 페이지 수 (안전 상한).
+    **중요 안전 속성**:
 
-    Yields:
-        ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
-        ``type`` 등을 포함한다.
+    1. ``total_size`` 가 알려진 경우 "short page 휴리스틱"을 건너뛴다. 일부
+       서버 구현은 요청한 ``limit`` 보다 적은 개수로 페이지당 응답을 cap 할 수
+       있는데, 그때 ``size < page_size`` 로 break 하면 ``total_size`` 에
+       도달하기 전에 중단되어 결과가 누락된다.
+    2. ``start`` 는 요청한 ``page_size`` 가 아니라 **실제 반환된 개수**
+       (``env.size`` 또는 ``len(env.results)``) 만큼 전진시킨다. 서버 cap
+       으로 부분 응답이 올 때 건너뛰는 구간이 생기지 않도록 함.
     """
-    cql = _space_cql(space_key)
     start = 0
     emitted = 0
     total_size: int | None = None
@@ -719,23 +716,53 @@ async def enumerate_space_pages(
             yield page
             emitted += 1
             if emitted >= max_pages:
-                logger.warning(
-                    "enumerate_space_pages max_pages(%d) 도달 — space=%s",
-                    max_pages, space_key,
-                )
+                logger.warning("%s max_pages(%d) 도달", label, max_pages)
                 return
 
-        # 첫 응답에서 totalSize를 고정한다 (서버가 값을 바꾸지는 않지만 방어적).
         if total_size is None and env.total_size is not None:
             total_size = env.total_size
 
         if total_size is not None and emitted >= total_size:
             break
-        if env.size < page_size:
-            # 마지막 페이지 (envelope의 size가 요청 limit보다 작음).
+        # totalSize 가 알려지지 않았을 때만 short-page 휴리스틱으로 종료.
+        if total_size is None and env.size < page_size:
             break
 
-        start += page_size
+        # 서버가 요청한 limit 보다 적게 돌려줄 수 있으므로 실제 반환 개수만큼 advance.
+        advance = env.size if env.size > 0 else len(env.results)
+        if advance <= 0:
+            break
+        start += advance
+
+
+async def enumerate_space_pages(
+    session: ClientSession,
+    space_key: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 10000,
+) -> AsyncIterator[dict[str, Any]]:
+    """공간의 모든 페이지를 CQL 페이지네이션으로 순회하며 하나씩 yield 한다.
+
+    ``space = "KEY" AND type = "page"`` CQL 을 :func:`_paginate_cql` 로 돌려
+    페이지네이션 세부 로직(서버 cap 대응, ``start`` 전진, 종료 조건)을 공유한다.
+
+    Args:
+        session: 초기화된 ClientSession.
+        space_key: 공간 키.
+        page_size: 한 번에 요청할 결과 수.
+        max_pages: yield할 수 있는 최대 페이지 수 (안전 상한).
+
+    Yields:
+        ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
+        ``type`` 등을 포함한다.
+    """
+    async for page in _paginate_cql(
+        session, _space_cql(space_key),
+        page_size=page_size, max_pages=max_pages,
+        label=f"enumerate_space_pages(space={space_key})",
+    ):
+        yield page
 
 
 def _subtree_cql(ancestor_page_id: str) -> str:
@@ -777,55 +804,22 @@ async def enumerate_subtree_pages(
 ) -> AsyncIterator[dict[str, Any]]:
     """서브트리의 후손 페이지(depth 무관)를 CQL 페이지네이션으로 순회한다.
 
-    ``ancestor = "ID" AND type = "page"`` CQL 로 **루트 아래 모든 depth 의
-    페이지를 평탄하게** 나열한다. per-parent ``getChild`` BFS (:func:`walk_subtree`)
-    와 달리 depth 제한·중간 노드 실패 격리·자식 페이지네이션 오류 등에 의한
-    누락이 없다. 루트 자신은 결과에 포함되지 않으므로 호출측이 별도로 추가한다.
-
-    종료 조건(:func:`enumerate_space_pages` 와 동일):
-      - envelope 의 ``total_size`` 가 있으면 yield 한 개수가 그 값에 도달했을 때
-      - ``total_size`` 가 없으면 응답의 ``size`` 가 ``page_size`` 보다 작을 때
-      - 빈 결과 시 즉시 종료
-      - ``max_pages`` 도달 시 경고 로그 남기고 조기 반환
+    ``ancestor = "ID" AND type = "page"`` CQL 을 :func:`_paginate_cql` 로 돌려
+    **루트 아래 모든 depth 의 페이지를 평탄하게** 나열한다. per-parent
+    ``getChild`` BFS(:func:`walk_subtree`) 와 달리 depth 제한·중간 노드 실패
+    격리·자식 페이지네이션 오류 등에 의한 누락이 없다. 루트 자신은 결과에
+    포함되지 않으므로 호출측이 별도로 추가한다.
 
     Yields:
         ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
         ``type`` 을 포함한다.
     """
-    cql = _subtree_cql(ancestor_page_id)
-    start = 0
-    emitted = 0
-    total_size: int | None = None
-
-    while emitted < max_pages:
-        env = await search_content_envelope(
-            session, cql, limit=page_size, start=start,
-        )
-
-        if not env.results:
-            break
-
-        for page in env.results:
-            if not isinstance(page, dict):
-                continue
-            yield page
-            emitted += 1
-            if emitted >= max_pages:
-                logger.warning(
-                    "enumerate_subtree_pages max_pages(%d) 도달 — ancestor=%s",
-                    max_pages, ancestor_page_id,
-                )
-                return
-
-        if total_size is None and env.total_size is not None:
-            total_size = env.total_size
-
-        if total_size is not None and emitted >= total_size:
-            break
-        if env.size < page_size:
-            break
-
-        start += page_size
+    async for page in _paginate_cql(
+        session, _subtree_cql(ancestor_page_id),
+        page_size=page_size, max_pages=max_pages,
+        label=f"enumerate_subtree_pages(ancestor={ancestor_page_id})",
+    ):
+        yield page
 
 
 async def get_space_info(

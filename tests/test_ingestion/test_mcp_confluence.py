@@ -1004,6 +1004,87 @@ async def test_enumerate_space_pages_skips_non_dict_items() -> None:
     assert [p["id"] for p in collected] == ["1", "2"]
 
 
+def _make_capping_search_session(
+    items: list[dict[str, Any]],
+    *,
+    server_cap: int,
+    total_size: int | None = None,
+    record_calls: list[dict[str, Any]] | None = None,
+) -> Any:
+    """``start`` 를 실제로 존중하고 응답당 ``server_cap`` 까지만 돌려주는 fake.
+
+    요청 ``limit`` 와 무관하게 서버가 응답당 개수를 cap 하는 상황을 재현한다.
+    totalSize 는 전체 건수로 고정 (보통 ``len(items)`` 와 같음).
+    """
+    effective_total = total_size if total_size is not None else len(items)
+
+    class FakeSession:
+        async def call_tool(self, tool_name: str, args: dict[str, Any]):
+            if tool_name != "searchContent":
+                raise AssertionError(f"Unexpected tool: {tool_name}")
+            if record_calls is not None:
+                record_calls.append(args)
+            start = int(args.get("start", 0))
+            # 서버가 요청한 limit 을 무시하고 server_cap 만큼만 돌려준다.
+            chunk = items[start:start + server_cap]
+            envelope = {
+                "results": chunk,
+                "size": len(chunk),
+                "start": start,
+                "limit": args.get("limit", 25),
+                "totalSize": effective_total,
+            }
+            return _make_result(json.dumps(envelope))
+
+    return FakeSession()
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_handles_server_cap_smaller_than_page_size() -> None:
+    """서버가 응답당 개수를 cap 해도 totalSize 까지 모두 열거한다.
+
+    회귀 방지: 기존 로직은 ``size < page_size`` 에서 무조건 break 해버려 첫
+    응답 이후 나머지를 잃었다. totalSize 가 알려진 경우 short-page 휴리스틱을
+    건너뛰고 ``start`` 를 실제 반환 개수만큼 전진시켜야 한다.
+    """
+    calls: list[dict[str, Any]] = []
+    items = [{"id": str(i)} for i in range(50)]
+    session = _make_capping_search_session(
+        items, server_cap=25, total_size=50, record_calls=calls,
+    )
+
+    collected = [
+        p async for p in enumerate_space_pages(
+            session, "ENG", page_size=100,
+        )
+    ]
+
+    assert len(collected) == 50
+    assert [p["id"] for p in collected] == [str(i) for i in range(50)]
+    # start=0 → 25, start=25 → 25 로 두 번의 호출로 모두 열거.
+    assert [c["start"] for c in calls] == [0, 25]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_handles_server_cap_smaller_than_page_size() -> None:
+    """서브트리 경로도 동일한 cap 대응을 상속한다(공통 헬퍼 `_paginate_cql`)."""
+    calls: list[dict[str, Any]] = []
+    items = [{"id": f"d{i}"} for i in range(30)]
+    session = _make_capping_search_session(
+        items, server_cap=10, total_size=30, record_calls=calls,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(
+            session, "100", page_size=100,
+        )
+    ]
+
+    assert len(collected) == 30
+    assert [p["id"] for p in collected] == [f"d{i}" for i in range(30)]
+    assert [c["start"] for c in calls] == [0, 10, 20]
+
+
 @pytest.mark.asyncio
 async def test_enumerate_space_pages_cql_is_correct() -> None:
     """CQL에 space와 type 필터가 함께 들어간다."""
