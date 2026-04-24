@@ -108,6 +108,50 @@
 
 ## 해결됨
 
+### I-035: Phase 2 인덱싱 자동화 + 동시성 + 실패 재시도 → 해결 (2026-04-24, D-044)
+- **증상**: 싱크 후 문서는 meta 에 저장되지만 벡터/그래프 인덱싱은 수동 "Process" 버튼 필요. Phase 2 가 직렬이라 대량 싱크 시 느림. 인덱싱 실패 문서는 `status='failed'` 로 stuck.
+- **해결 3단계** (`2178564` + `c5c9ca6`):
+  1. `execute_sync_target` 에 선택적 `embedding_client`/`pipeline_config` 주입 → Phase 2(process_document) 자동 실행. `SyncResult` 에 `processed`/`processing_errors` 버킷 + UI `◎N indexed · ⚠M indexing-failed` 노출
+  2. `asyncio.Semaphore(5)` + `asyncio.gather` 로 Phase 2 병렬화. `config.processor.phase2_concurrency` 운영자 튜닝 가능. 400 문서 기준 벽시계 ~5배 단축, OpenAI 기본 tier rate limit 의 ~5% 사용
+  3. `MetadataStore.list_failed_member_doc_ids(target_id)` 신설 — target 스코프 내 status='failed' 문서를 JOIN 쿼리로 식별. Phase 2 큐 = `created + updated + failed-in-membership`(중복 제거) → 재싱크마다 자동 재시도
+- 테스트 +11 (Phase 2 기본·unchanged skip·실패 격리·skip 조건·summary 확장·failed_member JOIN·concurrency bound·failed 재시도·clamp)
+
+### I-034: CQL 페이지네이션 서버 cap 대응 → 해결 (2026-04-24, `49add3c`)
+- **증상**: CQL `searchContent` 가 totalSize=356 을 돌려주는데 실제 임포트는 그보다 적음
+- **근본 원인 2가지 협력**:
+  1. `size < page_size` 에서 무조건 break — 일부 서버가 요청 `limit` 과 무관하게 응답당 개수를 cap (예: `limit=100` 요청에 `size=25` + `totalSize=500`) 하면 첫 응답 직후 종료되어 대량 누락
+  2. `start += page_size` (요청값 증분) — 서버 cap 으로 25개만 왔는데 start 를 100 증가 → items 25–99 구간 스킵
+- **해결**: `_paginate_cql` 공통 헬퍼 추출 + `total_size` 가 알려진 경우 short-page 휴리스틱 skip + `start += env.size` 로 실제 반환 개수만큼 전진. 관측성 보강: `_sync_subtree` 가 `estimate_subtree_page_count` 선행 호출해 totalSize vs 실제 열거 수 비교, 불일치 시 warning 로그
+- 테스트 +2 (`_make_capping_search_session` fake 로 server cap 재현 — space/subtree 각 1건)
+
+### I-033: 서브트리 BFS 누락 → CQL ancestor 평탄 열거로 전환 → 해결 (2026-04-24, `d507b15`, D-044)
+- **증상**: "하위 포함" 등록 시 최하위 depth 까지 가져오지 않음. walker 기반 BFS 가 몇 가지 경로로 누락 가능:
+  1. per-parent `getChild` 의 독립 페이지네이션 오판
+  2. 중간 노드 예외 격리가 그 아래 서브트리 전부 손실
+  3. `max_depth=20` 초과
+  4. `type` 필드가 `"page"` 아닌 값/누락으로 드롭
+  5. 권한 차이 per-node 호출
+- **해결**: 사용자 제안대로 CQL `ancestor = X AND type = "page"` 로 서버 측 평탄 열거. `_subtree_cql`/`estimate_subtree_page_count`/`enumerate_subtree_pages` 신설, `_sync_subtree` 가 descendants + 루트 수동 prepend (CQL ancestor 는 루트 자신 미포함)
+- **Trade-off**: membership 의 `parent_page_id`/`depth` 가 NULL 로 저장됨. 현재 코드베이스에서 이 컬럼을 읽는 곳이 없어 실영향 없음. hierarchy 가 필요해지면 별도 hydrate 단계 추가
+- `walk_subtree` 자체는 삭제하지 않고 유지 (다른 러너 호환)
+- 테스트 +9 (CQL helpers 3 + sync 재작성 6)
+
+### I-032: 서브트리 임포트 시 하위 페이지 누락 — structuredContent 누락 + envelope 키 변종 → 해결 (2026-04-24, `3bb7685`)
+- **증상**: 하위 포함 클릭 시 루트만 임포트되고 자식 전부 누락
+- **근본 원인 2가지 동시에**:
+  1. MCP 신규 스펙은 JSON 을 `CallToolResult.structuredContent` 에 직접 담기도 하는데, 기존 `_parse_json_result` 는 `content[].text` 만 읽어서 전체 페이로드가 소실됨. getChild 결과가 빈 리스트로 해석되어 walker 가 루트만 반환
+  2. 서버 구현체마다 envelope 키가 `results` / `children` / `page` / `pages` / `items` 또는 `{page: {results:[...]}}` 중첩 형태로 다양
+- **해결**: `_parse_json_result` 가 `structuredContent` 를 먼저 확인. `_unwrap_envelope(parsed) -> (items, envelope)` 공통 헬퍼 신설로 5가지 키 변종 + 1단계 중첩 흡수. `expand` 기본값 `""` → `"page"` (빈 문자열 거부하는 서버 방어)
+- 테스트 +4 (structuredContent 우선, children 키, 중첩 page.results, expand non-empty)
+
+### I-031: MCP tool 필수 파라미터 검증 에러 → 해결 (2026-04-24, `de0d7fb` + `9536c0c`)
+- **증상**: UI 에서 공간 검색 클릭 시 `CallToolResult validation` 에러. 사내 MCP 서버가 `getSpaceInfoAll` 에 `start`/`limit` 필수로 요구. 같은 날 `getChild` 도 `pageId`/`start`/`limit`/`expand` 필수로 확인
+- **해결**:
+  - `get_all_spaces` 가 `{"start": 0, "limit": 100}` 전달 + envelope 응답 페이지네이션 (`de0d7fb`)
+  - `get_child_pages` 가 `pageId`/`start`/`limit`/`expand` 함께 전달 + 동일 페이지네이션 로직 (`9536c0c`)
+  - 둘 다 envelope 없이 list 만 오는 서버 변종도 한 번에 처리 후 종료
+- 테스트 +5
+
 ### I-030: Confluence MCP 3-scope 싱크 UI 구현 → 해결 (2026-04-24)
 - `web/templates/confluence_mcp.html` 단일 파일 확장으로 완료. `syncTargetsPanel()` Alpine 컴포넌트 신설.
 - 구현된 요소:

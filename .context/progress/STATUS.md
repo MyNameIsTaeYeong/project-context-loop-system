@@ -1,9 +1,18 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 2.6–2.8 — Confluence MCP Client 3-scope 싱크 백엔드
-- **Step**: 백엔드 전체 완성, UI 잔여 (I-030)
-- **최신(2026-04-23)**: Confluence MCP 3-scope(page/subtree/space) 싱크 백엔드 9단계 완성 (D-043). 브랜치 `claude/confluence-continuous-fetch-aOGCB`. 사내 Confluence REST 차단(I-011) 환경에서 "특정 페이지만 / 특정 페이지 하위 전체 / 공간 전체" 3가지 범위를 동일한 디스패처(`execute_sync_target`)로 처리. 참조 카운팅 membership 모델(`confluence_sync_membership`)로 공유 페이지(subtree+space 동시 등록) 안전성을 확보 — 한쪽 해제 시 다른 소유자가 있으면 문서 보존, 양쪽 모두 해제 시 `delete_document_cascade` 로 완전 삭제. 두 핵심 안전 속성을 테스트로 고정: (1) walker/enumerate 실패 시 membership 보존(일시 장애가 cascade 삭제로 번지지 않음), (2) 개별 import 실패가 stale 삭제로 번지지 않음(walker 가 확인한 페이지는 import 성공 여부 무관하게 current_ids 포함). 웹 API 7종 + target_id 별 asyncio.Lock + BackgroundTasks 기반 비동기 실행. 테스트 +110건 전부 통과 (cascade 4, 스키마/CRUD 31, MCP 유틸 +42, 디스패처 14, 웹 API 19). UI (검색박스/3버튼 카드/확인 다이얼로그/등록카드+폴링 진행률)는 I-030 으로 분리.
+- **Phase**: Phase 2.6 완료 — Confluence MCP Client 3-scope 싱크 end-to-end (백엔드 + UI + 자동 인덱싱)
+- **Step**: UI 배포 + 실제 사용 피드백으로 드러난 5개 이슈 수정 + Phase 2 인덱싱 자동화. 전체 흐름(등록 → fetch → index → 검색 가능) 단일 버튼으로 완결.
+- **최신(2026-04-24)**: 브랜치 `claude/plan-document-sync-ui-aOBNT`. 하루 세션에 2단계로 전개.
+  1. **오전 — UI 배포 (I-030 해결)**: `web/templates/confluence_mcp.html` 단일 파일 확장. `syncTargetsPanel()` Alpine 컴포넌트 + 3 버튼 카드(📄/🌿/🏢) + 3 확인 다이얼로그(subtree 안내·space estimate·unregister cascade 경고) + 등록 대상 카드 목록(scope 뱃지·상대시간·증분 요약) + 자가 시작·정지 폴링(2초 간격, running/queued 없으면 자동 정지). 구 단발성 임포트 UI 는 `<details>` 로 보존.
+  2. **오후 — 트러블슈팅 체인 5개 이슈 수정 (D-044)**:
+     - I-031 MCP 필수 파라미터: `getSpaceInfoAll` 에 `start`/`limit`, `getChild` 에 `start`/`limit`/`expand` 필수. 페이지네이션 포함해 수정
+     - I-032 서브트리 루트만 임포트: `CallToolResult.structuredContent` 채널 누락 + envelope 키 변종(results/children/pages/page/items + 1단 중첩) 대응. `_parse_json_result` 가 structuredContent 우선, `_unwrap_envelope` 공통 헬퍼 신설, `expand` 기본값 `""` → `"page"`
+     - I-033 BFS 누락 → CQL 전환: walker 가 5가지 경로로 누락 가능(per-parent 페이지네이션·중간 노드 예외·max_depth·type 필드·권한). 사용자 제안대로 `ancestor = X AND type = "page"` 평탄 열거로 전환. `_subtree_cql` / `estimate_subtree_page_count` / `enumerate_subtree_pages` 신설, `_sync_subtree` 가 CQL descendants + 루트 수동 prepend. `walk_subtree` 는 유지 (다른 러너 호환)
+     - I-034 페이지네이션 서버 cap 버그 2개: (a) `size < page_size` 에서 무조건 break — totalSize 알려지면 skip 하도록, (b) `start += page_size` → `start += env.size` 로 실제 반환 개수만큼 전진. `_paginate_cql` 공통 헬퍼로 중복 제거하며 동시 수정
+     - I-035 Phase 2 인덱싱 자동화 + 동시성 + 실패 재시도: `execute_sync_target` 에 선택적 `embedding_client`/`pipeline_config`/`phase2_concurrency` 주입 → created+updated+failed-in-membership 자동 인덱싱. `asyncio.Semaphore(5)` + `asyncio.gather` 로 400 문서 기준 벽시계 ~5배 단축. `MetadataStore.list_failed_member_doc_ids(target_id)` JOIN 쿼리로 재싱크마다 stuck failed 문서 자동 재시도
+- 테스트 누적 +70건(UI 반영 포함), 최종 178 passed. UI UX 는 한 버튼 = 한 작업 모델 유지 (내부만 2-phase 로 분리).
+- **이전(2026-04-23)**: Confluence MCP 3-scope(page/subtree/space) 싱크 백엔드 9단계 완성 (D-043). 브랜치 `claude/confluence-continuous-fetch-aOGCB`. 사내 Confluence REST 차단(I-011) 환경에서 "특정 페이지만 / 특정 페이지 하위 전체 / 공간 전체" 3가지 범위를 동일한 디스패처(`execute_sync_target`)로 처리. 참조 카운팅 membership 모델(`confluence_sync_membership`)로 공유 페이지(subtree+space 동시 등록) 안전성을 확보 — 한쪽 해제 시 다른 소유자가 있으면 문서 보존, 양쪽 모두 해제 시 `delete_document_cascade` 로 완전 삭제. 두 핵심 안전 속성을 테스트로 고정: (1) walker/enumerate 실패 시 membership 보존(일시 장애가 cascade 삭제로 번지지 않음), (2) 개별 import 실패가 stale 삭제로 번지지 않음(walker 가 확인한 페이지는 import 성공 여부 무관하게 current_ids 포함). 웹 API 7종 + target_id 별 asyncio.Lock + BackgroundTasks 기반 비동기 실행. 테스트 +110건 전부 통과. UI (검색박스/3버튼 카드/확인 다이얼로그/등록카드+폴링 진행률)는 I-030 으로 분리.
 - **이전(2026-04-22)**: 멀티뷰 임베딩 Phase 1 도입 (D-042). 일반 문서 분기에서 청크당 ChromaDB 엔트리 2개 저장 — `{id}#body`(임베딩=본문) + `{id}#meta`(임베딩=title+section_path), 두 엔트리 document 동일, `logical_chunk_id`로 dedup. `context_assembler._search_chunks`에 over-fetch(×2) + dedup 로직 추가. 기존 body 뷰는 그대로 유지되므로 본문 친화 질의는 손해 없고, 경로/제목 친화 질의는 meta 뷰로 리콜 상승. SQLite `chunks`는 논리 청크 1행 유지. title/section_path 모두 비면 meta 뷰 생략. 테스트 +3 (pipeline 2, context_assembler 1) — 전체 450건 통과(web 제외).
 - **이전 상태**: 3단계로 완료. (1) **Step 1** — `ingestion/confluence_extractor.py` 신설 (ExtractedDocument: sections/outbound_links/code_blocks/tables/mentions), `documents.raw_content` 컬럼 추가 및 REST/MCP 수집 경로에서 원본 HTML 보존, 파이프라인 Confluence 분기가 추출기를 호출하도록 주입 (D-039). (2) **Step 2** — `processor/link_graph_builder.py` 신설: `OutLink` → `GraphData` 결정론적 변환 (`page/user/jira/attachment` → 각각 entity_type + relation, `url`은 병합 키 불안정 이슈로 제외). self-entity 패턴으로 GraphStore의 `(name, type)` 병합을 통한 인접 문서 간 엣지 수렴. 파이프라인 Confluence 분기에 통합 (D-039). (3) **LLM classifier/graph_extractor 전면 제거** — 결정론적 대체(AST + 링크 그래프)가 모든 소스를 커버하므로 `classifier.py` 삭제, `graph_extractor.py`에서 Entity/Relation/GraphData 스키마만 남기고 LLM 프롬프트·extract_graph·맵리듀스 제거. `process_document()`에서 `llm_client`/`storage_method_override` 파라미터 제거, `storage_method`는 실제 저장 산출물에서 파생(chunks only=`chunk`, graph only=`graph`, 둘 다=`hybrid`). coordinator/documents/git_sync 호출 경로 정리 (D-040). (4) **Step 3** — `Chunk.section_anchor` 필드 추가, `chunk_extracted_document()` 신설로 `extracted.sections`를 그대로 소비(헤딩 재파싱 제거). `_split_markdown_blocks()`이 펜스 코드블록(```)과 마크다운 테이블을 `atomic=True`로 묶어 청크 경계 중간 분할 금지, 일반 블록은 기존처럼 강제 분할. `section_anchor`를 VectorStore metadata까지 전파 (D-041). 테스트: confluence_extractor 28건, link_graph_builder 13건, chunker +4건(코드블록/테이블 원자성 + anchor 전파 + 빈 sections 폴백), pipeline 8건 전면 재작성, coordinator/documents/git_sync 호출 정합성 확보. 총 회귀 없음 (440+건). 다음: (a) section_anchor를 UI 청크 탭/검색 결과 deep-link에 노출, (b) `extracted.code_blocks`/`tables`를 별도 구조화 메타로 검색에 활용, (c) Phase 9.9(증분 처리) 또는 9.10(GitHub webhook).
 
@@ -21,8 +30,8 @@
 - [x] 2.3 Confluence API 임포트 (인증, 스페이스/페이지 조회, HTML→MD 변환)
 - [x] 2.4 Confluence 증분 동기화
 - [x] 2.5 문서 변경 감지 및 재처리 파이프라인 (Delete & Recreate)
-- [x] 2.6 Confluence MCP Client — 3-scope 싱크 백엔드 (page/subtree/space, D-043). **UI 잔여(I-030)**
-- [ ] 2.7 Confluence MCP Client — 탐색형 UI (검색 진입 + 서브트리 트리 뷰) (I-030)
+- [x] 2.6 Confluence MCP Client — 3-scope 싱크 end-to-end (백엔드 D-043 + UI I-030 + 자동 인덱싱·동시성·실패 재시도 D-044, I-031~I-035)
+- [ ] 2.7 Confluence MCP Client — 탐색형 UI (서브트리 트리 뷰, 검색 기반 진입은 완료)
 - [ ] 2.8 Confluence MCP Client — 내 문서 임포트 (`getUserContributedPages` 백엔드는 존재, UI 미구현)
 
 ### Phase 3: LLM 저장 방식 판단 + 처리

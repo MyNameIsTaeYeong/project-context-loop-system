@@ -652,3 +652,42 @@
   - 테스트 +110건 전부 통과 (cascade 4, 스키마/CRUD 31, MCP 유틸 +42, 디스패처 14, 웹 API 19). 회귀 없음.
   - UI 미구현(검색 박스, 3버튼 카드, 확인 다이얼로그, 등록 카드 + 폴링 진행률) — I-030 으로 별도 추적.
 
+---
+
+## D-044: 서브트리 CQL 전환 + 싱크 2-phase (import + index) + Phase 2 동시성/실패 재시도
+
+- **일시**: 2026-04-24
+- **맥락**: D-043 백엔드 + I-030 UI 배포 직후 실제 사용 피드백으로 드러난 이슈 5종(I-031 ~ I-035)을 순차 수정하며 싱크 파이프라인의 두 가지 핵심 재설계에 도달. (1) 서브트리 열거를 per-parent BFS(`walk_subtree`) 에서 CQL `ancestor` 평탄 열거로 전환, (2) 싱크가 문서 저장에 그치지 않고 벡터/그래프 인덱싱까지 단일 BackgroundTask 안에서 자동 수행하는 2-phase 구조. 두 재설계는 서로 독립이지만 같은 세션에서 연속으로 나와 단일 결정으로 묶는다.
+- **결정**:
+  1. **서브트리 열거 = CQL `ancestor` 평탄 (D-043 의 walker 대체)**
+     - `_subtree_cql(id)` + `estimate_subtree_page_count(session, id)` + `enumerate_subtree_pages(session, id)` 신설. `enumerate_space_pages` 와 동일한 async generator 패턴.
+     - `_sync_subtree` 가 walker 대신 CQL descendants + 루트 수동 prepend (CQL `ancestor` 는 루트 자신을 포함하지 않음).
+     - `walk_subtree` 자체는 삭제하지 않고 유지 — 다른 러너·테스트 호환.
+  2. **싱크 = Phase 1(import) + Phase 2(index) 단일 BackgroundTask**
+     - `execute_sync_target(..., embedding_client=None, pipeline_config=None, phase2_concurrency=5)` 시그니처 확장. 세 파라미터 모두 선택적 — 미주입 시 기존 Phase 1 동작 유지(커널 순수성 + 기존 테스트·CLI 러너 비파괴).
+     - `SyncResult` 에 `processed`/`processing_errors` 버킷 + `to_dict().summary` 확장.
+     - Phase 2 큐 = `created + updated + list_failed_member_doc_ids(target_id)` (중복 제거). `unchanged` 는 skip (재임베딩 낭비 방지).
+     - `MetadataStore.list_failed_member_doc_ids(target_id)` 신설 — `confluence_sync_membership INNER JOIN documents WHERE status='failed'` 로 target 스코프 내 실패 문서만 식별.
+  3. **Phase 2 바운디드 동시성**
+     - `asyncio.Semaphore(phase2_concurrency)` + `asyncio.gather`. 기본 5, `config.processor.phase2_concurrency` 로 튜닝. 0 이하 값은 방어적으로 1로 clamp.
+     - 문서별 try/except 유지 — 한 문서 인덱싱 실패가 다른 문서 처리를 막지 않음. 실패 시 `meta.status='failed'` 마킹 → 다음 재싱크에서 자동 재시도 대상.
+  4. **공통 MCP 응답 파싱 계층**
+     - `_parse_json_result` 가 `CallToolResult.structuredContent` 를 `content[].text` 보다 우선 확인 (MCP 신규 스펙 대응).
+     - `_unwrap_envelope(parsed) -> (items, envelope)` 공통 헬퍼 — envelope 키 변종 5종(`results`/`children`/`pages`/`page`/`items`) + 1단계 중첩(`{page: {results:[...]}}`) 흡수.
+     - `_paginate_cql(session, cql, *, page_size, max_pages, label)` 공통 페이지네이션 헬퍼 — `enumerate_space_pages` / `enumerate_subtree_pages` 에서 재사용. 핵심 안전 속성: (a) `totalSize` 알려진 경우 short-page 휴리스틱 skip (서버 cap 대응), (b) `start += env.size` 로 실제 반환 개수만큼 전진.
+- **이유**:
+  - **CQL 평탄 열거가 BFS 를 지배**: BFS 누락 경로(per-parent 페이지네이션 독립 오판 / 중간 노드 예외 격리로 서브트리 손실 / max_depth 초과 / type 필드 누락으로 드롭 / 권한 차이 per-node)가 5개인데 비해 CQL `ancestor = X` 는 **서버 측에서 직·간접 조상 관계로 단일 평가** — 해당 조상의 모든 후손 페이지를 한 번에 완전 열거. `totalSize` 로 기대값도 서버 권위로 제공.
+  - **2-phase 분리가 단순 결합보다 낫다**: 임포트(MCP 네트워크)와 인덱싱(임베딩 API + 청킹 + 그래프) 은 비용·rate limit·실패 시 복구 경계가 완전히 다름. 분리해야 각 단계의 동시성을 독립 튜닝 가능하고, `SyncResult.processing_errors` 로 실패 원인을 MCP / 인덱싱으로 명확히 분류. 사용자 UX 는 동일(한 버튼 = 한 작업)이므로 내부 분리가 순수 이득.
+  - **bounded 동시성 + gather 가 적절한 기본**: 400 문서 기준 직렬은 ~20 분이지만 concurrency=5 면 ~4 분, OpenAI 기본 tier rate limit 의 ~5% 사용. Queue 기반 pipelined 는 복잡도 대비 이득 작음 — 지금 규모에선 overkill.
+  - **failed 재시도를 기본 재싱크에 녹임**: 별도 "재인덱싱" 버튼이나 cron 없이, 사용자가 평소 하던 재싱크 행위에 자동 복구 포함. membership 테이블이 이미 target 스코프의 권위 있는 집합이라 JOIN 한 번으로 깔끔하게 식별.
+  - **응답 파싱은 서버 스펙 다양성 흡수층이 있어야 유지 가능**: MCP 서버 구현체마다 (content.text vs structuredContent) × (envelope 키) × (server cap) 조합이 다수. 각 call site 에서 분기하면 신규 도구 추가마다 같은 버그가 재현됨 — 한 곳(`_parse_json_result` / `_unwrap_envelope` / `_paginate_cql`)에서 흡수하는 것이 구조적으로 올바름.
+- **영향**:
+  - `ingestion/mcp_confluence.py`: `_parse_json_result` 에 structuredContent 우선, `_unwrap_envelope` / `_paginate_cql` / `_subtree_cql` / `estimate_subtree_page_count` / `enumerate_subtree_pages` 신설. `get_all_spaces` / `get_child_pages` / `enumerate_space_pages` / `enumerate_subtree_pages` 가 공통 헬퍼 사용하도록 재정리. `get_child_pages` 기본 `expand="page"` (빈 문자열 거부 서버 방어).
+  - `sync/mcp_sync.py`: `SyncResult` 에 processed/processing_errors 추가, `execute_sync_target` 확장 파라미터 3종, `_run_processing_phase` 신설(Semaphore + gather + failed 재시도).
+  - `storage/metadata_store.py`: `list_failed_member_doc_ids` 신설.
+  - `web/api/confluence_mcp.py`: `_build_pipeline_config` + `get_embedding_client` 의존성 주입. `_run_sync_in_background` 시그니처에 embedding_client 추가. `processor.phase2_concurrency` config 전달.
+  - `web/templates/confluence_mcp.html`: `syncTargetsPanel.summaryFor()` 에 `◎N indexed · ⚠M indexing-failed` 두 조각 추가.
+  - `config/default.yaml`: `processor.phase2_concurrency: 5` 기본값 + 튜닝 가이드 주석.
+  - 테스트 누적 +31 (Phase 2 11건 + CQL helpers 11건 + 파싱 계층 4건 + MCP 필수 파라미터 5건), 최종 178 passed. 회귀 없음.
+- **관련 이슈**: I-031 (MCP 필수 파라미터), I-032 (structuredContent + envelope 변종), I-033 (BFS → CQL), I-034 (페이지네이션 서버 cap), I-035 (Phase 2 자동화 + 동시성 + 실패 재시도) 모두 이 결정의 구성요소로 해결.
+
