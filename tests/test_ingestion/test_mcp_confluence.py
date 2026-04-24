@@ -97,6 +97,23 @@ def test_parse_json_result_plain_text() -> None:
     assert parsed == "not json"
 
 
+def test_parse_json_result_prefers_structured_content() -> None:
+    """MCP 신규 스펙: structuredContent 가 있으면 content 파싱보다 우선한다."""
+
+    @dataclass
+    class ResultWithStructured:
+        content: list[FakeTextContent]
+        structuredContent: Any
+
+    r = ResultWithStructured(
+        content=[FakeTextContent(text='"ignored"')],
+        structuredContent={"results": [{"id": "s1"}], "size": 1},
+    )
+    parsed = _parse_json_result(r)
+    assert isinstance(parsed, dict)
+    assert parsed["results"][0]["id"] == "s1"
+
+
 # --- _extract_page_content 테스트 ---
 
 
@@ -577,6 +594,44 @@ async def test_get_child_pages_stops_when_size_less_than_page_size() -> None:
 
     assert [c["id"] for c in children] == ["1"]
     assert session.call_tool.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_accepts_children_envelope_key() -> None:
+    """서버 변종: envelope 키가 ``children`` 인 경우도 파싱."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"children":[{"id":"1"},{"id":"2"}], "size":2, "totalSize":2}',
+    )
+
+    children = await get_child_pages(session, "root")
+
+    assert [c["id"] for c in children] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_accepts_nested_page_results() -> None:
+    """서버 변종: ``{page: {results: [...]}}`` 중첩 envelope 파싱."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"page":{"results":[{"id":"1"}]}, "size":1}',
+    )
+
+    children = await get_child_pages(session, "root")
+
+    assert [c["id"] for c in children] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_default_expand_is_nonempty() -> None:
+    """빈 expand 를 거부하는 서버에 대비해 기본값은 비어있지 않아야 한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result('[]')
+
+    await get_child_pages(session, "1")
+
+    args = session.call_tool.call_args.args[1]
+    assert args["expand"] != ""
 
 
 # --- walk_subtree 테스트 ---

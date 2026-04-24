@@ -56,14 +56,43 @@ def _extract_text(result: Any) -> str:
 def _parse_json_result(result: Any) -> Any:
     """CallToolResult에서 JSON을 파싱한다.
 
-    텍스트 형태의 결과를 JSON으로 파싱 시도하고,
-    실패하면 원본 텍스트를 반환한다.
+    우선순위:
+      1. ``structuredContent`` 필드 — MCP 신규 스펙에서 구조화된 JSON 이
+         직접 담기는 채널. 이 값이 있으면 그대로 반환한다.
+      2. ``content[].text`` 블록 — 텍스트 페이로드로 JSON 직렬화되어 오는
+         기존 관행. 파싱 성공 시 그 값, 실패 시 원본 텍스트를 반환한다.
     """
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        return structured
     text = _extract_text(result)
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return text
+
+
+def _unwrap_envelope(parsed: Any) -> tuple[list[Any] | None, dict[str, Any] | None]:
+    """페이지네이션 응답에서 ``(results, envelope_meta)`` 를 꺼낸다.
+
+    MCP 서버 구현체마다 envelope 키가 달라 ``results`` / ``children`` / ``page``
+    / ``pages`` / ``items`` 등 여러 변종이 관찰된다. 이 헬퍼는 ``parsed`` 가
+    list 면 envelope 없음 신호로 ``(list, None)`` 을 돌려주고, dict 면 위
+    후보들에서 배열을 찾아 ``(results, parsed)`` 로 돌려준다. 배열 찾기에
+    실패하면 ``(None, parsed)``.
+    """
+    if isinstance(parsed, list):
+        return parsed, None
+    if not isinstance(parsed, dict):
+        return None, None
+    for key in ("results", "children", "pages", "page", "items"):
+        val = parsed.get(key)
+        if isinstance(val, list):
+            return val, parsed
+        # 일부 서버는 {page: {results: [...]}} 처럼 한 단계 더 중첩된다.
+        if isinstance(val, dict) and isinstance(val.get("results"), list):
+            return val["results"], parsed
+    return None, parsed
 
 
 def connect_mcp(
@@ -432,27 +461,41 @@ def format_breadcrumb(page: dict[str, Any]) -> str:
     return str(page_id) if page_id else ""
 
 
+def _extract_total_size(envelope: dict[str, Any]) -> int | None:
+    """envelope dict 에서 ``totalSize``/``total``/``_totalSize`` 중 하나를 꺼낸다."""
+    for key in ("totalSize", "total", "_totalSize"):
+        val = envelope.get(key)
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 async def get_child_pages(
     session: ClientSession,
     page_id: str,
     *,
     page_size: int = 100,
     max_children: int = 5000,
-    expand: str = "",
+    expand: str = "page",
 ) -> list[dict[str, Any]]:
     """MCP 서버의 ``getChild`` 도구로 하위 페이지 목록을 가져온다.
 
     ``getChild`` 는 ``pageId`` 뿐 아니라 ``start``/``limit``/``expand`` 를
-    필수 인자로 요구한다. envelope 응답(``{results, start, limit, size,
-    totalSize}``) 인 경우 페이지네이션으로 전체를 수집하고, envelope 없이
-    list 로 오는 변종은 한 번에 처리한다.
+    필수 인자로 요구한다. 서버 구현체마다 envelope 키(``results`` /
+    ``children`` / ``page`` / ``pages`` / ``items``)가 다른 경우가 있어
+    :func:`_unwrap_envelope` 로 유연하게 풀어낸다.
 
     Args:
         session: 초기화된 ClientSession.
         page_id: 부모 페이지 ID.
         page_size: 한 번에 요청할 결과 수.
         max_children: 수집 상한(안전장치).
-        expand: ``getChild`` 의 필수 파라미터. 기본값 ``""`` 는 최소 필드만.
+        expand: ``getChild`` 의 필수 파라미터. 기본 ``"page"`` — 빈 문자열을
+            거부하는 서버가 있어 안전한 최소값.
     """
     children: list[dict[str, Any]] = []
     start = 0
@@ -469,34 +512,27 @@ async def get_child_pages(
             },
         )
         parsed = _parse_json_result(result)
+        items, envelope = _unwrap_envelope(parsed)
 
-        # envelope 없이 list 로 오는 서버 변종 — 전부 반환 후 종료.
-        if isinstance(parsed, list):
-            children.extend(c for c in parsed if isinstance(c, dict))
-            break
-
-        if not isinstance(parsed, dict) or "results" not in parsed:
-            break
-
-        results = parsed.get("results") or []
-        if not results:
-            break
-        children.extend(c for c in results if isinstance(c, dict))
-        size = int(parsed.get("size", len(results)))
-
-        if total_size is None:
-            ts_val = (
-                parsed.get("totalSize")
-                if parsed.get("totalSize") is not None
-                else parsed.get("total")
-                if parsed.get("total") is not None
-                else parsed.get("_totalSize")
+        if items is None:
+            logger.debug(
+                "getChild: 알 수 없는 응답 형태 page_id=%s keys=%s",
+                page_id,
+                list(envelope.keys()) if envelope else None,
             )
-            if ts_val is not None:
-                try:
-                    total_size = int(ts_val)
-                except (TypeError, ValueError):
-                    total_size = None
+            break
+        if not items:
+            break
+
+        children.extend(c for c in items if isinstance(c, dict))
+
+        # envelope 이 없으면 한 번에 전부이므로 종료.
+        if envelope is None:
+            break
+
+        size = int(envelope.get("size", len(items)))
+        if total_size is None:
+            total_size = _extract_total_size(envelope)
 
         if total_size is not None and len(children) >= total_size:
             break
@@ -730,16 +766,9 @@ async def get_all_spaces(
 ) -> list[dict[str, Any]]:
     """MCP 서버의 ``getSpaceInfoAll`` 도구로 모든 스페이스를 가져온다.
 
-    서버가 ``start``/``limit`` 을 필수 인자로 요구하므로 envelope 응답
-    (``{results, start, limit, size, totalSize}``) 에 대해 페이지네이션으로
-    전체를 수집한다. 일부 서버 변종이 envelope 없이 list 만 돌려주는 경우엔
-    그 한 번의 응답을 그대로 반환하고 종료한다.
-
-    종료 조건(envelope 경로):
-      - ``totalSize`` 가 있으면 누적이 그 값에 도달했을 때
-      - ``size`` 가 ``page_size`` 보다 작으면 마지막 페이지로 간주
-      - ``results`` 가 비면 즉시 종료
-      - ``max_spaces`` 안전 상한 초과 시 경고 후 조기 반환
+    서버가 ``start``/``limit`` 을 필수 인자로 요구하므로 envelope 응답에
+    대해 페이지네이션으로 전체를 수집한다. 서버 구현체마다 envelope 키가
+    다를 수 있어 :func:`_unwrap_envelope` 로 유연하게 풀어낸다.
 
     Args:
         session: 초기화된 ClientSession.
@@ -755,34 +784,25 @@ async def get_all_spaces(
             "getSpaceInfoAll", {"start": start, "limit": page_size},
         )
         parsed = _parse_json_result(result)
+        items, envelope = _unwrap_envelope(parsed)
 
-        # envelope 없이 list만 오는 서버 변종 — 한 번에 전부이므로 종료.
-        if isinstance(parsed, list):
-            spaces.extend(s for s in parsed if isinstance(s, dict))
-            break
-
-        if not isinstance(parsed, dict) or "results" not in parsed:
-            break
-
-        results = parsed.get("results") or []
-        if not results:
-            break
-        spaces.extend(s for s in results if isinstance(s, dict))
-        size = int(parsed.get("size", len(results)))
-
-        if total_size is None:
-            ts_val = (
-                parsed.get("totalSize")
-                if parsed.get("totalSize") is not None
-                else parsed.get("total")
-                if parsed.get("total") is not None
-                else parsed.get("_totalSize")
+        if items is None:
+            logger.debug(
+                "getSpaceInfoAll: 알 수 없는 응답 형태 keys=%s",
+                list(envelope.keys()) if envelope else None,
             )
-            if ts_val is not None:
-                try:
-                    total_size = int(ts_val)
-                except (TypeError, ValueError):
-                    total_size = None
+            break
+        if not items:
+            break
+
+        spaces.extend(s for s in items if isinstance(s, dict))
+
+        if envelope is None:
+            break
+
+        size = int(envelope.get("size", len(items)))
+        if total_size is None:
+            total_size = _extract_total_size(envelope)
 
         if total_size is not None and len(spaces) >= total_size:
             break
