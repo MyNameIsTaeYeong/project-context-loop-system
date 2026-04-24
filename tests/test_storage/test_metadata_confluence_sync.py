@@ -470,6 +470,45 @@ async def test_list_membership_page_ids_scoped_to_target(
     assert await store.list_membership_page_ids(t2["id"]) == {"2"}
 
 
+async def test_list_failed_member_doc_ids_returns_only_failed_members(
+    store: MetadataStore,
+) -> None:
+    """Target 의 membership + status='failed' 문서만 반환한다."""
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    # 세 페이지: 200=failed (member), 201=completed (member), 202=failed (member 아님)
+    d200 = await store.create_document(
+        source_type="confluence_mcp", source_id="200",
+        title="P1", original_content="x", content_hash="h1",
+    )
+    d201 = await store.create_document(
+        source_type="confluence_mcp", source_id="201",
+        title="P2", original_content="x", content_hash="h2",
+    )
+    _ = await store.create_document(
+        source_type="confluence_mcp", source_id="202",
+        title="P3", original_content="x", content_hash="h3",
+    )
+    await store.update_document_status(d200, "failed")
+    await store.update_document_status(d201, "completed")
+    # 202 는 failed 로 만들지만 membership 에는 넣지 않음
+    await store.upsert_membership(target_id=t["id"], page_id="200", space_key="ENG")
+    await store.upsert_membership(target_id=t["id"], page_id="201", space_key="ENG")
+
+    ids = await store.list_failed_member_doc_ids(t["id"])
+    assert ids == [d200]
+
+
+async def test_list_failed_member_doc_ids_empty_when_no_members(
+    store: MetadataStore,
+) -> None:
+    t = await store.upsert_sync_target(
+        scope="page", space_key="ENG", page_id="999", name="Solo",
+    )
+    assert await store.list_failed_member_doc_ids(t["id"]) == []
+
+
 # --- orphan detection via remove_memberships / delete_sync_target ---
 
 

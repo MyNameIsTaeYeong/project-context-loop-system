@@ -747,3 +747,139 @@ async def test_phase2_is_skipped_when_embedding_client_missing(stores, monkeypat
     assert called == []
     assert result.processed == []
     assert result.processing_errors == []
+
+
+async def test_phase2_respects_concurrency_bound(stores, monkeypatch) -> None:
+    """Semaphore 로 동시 in-flight 문서 수가 상한 이하로 유지된다."""
+    import asyncio as _asyncio
+
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    # 10 건의 문서를 임포트
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": f"d{i}"} for i in range(10)]),
+    )
+
+    in_flight = 0
+    max_in_flight = 0
+    overlap_observed = 0
+
+    async def slow_proc(
+        document_id: int, *, meta_store: Any, vector_store: Any,
+        graph_store: Any, embedding_client: Any, config: Any = None,
+    ) -> dict[str, Any]:
+        nonlocal in_flight, max_in_flight, overlap_observed
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        if in_flight > 1:
+            overlap_observed += 1
+        # Phase 2 처리에 시간이 걸리는 것처럼 흉내
+        await _asyncio.sleep(0.02)
+        in_flight -= 1
+        return {"id": document_id}
+
+    monkeypatch.setattr(mcp_sync, "process_document", slow_proc)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result = await execute_sync_target(
+        None, t,
+        meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+        phase2_concurrency=3,
+    )
+
+    assert len(result.processed) == 11  # root + 10 descendants
+    # 동시 실행은 3 건을 넘지 못한다
+    assert max_in_flight <= 3
+    # 실제로 동시성이 작동해 겹침이 발생했는지 (직렬이면 0)
+    assert overlap_observed > 0
+
+
+async def test_phase2_retries_previously_failed_docs(stores, monkeypatch) -> None:
+    """재싱크 시 이전에 인덱싱 실패한 문서가 unchanged 여도 Phase 2 에 포함된다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
+    )
+
+    # 1차: 200 만 실패하도록 설정
+    call_log_1: list[int] = []
+
+    async def fake_proc_1(
+        document_id: int, *, meta_store: Any, vector_store: Any,
+        graph_store: Any, embedding_client: Any, config: Any = None,
+    ) -> dict[str, Any]:
+        call_log_1.append(document_id)
+        # 첫 실행에서 page_id=200 을 가진 doc (두 번째 처리) 실패
+        if len(call_log_1) == 2:
+            raise RuntimeError("indexing fails first time")
+        return {"id": document_id}
+
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc_1)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result1 = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+        phase2_concurrency=1,  # 순서 예측 가능하게 직렬
+    )
+    assert len(result1.processing_errors) == 1
+    failed_doc_id = result1.processing_errors[0]["doc_id"]
+
+    # 2차: 같은 페이지를 재싱크. hash 동일 → 모두 unchanged.
+    # 하지만 failed 문서는 재시도되어야 함.
+    call_log_2: list[int] = []
+
+    async def fake_proc_2(
+        document_id: int, *, meta_store: Any, vector_store: Any,
+        graph_store: Any, embedding_client: Any, config: Any = None,
+    ) -> dict[str, Any]:
+        call_log_2.append(document_id)
+        return {"id": document_id}
+
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc_2)
+
+    result2 = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+        phase2_concurrency=1,
+    )
+
+    # 재싱크에서는 created/updated 가 없지만 failed 는 재시도 대상
+    assert result2.created == []
+    assert result2.updated == []
+    assert failed_doc_id in call_log_2
+    assert failed_doc_id in result2.processed
+    assert result2.processing_errors == []
+
+
+async def test_phase2_concurrency_zero_or_negative_defaults_to_1(
+    stores, monkeypatch,
+) -> None:
+    """``phase2_concurrency=0`` 같은 잘못된 값이 들어와도 무한루프/데드락 없이 직렬 실행."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
+    )
+    called, fake_proc = _make_recording_process_document()
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+        phase2_concurrency=0,
+    )
+    assert len(called) == 2
+    assert len(result.processed) == 2

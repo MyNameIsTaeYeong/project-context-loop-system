@@ -810,6 +810,24 @@ class MetadataStore:
         rows = await cursor.fetchall()
         return {row["page_id"] for row in rows}
 
+    async def list_failed_member_doc_ids(self, target_id: int) -> list[int]:
+        """Target 의 membership 에 속한 문서 중 ``status='failed'`` 인 doc_id 목록.
+
+        재싱크 시 Phase 2 가 이전에 인덱싱 실패한 문서를 자동 재시도하도록
+        식별하기 위한 헬퍼. Phase 1 이 해당 문서를 ``unchanged`` 로 분류해
+        Phase 2 큐에서 누락되는 것을 보완한다.
+        """
+        cursor = await self.db.execute(
+            """SELECT d.id FROM documents d
+               INNER JOIN confluence_sync_membership m
+                 ON d.source_id = m.page_id
+                 AND d.source_type = 'confluence_mcp'
+               WHERE m.target_id = ? AND d.status = 'failed'""",
+            (target_id,),
+        )
+        rows = await cursor.fetchall()
+        return [row["id"] for row in rows]
+
     async def remove_memberships(
         self,
         target_id: int,

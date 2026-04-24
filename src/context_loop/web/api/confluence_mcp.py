@@ -549,6 +549,9 @@ async def _run_sync_in_background(
                 return
 
             pipeline_config = _build_pipeline_config(config)
+            phase2_concurrency = int(
+                config.get("processor.phase2_concurrency", 5),
+            )
             async with connect_mcp(
                 _get_server_url(config),
                 token=_get_token(),
@@ -561,6 +564,7 @@ async def _run_sync_in_background(
                     graph_store=graph_store,
                     embedding_client=embedding_client,
                     pipeline_config=pipeline_config,
+                    phase2_concurrency=phase2_concurrency,
                 )
 
             await meta_store.update_sync_result(
