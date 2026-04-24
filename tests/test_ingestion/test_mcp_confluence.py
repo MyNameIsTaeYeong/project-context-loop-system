@@ -912,13 +912,76 @@ async def test_enumerate_space_pages_cql_is_correct() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_all_spaces() -> None:
+async def test_get_all_spaces_list_response() -> None:
+    """envelope 없이 list 만 돌려주는 서버 변종 — 한 번에 전부 반환."""
     session = AsyncMock()
-    session.call_tool.return_value = _make_result('[{"id": "s1", "key": "DEV", "name": "Dev Team"}]')
+    session.call_tool.return_value = _make_result(
+        '[{"id": "s1", "key": "DEV", "name": "Dev Team"}]',
+    )
 
     spaces = await get_all_spaces(session)
-    session.call_tool.assert_called_once_with("getSpaceInfoAll", {})
+
+    assert session.call_tool.call_count == 1
+    # start/limit 은 필수 인자이므로 반드시 같이 전달되어야 한다.
+    args, kwargs = session.call_tool.call_args
+    assert args[0] == "getSpaceInfoAll"
+    assert args[1]["start"] == 0
+    assert "limit" in args[1]
     assert spaces[0]["key"] == "DEV"
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_paginates_until_total_size() -> None:
+    """envelope 응답에서 totalSize 에 도달할 때까지 페이지네이션 한다."""
+    session = AsyncMock()
+    responses = [
+        _make_result(
+            '{"results":[{"key":"A"},{"key":"B"}],'
+            ' "start":0, "limit":2, "size":2, "totalSize":3}',
+        ),
+        _make_result(
+            '{"results":[{"key":"C"}],'
+            ' "start":2, "limit":2, "size":1, "totalSize":3}',
+        ),
+    ]
+    session.call_tool.side_effect = responses
+
+    spaces = await get_all_spaces(session, page_size=2)
+
+    assert [s["key"] for s in spaces] == ["A", "B", "C"]
+    assert session.call_tool.call_count == 2
+    first_call_args = session.call_tool.call_args_list[0].args[1]
+    second_call_args = session.call_tool.call_args_list[1].args[1]
+    assert first_call_args == {"start": 0, "limit": 2}
+    assert second_call_args == {"start": 2, "limit": 2}
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_stops_when_size_less_than_page_size() -> None:
+    """totalSize 가 없으면 size < page_size 로 마지막 페이지 판정."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results":[{"key":"A"}], "start":0, "limit":10, "size":1}',
+    )
+
+    spaces = await get_all_spaces(session, page_size=10)
+
+    assert [s["key"] for s in spaces] == ["A"]
+    assert session.call_tool.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_stops_on_empty_results() -> None:
+    """빈 results 이면 즉시 종료."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results":[], "start":0, "limit":10, "size":0}',
+    )
+
+    spaces = await get_all_spaces(session)
+
+    assert spaces == []
+    assert session.call_tool.call_count == 1
 
 
 @pytest.mark.asyncio

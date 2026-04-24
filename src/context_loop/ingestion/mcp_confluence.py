@@ -653,15 +653,77 @@ async def get_space_info(
     return {"key": space_key}
 
 
-async def get_all_spaces(session: ClientSession) -> list[dict[str, Any]]:
-    """MCP 서버의 getSpaceInfoAll 도구로 스페이스 목록을 가져온다."""
-    result = await session.call_tool("getSpaceInfoAll", {})
-    parsed = _parse_json_result(result)
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict) and "results" in parsed:
-        return parsed["results"]
-    return []
+async def get_all_spaces(
+    session: ClientSession,
+    *,
+    page_size: int = 100,
+    max_spaces: int = 10000,
+) -> list[dict[str, Any]]:
+    """MCP 서버의 ``getSpaceInfoAll`` 도구로 모든 스페이스를 가져온다.
+
+    서버가 ``start``/``limit`` 을 필수 인자로 요구하므로 envelope 응답
+    (``{results, start, limit, size, totalSize}``) 에 대해 페이지네이션으로
+    전체를 수집한다. 일부 서버 변종이 envelope 없이 list 만 돌려주는 경우엔
+    그 한 번의 응답을 그대로 반환하고 종료한다.
+
+    종료 조건(envelope 경로):
+      - ``totalSize`` 가 있으면 누적이 그 값에 도달했을 때
+      - ``size`` 가 ``page_size`` 보다 작으면 마지막 페이지로 간주
+      - ``results`` 가 비면 즉시 종료
+      - ``max_spaces`` 안전 상한 초과 시 경고 후 조기 반환
+
+    Args:
+        session: 초기화된 ClientSession.
+        page_size: 한 번에 요청할 개수.
+        max_spaces: 수집 상한.
+    """
+    spaces: list[dict[str, Any]] = []
+    start = 0
+    total_size: int | None = None
+
+    while len(spaces) < max_spaces:
+        result = await session.call_tool(
+            "getSpaceInfoAll", {"start": start, "limit": page_size},
+        )
+        parsed = _parse_json_result(result)
+
+        # envelope 없이 list만 오는 서버 변종 — 한 번에 전부이므로 종료.
+        if isinstance(parsed, list):
+            spaces.extend(s for s in parsed if isinstance(s, dict))
+            break
+
+        if not isinstance(parsed, dict) or "results" not in parsed:
+            break
+
+        results = parsed.get("results") or []
+        if not results:
+            break
+        spaces.extend(s for s in results if isinstance(s, dict))
+        size = int(parsed.get("size", len(results)))
+
+        if total_size is None:
+            ts_val = (
+                parsed.get("totalSize")
+                if parsed.get("totalSize") is not None
+                else parsed.get("total")
+                if parsed.get("total") is not None
+                else parsed.get("_totalSize")
+            )
+            if ts_val is not None:
+                try:
+                    total_size = int(ts_val)
+                except (TypeError, ValueError):
+                    total_size = None
+
+        if total_size is not None and len(spaces) >= total_size:
+            break
+        if size < page_size:
+            break
+        start += page_size
+    else:
+        logger.warning("get_all_spaces max_spaces(%d) 도달", max_spaces)
+
+    return spaces[:max_spaces]
 
 
 async def get_user_contributed_pages(
