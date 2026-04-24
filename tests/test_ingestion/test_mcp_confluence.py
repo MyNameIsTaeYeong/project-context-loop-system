@@ -27,6 +27,9 @@ from context_loop.ingestion.mcp_confluence import (
     get_page,
     get_page_with_ancestors,
     get_space_info,
+    _subtree_cql,
+    enumerate_subtree_pages,
+    estimate_subtree_page_count,
     get_user_contributed_pages,
     import_page_via_mcp,
     list_available_tools,
@@ -1012,6 +1015,107 @@ async def test_enumerate_space_pages_cql_is_correct() -> None:
     _ = [p async for p in enumerate_space_pages(session, "OPS")]
 
     assert calls[0]["cql"] == 'space = "OPS" AND type = "page"'
+
+
+# --- _subtree_cql / estimate_subtree_page_count / enumerate_subtree_pages 테스트 ---
+
+
+def test_subtree_cql_escapes_quotes_and_backslashes() -> None:
+    assert _subtree_cql("12345") == 'ancestor = "12345" AND type = "page"'
+    assert _subtree_cql('a"b') == 'ancestor = "a\\"b" AND type = "page"'
+    assert _subtree_cql("c\\d") == 'ancestor = "c\\\\d" AND type = "page"'
+
+
+@pytest.mark.asyncio
+async def test_estimate_subtree_page_count_returns_total_size() -> None:
+    """totalSize 를 그대로 돌려주고, CQL 은 ancestor 기반."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [[{"id": "1"}]], total_size=57, record_calls=calls,
+    )
+
+    count = await estimate_subtree_page_count(session, "100")
+
+    assert count == 57
+    assert calls[0] == {
+        "cql": 'ancestor = "100" AND type = "page"', "limit": 1, "start": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_estimate_subtree_page_count_returns_none_when_server_omits() -> None:
+    session = _make_search_session([[{"id": "1"}]], total_size=None)
+    assert await estimate_subtree_page_count(session, "100") is None
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_multiple_pages_with_total_size() -> None:
+    """CQL 페이지네이션으로 모든 depth 후손을 한 번에 열거한다."""
+    session = _make_search_session(
+        [
+            [{"id": "d1"}, {"id": "d2"}],
+            [{"id": "d3"}],
+        ],
+        total_size=3,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(session, "100", page_size=2)
+    ]
+
+    assert [p["id"] for p in collected] == ["d1", "d2", "d3"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_terminates_on_short_page_without_total_size() -> None:
+    """totalSize 가 없을 때 size < page_size 를 마지막 페이지로 간주한다."""
+    session = _make_search_session(
+        [[{"id": "d1"}]],  # size=1 < page_size=10
+        total_size=None,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(session, "100", page_size=10)
+    ]
+
+    assert [p["id"] for p in collected] == ["d1"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_empty_subtree() -> None:
+    session = _make_search_session([[]], total_size=0)
+    collected = [p async for p in enumerate_subtree_pages(session, "100")]
+    assert collected == []
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_respects_max_pages_cap() -> None:
+    """max_pages 상한 초과 시 조기 반환."""
+    session = _make_search_session(
+        [[{"id": str(i)} for i in range(200)]],
+        total_size=200,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(
+            session, "100", page_size=100, max_pages=5,
+        )
+    ]
+
+    assert len(collected) == 5
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_cql_is_correct() -> None:
+    """CQL 에 ancestor 와 type 필터가 함께 들어간다."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [[]], total_size=0, record_calls=calls,
+    )
+
+    _ = [p async for p in enumerate_subtree_pages(session, "42")]
+
+    assert calls[0]["cql"] == 'ancestor = "42" AND type = "page"'
 
 
 @pytest.mark.asyncio

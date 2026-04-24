@@ -67,37 +67,25 @@ def _make_fake_importer(fail_pages: set[str] | None = None):
     return fake
 
 
-def _make_fake_walk_subtree(tree: dict[str, list[dict[str, Any]]]):
-    """walker 결과를 하드코딩한 노드 목록으로 반환하는 fake."""
+def _make_fake_subtree_enum(descendants: list[dict[str, Any]]):
+    """CQL ``ancestor`` 평탄 열거를 흉내내는 async generator fake.
 
-    async def fake(session: Any, root_page_id: str, **_: Any):
-        nodes: list[dict[str, Any]] = [
-            {"id": root_page_id, "parent_id": None, "depth": 0, "title": ""},
-        ]
-        queue = [(root_page_id, 0)]
-        visited = {root_page_id}
-        while queue:
-            pid, depth = queue.pop(0)
-            for child in tree.get(pid, []):
-                cid = str(child["id"])
-                if cid in visited:
-                    continue
-                visited.add(cid)
-                nodes.append({
-                    "id": cid,
-                    "parent_id": pid,
-                    "depth": depth + 1,
-                    "title": child.get("title", ""),
-                })
-                queue.append((cid, depth + 1))
-        return nodes
+    CQL 응답에는 루트 자신이 포함되지 않으므로 descendants 만 전달한다 —
+    ``_sync_subtree`` 가 루트를 별도로 prepend 한다.
+    """
+
+    async def fake(session: Any, ancestor_page_id: str, **_: Any):
+        for p in descendants:
+            yield p
 
     return fake
 
 
-def _make_failing_walker():
-    async def fake(*_: Any, **__: Any):
-        raise RuntimeError("walker blew up")
+def _make_failing_subtree_enum():
+    async def fake(session: Any, ancestor_page_id: str, **_: Any):
+        raise RuntimeError("enumerate blew up")
+        yield  # 제너레이터 마커 — 실제로 도달 안 함
+
     return fake
 
 
@@ -191,17 +179,24 @@ async def test_sync_page_import_error_recorded_without_membership(
 # --- subtree scope ---
 
 
-async def test_sync_subtree_imports_all_pages_and_saves_hierarchy(
+async def test_sync_subtree_imports_root_and_all_descendants_flat(
     stores, monkeypatch,
 ) -> None:
+    """CQL ``ancestor`` 평탄 열거로 루트 + 모든 depth 후손이 임포트된다.
+
+    CQL 결과에는 parent/depth 가 없으므로 membership 은 flat 으로 저장된다
+    (``parent_page_id``/``depth`` 는 모두 ``NULL``). 이는 누락 제거를 위한
+    의도된 trade-off 다.
+    """
     meta, vec, graph = stores
     monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({
-            "100": [{"id": "200", "title": "A"}, {"id": "201", "title": "B"}],
-            "200": [{"id": "300", "title": "A1"}],
-        }),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([
+            {"id": "200", "title": "A"},
+            {"id": "201", "title": "B"},
+            {"id": "300", "title": "A1"},
+        ]),
     )
 
     t = await meta.upsert_sync_target(
@@ -212,27 +207,51 @@ async def test_sync_subtree_imports_all_pages_and_saves_hierarchy(
     )
 
     assert len(result.created) == 4   # root + 3 descendants
-    assert await meta.list_membership_page_ids(t["id"]) == {"100", "200", "201", "300"}
+    assert await meta.list_membership_page_ids(t["id"]) == {
+        "100", "200", "201", "300",
+    }
 
-    # hierarchy (parent/depth) 가 저장되는지 확인
+    # CQL 경로에서는 hierarchy 를 저장하지 않는다 — 모두 NULL.
     cur = await meta.db.execute(
         "SELECT page_id, parent_page_id, depth FROM confluence_sync_membership "
         "WHERE target_id = ?",
         (t["id"],),
     )
     rows = {r["page_id"]: dict(r) for r in await cur.fetchall()}
-    assert rows["100"]["parent_page_id"] is None
-    assert rows["100"]["depth"] == 0
-    assert rows["200"]["parent_page_id"] == "100"
-    assert rows["200"]["depth"] == 1
-    assert rows["300"]["parent_page_id"] == "200"
-    assert rows["300"]["depth"] == 2
+    for pid in ("100", "200", "201", "300"):
+        assert rows[pid]["parent_page_id"] is None
+        assert rows[pid]["depth"] is None
 
 
-async def test_sync_subtree_walker_failure_preserves_membership(
+async def test_sync_subtree_deduplicates_root_if_returned_by_cql(
     stores, monkeypatch,
 ) -> None:
-    """walker 전체 실패 시 기존 membership 이 그대로 보존되어야 한다."""
+    """만약 CQL 이 루트 자신을 결과에 섞어 돌려줘도 중복으로 임포트하지 않는다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([
+            {"id": "100"},  # 루트 자신 — 무시되어야 함
+            {"id": "200"},
+        ]),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert len(result.created) == 2   # 100, 200 만
+    assert await meta.list_membership_page_ids(t["id"]) == {"100", "200"}
+
+
+async def test_sync_subtree_enumerate_failure_preserves_membership(
+    stores, monkeypatch,
+) -> None:
+    """CQL 열거 전체 실패 시 기존 membership 이 그대로 보존되어야 한다."""
     meta, vec, graph = stores
     monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
 
@@ -247,14 +266,16 @@ async def test_sync_subtree_walker_failure_preserves_membership(
         target_id=t["id"], page_id="200", space_key="ENG",
     )
 
-    monkeypatch.setattr(mcp_sync, "walk_subtree", _make_failing_walker())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages", _make_failing_subtree_enum(),
+    )
 
     result = await execute_sync_target(
         None, t, meta_store=meta, vector_store=vec, graph_store=graph,
     )
 
     assert len(result.errors) == 1
-    assert "walk_subtree" in result.errors[0]["error"]
+    assert "enumerate_subtree_pages" in result.errors[0]["error"]
     # 기존 membership 이 그대로 있는지 확인
     assert await meta.list_membership_page_ids(t["id"]) == {"100", "200"}
     assert result.removed == []
@@ -273,10 +294,8 @@ async def test_sync_subtree_stale_page_triggers_cascade_delete(
 
     # 첫 sync: 100 + 200 + 201 포함
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({
-            "100": [{"id": "200"}, {"id": "201"}],
-        }),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}, {"id": "201"}]),
     )
     await execute_sync_target(
         None, t, meta_store=meta, vector_store=vec, graph_store=graph,
@@ -285,10 +304,8 @@ async def test_sync_subtree_stale_page_triggers_cascade_delete(
 
     # 두 번째 sync: 201 이 사라짐
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({
-            "100": [{"id": "200"}],
-        }),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
     )
     result = await execute_sync_target(
         None, t, meta_store=meta, vector_store=vec, graph_store=graph,
@@ -305,7 +322,7 @@ async def test_sync_subtree_stale_page_triggers_cascade_delete(
 async def test_sync_subtree_import_failure_does_not_cause_stale_deletion(
     stores, monkeypatch,
 ) -> None:
-    """walker 는 페이지를 봤는데 import 가 실패해도 기존 membership 은 유지된다.
+    """열거 단계에서 본 페이지의 import 가 실패해도 기존 membership 은 유지된다.
 
     일시적 import 실패가 cascade 삭제로 번지지 않는 안전 속성 검증.
     """
@@ -316,8 +333,8 @@ async def test_sync_subtree_import_failure_does_not_cause_stale_deletion(
         scope="subtree", space_key="ENG", page_id="100", name="Root",
     )
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({"100": [{"id": "200"}]}),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
     )
     await execute_sync_target(
         None, t, meta_store=meta, vector_store=vec, graph_store=graph,
@@ -461,8 +478,8 @@ async def test_shared_page_kept_when_one_target_loses_it(
     )
 
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({"100": [{"id": "200"}]}),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
     )
     await execute_sync_target(
         None, t_sub, meta_store=meta, vector_store=vec, graph_store=graph,
@@ -471,10 +488,10 @@ async def test_shared_page_kept_when_one_target_loses_it(
     assert await meta.list_membership_page_ids(t_space["id"]) == {"100", "200"}
     assert await meta.list_membership_page_ids(t_sub["id"]) == {"100", "200"}
 
-    # 이제 subtree 에서 200 이 사라짐 (walker 결과에서 빠짐)
+    # 이제 subtree 에서 200 이 사라짐 (CQL 결과에서 빠짐)
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({"100": []}),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([]),
     )
     result = await execute_sync_target(
         None, t_sub, meta_store=meta, vector_store=vec, graph_store=graph,
@@ -510,8 +527,8 @@ async def test_shared_page_deleted_when_both_targets_lose_it(
         None, t_space, meta_store=meta, vector_store=vec, graph_store=graph,
     )
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({"100": [{"id": "200"}]}),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
     )
     await execute_sync_target(
         None, t_sub, meta_store=meta, vector_store=vec, graph_store=graph,
@@ -529,8 +546,8 @@ async def test_shared_page_deleted_when_both_targets_lose_it(
     assert r_space.removed == []
 
     monkeypatch.setattr(
-        mcp_sync, "walk_subtree",
-        _make_fake_walk_subtree({"100": []}),
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([]),
     )
     r_sub = await execute_sync_target(
         None, t_sub, meta_store=meta, vector_store=vec, graph_store=graph,

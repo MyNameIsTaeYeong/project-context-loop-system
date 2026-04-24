@@ -738,6 +738,96 @@ async def enumerate_space_pages(
         start += page_size
 
 
+def _subtree_cql(ancestor_page_id: str) -> str:
+    """주어진 ancestor 페이지의 모든 후손을 매치하는 CQL을 만든다.
+
+    CQL ``ancestor = X`` 는 해당 페이지를 **직·간접 조상**으로 갖는 결과를
+    모두 매치한다 — 즉 모든 depth 의 후손이 한 쿼리에 평탄하게 포함된다.
+    ``ancestor`` 자신은 결과에 포함되지 않으므로 호출측이 루트를 별도로
+    추가해야 한다.
+    """
+    escaped = str(ancestor_page_id).replace("\\", "\\\\").replace('"', '\\"')
+    return f'ancestor = "{escaped}" AND type = "page"'
+
+
+async def estimate_subtree_page_count(
+    session: ClientSession, ancestor_page_id: str,
+) -> int | None:
+    """서브트리(루트 제외)의 후손 페이지 수를 추정한다.
+
+    ``searchContent`` envelope 의 ``totalSize`` 를 서버 측 권위 값으로 사용한다.
+    서브트리 싱크 확인 다이얼로그의 "예상 N개" 표기나, 싱크 후 임포트 수와
+    비교해 완전성 검증을 하는 용도로 쓸 수 있다.
+
+    Returns:
+        루트를 제외한 후손 페이지 수. 서버가 ``totalSize`` 를 내려주지 않으면 ``None``.
+    """
+    env = await search_content_envelope(
+        session, _subtree_cql(ancestor_page_id), limit=1, start=0,
+    )
+    return env.total_size
+
+
+async def enumerate_subtree_pages(
+    session: ClientSession,
+    ancestor_page_id: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 10000,
+) -> AsyncIterator[dict[str, Any]]:
+    """서브트리의 후손 페이지(depth 무관)를 CQL 페이지네이션으로 순회한다.
+
+    ``ancestor = "ID" AND type = "page"`` CQL 로 **루트 아래 모든 depth 의
+    페이지를 평탄하게** 나열한다. per-parent ``getChild`` BFS (:func:`walk_subtree`)
+    와 달리 depth 제한·중간 노드 실패 격리·자식 페이지네이션 오류 등에 의한
+    누락이 없다. 루트 자신은 결과에 포함되지 않으므로 호출측이 별도로 추가한다.
+
+    종료 조건(:func:`enumerate_space_pages` 와 동일):
+      - envelope 의 ``total_size`` 가 있으면 yield 한 개수가 그 값에 도달했을 때
+      - ``total_size`` 가 없으면 응답의 ``size`` 가 ``page_size`` 보다 작을 때
+      - 빈 결과 시 즉시 종료
+      - ``max_pages`` 도달 시 경고 로그 남기고 조기 반환
+
+    Yields:
+        ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
+        ``type`` 을 포함한다.
+    """
+    cql = _subtree_cql(ancestor_page_id)
+    start = 0
+    emitted = 0
+    total_size: int | None = None
+
+    while emitted < max_pages:
+        env = await search_content_envelope(
+            session, cql, limit=page_size, start=start,
+        )
+
+        if not env.results:
+            break
+
+        for page in env.results:
+            if not isinstance(page, dict):
+                continue
+            yield page
+            emitted += 1
+            if emitted >= max_pages:
+                logger.warning(
+                    "enumerate_subtree_pages max_pages(%d) 도달 — ancestor=%s",
+                    max_pages, ancestor_page_id,
+                )
+                return
+
+        if total_size is None and env.total_size is not None:
+            total_size = env.total_size
+
+        if total_size is not None and emitted >= total_size:
+            break
+        if env.size < page_size:
+            break
+
+        start += page_size
+
+
 async def get_space_info(
     session: ClientSession, space_key: str,
 ) -> dict[str, Any]:

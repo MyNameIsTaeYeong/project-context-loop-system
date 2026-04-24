@@ -25,8 +25,8 @@ from mcp import ClientSession
 
 from context_loop.ingestion.mcp_confluence import (
     enumerate_space_pages,
+    enumerate_subtree_pages,
     import_page_via_mcp,
-    walk_subtree,
 )
 from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
@@ -170,29 +170,53 @@ async def _sync_subtree(
     vector_store: VectorStore,
     graph_store: GraphStore,
 ) -> SyncResult:
-    """서브트리 BFS + 증분 동기화."""
+    """서브트리 전체(루트 + 모든 후손)를 CQL 평탄 열거로 증분 동기화.
+
+    CQL ``ancestor = ROOT AND type = "page"`` 로 depth 제한 없이 모든 후손
+    페이지를 서버 측 권위로 나열한다. per-parent ``getChild`` BFS 를 거치는
+    기존 ``walk_subtree`` 경로와 달리 자식 페이지네이션 오류·중간 노드
+    예외·``type`` 필드 누락 등에 의한 누락이 없다. ``ancestor`` 는 루트 자신을
+    포함하지 않으므로 첫 노드로 수동 추가한다.
+    """
     result = SyncResult()
     root_id = str(target["page_id"])
     space_key = target["space_key"]
     target_id = target["id"]
 
     try:
-        nodes = await walk_subtree(session, root_id)
+        descendants: list[dict[str, Any]] = [
+            p async for p in enumerate_subtree_pages(session, root_id)
+        ]
     except Exception as exc:  # noqa: BLE001
-        # walker 전면 실패 시 membership 은 건드리지 않는다.
+        # 열거 전면 실패 시 membership 은 건드리지 않는다.
         logger.warning(
-            "서브트리 walker 실패 target_id=%s root=%s: %s",
+            "서브트리 열거 실패 target_id=%s root=%s: %s",
             target_id, root_id, exc,
         )
-        result.errors.append({"page_id": root_id, "error": f"walk_subtree: {exc}"})
+        result.errors.append(
+            {"page_id": root_id, "error": f"enumerate_subtree_pages: {exc}"},
+        )
         return result
+
+    # 루트 + 후손. CQL 결과에는 parent_id/depth 가 없으므로 hierarchy 저장은 안 함.
+    nodes: list[dict[str, Any]] = [{"id": root_id}]
+    seen: set[str] = {root_id}
+    for page in descendants:
+        pid = page.get("id")
+        if not pid:
+            continue
+        pid_str = str(pid)
+        if pid_str in seen:
+            continue
+        seen.add(pid_str)
+        nodes.append({"id": pid_str})
 
     previous_ids = await meta_store.list_membership_page_ids(target_id)
     current_ids: set[str] = set()
 
     await _import_nodes_and_upsert(
         session, nodes, space_key, target_id, result, current_ids,
-        meta_store=meta_store, with_hierarchy=True,
+        meta_store=meta_store, with_hierarchy=False,
     )
 
     await _prune_stale_memberships(
