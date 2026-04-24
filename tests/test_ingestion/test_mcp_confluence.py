@@ -27,6 +27,9 @@ from context_loop.ingestion.mcp_confluence import (
     get_page,
     get_page_with_ancestors,
     get_space_info,
+    _subtree_cql,
+    enumerate_subtree_pages,
+    estimate_subtree_page_count,
     get_user_contributed_pages,
     import_page_via_mcp,
     list_available_tools,
@@ -95,6 +98,23 @@ def test_parse_json_result_plain_text() -> None:
     result = _make_result("not json")
     parsed = _parse_json_result(result)
     assert parsed == "not json"
+
+
+def test_parse_json_result_prefers_structured_content() -> None:
+    """MCP 신규 스펙: structuredContent 가 있으면 content 파싱보다 우선한다."""
+
+    @dataclass
+    class ResultWithStructured:
+        content: list[FakeTextContent]
+        structuredContent: Any
+
+    r = ResultWithStructured(
+        content=[FakeTextContent(text='"ignored"')],
+        structuredContent={"results": [{"id": "s1"}], "size": 1},
+    )
+    parsed = _parse_json_result(r)
+    assert isinstance(parsed, dict)
+    assert parsed["results"][0]["id"] == "s1"
 
 
 # --- _extract_page_content 테스트 ---
@@ -522,13 +542,99 @@ def test_format_breadcrumb_malformed_ancestors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_child_pages() -> None:
+async def test_get_child_pages_list_response() -> None:
+    """envelope 없이 list 만 오는 서버 변종 — 한 번에 전부 반환."""
     session = AsyncMock()
     session.call_tool.return_value = _make_result('[{"id": "10", "title": "Child"}]')
 
     children = await get_child_pages(session, "1")
-    session.call_tool.assert_called_once_with("getChild", {"pageId": "1"})
+
+    assert session.call_tool.call_count == 1
+    # pageId 뿐 아니라 start/limit/expand 를 반드시 같이 넘겨야 한다.
+    args, _ = session.call_tool.call_args
+    assert args[0] == "getChild"
+    assert args[1]["pageId"] == "1"
+    assert args[1]["start"] == 0
+    assert "limit" in args[1]
+    assert "expand" in args[1]
     assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_paginates_until_total_size() -> None:
+    """envelope 응답이면 totalSize 에 도달할 때까지 페이지네이션."""
+    session = AsyncMock()
+    session.call_tool.side_effect = [
+        _make_result(
+            '{"results":[{"id":"1"},{"id":"2"}],'
+            ' "start":0, "limit":2, "size":2, "totalSize":3}',
+        ),
+        _make_result(
+            '{"results":[{"id":"3"}],'
+            ' "start":2, "limit":2, "size":1, "totalSize":3}',
+        ),
+    ]
+
+    children = await get_child_pages(session, "root", page_size=2)
+
+    assert [c["id"] for c in children] == ["1", "2", "3"]
+    assert session.call_tool.call_count == 2
+    first_args = session.call_tool.call_args_list[0].args[1]
+    second_args = session.call_tool.call_args_list[1].args[1]
+    assert first_args["start"] == 0 and first_args["limit"] == 2
+    assert second_args["start"] == 2 and second_args["limit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_stops_when_size_less_than_page_size() -> None:
+    """totalSize 가 없으면 size < page_size 로 마지막 페이지 판정."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results":[{"id":"1"}], "start":0, "limit":10, "size":1}',
+    )
+
+    children = await get_child_pages(session, "root", page_size=10)
+
+    assert [c["id"] for c in children] == ["1"]
+    assert session.call_tool.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_accepts_children_envelope_key() -> None:
+    """서버 변종: envelope 키가 ``children`` 인 경우도 파싱."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"children":[{"id":"1"},{"id":"2"}], "size":2, "totalSize":2}',
+    )
+
+    children = await get_child_pages(session, "root")
+
+    assert [c["id"] for c in children] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_accepts_nested_page_results() -> None:
+    """서버 변종: ``{page: {results: [...]}}`` 중첩 envelope 파싱."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"page":{"results":[{"id":"1"}]}, "size":1}',
+    )
+
+    children = await get_child_pages(session, "root")
+
+    assert [c["id"] for c in children] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_get_child_pages_default_expand_is_nonempty() -> None:
+    """빈 expand 를 거부하는 서버에 대비해 기본값은 비어있지 않아야 한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result('[]')
+
+    await get_child_pages(session, "1")
+
+    args = session.call_tool.call_args.args[1]
+    assert args["expand"] != ""
 
 
 # --- walk_subtree 테스트 ---
@@ -898,6 +1004,87 @@ async def test_enumerate_space_pages_skips_non_dict_items() -> None:
     assert [p["id"] for p in collected] == ["1", "2"]
 
 
+def _make_capping_search_session(
+    items: list[dict[str, Any]],
+    *,
+    server_cap: int,
+    total_size: int | None = None,
+    record_calls: list[dict[str, Any]] | None = None,
+) -> Any:
+    """``start`` 를 실제로 존중하고 응답당 ``server_cap`` 까지만 돌려주는 fake.
+
+    요청 ``limit`` 와 무관하게 서버가 응답당 개수를 cap 하는 상황을 재현한다.
+    totalSize 는 전체 건수로 고정 (보통 ``len(items)`` 와 같음).
+    """
+    effective_total = total_size if total_size is not None else len(items)
+
+    class FakeSession:
+        async def call_tool(self, tool_name: str, args: dict[str, Any]):
+            if tool_name != "searchContent":
+                raise AssertionError(f"Unexpected tool: {tool_name}")
+            if record_calls is not None:
+                record_calls.append(args)
+            start = int(args.get("start", 0))
+            # 서버가 요청한 limit 을 무시하고 server_cap 만큼만 돌려준다.
+            chunk = items[start:start + server_cap]
+            envelope = {
+                "results": chunk,
+                "size": len(chunk),
+                "start": start,
+                "limit": args.get("limit", 25),
+                "totalSize": effective_total,
+            }
+            return _make_result(json.dumps(envelope))
+
+    return FakeSession()
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_handles_server_cap_smaller_than_page_size() -> None:
+    """서버가 응답당 개수를 cap 해도 totalSize 까지 모두 열거한다.
+
+    회귀 방지: 기존 로직은 ``size < page_size`` 에서 무조건 break 해버려 첫
+    응답 이후 나머지를 잃었다. totalSize 가 알려진 경우 short-page 휴리스틱을
+    건너뛰고 ``start`` 를 실제 반환 개수만큼 전진시켜야 한다.
+    """
+    calls: list[dict[str, Any]] = []
+    items = [{"id": str(i)} for i in range(50)]
+    session = _make_capping_search_session(
+        items, server_cap=25, total_size=50, record_calls=calls,
+    )
+
+    collected = [
+        p async for p in enumerate_space_pages(
+            session, "ENG", page_size=100,
+        )
+    ]
+
+    assert len(collected) == 50
+    assert [p["id"] for p in collected] == [str(i) for i in range(50)]
+    # start=0 → 25, start=25 → 25 로 두 번의 호출로 모두 열거.
+    assert [c["start"] for c in calls] == [0, 25]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_handles_server_cap_smaller_than_page_size() -> None:
+    """서브트리 경로도 동일한 cap 대응을 상속한다(공통 헬퍼 `_paginate_cql`)."""
+    calls: list[dict[str, Any]] = []
+    items = [{"id": f"d{i}"} for i in range(30)]
+    session = _make_capping_search_session(
+        items, server_cap=10, total_size=30, record_calls=calls,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(
+            session, "100", page_size=100,
+        )
+    ]
+
+    assert len(collected) == 30
+    assert [p["id"] for p in collected] == [f"d{i}" for i in range(30)]
+    assert [c["start"] for c in calls] == [0, 10, 20]
+
+
 @pytest.mark.asyncio
 async def test_enumerate_space_pages_cql_is_correct() -> None:
     """CQL에 space와 type 필터가 함께 들어간다."""
@@ -911,14 +1098,178 @@ async def test_enumerate_space_pages_cql_is_correct() -> None:
     assert calls[0]["cql"] == 'space = "OPS" AND type = "page"'
 
 
+# --- _subtree_cql / estimate_subtree_page_count / enumerate_subtree_pages 테스트 ---
+
+
+def test_subtree_cql_escapes_quotes_and_backslashes() -> None:
+    assert _subtree_cql("12345") == 'ancestor = "12345" AND type = "page"'
+    assert _subtree_cql('a"b') == 'ancestor = "a\\"b" AND type = "page"'
+    assert _subtree_cql("c\\d") == 'ancestor = "c\\\\d" AND type = "page"'
+
+
 @pytest.mark.asyncio
-async def test_get_all_spaces() -> None:
+async def test_estimate_subtree_page_count_returns_total_size() -> None:
+    """totalSize 를 그대로 돌려주고, CQL 은 ancestor 기반."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [[{"id": "1"}]], total_size=57, record_calls=calls,
+    )
+
+    count = await estimate_subtree_page_count(session, "100")
+
+    assert count == 57
+    assert calls[0] == {
+        "cql": 'ancestor = "100" AND type = "page"', "limit": 1, "start": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_estimate_subtree_page_count_returns_none_when_server_omits() -> None:
+    session = _make_search_session([[{"id": "1"}]], total_size=None)
+    assert await estimate_subtree_page_count(session, "100") is None
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_multiple_pages_with_total_size() -> None:
+    """CQL 페이지네이션으로 모든 depth 후손을 한 번에 열거한다."""
+    session = _make_search_session(
+        [
+            [{"id": "d1"}, {"id": "d2"}],
+            [{"id": "d3"}],
+        ],
+        total_size=3,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(session, "100", page_size=2)
+    ]
+
+    assert [p["id"] for p in collected] == ["d1", "d2", "d3"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_terminates_on_short_page_without_total_size() -> None:
+    """totalSize 가 없을 때 size < page_size 를 마지막 페이지로 간주한다."""
+    session = _make_search_session(
+        [[{"id": "d1"}]],  # size=1 < page_size=10
+        total_size=None,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(session, "100", page_size=10)
+    ]
+
+    assert [p["id"] for p in collected] == ["d1"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_empty_subtree() -> None:
+    session = _make_search_session([[]], total_size=0)
+    collected = [p async for p in enumerate_subtree_pages(session, "100")]
+    assert collected == []
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_respects_max_pages_cap() -> None:
+    """max_pages 상한 초과 시 조기 반환."""
+    session = _make_search_session(
+        [[{"id": str(i)} for i in range(200)]],
+        total_size=200,
+    )
+
+    collected = [
+        p async for p in enumerate_subtree_pages(
+            session, "100", page_size=100, max_pages=5,
+        )
+    ]
+
+    assert len(collected) == 5
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_cql_is_correct() -> None:
+    """CQL 에 ancestor 와 type 필터가 함께 들어간다."""
+    calls: list[dict[str, Any]] = []
+    session = _make_search_session(
+        [[]], total_size=0, record_calls=calls,
+    )
+
+    _ = [p async for p in enumerate_subtree_pages(session, "42")]
+
+    assert calls[0]["cql"] == 'ancestor = "42" AND type = "page"'
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_list_response() -> None:
+    """envelope 없이 list 만 돌려주는 서버 변종 — 한 번에 전부 반환."""
     session = AsyncMock()
-    session.call_tool.return_value = _make_result('[{"id": "s1", "key": "DEV", "name": "Dev Team"}]')
+    session.call_tool.return_value = _make_result(
+        '[{"id": "s1", "key": "DEV", "name": "Dev Team"}]',
+    )
 
     spaces = await get_all_spaces(session)
-    session.call_tool.assert_called_once_with("getSpaceInfoAll", {})
+
+    assert session.call_tool.call_count == 1
+    # start/limit 은 필수 인자이므로 반드시 같이 전달되어야 한다.
+    args, kwargs = session.call_tool.call_args
+    assert args[0] == "getSpaceInfoAll"
+    assert args[1]["start"] == 0
+    assert "limit" in args[1]
     assert spaces[0]["key"] == "DEV"
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_paginates_until_total_size() -> None:
+    """envelope 응답에서 totalSize 에 도달할 때까지 페이지네이션 한다."""
+    session = AsyncMock()
+    responses = [
+        _make_result(
+            '{"results":[{"key":"A"},{"key":"B"}],'
+            ' "start":0, "limit":2, "size":2, "totalSize":3}',
+        ),
+        _make_result(
+            '{"results":[{"key":"C"}],'
+            ' "start":2, "limit":2, "size":1, "totalSize":3}',
+        ),
+    ]
+    session.call_tool.side_effect = responses
+
+    spaces = await get_all_spaces(session, page_size=2)
+
+    assert [s["key"] for s in spaces] == ["A", "B", "C"]
+    assert session.call_tool.call_count == 2
+    first_call_args = session.call_tool.call_args_list[0].args[1]
+    second_call_args = session.call_tool.call_args_list[1].args[1]
+    assert first_call_args == {"start": 0, "limit": 2}
+    assert second_call_args == {"start": 2, "limit": 2}
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_stops_when_size_less_than_page_size() -> None:
+    """totalSize 가 없으면 size < page_size 로 마지막 페이지 판정."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results":[{"key":"A"}], "start":0, "limit":10, "size":1}',
+    )
+
+    spaces = await get_all_spaces(session, page_size=10)
+
+    assert [s["key"] for s in spaces] == ["A"]
+    assert session.call_tool.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_all_spaces_stops_on_empty_results() -> None:
+    """빈 results 이면 즉시 종료."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results":[], "start":0, "limit":10, "size":0}',
+    )
+
+    spaces = await get_all_spaces(session)
+
+    assert spaces == []
+    assert session.call_tool.call_count == 1
 
 
 @pytest.mark.asyncio

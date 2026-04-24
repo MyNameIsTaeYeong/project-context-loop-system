@@ -36,7 +36,8 @@
 - 사내 MCP 서버 전송 방식(SSE/stdio) 및 각 도구의 입출력 형식 확인 필요
 - 3가지 임포트 시나리오(검색, 트리 탐색, 내 문서) 구현
 - 웹 UI (탭 기반) 및 API 엔드포인트 추가
-- **진행 상태 (2026-04-23)**: 3-scope 싱크로 재설계되어 D-043 으로 백엔드 완성. 검색 기반 진입 + page/subtree/space 3범위 등록·싱크·해제의 REST API 와 동시성·안전 속성까지 완료. 수동 "검색 결과에서 페이지 선택 → 임포트" 와 "MCP `search_content` 기반 프리뷰" 는 기존 엔드포인트(`POST /api/confluence-mcp/search`, `POST /api/confluence-mcp/import`)가 유지된다. **남은 것은 UI(I-030)** 와 내 문서 임포트 UI.
+- **진행 상태 (2026-04-23)**: 3-scope 싱크로 재설계되어 D-043 으로 백엔드 완성. 검색 기반 진입 + page/subtree/space 3범위 등록·싱크·해제의 REST API 와 동시성·안전 속성까지 완료. 수동 "검색 결과에서 페이지 선택 → 임포트" 와 "MCP `search_content` 기반 프리뷰" 는 기존 엔드포인트(`POST /api/confluence-mcp/search`, `POST /api/confluence-mcp/import`)가 유지된다.
+- **진행 상태 (2026-04-24)**: I-030 해결로 3-scope 싱크 UI 까지 완성. 남은 항목은 트리 탐색형 UI 와 내 문서 임포트 UI 정도.
 
 ### I-011: Confluence REST API 접근 차단
 - 사내 보안 정책으로 Confluence REST API 직접 호출 불가
@@ -105,21 +106,62 @@
 - `get_neighbors`의 짧은 이름 fallback이 동작을 보장하지만, 스키마 요약에서 짧은 이름만 노출하거나 FQN 표기 가이드를 프롬프트에 추가하면 품질/토큰 모두 개선 여지
 - 우선순위: 중간. 현재는 fallback으로 문제 없음.
 
-### I-030: Confluence MCP 3-scope 싱크 UI 구현
-- D-043 로 백엔드(REST API + 동시성 + 안전 속성)는 완성됐으나 UI 는 미구현
-- 구현해야 하는 화면 요소 (`web/templates/confluence_mcp.html` 확장 + vanilla JS):
-  - 🔍 **검색 박스** + `GET /api/confluence-mcp/search?q=...` 호출 → spaces 섹션 + pages 섹션 병합 렌더
-  - 결과 카드에 3버튼 — 📄 "페이지만" / 🌿 "하위 포함" / 🏢 "공간 전체 싱크"
-  - **확인 다이얼로그 3종**:
-    - 🌿 하위 포함: 가벼운 안내 ("수십 분 걸릴 수 있음")
-    - 🏢 공간 전체: `GET /spaces/{key}/estimate` 선행 호출 → "예상 N개" 표시 + 시작/취소
-    - ❌ 해제: "다른 target 이 공유하지 않는 문서는 함께 삭제" 경고
-  - 등록된 대상 카드 목록 (`GET /sync-targets`) + scope 아이콘 + last_sync / page_count 뱃지 + [🔄 싱크] [해제] 버튼
-  - 폴링 기반 진행 상태 (2초 간격 `GET /sync-targets/{id}` → in_progress 스피너 + "완료: +N new · ~N updated · -N removed" 요약)
-- 참고: 기존 `POST /api/confluence-mcp/search` (수동 import) 와 신규 `GET /api/confluence-mcp/search` (3-scope 진입) 는 HTTP 메서드로 구분되어 공존 중. 구 UI(수동 임포트 탭)는 유지.
-- 우선순위: 높음 (백엔드 제공 가치를 사용자에게 노출하는 마지막 관문). 병렬 세션으로 분리 가능.
-
 ## 해결됨
+
+### I-035: Phase 2 인덱싱 자동화 + 동시성 + 실패 재시도 → 해결 (2026-04-24, D-044)
+- **증상**: 싱크 후 문서는 meta 에 저장되지만 벡터/그래프 인덱싱은 수동 "Process" 버튼 필요. Phase 2 가 직렬이라 대량 싱크 시 느림. 인덱싱 실패 문서는 `status='failed'` 로 stuck.
+- **해결 3단계** (`2178564` + `c5c9ca6`):
+  1. `execute_sync_target` 에 선택적 `embedding_client`/`pipeline_config` 주입 → Phase 2(process_document) 자동 실행. `SyncResult` 에 `processed`/`processing_errors` 버킷 + UI `◎N indexed · ⚠M indexing-failed` 노출
+  2. `asyncio.Semaphore(5)` + `asyncio.gather` 로 Phase 2 병렬화. `config.processor.phase2_concurrency` 운영자 튜닝 가능. 400 문서 기준 벽시계 ~5배 단축, OpenAI 기본 tier rate limit 의 ~5% 사용
+  3. `MetadataStore.list_failed_member_doc_ids(target_id)` 신설 — target 스코프 내 status='failed' 문서를 JOIN 쿼리로 식별. Phase 2 큐 = `created + updated + failed-in-membership`(중복 제거) → 재싱크마다 자동 재시도
+- 테스트 +11 (Phase 2 기본·unchanged skip·실패 격리·skip 조건·summary 확장·failed_member JOIN·concurrency bound·failed 재시도·clamp)
+
+### I-034: CQL 페이지네이션 서버 cap 대응 → 해결 (2026-04-24, `49add3c`)
+- **증상**: CQL `searchContent` 가 totalSize=356 을 돌려주는데 실제 임포트는 그보다 적음
+- **근본 원인 2가지 협력**:
+  1. `size < page_size` 에서 무조건 break — 일부 서버가 요청 `limit` 과 무관하게 응답당 개수를 cap (예: `limit=100` 요청에 `size=25` + `totalSize=500`) 하면 첫 응답 직후 종료되어 대량 누락
+  2. `start += page_size` (요청값 증분) — 서버 cap 으로 25개만 왔는데 start 를 100 증가 → items 25–99 구간 스킵
+- **해결**: `_paginate_cql` 공통 헬퍼 추출 + `total_size` 가 알려진 경우 short-page 휴리스틱 skip + `start += env.size` 로 실제 반환 개수만큼 전진. 관측성 보강: `_sync_subtree` 가 `estimate_subtree_page_count` 선행 호출해 totalSize vs 실제 열거 수 비교, 불일치 시 warning 로그
+- 테스트 +2 (`_make_capping_search_session` fake 로 server cap 재현 — space/subtree 각 1건)
+
+### I-033: 서브트리 BFS 누락 → CQL ancestor 평탄 열거로 전환 → 해결 (2026-04-24, `d507b15`, D-044)
+- **증상**: "하위 포함" 등록 시 최하위 depth 까지 가져오지 않음. walker 기반 BFS 가 몇 가지 경로로 누락 가능:
+  1. per-parent `getChild` 의 독립 페이지네이션 오판
+  2. 중간 노드 예외 격리가 그 아래 서브트리 전부 손실
+  3. `max_depth=20` 초과
+  4. `type` 필드가 `"page"` 아닌 값/누락으로 드롭
+  5. 권한 차이 per-node 호출
+- **해결**: 사용자 제안대로 CQL `ancestor = X AND type = "page"` 로 서버 측 평탄 열거. `_subtree_cql`/`estimate_subtree_page_count`/`enumerate_subtree_pages` 신설, `_sync_subtree` 가 descendants + 루트 수동 prepend (CQL ancestor 는 루트 자신 미포함)
+- **Trade-off**: membership 의 `parent_page_id`/`depth` 가 NULL 로 저장됨. 현재 코드베이스에서 이 컬럼을 읽는 곳이 없어 실영향 없음. hierarchy 가 필요해지면 별도 hydrate 단계 추가
+- `walk_subtree` 자체는 삭제하지 않고 유지 (다른 러너 호환)
+- 테스트 +9 (CQL helpers 3 + sync 재작성 6)
+
+### I-032: 서브트리 임포트 시 하위 페이지 누락 — structuredContent 누락 + envelope 키 변종 → 해결 (2026-04-24, `3bb7685`)
+- **증상**: 하위 포함 클릭 시 루트만 임포트되고 자식 전부 누락
+- **근본 원인 2가지 동시에**:
+  1. MCP 신규 스펙은 JSON 을 `CallToolResult.structuredContent` 에 직접 담기도 하는데, 기존 `_parse_json_result` 는 `content[].text` 만 읽어서 전체 페이로드가 소실됨. getChild 결과가 빈 리스트로 해석되어 walker 가 루트만 반환
+  2. 서버 구현체마다 envelope 키가 `results` / `children` / `page` / `pages` / `items` 또는 `{page: {results:[...]}}` 중첩 형태로 다양
+- **해결**: `_parse_json_result` 가 `structuredContent` 를 먼저 확인. `_unwrap_envelope(parsed) -> (items, envelope)` 공통 헬퍼 신설로 5가지 키 변종 + 1단계 중첩 흡수. `expand` 기본값 `""` → `"page"` (빈 문자열 거부하는 서버 방어)
+- 테스트 +4 (structuredContent 우선, children 키, 중첩 page.results, expand non-empty)
+
+### I-031: MCP tool 필수 파라미터 검증 에러 → 해결 (2026-04-24, `de0d7fb` + `9536c0c`)
+- **증상**: UI 에서 공간 검색 클릭 시 `CallToolResult validation` 에러. 사내 MCP 서버가 `getSpaceInfoAll` 에 `start`/`limit` 필수로 요구. 같은 날 `getChild` 도 `pageId`/`start`/`limit`/`expand` 필수로 확인
+- **해결**:
+  - `get_all_spaces` 가 `{"start": 0, "limit": 100}` 전달 + envelope 응답 페이지네이션 (`de0d7fb`)
+  - `get_child_pages` 가 `pageId`/`start`/`limit`/`expand` 함께 전달 + 동일 페이지네이션 로직 (`9536c0c`)
+  - 둘 다 envelope 없이 list 만 오는 서버 변종도 한 번에 처리 후 종료
+- 테스트 +5
+
+### I-030: Confluence MCP 3-scope 싱크 UI 구현 → 해결 (2026-04-24)
+- `web/templates/confluence_mcp.html` 단일 파일 확장으로 완료. `syncTargetsPanel()` Alpine 컴포넌트 신설.
+- 구현된 요소:
+  - 🔍 검색 박스: `GET /api/confluence-mcp/search?q=...` → Spaces / Pages 두 섹션으로 분리 렌더, 빈 쿼리 시 모든 공간 노출
+  - 결과 카드 3버튼: 📄 페이지만 / 🌿 하위 포함 / 🏢 공간 전체 (Space 카드는 🏢 단일 버튼)
+  - 확인 다이얼로그 3종: subtree(즉시), space(estimate 선행 후 "예상 N개" 표시), unregister(cascade 경고)
+  - 등록된 대상 카드 목록: scope 뱃지 색상(`scope-page`/`subtree`/`space`) + 상대시간 last_sync + 증분 요약 monospace 뱃지(+N new · ~N updated · -N removed) + [🔄 재싱크] [❌ 해제]
+  - 폴링: running/queued 가 하나라도 있을 때만 2초 간격 `GET /sync-targets/{id}` 자가 시작·정지
+- 구 단발성 임포트 UI(3탭)는 `<details>` 로 접어 "고급" 영역에 보존
+- 회귀 테스트: `tests/test_web/test_confluence_mcp_sync_api.py` 19건 모두 통과 (UI 자체는 E2E 없음, 백엔드 계약을 따름)
 
 ### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
 - `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리

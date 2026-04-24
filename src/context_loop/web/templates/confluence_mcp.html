@@ -45,8 +45,173 @@
 </article>
 
 {% if connected %}
-<!-- 탭 기반 임포트 UI -->
-<article x-data="mcpBrowser()">
+<!-- 3-scope 지속 싱크 UI -->
+<article x-data="syncTargetsPanel()" x-init="init()">
+    <header><strong>📚 문서 싱크</strong></header>
+
+    <!-- 검색 박스 -->
+    <form @submit.prevent="search()">
+        <div role="group">
+            <input type="search" x-model="query" placeholder="공간 키 또는 페이지 제목 (비우면 모든 공간 표시)">
+            <button type="submit" :aria-busy="searching" :disabled="searching" style="width: auto;">검색</button>
+        </div>
+    </form>
+
+    <!-- 검색 결과: Spaces -->
+    <div x-show="searchDone && (spaces.length > 0 || pages.length > 0)" style="margin-top: 1rem;">
+        <div x-show="spaces.length > 0">
+            <h5 style="margin-bottom: 0.5rem;">🏢 Spaces (<span x-text="spaces.length"></span>)</h5>
+            <div class="sync-result-list">
+                <template x-for="s in spaces" :key="s.key">
+                    <div class="sync-result-card">
+                        <div class="sync-result-info">
+                            <strong x-text="s.name || s.key"></strong>
+                            <small x-show="s.key" style="color: var(--pico-muted-color);" x-text="' (' + s.key + ')'"></small>
+                        </div>
+                        <div class="sync-result-actions">
+                            <button class="outline" @click="askRegisterSpace(s)">🏢 공간 전체 싱크</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <div x-show="pages.length > 0" style="margin-top: 1rem;">
+            <h5 style="margin-bottom: 0.5rem;">
+                📄 Pages (<span x-text="pages.length"></span>
+                <span x-show="totalPages !== null && totalPages > pages.length"
+                      x-text="' / 전체 ' + totalPages"></span>)
+            </h5>
+            <div class="sync-result-list">
+                <template x-for="p in pages" :key="p.id">
+                    <div class="sync-result-card">
+                        <div class="sync-result-info">
+                            <strong x-text="p.title || '(제목 없음)'"></strong>
+                            <small style="color: var(--pico-muted-color);"
+                                   x-text="(p.space?.name || p.space?.key || p.spaceKey || '')"></small>
+                        </div>
+                        <div class="sync-result-actions">
+                            <button class="outline" @click="registerPage(p)">📄 페이지만</button>
+                            <button class="outline" @click="askRegisterSubtree(p)">🌿 하위 포함</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </div>
+
+    <p x-show="searchDone && spaces.length === 0 && pages.length === 0"
+       style="color: var(--pico-muted-color);">검색 결과가 없습니다.</p>
+
+    <!-- 등록된 싱크 대상 -->
+    <hr>
+    <header style="display: flex; justify-content: space-between; align-items: center;">
+        <strong>🔁 등록된 싱크 대상 (<span x-text="targets.length"></span>)</strong>
+        <button class="outline" style="width: auto;" @click="loadTargets()" :aria-busy="loadingTargets">새로고침</button>
+    </header>
+
+    <p x-show="!loadingTargets && targets.length === 0" style="color: var(--pico-muted-color);">
+        등록된 싱크 대상이 없습니다. 위에서 검색 후 싱크할 대상을 등록하세요.
+    </p>
+
+    <div class="sync-target-list" x-show="targets.length > 0">
+        <template x-for="t in targets" :key="t.id">
+            <div class="sync-target-card">
+                <div class="sync-target-head">
+                    <span class="scope-badge" :class="'scope-' + t.scope"
+                          x-text="scopeIcon(t.scope) + ' ' + scopeLabel(t.scope)"></span>
+                    <strong x-text="t.name"></strong>
+                </div>
+                <div class="sync-target-meta">
+                    <small x-text="'space=' + t.space_key + (t.page_id ? ' · page=' + t.page_id : '')"></small>
+                    <small x-show="t.last_sync_at" x-text="'마지막 싱크: ' + formatRelative(t.last_sync_at)"></small>
+                    <small x-show="!t.last_sync_at" style="color: var(--pico-muted-color);">아직 싱크하지 않음</small>
+                </div>
+                <div class="sync-target-status">
+                    <template x-if="t.status?.state === 'running' || t.status?.state === 'queued'">
+                        <span class="badge badge-processing" aria-busy="true"
+                              x-text="t.status.state === 'queued' ? '대기 중' : '진행 중'"></span>
+                    </template>
+                    <template x-if="t.status?.state === 'completed'">
+                        <span class="badge badge-completed">완료</span>
+                    </template>
+                    <template x-if="t.status?.state === 'failed'">
+                        <span class="badge badge-failed" :title="t.status.error">실패</span>
+                    </template>
+                    <span class="sync-summary" x-html="summaryFor(t)"></span>
+                </div>
+                <div class="sync-target-actions">
+                    <button class="outline" @click="resync(t)"
+                            :disabled="t.status?.state === 'running' || t.status?.state === 'queued'">
+                        🔄 재싱크
+                    </button>
+                    <button class="outline" @click="askUnregister(t)">❌ 해제</button>
+                </div>
+            </div>
+        </template>
+    </div>
+
+    <!-- 확인 다이얼로그: 서브트리 -->
+    <dialog :open="dialog.type === 'subtree'">
+        <article>
+            <header><strong>🌿 하위 포함 싱크 등록</strong></header>
+            <p x-show="dialog.payload">
+                <span x-text="'페이지 「' + (dialog.payload?.title || '') + '」 와 모든 하위 페이지를 등록합니다.'"></span>
+            </p>
+            <p style="color: var(--pico-muted-color);">
+                ⏱️ 페이지 수에 따라 수십 분 이상 걸릴 수 있습니다. 작업은 백그라운드에서 실행됩니다.
+            </p>
+            <footer>
+                <button class="secondary" @click="closeDialog()">취소</button>
+                <button @click="confirmRegisterSubtree()" :aria-busy="dialog.busy">시작</button>
+            </footer>
+        </article>
+    </dialog>
+
+    <!-- 확인 다이얼로그: 공간 전체 (estimate 선행) -->
+    <dialog :open="dialog.type === 'space'">
+        <article>
+            <header><strong>🏢 공간 전체 싱크 등록</strong></header>
+            <p x-show="dialog.payload">
+                <span x-text="'공간 「' + (dialog.payload?.name || dialog.payload?.key || '') + '」 의 모든 페이지를 등록합니다.'"></span>
+            </p>
+            <p x-show="dialog.estimating" aria-busy="true">예상 페이지 수 확인 중…</p>
+            <p x-show="!dialog.estimating && dialog.estimate !== null">
+                <strong>예상 페이지 수: <span x-text="dialog.estimate"></span> 개</strong>
+            </p>
+            <p style="color: var(--pico-muted-color);">
+                ⏱️ 페이지 수에 비례한 시간이 걸리며, 공간이 큰 경우 수 시간 이상 걸릴 수 있습니다.
+            </p>
+            <footer>
+                <button class="secondary" @click="closeDialog()">취소</button>
+                <button @click="confirmRegisterSpace()" :aria-busy="dialog.busy"
+                        :disabled="dialog.estimating">시작</button>
+            </footer>
+        </article>
+    </dialog>
+
+    <!-- 확인 다이얼로그: 해제 -->
+    <dialog :open="dialog.type === 'unregister'">
+        <article>
+            <header><strong>❌ 싱크 해제</strong></header>
+            <p>
+                <span x-text="'「' + (dialog.payload?.name || '') + '」 싱크를 해제합니다.'"></span>
+            </p>
+            <p style="color: var(--pico-del-color);">
+                ⚠️ 다른 싱크 대상이 공유하지 않는 임포트된 문서는 함께 삭제됩니다.
+            </p>
+            <footer>
+                <button class="secondary" @click="closeDialog()">취소</button>
+                <button class="contrast" @click="confirmUnregister()" :aria-busy="dialog.busy">해제</button>
+            </footer>
+        </article>
+    </dialog>
+</article>
+
+<!-- 단발성 임포트 (구 UI) -->
+<details>
+    <summary><strong>고급: 단발성 임포트 (검색·트리·내 문서)</strong></summary>
+    <article x-data="mcpBrowser()">
     <header>
         <nav>
             <ul>
@@ -188,6 +353,7 @@
         </details>
     </div>
 </article>
+</details>
 
 <script>
 function connectMCP(event) {
@@ -200,6 +366,250 @@ function connectMCP(event) {
         .then(() => location.reload())
         .catch(e => { this.error = e.message; })
         .finally(() => { this.connecting = false; });
+}
+
+function syncTargetsPanel() {
+    return {
+        // 검색
+        query: '',
+        spaces: [],
+        pages: [],
+        totalPages: null,
+        searching: false,
+        searchDone: false,
+
+        // 등록된 대상
+        targets: [],
+        loadingTargets: false,
+        pollTimer: null,
+
+        // 다이얼로그 상태
+        dialog: { type: null, payload: null, busy: false, estimating: false, estimate: null },
+
+        async init() {
+            await this.loadTargets();
+        },
+
+        scopeIcon(scope) {
+            return scope === 'page' ? '📄' : scope === 'subtree' ? '🌿' : '🏢';
+        },
+        scopeLabel(scope) {
+            return scope === 'page' ? '페이지' : scope === 'subtree' ? '서브트리' : '공간';
+        },
+
+        formatRelative(iso) {
+            if (!iso) return '';
+            const d = new Date(iso.replace(' ', 'T') + (iso.includes('Z') ? '' : 'Z'));
+            const diffSec = (Date.now() - d.getTime()) / 1000;
+            if (diffSec < 60) return '방금 전';
+            if (diffSec < 3600) return Math.floor(diffSec / 60) + '분 전';
+            if (diffSec < 86400) return Math.floor(diffSec / 3600) + '시간 전';
+            return Math.floor(diffSec / 86400) + '일 전';
+        },
+
+        summaryFor(t) {
+            // running 중인 결과는 status.result 에 없으므로, 마지막 완료 결과를 표시
+            const live = t.status?.result?.summary;
+            const stored = t.last_result_json ? this._parseSummary(t.last_result_json) : null;
+            const s = live || stored;
+            if (!s) return '';
+            const parts = [];
+            if (s.created) parts.push(`<span style="color: var(--pico-ins-color);">+${s.created} new</span>`);
+            if (s.updated) parts.push(`<span style="color: #856404;">~${s.updated} updated</span>`);
+            if (s.removed) parts.push(`<span style="color: var(--pico-del-color);">-${s.removed} removed</span>`);
+            if (s.unchanged) parts.push(`<span style="color: var(--pico-muted-color);">${s.unchanged} unchanged</span>`);
+            if (s.errors) parts.push(`<span style="color: var(--pico-del-color);">${s.errors} errors</span>`);
+            if (s.processed) parts.push(`<span style="color: var(--pico-ins-color);">◎${s.processed} indexed</span>`);
+            if (s.processing_errors) parts.push(`<span style="color: var(--pico-del-color);">⚠${s.processing_errors} indexing-failed</span>`);
+            return parts.join(' · ');
+        },
+
+        _parseSummary(json) {
+            try {
+                return JSON.parse(json)?.summary || null;
+            } catch (e) {
+                return null;
+            }
+        },
+
+        async search() {
+            this.searching = true;
+            this.searchDone = false;
+            try {
+                const r = await fetch('/api/confluence-mcp/search?q=' + encodeURIComponent(this.query));
+                if (!r.ok) throw new Error('search failed: ' + r.status);
+                const data = await r.json();
+                this.spaces = data.spaces || [];
+                this.pages = data.pages || [];
+                this.totalPages = data.total_pages;
+            } catch (e) {
+                this.spaces = []; this.pages = []; this.totalPages = null;
+                this._toast('검색 실패: ' + e.message, 'error');
+            } finally {
+                this.searching = false;
+                this.searchDone = true;
+            }
+        },
+
+        async loadTargets() {
+            this.loadingTargets = true;
+            try {
+                const r = await fetch('/api/confluence-mcp/sync-targets');
+                if (!r.ok) throw new Error('load failed: ' + r.status);
+                const data = await r.json();
+                this.targets = data.targets || [];
+                this._maybePoll();
+            } catch (e) {
+                this._toast('등록 목록 불러오기 실패: ' + e.message, 'error');
+            } finally {
+                this.loadingTargets = false;
+            }
+        },
+
+        async registerPage(page) {
+            await this._register({ scope: 'page', page_id: String(page.id) });
+        },
+
+        askRegisterSubtree(page) {
+            this.dialog = { type: 'subtree', payload: page, busy: false, estimating: false, estimate: null };
+        },
+
+        async confirmRegisterSubtree() {
+            this.dialog.busy = true;
+            try {
+                await this._register({ scope: 'subtree', page_id: String(this.dialog.payload.id) });
+                this.closeDialog();
+            } finally {
+                this.dialog.busy = false;
+            }
+        },
+
+        async askRegisterSpace(space) {
+            this.dialog = { type: 'space', payload: space, busy: false, estimating: true, estimate: null };
+            try {
+                const r = await fetch('/api/confluence-mcp/spaces/' + encodeURIComponent(space.key) + '/estimate');
+                if (r.ok) {
+                    const data = await r.json();
+                    this.dialog.estimate = data.estimated_pages;
+                } else {
+                    this.dialog.estimate = null;
+                }
+            } catch (e) {
+                this.dialog.estimate = null;
+            } finally {
+                this.dialog.estimating = false;
+            }
+        },
+
+        async confirmRegisterSpace() {
+            this.dialog.busy = true;
+            try {
+                await this._register({ scope: 'space', space_key: this.dialog.payload.key });
+                this.closeDialog();
+            } finally {
+                this.dialog.busy = false;
+            }
+        },
+
+        askUnregister(target) {
+            this.dialog = { type: 'unregister', payload: target, busy: false, estimating: false, estimate: null };
+        },
+
+        async confirmUnregister() {
+            this.dialog.busy = true;
+            try {
+                const r = await fetch('/api/confluence-mcp/sync-targets/' + this.dialog.payload.id, {
+                    method: 'DELETE',
+                });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                this._toast(`해제 완료 (문서 ${data.deleted_documents}개 삭제)`, 'success');
+                this.closeDialog();
+                await this.loadTargets();
+            } catch (e) {
+                this._toast('해제 실패: ' + e.message, 'error');
+            } finally {
+                this.dialog.busy = false;
+            }
+        },
+
+        closeDialog() {
+            this.dialog = { type: null, payload: null, busy: false, estimating: false, estimate: null };
+        },
+
+        async _register(body) {
+            try {
+                const r = await fetch('/api/confluence-mcp/sync-targets', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body),
+                });
+                if (!r.ok) throw new Error(await r.text());
+                this._toast('싱크 등록됨 — 백그라운드 실행 중', 'success');
+                await this.loadTargets();
+            } catch (e) {
+                this._toast('등록 실패: ' + e.message, 'error');
+            }
+        },
+
+        async resync(target) {
+            try {
+                const r = await fetch('/api/confluence-mcp/sync-targets/' + target.id + '/sync', {
+                    method: 'POST',
+                });
+                if (r.status === 409) {
+                    this._toast('이미 진행 중입니다', 'info');
+                    return;
+                }
+                if (!r.ok) throw new Error(await r.text());
+                this._toast('재싱크 시작', 'success');
+                await this.loadTargets();
+            } catch (e) {
+                this._toast('재싱크 실패: ' + e.message, 'error');
+            }
+        },
+
+        _maybePoll() {
+            const hasActive = this.targets.some(
+                t => t.status?.state === 'running' || t.status?.state === 'queued',
+            );
+            if (hasActive && !this.pollTimer) {
+                this.pollTimer = setInterval(() => this._pollOnce(), 2000);
+            } else if (!hasActive && this.pollTimer) {
+                clearInterval(this.pollTimer);
+                this.pollTimer = null;
+            }
+        },
+
+        async _pollOnce() {
+            const updates = await Promise.all(
+                this.targets
+                    .filter(t => t.status?.state === 'running' || t.status?.state === 'queued')
+                    .map(async t => {
+                        try {
+                            const r = await fetch('/api/confluence-mcp/sync-targets/' + t.id);
+                            return r.ok ? await r.json() : null;
+                        } catch (e) { return null; }
+                    }),
+            );
+            for (const fresh of updates) {
+                if (!fresh) continue;
+                const idx = this.targets.findIndex(t => t.id === fresh.id);
+                if (idx >= 0) this.targets[idx] = fresh;
+            }
+            this._maybePoll();
+        },
+
+        _toast(msg, kind) {
+            const area = document.getElementById('toast-area');
+            if (!area) return;
+            const div = document.createElement('div');
+            div.className = 'toast toast-' + (kind || 'info');
+            div.textContent = msg;
+            area.appendChild(div);
+            setTimeout(() => div.remove(), 3500);
+        },
+    };
 }
 
 function mcpBrowser() {
@@ -335,6 +745,74 @@ nav ul li a.active {
     text-decoration: underline;
     text-underline-offset: 0.3rem;
 }
+
+.sync-result-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.sync-result-card {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: 0.4rem;
+}
+.sync-result-info { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; flex: 1; }
+.sync-result-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+.sync-result-actions button { width: auto; padding: 0.3rem 0.7rem; font-size: 0.85rem; margin: 0; }
+
+.sync-target-list { display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.6rem; }
+.sync-target-card {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+        "head    actions"
+        "meta    actions"
+        "status  actions";
+    gap: 0.3rem 1rem;
+    padding: 0.7rem 0.9rem;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: 0.4rem;
+}
+.sync-target-head    { grid-area: head; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.sync-target-meta    { grid-area: meta; display: flex; gap: 0.8rem; flex-wrap: wrap; }
+.sync-target-status  { grid-area: status; display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+.sync-target-actions { grid-area: actions; display: flex; flex-direction: column; gap: 0.3rem; align-self: center; }
+.sync-target-actions button { width: auto; padding: 0.3rem 0.7rem; font-size: 0.85rem; margin: 0; }
+
+.scope-badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.4rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: var(--pico-muted-border-color);
+}
+.scope-page    { background: #d1ecf1; color: #0c5460; }
+.scope-subtree { background: #d4edda; color: #155724; }
+.scope-space   { background: #e8daef; color: #6c3483; }
+
+.sync-summary {
+    font-family: var(--pico-font-family-monospace);
+    font-size: 0.8rem;
+}
+
+dialog[open] {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    border: none;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+dialog[open] article {
+    max-width: 32rem;
+    width: 90%;
+    margin: 0;
+}
+dialog footer { display: flex; justify-content: flex-end; gap: 0.5rem; }
+dialog footer button { width: auto; margin: 0; }
 </style>
 {% endif %}
 {% endblock %}
