@@ -67,6 +67,12 @@ async def stores(tmp_path: Path):  # type: ignore[misc]
     await meta.close()
 
 
+class _DummyEmbeddings:
+    """get_embedding_client 의존성만 채우기 위한 placeholder. Phase 2 는
+    _run_sync_in_background 안에서만 돌고, 테스트는 BackgroundTasks 의
+    실행을 기다리지 않으므로 이 객체의 메서드는 호출되지 않는다."""
+
+
 @pytest.fixture
 async def client(stores):  # type: ignore[misc]
     """설정까지 주입된 테스트용 AsyncClient."""
@@ -76,6 +82,7 @@ async def client(stores):  # type: ignore[misc]
     app.state.meta_store = meta_store
     app.state.vector_store = vector_store
     app.state.graph_store = graph_store
+    app.state.embedding_client = _DummyEmbeddings()
 
     async with AsyncClient(
         transport=ASGITransport(app=app),

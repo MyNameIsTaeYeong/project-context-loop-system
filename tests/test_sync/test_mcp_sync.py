@@ -568,10 +568,182 @@ def test_sync_result_to_dict_summary() -> None:
     r.unchanged = [4, 5, 6]
     r.errors = [{"page_id": "x", "error": "boom"}]
     r.removed = [7]
+    r.processed = [1, 2, 3]
+    r.processing_errors = [{"doc_id": 9, "error": "embed failed"}]
 
     d = r.to_dict()
     assert d["summary"] == {
         "created": 2, "updated": 1, "unchanged": 3,
-        "errors": 1, "removed": 1, "total": 7,
+        "errors": 1, "removed": 1,
+        "processed": 3, "processing_errors": 1,
+        "total": 7,
     }
     assert d["removed"] == [7]
+    assert d["processed"] == [1, 2, 3]
+
+
+# --- Phase 2 (인덱싱) ---
+
+
+def _make_recording_process_document(
+    fail_docs: set[int] | None = None,
+) -> tuple[list[int], Any]:
+    """``process_document`` 를 대체하는 기록용 fake + 호출된 doc_id 누적 리스트.
+
+    ``fail_docs`` 의 doc_id 는 예외를 던지도록 설정해 Phase 2 실패 격리를 검증한다.
+    """
+    fail = fail_docs or set()
+    called: list[int] = []
+
+    async def fake(
+        document_id: int,
+        *,
+        meta_store: Any,
+        vector_store: Any,
+        graph_store: Any,
+        embedding_client: Any,
+        config: Any = None,
+    ) -> dict[str, Any]:
+        called.append(document_id)
+        if document_id in fail:
+            raise RuntimeError(f"simulated indexing failure for {document_id}")
+        return {"id": document_id, "status": "completed"}
+
+    return called, fake
+
+
+class _DummyEmbeddings:
+    """인덱싱 브랜치를 켜기 위한 진짜가 아닌 placeholder. Phase 2 에선
+    monkeypatch 된 process_document 가 실제로 호출되므로 이 객체 내용은 무관."""
+
+
+async def test_phase2_indexes_created_and_updated_docs(stores, monkeypatch) -> None:
+    """Phase 1 결과의 created + updated 가 인덱싱 대상. unchanged 는 제외."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}, {"id": "201"}]),
+    )
+    called, fake_proc = _make_recording_process_document()
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result = await execute_sync_target(
+        None, t,
+        meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+    )
+
+    # 첫 싱크 — 3건 모두 created → 3건 모두 인덱싱 대상
+    assert set(called) == set(result.created)
+    assert len(result.processed) == 3
+    assert result.processing_errors == []
+
+
+async def test_phase2_skips_unchanged(stores, monkeypatch) -> None:
+    """해시 동일로 skip 된 문서는 재임베딩하지 않는다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
+    )
+    called, fake_proc = _make_recording_process_document()
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    # 1st: 모두 created → 인덱싱
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+    )
+    first_call_count = len(called)
+
+    # 2nd: hash 동일로 unchanged → Phase 2 는 아무것도 안 함
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+    )
+
+    assert len(called) == first_call_count  # 추가 호출 없음
+    assert result.processed == []
+    assert len(result.unchanged) >= 1
+
+
+async def test_phase2_failure_isolated_per_doc(stores, monkeypatch) -> None:
+    """한 문서의 인덱싱 실패가 다른 문서 인덱싱을 막지 않는다.
+
+    첫 싱크에서 3건 모두 created 로 임포트되고, 그중 한 건의 인덱싱만
+    실패하도록 설정 → 나머지는 그대로 processed, 실패 건만 격리.
+    """
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}, {"id": "201"}]),
+    )
+
+    # 첫 실행 시 생성될 doc_id 를 미리 알 수 없으므로, 실패 대상은
+    # "두 번째 처리되는 문서" 라는 기준으로 실행 중에 결정한다.
+    call_log: list[int] = []
+
+    async def fake_proc(
+        document_id: int, *, meta_store: Any, vector_store: Any,
+        graph_store: Any, embedding_client: Any, config: Any = None,
+    ) -> dict[str, Any]:
+        call_log.append(document_id)
+        if len(call_log) == 2:
+            raise RuntimeError(f"simulated indexing failure for {document_id}")
+        return {"id": document_id, "status": "completed"}
+
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result = await execute_sync_target(
+        None, t,
+        meta_store=meta, vector_store=vec, graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+    )
+
+    # 3 건 모두 process_document 호출 — 중간 실패가 다음 호출을 막지 않음
+    assert len(call_log) == 3
+    # 2번째 호출이 실패하므로 processed 2건, processing_errors 1건
+    assert len(result.processed) == 2
+    assert len(result.processing_errors) == 1
+    failed_doc_id = call_log[1]  # 두 번째 처리 = 실패 대상
+    assert result.processing_errors[0]["doc_id"] == failed_doc_id
+    # 실패 문서는 status=failed 로 마킹
+    failed_doc = await meta.get_document(failed_doc_id)
+    assert failed_doc is not None
+    assert failed_doc["status"] == "failed"
+
+
+async def test_phase2_is_skipped_when_embedding_client_missing(stores, monkeypatch) -> None:
+    """embedding_client 미주입 시 Phase 2 는 전혀 실행되지 않는다(기존 동작 유지)."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
+    )
+    called, fake_proc = _make_recording_process_document()
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc)
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        # embedding_client 주입 안 함
+    )
+
+    assert called == []
+    assert result.processed == []
+    assert result.processing_errors == []

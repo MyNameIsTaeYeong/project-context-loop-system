@@ -419,6 +419,8 @@ function syncTargetsPanel() {
             if (s.removed) parts.push(`<span style="color: var(--pico-del-color);">-${s.removed} removed</span>`);
             if (s.unchanged) parts.push(`<span style="color: var(--pico-muted-color);">${s.unchanged} unchanged</span>`);
             if (s.errors) parts.push(`<span style="color: var(--pico-del-color);">${s.errors} errors</span>`);
+            if (s.processed) parts.push(`<span style="color: var(--pico-ins-color);">◎${s.processed} indexed</span>`);
+            if (s.processing_errors) parts.push(`<span style="color: var(--pico-del-color);">⚠${s.processing_errors} indexing-failed</span>`);
             return parts.join(' · ');
         },
 

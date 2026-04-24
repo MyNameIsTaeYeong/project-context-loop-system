@@ -4,15 +4,23 @@
 :func:`execute_sync_target` 디스패처가 선택해 실행한다.
 
 - ``page`` scope: 단건 :func:`import_page_via_mcp`, diff 없음.
-- ``subtree`` scope: :func:`walk_subtree` 로 루트 아래 모든 페이지를
-  평탄화한 뒤 각 페이지를 임포트하고, 이전 membership 과의 차집합으로
-  제거된 페이지를 식별해 cascade 삭제한다.
+- ``subtree`` scope: :func:`enumerate_subtree_pages` 로 루트 아래 모든 depth
+  의 페이지를 CQL 로 평탄 열거한 뒤 각 페이지를 임포트하고, 이전 membership
+  과의 차집합으로 제거된 페이지를 cascade 삭제한다.
 - ``space`` scope: :func:`enumerate_space_pages` 로 공간 전체 페이지를
   CQL 페이지네이션으로 나열한 뒤 동일한 증분 로직을 적용한다.
 
 membership 반영은 **임포트 성공 시에만** 수행된다. 열거 자체가 실패하면
 membership을 건드리지 않고 반환 — 일시적 Confluence 장애가 기존 문서를
 삭제시키지 않도록 하기 위함.
+
+2 단계 구조 (Phase 1 + Phase 2):
+  1. 임포트 단계(Phase 1): MCP 에서 본문을 받아 meta 에 저장. 해시 기반 중복
+     제거로 ``created``/``updated``/``unchanged`` 분류.
+  2. 인덱싱 단계(Phase 2): ``execute_sync_target`` 에 ``embedding_client``/
+     ``pipeline_config`` 가 주입된 경우에만 실행. ``created``/``updated``
+     문서를 :func:`process_document` 로 처리(청크 → 임베딩 → 그래프). 인덱싱
+     실패는 ``processing_errors`` 에 격리되어 Phase 1 결과에 영향 없음.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from langchain_core.embeddings import Embeddings
 from mcp import ClientSession
 
 from context_loop.ingestion.mcp_confluence import (
@@ -29,6 +38,7 @@ from context_loop.ingestion.mcp_confluence import (
     estimate_subtree_page_count,
     import_page_via_mcp,
 )
+from context_loop.processor.pipeline import PipelineConfig, process_document
 from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
@@ -42,11 +52,13 @@ class SyncResult:
     """MCP 싱크 실행 결과 집계.
 
     Attributes:
-        created: 새로 임포트된 문서 ID.
-        updated: 내용이 변경된 문서 ID.
-        unchanged: 해시 동일로 건너뛴 문서 ID.
-        errors: 개별 페이지 처리 실패 ``{"page_id", "error"}`` 목록.
-        removed: 스코프에서 사라져 cascade 삭제된 문서 ID.
+        created: Phase 1 — 새로 임포트된 문서 ID.
+        updated: Phase 1 — 내용이 변경된 문서 ID.
+        unchanged: Phase 1 — 해시 동일로 건너뛴 문서 ID.
+        errors: Phase 1 — 개별 페이지 import 실패 ``{"page_id", "error"}`` 목록.
+        removed: Phase 1 — 스코프에서 사라져 cascade 삭제된 문서 ID.
+        processed: Phase 2 — 인덱싱 완료된 문서 ID (created+updated 중 성공한 것).
+        processing_errors: Phase 2 — 인덱싱 실패 ``{"doc_id", "error"}`` 목록.
     """
 
     created: list[int] = field(default_factory=list)
@@ -54,6 +66,8 @@ class SyncResult:
     unchanged: list[int] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
     removed: list[int] = field(default_factory=list)
+    processed: list[int] = field(default_factory=list)
+    processing_errors: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -71,12 +85,16 @@ class SyncResult:
             "unchanged": self.unchanged,
             "errors": self.errors,
             "removed": self.removed,
+            "processed": self.processed,
+            "processing_errors": self.processing_errors,
             "summary": {
                 "created": len(self.created),
                 "updated": len(self.updated),
                 "unchanged": len(self.unchanged),
                 "errors": len(self.errors),
                 "removed": len(self.removed),
+                "processed": len(self.processed),
+                "processing_errors": len(self.processing_errors),
                 "total": self.total,
             },
         }
@@ -89,6 +107,8 @@ async def execute_sync_target(
     meta_store: MetadataStore,
     vector_store: VectorStore,
     graph_store: GraphStore,
+    embedding_client: Embeddings | None = None,
+    pipeline_config: PipelineConfig | None = None,
 ) -> SyncResult:
     """싱크 대상 행의 scope 에 따라 올바른 sync 경로로 위임한다.
 
@@ -99,36 +119,102 @@ async def execute_sync_target(
         meta_store: 초기화된 MetadataStore.
         vector_store: 초기화된 VectorStore.
         graph_store: 초기화된 GraphStore.
+        embedding_client: 선택적. 주입되면 Phase 2(인덱싱)가 자동 실행된다.
+            주입되지 않으면 Phase 1(임포트) 까지만 수행하고 반환 — 기존 동작.
+        pipeline_config: 선택적. Phase 2 에서 :func:`process_document` 에
+            전달할 설정. 기본값은 :class:`PipelineConfig` 기본값.
 
     Returns:
-        :class:`SyncResult` 집계.
+        :class:`SyncResult` 집계. ``embedding_client`` 가 주입된 경우
+        ``processed``/``processing_errors`` 가 채워진다.
 
     Raises:
         ValueError: ``scope`` 가 알려진 값(page/subtree/space)이 아닐 때.
     """
     scope = target.get("scope")
     if scope == "page":
-        return await _sync_page(
+        result = await _sync_page(
             session, target,
             meta_store=meta_store,
             vector_store=vector_store,
             graph_store=graph_store,
         )
-    if scope == "subtree":
-        return await _sync_subtree(
+    elif scope == "subtree":
+        result = await _sync_subtree(
             session, target,
             meta_store=meta_store,
             vector_store=vector_store,
             graph_store=graph_store,
         )
-    if scope == "space":
-        return await _sync_space(
+    elif scope == "space":
+        result = await _sync_space(
             session, target,
             meta_store=meta_store,
             vector_store=vector_store,
             graph_store=graph_store,
         )
-    raise ValueError(f"Unknown sync target scope: {scope!r}")
+    else:
+        raise ValueError(f"Unknown sync target scope: {scope!r}")
+
+    # Phase 2: 인덱싱. embedding_client 가 주입된 경우에만 실행.
+    if embedding_client is not None:
+        await _run_processing_phase(
+            result,
+            meta_store=meta_store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            pipeline_config=pipeline_config,
+        )
+
+    return result
+
+
+async def _run_processing_phase(
+    result: SyncResult,
+    *,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Embeddings,
+    pipeline_config: PipelineConfig | None,
+) -> None:
+    """Phase 1 결과의 created/updated 문서를 파이프라인으로 인덱싱한다.
+
+    인덱싱 실패는 개별 문서 단위로 격리되어 ``result.processing_errors`` 에
+    누적될 뿐, 다른 문서의 인덱싱을 막지 않는다. 실패한 문서는 meta 의
+    ``status='failed'`` 로 마킹되어 사용자가 수동으로 재처리할 수 있다.
+
+    ``unchanged`` 는 인덱싱하지 않는다 — 내용이 그대로면 재임베딩은 낭비.
+    """
+    to_process = list(result.created) + list(result.updated)
+    if not to_process:
+        return
+
+    config = pipeline_config or PipelineConfig()
+    for doc_id in to_process:
+        try:
+            await process_document(
+                doc_id,
+                meta_store=meta_store,
+                vector_store=vector_store,
+                graph_store=graph_store,
+                embedding_client=embedding_client,
+                config=config,
+            )
+            result.processed.append(doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("문서 인덱싱 실패 doc_id=%s: %s", doc_id, exc)
+            result.processing_errors.append({
+                "doc_id": doc_id, "error": str(exc),
+            })
+            # 실패 표식 — 수동 재처리 흐름과 일치.
+            try:
+                await meta_store.update_document_status(doc_id, "failed")
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "status=failed 업데이트 실패 doc_id=%s", doc_id, exc_info=True,
+                )
 
 
 async def _sync_page(
