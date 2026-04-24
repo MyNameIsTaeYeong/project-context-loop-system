@@ -36,7 +36,8 @@
 - 사내 MCP 서버 전송 방식(SSE/stdio) 및 각 도구의 입출력 형식 확인 필요
 - 3가지 임포트 시나리오(검색, 트리 탐색, 내 문서) 구현
 - 웹 UI (탭 기반) 및 API 엔드포인트 추가
-- **진행 상태 (2026-04-23)**: 3-scope 싱크로 재설계되어 D-043 으로 백엔드 완성. 검색 기반 진입 + page/subtree/space 3범위 등록·싱크·해제의 REST API 와 동시성·안전 속성까지 완료. 수동 "검색 결과에서 페이지 선택 → 임포트" 와 "MCP `search_content` 기반 프리뷰" 는 기존 엔드포인트(`POST /api/confluence-mcp/search`, `POST /api/confluence-mcp/import`)가 유지된다. **남은 것은 UI(I-030)** 와 내 문서 임포트 UI.
+- **진행 상태 (2026-04-23)**: 3-scope 싱크로 재설계되어 D-043 으로 백엔드 완성. 검색 기반 진입 + page/subtree/space 3범위 등록·싱크·해제의 REST API 와 동시성·안전 속성까지 완료. 수동 "검색 결과에서 페이지 선택 → 임포트" 와 "MCP `search_content` 기반 프리뷰" 는 기존 엔드포인트(`POST /api/confluence-mcp/search`, `POST /api/confluence-mcp/import`)가 유지된다.
+- **진행 상태 (2026-04-24)**: I-030 해결로 3-scope 싱크 UI 까지 완성. 남은 항목은 트리 탐색형 UI 와 내 문서 임포트 UI 정도.
 
 ### I-011: Confluence REST API 접근 차단
 - 사내 보안 정책으로 Confluence REST API 직접 호출 불가
@@ -105,21 +106,18 @@
 - `get_neighbors`의 짧은 이름 fallback이 동작을 보장하지만, 스키마 요약에서 짧은 이름만 노출하거나 FQN 표기 가이드를 프롬프트에 추가하면 품질/토큰 모두 개선 여지
 - 우선순위: 중간. 현재는 fallback으로 문제 없음.
 
-### I-030: Confluence MCP 3-scope 싱크 UI 구현
-- D-043 로 백엔드(REST API + 동시성 + 안전 속성)는 완성됐으나 UI 는 미구현
-- 구현해야 하는 화면 요소 (`web/templates/confluence_mcp.html` 확장 + vanilla JS):
-  - 🔍 **검색 박스** + `GET /api/confluence-mcp/search?q=...` 호출 → spaces 섹션 + pages 섹션 병합 렌더
-  - 결과 카드에 3버튼 — 📄 "페이지만" / 🌿 "하위 포함" / 🏢 "공간 전체 싱크"
-  - **확인 다이얼로그 3종**:
-    - 🌿 하위 포함: 가벼운 안내 ("수십 분 걸릴 수 있음")
-    - 🏢 공간 전체: `GET /spaces/{key}/estimate` 선행 호출 → "예상 N개" 표시 + 시작/취소
-    - ❌ 해제: "다른 target 이 공유하지 않는 문서는 함께 삭제" 경고
-  - 등록된 대상 카드 목록 (`GET /sync-targets`) + scope 아이콘 + last_sync / page_count 뱃지 + [🔄 싱크] [해제] 버튼
-  - 폴링 기반 진행 상태 (2초 간격 `GET /sync-targets/{id}` → in_progress 스피너 + "완료: +N new · ~N updated · -N removed" 요약)
-- 참고: 기존 `POST /api/confluence-mcp/search` (수동 import) 와 신규 `GET /api/confluence-mcp/search` (3-scope 진입) 는 HTTP 메서드로 구분되어 공존 중. 구 UI(수동 임포트 탭)는 유지.
-- 우선순위: 높음 (백엔드 제공 가치를 사용자에게 노출하는 마지막 관문). 병렬 세션으로 분리 가능.
-
 ## 해결됨
+
+### I-030: Confluence MCP 3-scope 싱크 UI 구현 → 해결 (2026-04-24)
+- `web/templates/confluence_mcp.html` 단일 파일 확장으로 완료. `syncTargetsPanel()` Alpine 컴포넌트 신설.
+- 구현된 요소:
+  - 🔍 검색 박스: `GET /api/confluence-mcp/search?q=...` → Spaces / Pages 두 섹션으로 분리 렌더, 빈 쿼리 시 모든 공간 노출
+  - 결과 카드 3버튼: 📄 페이지만 / 🌿 하위 포함 / 🏢 공간 전체 (Space 카드는 🏢 단일 버튼)
+  - 확인 다이얼로그 3종: subtree(즉시), space(estimate 선행 후 "예상 N개" 표시), unregister(cascade 경고)
+  - 등록된 대상 카드 목록: scope 뱃지 색상(`scope-page`/`subtree`/`space`) + 상대시간 last_sync + 증분 요약 monospace 뱃지(+N new · ~N updated · -N removed) + [🔄 재싱크] [❌ 해제]
+  - 폴링: running/queued 가 하나라도 있을 때만 2초 간격 `GET /sync-targets/{id}` 자가 시작·정지
+- 구 단발성 임포트 UI(3탭)는 `<details>` 로 접어 "고급" 영역에 보존
+- 회귀 테스트: `tests/test_web/test_confluence_mcp_sync_api.py` 19건 모두 통과 (UI 자체는 E2E 없음, 백엔드 계약을 따름)
 
 ### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
 - `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리
