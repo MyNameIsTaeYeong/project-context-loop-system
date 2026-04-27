@@ -35,10 +35,14 @@ async def client(stores):
     meta_store, vector_store, graph_store = stores
 
     app = create_app()
-    # lifespan 대신 직접 스토어를 주입
+    # lifespan 대신 직접 스토어를 주입.
+    # llm_client / embedding_client 는 라우트가 Depends 로 요구하므로 None 으로
+    # 등록만 해 둔다 (실제 호출은 mock 으로 격리되거나 None-가드로 스킵됨).
     app.state.meta_store = meta_store
     app.state.vector_store = vector_store
     app.state.graph_store = graph_store
+    app.state.llm_client = None
+    app.state.embedding_client = None
 
     async with AsyncClient(
         transport=ASGITransport(app=app),

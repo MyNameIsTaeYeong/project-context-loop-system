@@ -290,8 +290,9 @@ class TestPipelineProcessing:
         assert call_kwargs[1]["vector_store"] is mock_vs
         assert call_kwargs[1]["graph_store"] is mock_gs
         assert call_kwargs[1]["embedding_client"] is mock_emb
-        # llm_client / storage_method_override는 더 이상 전달되지 않는다
-        assert "llm_client" not in call_kwargs[1]
+        # storage_method_override 는 더 이상 전달되지 않는다.
+        # llm_client 는 이제 항상 전달되며, CoordinatorAgent 가 받지 않았으면 None.
+        assert call_kwargs[1].get("llm_client") is None
         assert "storage_method_override" not in call_kwargs[1]
 
     async def test_process_through_pipeline_handles_error(

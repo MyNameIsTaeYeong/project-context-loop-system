@@ -10,6 +10,7 @@ from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.editor import save_document
+from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.pipeline import build_meta_view_text
 from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
@@ -19,6 +20,7 @@ from context_loop.web.dependencies import (
     get_config,
     get_embedding_client,
     get_graph_store,
+    get_llm_client,
     get_meta_store,
     get_templates,
     get_vector_store,
@@ -326,6 +328,7 @@ async def trigger_processing(
     graph_store: GraphStore = Depends(get_graph_store),
     config: Config = Depends(get_config),
     embedding_client: Embeddings = Depends(get_embedding_client),
+    llm_client: LLMClient = Depends(get_llm_client),
 ):
     """문서 처리를 백그라운드로 실행한다."""
     doc = await meta_store.get_document(document_id)
@@ -336,7 +339,7 @@ async def trigger_processing(
     background_tasks.add_task(
         _run_pipeline,
         document_id, meta_store, vector_store, graph_store, config,
-        embedding_client,
+        embedding_client, llm_client,
     )
     return {"status": "processing", "document_id": document_id}
 
@@ -348,6 +351,7 @@ async def _run_pipeline(
     graph_store: GraphStore,
     config: Config,
     embedding_client: Embeddings,
+    llm_client: LLMClient | None = None,
 ) -> None:
     """백그라운드에서 파이프라인을 실행한다."""
     try:
@@ -366,6 +370,7 @@ async def _run_pipeline(
             graph_store=graph_store,
             embedding_client=embedding_client,
             config=pipeline_config,
+            llm_client=llm_client,
         )
     except Exception:
         logger.exception("문서 %d 파이프라인 실행 실패", document_id)

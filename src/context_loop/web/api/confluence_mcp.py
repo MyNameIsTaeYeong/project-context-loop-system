@@ -28,6 +28,7 @@ from context_loop.ingestion.mcp_confluence import (
     search_content,
     search_content_envelope,
 )
+from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.pipeline import PipelineConfig
 from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
@@ -38,6 +39,7 @@ from context_loop.web.dependencies import (
     get_config,
     get_embedding_client,
     get_graph_store,
+    get_llm_client,
     get_meta_store,
     get_templates,
     get_vector_store,
@@ -357,6 +359,7 @@ async def create_sync_target(
     vector_store: VectorStore = Depends(get_vector_store),
     graph_store: GraphStore = Depends(get_graph_store),
     embedding_client: Embeddings = Depends(get_embedding_client),
+    llm_client: LLMClient = Depends(get_llm_client),
 ) -> dict[str, Any]:
     """싱크 대상을 등록하고 첫 싱크를 백그라운드로 예약한다.
 
@@ -413,7 +416,7 @@ async def create_sync_target(
     background_tasks.add_task(
         _run_sync_in_background,
         target["id"], config, meta_store, vector_store, graph_store,
-        embedding_client,
+        embedding_client, llm_client,
     )
 
     return {
@@ -455,6 +458,7 @@ async def trigger_sync_target(
     vector_store: VectorStore = Depends(get_vector_store),
     graph_store: GraphStore = Depends(get_graph_store),
     embedding_client: Embeddings = Depends(get_embedding_client),
+    llm_client: LLMClient = Depends(get_llm_client),
 ) -> dict[str, Any]:
     """등록된 대상을 다시 싱크한다 (동일 target 중복 실행 시 409)."""
     target = await meta_store.get_sync_target(target_id)
@@ -468,7 +472,7 @@ async def trigger_sync_target(
     background_tasks.add_task(
         _run_sync_in_background,
         target_id, config, meta_store, vector_store, graph_store,
-        embedding_client,
+        embedding_client, llm_client,
     )
     return {"status": {"state": "queued"}}
 
@@ -524,6 +528,7 @@ async def _run_sync_in_background(
     vector_store: VectorStore,
     graph_store: GraphStore,
     embedding_client: Embeddings,
+    llm_client: LLMClient | None = None,
 ) -> None:
     """BackgroundTasks 로 호출되는 실제 싱크 러너.
 
@@ -563,6 +568,7 @@ async def _run_sync_in_background(
                     vector_store=vector_store,
                     graph_store=graph_store,
                     embedding_client=embedding_client,
+                    llm_client=llm_client,
                     pipeline_config=pipeline_config,
                     phase2_concurrency=phase2_concurrency,
                 )

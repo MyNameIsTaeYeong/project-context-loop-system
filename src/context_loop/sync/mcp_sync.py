@@ -39,6 +39,7 @@ from context_loop.ingestion.mcp_confluence import (
     estimate_subtree_page_count,
     import_page_via_mcp,
 )
+from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.pipeline import PipelineConfig, process_document
 from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
@@ -112,6 +113,7 @@ async def execute_sync_target(
     vector_store: VectorStore,
     graph_store: GraphStore,
     embedding_client: Embeddings | None = None,
+    llm_client: LLMClient | None = None,
     pipeline_config: PipelineConfig | None = None,
     phase2_concurrency: int = DEFAULT_PHASE2_CONCURRENCY,
 ) -> SyncResult:
@@ -173,6 +175,7 @@ async def execute_sync_target(
             vector_store=vector_store,
             graph_store=graph_store,
             embedding_client=embedding_client,
+            llm_client=llm_client,
             pipeline_config=pipeline_config,
             concurrency=phase2_concurrency,
         )
@@ -188,6 +191,7 @@ async def _run_processing_phase(
     vector_store: VectorStore,
     graph_store: GraphStore,
     embedding_client: Embeddings,
+    llm_client: LLMClient | None,
     pipeline_config: PipelineConfig | None,
     concurrency: int,
 ) -> None:
@@ -246,6 +250,7 @@ async def _run_processing_phase(
                     graph_store=graph_store,
                     embedding_client=embedding_client,
                     config=config,
+                    llm_client=llm_client,
                 )
                 result.processed.append(doc_id)
             except Exception as exc:  # noqa: BLE001

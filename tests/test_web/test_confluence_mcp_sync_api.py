@@ -83,6 +83,7 @@ async def client(stores):  # type: ignore[misc]
     app.state.vector_store = vector_store
     app.state.graph_store = graph_store
     app.state.embedding_client = _DummyEmbeddings()
+    app.state.llm_client = None
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
