@@ -37,6 +37,7 @@ from context_loop.processor.body_extractor import extract_body_graph
 from context_loop.processor.chunker import chunk_extracted_document, chunk_text
 from context_loop.processor.extraction_unit import build_extraction_units
 from context_loop.processor.link_graph_builder import build_link_graph
+from context_loop.processor.llm_body_extractor import extract_llm_body_graph
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
     start_reprocessing,
@@ -61,6 +62,7 @@ class PipelineConfig:
     chunk_size: int = 512
     chunk_overlap: int = 50
     embedding_model: str = "text-embedding-3-small"
+    enable_llm_body_extraction: bool = False  # opt-in (비용 발생)
 
 
 async def process_document(
@@ -71,6 +73,7 @@ async def process_document(
     graph_store: GraphStore,
     embedding_client: Embeddings,
     config: PipelineConfig | None = None,
+    llm_client: Any = None,
 ) -> dict[str, Any]:
     """단일 문서를 전체 파이프라인으로 처리한다.
 
@@ -313,6 +316,31 @@ async def process_document(
                             body_result.get("merged", 0),
                             len(units),
                         )
+
+                    # LLM 의미 관계 추출 (opt-in, 비용 발생)
+                    # 결정론 본문 그래프와 같은 ``document`` 노드로 수렴하지는
+                    # 않지만, 도메인 엔티티 간 의미 관계 (depends_on, implements,
+                    # owned_by 등) 를 추가하여 그래프의 추론 가치를 끌어올린다.
+                    if cfg.enable_llm_body_extraction and llm_client is not None:
+                        llm_graph, llm_stats = await extract_llm_body_graph(
+                            units, doc_title=title, llm_client=llm_client,
+                        )
+                        if llm_graph.entities:
+                            llm_result = await graph_store.save_graph_data(
+                                document_id, llm_graph,
+                            )
+                            node_count += llm_result["nodes"]
+                            edge_count += llm_result["edges"]
+                            logger.info(
+                                "LLM 본문 그래프 저장 — doc_id=%d, nodes=%d, "
+                                "edges=%d, merged=%d, units_called=%d/%d",
+                                document_id,
+                                llm_result["nodes"],
+                                llm_result["edges"],
+                                llm_result.get("merged", 0),
+                                llm_stats.units_called,
+                                llm_stats.units_total,
+                            )
 
         storage_method = _derive_storage_method(
             has_chunks=chunk_count > 0,

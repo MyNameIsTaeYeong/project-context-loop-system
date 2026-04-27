@@ -677,3 +677,120 @@ async def test_body_graph_skipped_when_no_signal(
 
     # outbound_links 도 없고 본문 시그널도 없으므로 save_graph_data 미호출
     graph_store.save_graph_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_skipped_when_disabled(
+    store: MetadataStore,
+) -> None:
+    """기본 PipelineConfig (enable_llm_body_extraction=False) 에서는 LLM 호출 없음."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+    llm_client.complete = AsyncMock(return_value='{"entities": [], "relations": []}')
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),  # enable_llm_body_extraction=False
+            llm_client=llm_client,
+        )
+
+    llm_client.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_skipped_when_no_client(
+    store: MetadataStore,
+) -> None:
+    """enable_llm_body_extraction=True 여도 llm_client=None 이면 스킵."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        # llm_client 미전달 → 호출 흐름이 LLM 단계로 들어가지 않음
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+        )
+
+    # 정상 통과 (예외 없이) + 그래프는 link/body 결정론만 저장됨
+    # 추가 검증: extract_llm_body_graph 호출 흔적 없음
+    # (별도 patch 로 호출 여부 검증)
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_runs_when_enabled(
+    store: MetadataStore,
+) -> None:
+    """enable=True + llm_client 가 있으면 LLM 본문 추출이 실행되어 그래프에 저장된다."""
+    from context_loop.processor.graph_extractor import Entity, Relation
+    from context_loop.processor.llm_body_extractor import LLMBodyExtractionStats
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    fake_llm_graph = GraphData(
+        entities=[
+            Entity(name="Auth Service", entity_type="system"),
+            Entity(name="Token Validator", entity_type="module"),
+        ],
+        relations=[
+            Relation(
+                source="Auth Service",
+                target="Token Validator",
+                relation_type="depends_on",
+            ),
+        ],
+    )
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ), patch(
+        # 결정론 본문 추출은 격리
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ), patch(
+        # LLM 추출기 자체를 patch — 게이트/실제 LLM 호출은 별도 단위 테스트에서 검증
+        "context_loop.processor.pipeline.extract_llm_body_graph",
+        new=AsyncMock(return_value=(fake_llm_graph, LLMBodyExtractionStats())),
+    ) as mock_llm_extract:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+            llm_client=llm_client,
+        )
+
+    # extract_llm_body_graph 가 호출되었는지 (게이트 통과)
+    mock_llm_extract.assert_awaited_once()
+    # LLM 그래프가 GraphStore 에 저장되었는지
+    saved_graphs = [
+        call.args[1] for call in graph_store.save_graph_data.await_args_list
+    ]
+    llm_graphs = [
+        g for g in saved_graphs
+        if any(r.relation_type == "depends_on" for r in g.relations)
+    ]
+    assert len(llm_graphs) == 1
+    names = {e.name for e in llm_graphs[0].entities}
+    assert {"Auth Service", "Token Validator"} <= names
