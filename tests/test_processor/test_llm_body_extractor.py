@@ -459,3 +459,21 @@ async def test_prompt_includes_doc_title_and_unit_body() -> None:
     # 시스템 프롬프트에 어휘가 들어가 있어야 함
     assert "depends_on" in system_prompt
     assert "system" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_complete_call_disables_thinking_mode() -> None:
+    """reasoning 모델(Qwen3 등) 의 thinking 모드를 끄는 extra_body 가 전달된다.
+
+    빈 응답 회귀 방지: thinking 모드가 켜진 채 JSON 추출 프롬프트가 들어가면
+    모델이 max_tokens 예산을 사고에 모두 쓰고 답변이 비는 문제가 있었다.
+    ``graph_search_planner`` 와 동일한 처방을 적용한다.
+    """
+    payload = {"entities": [], "relations": []}
+    llm = _llm_returning(payload)
+    await extract_llm_body_graph([_unit()], doc_title="d", llm_client=llm)
+
+    kwargs = llm.complete.await_args.kwargs
+    extra_body = kwargs.get("extra_body")
+    assert extra_body is not None, "extra_body 가 누락되었습니다"
+    assert extra_body == {"chat_template_kwargs": {"enable_thinking": False}}

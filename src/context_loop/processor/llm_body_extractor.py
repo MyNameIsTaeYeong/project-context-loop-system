@@ -77,7 +77,9 @@ class LLMBodyExtractionConfig:
     skip_split_overlap_parts: bool = True
     max_units_per_doc: int | None = None
     max_concurrency: int = 3
-    max_tokens: int = 1024
+    # 본문 1500 토큰 unit 에서 entities + relations JSON 응답이 1000+ 토큰
+    # 으로 늘어날 수 있어 1024 는 빠듯함. 2048 로 두면 일반적 응답 안정.
+    max_tokens: int = 2048
     temperature: float = 0.0
 
 
@@ -299,7 +301,15 @@ async def _call_llm(
     llm_client: LLMClient,
     cfg: LLMBodyExtractionConfig,
 ) -> dict[str, Any]:
-    """unit 하나에 대해 LLM 호출 → JSON 파싱."""
+    """unit 하나에 대해 LLM 호출 → JSON 파싱.
+
+    ``extra_body`` 의 ``enable_thinking=False`` 는 Qwen3 등 reasoning 모델의
+    ``<think>...</think>`` 사고 모드를 비활성화한다. 사고 모드가 켜진 채로
+    JSON 추출 프롬프트를 받으면 모델이 ``max_tokens`` 예산을 사고에 모두
+    소진하고 실제 JSON 답변이 비거나 잘리는 문제를 방지한다 (
+    ``graph_search_planner`` 와 같은 처방). ``extra_body`` 를 지원하지
+    않는 클라이언트(Anthropic, OpenAI) 는 ``**kwargs`` 로 무시한다.
+    """
     system = _SYSTEM_PROMPT_TEMPLATE.format(
         entity_types=_format_vocab(cfg.allowed_entity_types),
         relation_types=_format_vocab(cfg.allowed_relation_types),
@@ -310,6 +320,7 @@ async def _call_llm(
         system=system,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     payload = extract_json(response)
     if not isinstance(payload, dict):
