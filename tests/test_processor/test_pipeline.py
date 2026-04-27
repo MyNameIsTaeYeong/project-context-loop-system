@@ -24,12 +24,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from context_loop.processor.chunker import Chunk
+from context_loop.processor.graph_extractor import GraphData
 from context_loop.processor.pipeline import (
     PipelineConfig,
     build_meta_view_text,
     process_document,
 )
 from context_loop.storage.metadata_store import MetadataStore
+
+
+def _empty_graph_data() -> GraphData:
+    return GraphData()
 
 
 @pytest.fixture
@@ -221,6 +226,10 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
     with patch(
         "context_loop.processor.pipeline.chunk_extracted_document",
         return_value=[],
+    ), patch(
+        # 본문 그래프는 별도 테스트에서 검증 — 여기서는 링크 그래프만 격리해서 본다
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=_empty_graph_data(),
     ):
         result = await process_document(
             doc_id,
@@ -231,7 +240,7 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
             config=PipelineConfig(),
         )
 
-    # AST graph/LLM graph가 제거된 상태이므로 save_graph_data는 링크 그래프 1회만 호출된다.
+    # 본문 그래프는 patch 되어 빈 GraphData → save_graph_data 는 링크 그래프 1회만
     graph_store.save_graph_data.assert_awaited_once()
     saved_doc_id, saved_graph = graph_store.save_graph_data.await_args.args
     assert saved_doc_id == doc_id
@@ -600,3 +609,71 @@ async def test_git_code_pipeline_persists_embed_text(
     assert "hello" in chunk["embed_text"]  # 심볼 이름
     # 본문(전체 코드)와 다른 값이어야 함 — 임베딩과 저장의 분리(D-036)
     assert chunk["embed_text"] != chunk["content"]
+
+
+@pytest.mark.asyncio
+async def test_body_graph_saved_for_confluence_with_signal(
+    store: MetadataStore,
+) -> None:
+    """ExtractionUnit 본문에 강조 용어/API/표 헤더가 있으면 body 그래프가 저장된다."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    graph_store.save_graph_data = AsyncMock(return_value={
+        "nodes": 4, "edges": 3, "merged": 0,
+    })
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # 링크 그래프 + 본문 그래프 = 최소 2회 호출
+    saved_graphs = [
+        call.args[1] for call in graph_store.save_graph_data.await_args_list
+    ]
+    assert len(saved_graphs) >= 2
+
+    # 본문 그래프는 has_attribute(테이블 헤더) 또는 documents(API) 관계를 갖는다
+    body_graphs = [
+        g for g in saved_graphs
+        if any(
+            r.relation_type in ("has_attribute", "documents", "mentions",
+                                "mentions_ticket")
+            for r in g.relations
+        )
+    ]
+    assert body_graphs, "본문 그래프가 저장되지 않음"
+
+
+@pytest.mark.asyncio
+async def test_body_graph_skipped_when_no_signal(
+    store: MetadataStore,
+) -> None:
+    """본문에 강조/API/표/Jira 가 하나도 없으면 body 그래프 save 가 호출되지 않는다."""
+    plain_html = "<h1>제목</h1><p>그냥 평문 본문 텍스트.</p>"
+    doc_id = await _create_confluence_doc(store, raw_content=plain_html)
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # outbound_links 도 없고 본문 시그널도 없으므로 save_graph_data 미호출
+    graph_store.save_graph_data.assert_not_awaited()

@@ -33,7 +33,9 @@ from context_loop.processor.ast_code_extractor import (
     to_chunks,
     to_graph_data,
 )
+from context_loop.processor.body_extractor import extract_body_graph
 from context_loop.processor.chunker import chunk_extracted_document, chunk_text
+from context_loop.processor.extraction_unit import build_extraction_units
 from context_loop.processor.link_graph_builder import build_link_graph
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
@@ -285,6 +287,32 @@ async def process_document(
                         link_edge_count,
                         link_result.get("merged", 0),
                     )
+
+            # 본문 그래프 (결정론적, LLM 호출 없음)
+            # ExtractionUnit 단위로 굵게/API/표 헤더/Jira 키를 엔티티로 추출하고
+            # self-document 와 연결한다. 링크 그래프와 같은 ``document`` 노드로
+            # GraphStore 의 정규 노드 병합을 통해 자연 수렴한다.
+            if extracted is not None and extracted.sections:
+                units = build_extraction_units(
+                    extracted, document_id=document_id, doc_title=title,
+                )
+                if units:
+                    body_graph = extract_body_graph(units, doc_title=title)
+                    if body_graph.entities:
+                        body_result = await graph_store.save_graph_data(
+                            document_id, body_graph,
+                        )
+                        node_count += body_result["nodes"]
+                        edge_count += body_result["edges"]
+                        logger.info(
+                            "본문 그래프 저장 — doc_id=%d, nodes=%d, edges=%d, "
+                            "merged=%d, units=%d",
+                            document_id,
+                            body_result["nodes"],
+                            body_result["edges"],
+                            body_result.get("merged", 0),
+                            len(units),
+                        )
 
         storage_method = _derive_storage_method(
             has_chunks=chunk_count > 0,
