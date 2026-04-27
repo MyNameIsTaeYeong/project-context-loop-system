@@ -53,6 +53,18 @@ def _filter(graph, *, entity_type: str | None = None, relation_type: str | None 
     return []
 
 
+def _full_config() -> BodyExtractionConfig:
+    """모든 시그널(bold/table 포함)을 활성화한 config.
+
+    기본 config 는 보수적으로 bold/table 을 OFF 로 두므로, 휴리스틱 시그널
+    동작을 검증하는 테스트는 명시적으로 ON 해서 사용한다.
+    """
+    return BodyExtractionConfig(
+        extract_bold_terms=True,
+        extract_table_headers=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 빈 입력 / 가드
 # ---------------------------------------------------------------------------
@@ -76,6 +88,27 @@ def test_no_signal_in_body_returns_empty_graph() -> None:
     assert g.entities == [] and g.relations == []
 
 
+def test_default_config_skips_bold_and_table() -> None:
+    """기본 config 는 bold/table 시그널 OFF — API/Jira 만 추출된다."""
+    body = (
+        "**Bold Term** 등장하지만 추출 안 됨.\n\n"
+        "| H1 | H2 |\n"
+        "|---|---|\n"
+        "| a | b |\n\n"
+        "POST /v1/test 와 PROJ-1 은 추출됨."
+    )
+    unit = _make_unit(body=body)
+    g = extract_body_graph([unit], doc_title="d")  # 기본 config
+    types = {(e.name, e.entity_type) for e in g.entities}
+    # 기본 ON: API, Jira
+    assert ("POST /v1/test", "api") in types
+    assert ("PROJ-1", "ticket") in types
+    # 기본 OFF: bold, table
+    assert ("Bold Term", "concept") not in types
+    assert ("H1", "concept") not in types
+    assert ("H2", "concept") not in types
+
+
 # ---------------------------------------------------------------------------
 # 굵게 강조 용어
 # ---------------------------------------------------------------------------
@@ -87,7 +120,7 @@ def test_bold_terms_extracted_as_concept() -> None:
         "또 다시 **Auth Service** 가 등장한다."
     )
     unit = _make_unit(body=body, section_path=("Arch", "Auth"))
-    g = extract_body_graph([unit], doc_title="설계서")
+    g = extract_body_graph([unit], doc_title="설계서", config=_full_config())
 
     concepts = _filter(g, entity_type="concept")
     names = sorted(e.name for e in concepts)
@@ -108,7 +141,7 @@ def test_bold_terms_extracted_as_concept() -> None:
 def test_bold_alternative_underscore_syntax() -> None:
     body = "__Single Sign On__ 은 인증 표준."
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     concepts = _filter(g, entity_type="concept")
     assert any(e.name == "Single Sign On" for e in concepts)
 
@@ -121,7 +154,7 @@ def test_bold_too_short_or_too_long_skipped() -> None:
         "**Valid Term** 정상."
     )
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     names = {e.name for e in _filter(g, entity_type="concept")}
     assert "Valid Term" in names
     assert "A" not in names
@@ -139,7 +172,7 @@ def test_bold_inside_code_blocks_skipped() -> None:
         "그리고 인라인 `**Inline Fake**` 도 무시.\n"
     )
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     names = {e.name for e in _filter(g, entity_type="concept")}
     assert "Real Concept" in names
     assert "Fake Concept" not in names
@@ -160,7 +193,7 @@ def test_bold_numeric_only_skipped() -> None:
     """숫자/기호만 있는 강조는 의미 부족 → 제외."""
     body = "**123** 와 **!!** 는 의미 없음. **정상 용어** 만 남는다."
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     names = {e.name for e in _filter(g, entity_type="concept")}
     assert "정상 용어" in names
     assert "123" not in names and "!!" not in names
@@ -226,7 +259,7 @@ def test_table_headers_extracted_as_concept() -> None:
         "| User DB | PG | Y |\n"
     )
     unit = _make_unit(body=body, section_path=("Arch",))
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     headers = {e.name for e in _filter(g, entity_type="concept")}
     assert {"컴포넌트", "종류", "필수"} <= headers
 
@@ -236,13 +269,13 @@ def test_table_headers_extracted_as_concept() -> None:
 
 
 def test_huge_tables_are_skipped() -> None:
-    """열 수가 ``max_table_columns`` 초과면 표를 건너뛴다."""
+    """열 수가 ``max_table_columns`` 초과면 표를 건너뛴다 (table 추출 ON 가정)."""
     headers = "| " + " | ".join(f"col{i}" for i in range(15)) + " |"
     sep = "|" + "---|" * 15
     row = "| " + " | ".join(f"v{i}" for i in range(15)) + " |"
     body = headers + "\n" + sep + "\n" + row
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     assert _filter(g, entity_type="concept") == []
 
 
@@ -306,7 +339,7 @@ def test_cross_unit_entity_dedup() -> None:
     """여러 unit 에 같은 용어가 등장해도 entity / relation 는 한 개."""
     u1 = _make_unit(body="**Auth Service** 는 1번 unit.", section_path=("S1",), ordinal=0)
     u2 = _make_unit(body="**Auth Service** 는 2번 unit.", section_path=("S2",), ordinal=1)
-    g = extract_body_graph([u1, u2], doc_title="d")
+    g = extract_body_graph([u1, u2], doc_title="d", config=_full_config())
     concepts = _filter(g, entity_type="concept")
     assert [e.name for e in concepts] == ["Auth Service"]
     rels = _filter(g, relation_type="mentions")
@@ -318,7 +351,7 @@ def test_cross_unit_entity_dedup() -> None:
 def test_case_insensitive_entity_dedup_keeps_first_casing() -> None:
     body = "처음 **Auth Service**, 그 다음 **AUTH SERVICE** 도 등장."
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="d")
+    g = extract_body_graph([unit], doc_title="d", config=_full_config())
     concepts = _filter(g, entity_type="concept")
     assert len(concepts) == 1
     # 첫 등장의 표기를 보존
@@ -326,9 +359,9 @@ def test_case_insensitive_entity_dedup_keeps_first_casing() -> None:
 
 
 def test_self_entity_first_and_only_one() -> None:
-    body = "**A** 와 **B** 그리고 POST /x 와 PROJ-1."
+    body = "**Aa** 와 **Bb** 그리고 POST /x 와 PROJ-1."
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="설계서")
+    g = extract_body_graph([unit], doc_title="설계서", config=_full_config())
     docs = [e for e in g.entities if e.entity_type == "document"]
     assert len(docs) == 1
     assert g.entities[0].name == "설계서"
@@ -347,7 +380,7 @@ def test_multiple_signal_types_in_one_unit() -> None:
         "| 의존 | Token Validator |\n"
     )
     unit = _make_unit(body=body)
-    g = extract_body_graph([unit], doc_title="설계")
+    g = extract_body_graph([unit], doc_title="설계", config=_full_config())
     types = {(e.name, e.entity_type) for e in g.entities}
     assert ("Auth Service", "concept") in types
     assert ("PROJ-42", "ticket") in types
@@ -367,7 +400,7 @@ def test_integration_with_build_extraction_units() -> None:
         ExtractedDocument(plain_text="ignored", sections=sections),
         document_id=1, doc_title="d",
     )
-    g = extract_body_graph(units, doc_title="d")
+    g = extract_body_graph(units, doc_title="d", config=_full_config())
     names = {e.name for e in g.entities}
     assert "Auth Service" in names
     assert "POST /v1/login" in names

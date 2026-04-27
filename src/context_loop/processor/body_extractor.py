@@ -1,11 +1,18 @@
 """ExtractionUnit 본문 → 결정론적 엔티티/관계 추출기.
 
-LLM 호출 없이 본문에서 다음 4가지 시그널을 추출하여 ``GraphData`` 로 변환한다.
+LLM 호출 없이 본문에서 4가지 시그널을 추출하여 ``GraphData`` 로 변환한다.
 
-1. 굵게 강조된 용어 (``**X**`` / ``__X__``)            → ``concept``
-2. HTTP API 엔드포인트 (``POST /v1/payments`` 등)      → ``api``
-3. 마크다운 테이블의 헤더 셀                           → ``concept``
-4. Jira 이슈 키 (``PROJ-123``)                         → ``ticket``
+1. HTTP API 엔드포인트 (``POST /v1/payments`` 등)      → ``api``       [기본 ON]
+2. Jira 이슈 키 (``PROJ-123``)                         → ``ticket``    [기본 ON]
+3. 굵게 강조된 용어 (``**X**`` / ``__X__``)            → ``concept``   [기본 OFF]
+4. 마크다운 테이블의 헤더 셀                           → ``concept``   [기본 OFF]
+
+기본 활성/비활성 정책
+---------------------
+구조적 신호(API 엔드포인트, Jira 키)는 형식이 명확하고 작성자 의도가
+강하므로 기본 ON. 반면 강조 용어와 표 헤더는 작성 컨벤션 의존도가
+높고 노이즈("Method", "필수", "예시" 같은 추상 헤더 / 단순 강조)가
+많아 기본 OFF. 의미 관계 추출은 LLM 추출기에 위임한다.
 
 링크 그래프(``link_graph_builder``)와 마찬가지로 자기 문서를
 ``Entity(name=doc_title, entity_type="document")`` 로 등록하고, 본문에서
@@ -55,11 +62,18 @@ _MAX_TABLE_COLUMNS = 12
 class BodyExtractionConfig:
     """본문 추출기 옵션.
 
+    기본값 정책: 구조적 신호(API/Jira)는 ON, 휴리스틱 신호(강조/표 헤더)는
+    OFF. 의미 관계 추출은 LLM 추출기에 위임한다 (모듈 docstring 참조).
+
     Attributes:
-        extract_bold_terms: ``**X**`` / ``__X__`` 굵게 강조 용어 추출.
-        extract_api_endpoints: ``GET /path`` 형태 API 엔드포인트 추출.
-        extract_table_headers: 마크다운 테이블 헤더 셀을 ``concept`` 로 추출.
-        extract_jira_keys: ``PROJ-123`` 형태 Jira 키를 ``ticket`` 으로 추출.
+        extract_api_endpoints: ``GET /path`` 형태 API 엔드포인트 추출
+            (기본 ON — 형식이 명확하고 작성자 의도가 강함).
+        extract_jira_keys: ``PROJ-123`` 형태 Jira 키를 ``ticket`` 으로 추출
+            (기본 ON — 정규 표현식으로 정확).
+        extract_bold_terms: ``**X**`` / ``__X__`` 굵게 강조 용어를
+            ``concept`` 로 추출 (기본 OFF — 작성 컨벤션 의존, 노이즈 많음).
+        extract_table_headers: 마크다운 테이블 헤더 셀을 ``concept`` 로
+            추출 (기본 OFF — "Method", "필수" 같은 추상 헤더가 노이즈).
         bold_min_length: 강조 용어 최소 글자 수 (이 미만 스킵).
         bold_max_length: 강조 용어 최대 글자 수 (초과 시 문장으로 보고 스킵).
         max_table_columns: 표 헤더 셀 수 상한 (초과 시 표 전체 스킵).
@@ -68,10 +82,10 @@ class BodyExtractionConfig:
             스캔한다 (코드 예제에 API 가 자주 있음).
     """
 
-    extract_bold_terms: bool = True
     extract_api_endpoints: bool = True
-    extract_table_headers: bool = True
     extract_jira_keys: bool = True
+    extract_bold_terms: bool = False
+    extract_table_headers: bool = False
     bold_min_length: int = 2
     bold_max_length: int = 60
     max_table_columns: int = _MAX_TABLE_COLUMNS
