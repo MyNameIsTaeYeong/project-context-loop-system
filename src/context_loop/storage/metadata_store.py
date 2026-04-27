@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     token_count INTEGER,
     section_path TEXT DEFAULT '',
     section_anchor TEXT DEFAULT '',
-    embed_text TEXT DEFAULT ''
+    embed_text TEXT DEFAULT '',
+    section_index INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -173,6 +174,10 @@ class MetadataStore:
         if "embed_text" not in chunk_columns:
             await self.db.execute(
                 "ALTER TABLE chunks ADD COLUMN embed_text TEXT DEFAULT ''",
+            )
+        if "section_index" not in chunk_columns:
+            await self.db.execute(
+                "ALTER TABLE chunks ADD COLUMN section_index INTEGER",
             )
 
     async def close(self) -> None:
@@ -315,6 +320,7 @@ class MetadataStore:
         section_path: str = "",
         section_anchor: str = "",
         embed_text: str = "",
+        section_index: int | None = None,
     ) -> None:
         """청크를 저장한다.
 
@@ -322,15 +328,20 @@ class MetadataStore:
         다른 경우(이름+시그니처+docstring)에 채운다. 일반 분기는 본문 자체가
         임베딩 입력이므로 빈 문자열로 둔다 — 대시보드/감사 시점에 ChromaDB
         엔트리의 임베딩 입력을 그대로 보여주기 위한 영속화 용도.
+
+        ``section_index`` 는 Confluence 구조화 추출 경로에서 청크가 유래한
+        ``ExtractedDocument.sections`` 인덱스이다. ExtractionUnit 의
+        ``section_ids`` 와 조인해 청크-unit 매핑을 복원하는 데 쓰인다.
+        그 외 경로(일반 마크다운, AST 코드)에서는 ``None`` 으로 둔다.
         """
         await self.db.execute(
             "INSERT INTO chunks "
             "(id, document_id, chunk_index, content, token_count, "
-            " section_path, section_anchor, embed_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " section_path, section_anchor, embed_text, section_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chunk_id, document_id, chunk_index, content, token_count,
-                section_path, section_anchor, embed_text,
+                section_path, section_anchor, embed_text, section_index,
             ),
         )
         await self.db.commit()

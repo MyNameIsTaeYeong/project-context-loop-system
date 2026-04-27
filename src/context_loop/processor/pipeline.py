@@ -162,6 +162,7 @@ async def process_document(
                         section_path=chunk.section_path,
                         section_anchor=chunk.section_anchor,
                         embed_text=embed_text,
+                        section_index=chunk.section_index,
                     )
                 chunk_count = len(chunks)
 
@@ -262,6 +263,7 @@ async def process_document(
                         token_count=chunk.token_count,
                         section_path=chunk.section_path,
                         section_anchor=chunk.section_anchor,
+                        section_index=chunk.section_index,
                     )
                 chunk_count = len(chunks)
 

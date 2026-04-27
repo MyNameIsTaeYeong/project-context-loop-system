@@ -419,6 +419,82 @@ async def test_multi_view_embeddings_stored_for_chunks(
 
 
 @pytest.mark.asyncio
+async def test_section_index_persisted_to_sqlite(
+    store: MetadataStore,
+) -> None:
+    """청크의 ``section_index`` 가 SQLite chunks 테이블까지 전달되어 저장된다.
+
+    PR-2: ExtractionUnit 의 ``section_ids`` 와 청크를 조인할 수 있게 하는
+    안정적 출처 키. Confluence 구조화 추출 경로에서만 채워진다.
+    """
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    fake_chunks = [
+        Chunk(
+            id="c0", index=0, content="첫 섹션", token_count=3,
+            section_path="결제 시스템", section_anchor="결제-시스템",
+            section_index=0,
+        ),
+        Chunk(
+            id="c1", index=1, content="둘째 섹션", token_count=3,
+            section_path="결제 시스템 > 엔드포인트", section_anchor="엔드포인트",
+            section_index=1,
+        ),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=fake_chunks,
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    stored = await store.get_chunks_by_document(doc_id)
+    by_id = {c["id"]: c for c in stored}
+    assert by_id["c0"]["section_index"] == 0
+    assert by_id["c1"]["section_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_section_index_null_for_chunks_without_section(
+    store: MetadataStore,
+) -> None:
+    """section_index 가 ``None`` 인 청크는 SQLite 에 NULL 로 저장된다."""
+    doc_id = await store.create_document(
+        source_type="upload", title="t", original_content="x", content_hash="h",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    fake_chunks = [
+        Chunk(id="c-null", index=0, content="본문", token_count=2),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=fake_chunks,
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    stored = await store.get_chunks_by_document(doc_id)
+    assert len(stored) == 1
+    assert stored[0]["section_index"] is None
+
+
+@pytest.mark.asyncio
 async def test_meta_view_skipped_when_title_and_path_empty(
     store: MetadataStore,
 ) -> None:

@@ -43,6 +43,10 @@ class Chunk:
         section_path: 상위 헤딩 경로 (예: "프로젝트 개요 > 아키텍처 > 백엔드").
         section_anchor: 해당 섹션 헤딩의 URL fragment용 앵커.
             Confluence 구조화 추출 경로에서만 채워지고, 그 외에는 빈 문자열.
+        section_index: 청크가 유래한 ``ExtractedDocument.sections`` 인덱스.
+            Confluence 구조화 추출 경로에서만 채워지며, 일반 마크다운/AST 추출
+            경로에서는 ``None`` 이다. ExtractionUnit 의 ``section_ids``
+            (``f"{document_id}:{section_index}"``)와 조인할 때 사용된다.
     """
 
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -51,6 +55,7 @@ class Chunk:
     token_count: int = 0
     section_path: str = ""
     section_anchor: str = ""
+    section_index: int | None = None
 
 
 def _get_tokenizer(model: str = "cl100k_base") -> object | None:
@@ -340,7 +345,7 @@ def chunk_extracted_document(
         )
 
     all_chunks: list[Chunk] = []
-    for section in extracted.sections:
+    for section_idx, section in enumerate(extracted.sections):
         heading_line = "#" * section.level + " " + section.title
         body = section.md_content.strip()
         section_text = heading_line + "\n\n" + body if body else heading_line
@@ -357,6 +362,7 @@ def chunk_extracted_document(
             chunk.index = len(all_chunks)
             chunk.section_path = section_path
             chunk.section_anchor = section.anchor
+            chunk.section_index = section_idx
             all_chunks.append(chunk)
 
     return all_chunks
