@@ -17,6 +17,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -58,8 +59,14 @@ class Chunk:
     section_index: int | None = None
 
 
+@lru_cache(maxsize=8)
 def _get_tokenizer(model: str = "cl100k_base") -> object | None:
-    """tiktoken 인코더를 반환한다. 없거나 로드 실패 시 None."""
+    """tiktoken 인코더를 반환한다. 없거나 로드 실패 시 None.
+
+    같은 모델명에 대해 첫 호출 후 결과를 캐시한다 — tiktoken 의 ``read_file``
+    이 환경에 따라 매 호출마다 vocabulary 를 네트워크/디스크에서 다시 읽어
+    상당한 지연(수십 ms × 호출 수)이 누적되는 케이스가 있다.
+    """
     try:
         import tiktoken  # noqa: PLC0415
         try:

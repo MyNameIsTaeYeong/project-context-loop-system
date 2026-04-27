@@ -109,10 +109,16 @@ class ExtractionUnit:
 
 @dataclass
 class _Node:
-    """섹션 트리의 한 노드. 빌드 과정 동안만 사용되는 가변 구조."""
+    """섹션 트리의 한 노드. 빌드 과정 동안만 사용되는 가변 구조.
+
+    ``own_body`` 는 self-render 결과(헤딩 + 본문)를 캐시한다 — 트리 빌드 시
+    한 번 만들어 두고 collect/render 단계에서 재사용해 중복 문자열 결합을
+    피한다.
+    """
 
     section_index: int
     section: Section
+    own_body: str
     own_tokens: int
     merged_tokens: int = 0
     children: list[_Node] = field(default_factory=list)
@@ -211,12 +217,22 @@ def _build_tree(
     각 ``Section.level`` 은 H1=1, H2=2, ... 이며 등장 순서가 곧 깊이 우선
     순회 순서이다. 스택을 사용해 같은 레벨 이상의 형제/부모를 pop 하며
     부모를 결정한다.
+
+    self-render 결과는 ``Node.own_body`` 에 캐시하여 collect/render 단계의
+    중복 문자열 결합을 피한다 (이전 구현은 트리 빌드 시 던졌다가 collect
+    단계에서 동일 문자열을 다시 만들었다).
     """
     roots: list[_Node] = []
     stack: list[_Node] = []
     for idx, section in enumerate(sections):
-        own = count_tokens(_self_render(section), cfg.encoding_model)
-        node = _Node(section_index=idx, section=section, own_tokens=own)
+        own_body = _self_render(section)
+        own_tokens = count_tokens(own_body, cfg.encoding_model) if own_body else 0
+        node = _Node(
+            section_index=idx,
+            section=section,
+            own_body=own_body,
+            own_tokens=own_tokens,
+        )
         while stack and stack[-1].section.level >= section.level:
             stack.pop()
         if stack:
@@ -273,10 +289,13 @@ def _collect_units(
     3) own_tokens > 0 → 자기 본문을 단독 unit 으로 emit (단,
        own_tokens < min_tokens AND 자식 존재 시 첫 자식 unit 머리로 흡수).
     4) 자식들 재귀 처리.
+
+    성능: ``own_body`` 캐시 + 응축 분기에서 단일 walk 로 body/section_ids
+    동시 생성 (이전 구현은 ``_render_subtree`` + ``_dfs`` 가 같은 서브트리를
+    각각 한 번씩 순회, 매 descendant 마다 ``_self_render`` 재계산).
     """
     if node.merged_tokens <= cfg.target_tokens:
-        body = _render_subtree(node)
-        section_ids = tuple(_section_id(document_id, n.section_index) for n in _dfs(node))
+        body, section_ids = _render_and_collect_ids(node, document_id)
         return [_PreUnit(
             section_ids=section_ids,
             primary_section_id=_section_id(document_id, node.section_index),
@@ -291,8 +310,7 @@ def _collect_units(
 
     if node.own_tokens > cfg.max_tokens:
         # 자기 본문을 분할 → 부모 own 흡수는 적용 안 함
-        own_body = _self_render(node.section)
-        parts = _split_oversized(own_body, cfg=cfg, encode=encode, decode=decode)
+        parts = _split_oversized(node.own_body, cfg=cfg, encode=encode, decode=decode)
         path = tuple(node.section.path)
         sid = _section_id(document_id, node.section_index)
         for i, part_body in enumerate(parts):
@@ -307,7 +325,7 @@ def _collect_units(
                 split_total=len(parts),
             ))
     elif node.own_tokens > 0:
-        own_body = _self_render(node.section)
+        own_body = node.own_body
         if node.own_tokens < cfg.min_tokens and node.children:
             # 첫 자식 unit 머리로 흡수
             absorb_pending = (node, own_body)
@@ -361,22 +379,26 @@ def _collect_units(
     return units
 
 
-def _dfs(node: _Node) -> list[_Node]:
-    """DFS 전위 순회 결과(자기 + 모든 자손) 반환. section_index 순서와 일치."""
-    out: list[_Node] = [node]
-    for child in node.children:
-        out.extend(_dfs(child))
-    return out
+def _render_and_collect_ids(
+    node: _Node, document_id: int,
+) -> tuple[str, tuple[str, ...]]:
+    """서브트리 한 번 순회로 (rendered body, section_ids 튜플) 동시 생성.
 
-
-def _render_subtree(node: _Node) -> str:
-    """노드와 모든 자손을 원래 등장 순서대로 마크다운으로 직렬화."""
+    각 노드의 ``own_body`` 캐시를 그대로 사용 — 재렌더 비용 없음. 이전 구현은
+    ``_render_subtree`` 와 ``_dfs`` 가 별도로 같은 서브트리를 두 번 순회했다.
+    """
     parts: list[str] = []
-    for n in _dfs(node):
-        rendered = _self_render(n.section)
-        if rendered:
-            parts.append(rendered)
-    return "\n\n".join(parts)
+    ids: list[str] = []
+
+    def walk(n: _Node) -> None:
+        ids.append(_section_id(document_id, n.section_index))
+        if n.own_body:
+            parts.append(n.own_body)
+        for child in n.children:
+            walk(child)
+
+    walk(node)
+    return "\n\n".join(parts), tuple(ids)
 
 
 # ---------------------------------------------------------------------------
