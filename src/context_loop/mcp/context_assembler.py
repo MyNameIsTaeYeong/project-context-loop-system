@@ -9,6 +9,7 @@ LLM 기반 리랭커로 검색 결과의 정밀도를 높인다.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -315,16 +316,34 @@ async def assemble_context_with_sources(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. LLM 기반 리랭킹
-    if chunk_results and rerank_enabled and llm_client:
-        chunk_results = await rerank(
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행한다.
+    #    리랭킹은 chunk_results, 그래프 계획은 query_embedding 에만 의존하므로
+    #    서로 무관한 두 LLM 호출을 동시에 보내 응답 지연을 줄인다.
+    async def _maybe_rerank() -> list[dict[str, Any]]:
+        if not (chunk_results and rerank_enabled and llm_client):
+            return chunk_results
+        reranked = await rerank(
             query, chunk_results, llm_client, top_k=rerank_top_k,
         )
         if rerank_score_threshold > 0:
-            chunk_results = [
-                c for c in chunk_results
+            reranked = [
+                c for c in reranked
                 if c.get("rerank_score", 0) >= rerank_score_threshold
             ]
+        return reranked
+
+    async def _maybe_graph() -> GraphSearchResult | None:
+        if not (include_graph and llm_client):
+            return None
+        return await _search_graph_with_llm(
+            query, graph_store, llm_client,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
+        )
+
+    chunk_results, graph_result = await asyncio.gather(
+        _maybe_rerank(), _maybe_graph(),
+    )
 
     if chunk_results:
         lines = []
@@ -345,24 +364,18 @@ async def assemble_context_with_sources(
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
-    if include_graph and llm_client:
-        graph_result = await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-        if graph_result:
-            sections.append(graph_result.text)
-            # 그래프 탐색 결과에서 출처 추출
-            existing_doc_ids = {s.document_id for s in sources}
-            for doc_id in graph_result.document_ids:
-                if doc_id not in existing_doc_ids:
-                    if doc_id not in doc_cache:
-                        doc = await meta_store.get_document(doc_id)
-                        doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
-                    title = doc_cache[doc_id]["title"]
-                    sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
+    # 3. 그래프 탐색 결과 처리 (쿼리 임베딩으로 관련 스키마 생성)
+    if graph_result:
+        sections.append(graph_result.text)
+        # 그래프 탐색 결과에서 출처 추출
+        existing_doc_ids = {s.document_id for s in sources}
+        for doc_id in graph_result.document_ids:
+            if doc_id not in existing_doc_ids:
+                if doc_id not in doc_cache:
+                    doc = await meta_store.get_document(doc_id)
+                    doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
+                title = doc_cache[doc_id]["title"]
+                sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
 
     # Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:
