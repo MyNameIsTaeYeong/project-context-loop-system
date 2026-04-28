@@ -100,7 +100,7 @@ async def chat_api(
     else:
         prompt = f"## 컨텍스트\n\n{assembled.context_text}\n\n## 질문\n\n{body.query}"
         try:
-            answer = await llm_client.complete(prompt, system=_SYSTEM_PROMPT, max_tokens=2048)
+            answer = await llm_client.complete(prompt, system=_SYSTEM_PROMPT, max_tokens=8192)
         except Exception:
             logger.exception("LLM 호출 실패")
             answer = "LLM 호출 중 오류가 발생했습니다. 설정을 확인해 주세요."
