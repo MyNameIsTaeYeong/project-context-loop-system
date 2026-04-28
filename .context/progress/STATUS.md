@@ -1,9 +1,23 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 2.6 완료 — Confluence MCP Client 3-scope 싱크 end-to-end (백엔드 + UI + 자동 인덱싱)
-- **Step**: UI 배포 + 실제 사용 피드백으로 드러난 5개 이슈 수정 + Phase 2 인덱싱 자동화. 전체 흐름(등록 → fetch → index → 검색 가능) 단일 버튼으로 완결.
-- **최신(2026-04-24)**: 브랜치 `claude/plan-document-sync-ui-aOBNT`. 하루 세션에 2단계로 전개.
+- **Phase**: Phase 7.12~7.16 — 그래프 컨텍스트 고도화 (Extraction Unit + 본문 의미 관계 + 어휘 단일 출처)
+- **Step**: Confluence 그래프가 link_graph 만 가지던 상태에서 본문 의미 관계(depends_on / implements / owned_by 등) 까지 확장. 사용자 보고 "그래프가 유의미하지 않다" 의 6가지 원인 중 4가지 해결, 2가지(렌더링/메타축) 차기로 분리.
+- **최신(2026-04-28)**: 브랜치 `claude/improve-graph-context-veDSQ`. 8개 PR 누적.
+  1. **PR-1 ExtractionUnit 빌더**: 추출 전용 입자도(target=1500/max=2400 토큰). 후위 순회 merged_tokens → top-down 응축/분할/흡수 4규칙. 안정적 `section_id = f"{document_id}:{section_index}"` + breadcrumb 주입(`# 문서:`, `## 위치:`, 머리말). 기존 chunker 와 분리.
+  2. **PR-2 chunk ↔ unit 조인 키**: `chunks.section_index INTEGER` 컬럼 + idempotent 마이그레이션 + pipeline 전달. ExtractionUnit 의 section_ids 와 정수 키로 조인 가능. 향후 검색 시 그래프 결과 → 본문 스니펫 인입의 인프라.
+  3. **PR-3 결정론 본문 추출기 + Option A**: `body_extractor.py` 신설 4가지 시그널(API/Jira/bold/table). 회고 후 보수적 기본값으로 변경 — API/Jira 만 ON, bold/table OFF (작성 컨벤션 의존 + 추상 헤더 노이즈). 의미 관계는 LLM 추출기에 위임.
+  4. **PR-4 LLM 본문 추출기**: `llm_body_extractor.py` 신설. 9개 의미 관계(depends_on/implements/calls/owned_by/supersedes/has_part/uses/provides/documented_in) + 7개 엔티티(system/module/api/concept/policy/person/team) 어휘 고정. 어휘 외 / 끝점 누락 / self-loop 검증 단계 드롭. 단위 격리 + 비용 게이트(min_unit_tokens=200, skip_split_overlap_parts). **opt-in**: `PipelineConfig.enable_llm_body_extraction=True` + `llm_client` 둘 다 전달 시에만.
+  5. **perf**: `_collect_units` 13447ms → 1.8ms (~7500배). cProfile 로 진단해보니 `tiktoken/load.py:read_file` 가 vocabulary 를 매 호출마다 재다운로드 시도(357 sections × 38ms). `chunker._get_tokenizer` 에 `lru_cache(maxsize=8)` 적용 + `_Node.own_body` 캐시 + `_render_subtree/_dfs` 단일 walk 통합.
+  6. **호출 체인 통합**: `process_document(llm_client=...)` 옵셔널 파라미터 추가, 4개 사이트 전파(coordinator Git, mcp_sync Confluence, web/api/documents 수동 재처리, web/api/git_sync). DI: `app.state.llm_client` → `Depends(get_llm_client)`. 테스트 conftest 에 `app.state.llm_client = None` 주입.
+  7. **fix 빈 응답**: `process_document` 흐름에서 LLM 본문 추출 응답이 비는 증상. Qwen3 등 reasoning 모델이 `<think>...</think>` 사고에 max_tokens 모두 소진 + `extract_json` 정규식 스트립 후 빈 문자열. `graph_search_planner` 와 동일 처방 적용 — `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` + max_tokens 1024 → 2048.
+  8. **PR-5 graph_vocabulary + planner 시스템 프롬프트 갱신**: `graph_vocabulary.py` 단일 출처(12 entity + 19 relation + 7 intent→relation 매핑). 추출기 어휘 ⊆ vocabulary 강제 테스트로 미래 누락 자동 검출. `_render_system_prompt()` 동적 렌더 → LLM 플래너가 어휘 의미 + 의도 매핑 가이드를 알게 됨. "Auth Service 의존?" → `focus_relations=["depends_on", "uses", "calls"]` 정확 선택 가능.
+- 테스트 누적 +90건(extraction_unit 21 + body 25 + llm_body 21 + vocab 7 + planner +2 + chunker/metadata/pipeline 회귀 보강), 311 통과 + 환경 의존 15 baseline 동일.
+- **남은 갭**:
+  - 처음 진단 6가지 원인 중 (3) 엔티티 병합 키 불안정 — 부분적, (4) 메타 축 부재 — 미진행, (5) 검색 결과 렌더링 빈약 — 미진행
+  - 추출은 강해졌지만 사용자에게 가치가 전달되는지(검색 품질) 측정 부재 → **다음 세션 1순위**
+  - cross-document 관계 출처 보존 (NetworkX DiGraph 단일 엣지 한계로 last-write-wins) → 향후 Option A
+- **이전(2026-04-24)**: 브랜치 `claude/plan-document-sync-ui-aOBNT`. 하루 세션에 2단계로 전개.
   1. **오전 — UI 배포 (I-030 해결)**: `web/templates/confluence_mcp.html` 단일 파일 확장. `syncTargetsPanel()` Alpine 컴포넌트 + 3 버튼 카드(📄/🌿/🏢) + 3 확인 다이얼로그(subtree 안내·space estimate·unregister cascade 경고) + 등록 대상 카드 목록(scope 뱃지·상대시간·증분 요약) + 자가 시작·정지 폴링(2초 간격, running/queued 없으면 자동 정지). 구 단발성 임포트 UI 는 `<details>` 로 보존.
   2. **오후 — 트러블슈팅 체인 5개 이슈 수정 (D-044)**:
      - I-031 MCP 필수 파라미터: `getSpaceInfoAll` 에 `start`/`limit`, `getChild` 에 `start`/`limit`/`expand` 필수. 페이지네이션 포함해 수정
@@ -11,7 +25,6 @@
      - I-033 BFS 누락 → CQL 전환: walker 가 5가지 경로로 누락 가능(per-parent 페이지네이션·중간 노드 예외·max_depth·type 필드·권한). 사용자 제안대로 `ancestor = X AND type = "page"` 평탄 열거로 전환. `_subtree_cql` / `estimate_subtree_page_count` / `enumerate_subtree_pages` 신설, `_sync_subtree` 가 CQL descendants + 루트 수동 prepend. `walk_subtree` 는 유지 (다른 러너 호환)
      - I-034 페이지네이션 서버 cap 버그 2개: (a) `size < page_size` 에서 무조건 break — totalSize 알려지면 skip 하도록, (b) `start += page_size` → `start += env.size` 로 실제 반환 개수만큼 전진. `_paginate_cql` 공통 헬퍼로 중복 제거하며 동시 수정
      - I-035 Phase 2 인덱싱 자동화 + 동시성 + 실패 재시도: `execute_sync_target` 에 선택적 `embedding_client`/`pipeline_config`/`phase2_concurrency` 주입 → created+updated+failed-in-membership 자동 인덱싱. `asyncio.Semaphore(5)` + `asyncio.gather` 로 400 문서 기준 벽시계 ~5배 단축. `MetadataStore.list_failed_member_doc_ids(target_id)` JOIN 쿼리로 재싱크마다 stuck failed 문서 자동 재시도
-- 테스트 누적 +70건(UI 반영 포함), 최종 178 passed. UI UX 는 한 버튼 = 한 작업 모델 유지 (내부만 2-phase 로 분리).
 - **이전(2026-04-23)**: Confluence MCP 3-scope(page/subtree/space) 싱크 백엔드 9단계 완성 (D-043). 브랜치 `claude/confluence-continuous-fetch-aOGCB`. 사내 Confluence REST 차단(I-011) 환경에서 "특정 페이지만 / 특정 페이지 하위 전체 / 공간 전체" 3가지 범위를 동일한 디스패처(`execute_sync_target`)로 처리. 참조 카운팅 membership 모델(`confluence_sync_membership`)로 공유 페이지(subtree+space 동시 등록) 안전성을 확보 — 한쪽 해제 시 다른 소유자가 있으면 문서 보존, 양쪽 모두 해제 시 `delete_document_cascade` 로 완전 삭제. 두 핵심 안전 속성을 테스트로 고정: (1) walker/enumerate 실패 시 membership 보존(일시 장애가 cascade 삭제로 번지지 않음), (2) 개별 import 실패가 stale 삭제로 번지지 않음(walker 가 확인한 페이지는 import 성공 여부 무관하게 current_ids 포함). 웹 API 7종 + target_id 별 asyncio.Lock + BackgroundTasks 기반 비동기 실행. 테스트 +110건 전부 통과. UI (검색박스/3버튼 카드/확인 다이얼로그/등록카드+폴링 진행률)는 I-030 으로 분리.
 - **이전(2026-04-22)**: 멀티뷰 임베딩 Phase 1 도입 (D-042). 일반 문서 분기에서 청크당 ChromaDB 엔트리 2개 저장 — `{id}#body`(임베딩=본문) + `{id}#meta`(임베딩=title+section_path), 두 엔트리 document 동일, `logical_chunk_id`로 dedup. `context_assembler._search_chunks`에 over-fetch(×2) + dedup 로직 추가. 기존 body 뷰는 그대로 유지되므로 본문 친화 질의는 손해 없고, 경로/제목 친화 질의는 meta 뷰로 리콜 상승. SQLite `chunks`는 논리 청크 1행 유지. title/section_path 모두 비면 meta 뷰 생략. 테스트 +3 (pipeline 2, context_assembler 1) — 전체 450건 통과(web 제외).
 - **이전 상태**: 3단계로 완료. (1) **Step 1** — `ingestion/confluence_extractor.py` 신설 (ExtractedDocument: sections/outbound_links/code_blocks/tables/mentions), `documents.raw_content` 컬럼 추가 및 REST/MCP 수집 경로에서 원본 HTML 보존, 파이프라인 Confluence 분기가 추출기를 호출하도록 주입 (D-039). (2) **Step 2** — `processor/link_graph_builder.py` 신설: `OutLink` → `GraphData` 결정론적 변환 (`page/user/jira/attachment` → 각각 entity_type + relation, `url`은 병합 키 불안정 이슈로 제외). self-entity 패턴으로 GraphStore의 `(name, type)` 병합을 통한 인접 문서 간 엣지 수렴. 파이프라인 Confluence 분기에 통합 (D-039). (3) **LLM classifier/graph_extractor 전면 제거** — 결정론적 대체(AST + 링크 그래프)가 모든 소스를 커버하므로 `classifier.py` 삭제, `graph_extractor.py`에서 Entity/Relation/GraphData 스키마만 남기고 LLM 프롬프트·extract_graph·맵리듀스 제거. `process_document()`에서 `llm_client`/`storage_method_override` 파라미터 제거, `storage_method`는 실제 저장 산출물에서 파생(chunks only=`chunk`, graph only=`graph`, 둘 다=`hybrid`). coordinator/documents/git_sync 호출 경로 정리 (D-040). (4) **Step 3** — `Chunk.section_anchor` 필드 추가, `chunk_extracted_document()` 신설로 `extracted.sections`를 그대로 소비(헤딩 재파싱 제거). `_split_markdown_blocks()`이 펜스 코드블록(```)과 마크다운 테이블을 `atomic=True`로 묶어 청크 경계 중간 분할 금지, 일반 블록은 기존처럼 강제 분할. `section_anchor`를 VectorStore metadata까지 전파 (D-041). 테스트: confluence_extractor 28건, link_graph_builder 13건, chunker +4건(코드블록/테이블 원자성 + anchor 전파 + 빈 sections 폴백), pipeline 8건 전면 재작성, coordinator/documents/git_sync 호출 정합성 확보. 총 회귀 없음 (440+건). 다음: (a) section_anchor를 UI 청크 탭/검색 결과 deep-link에 노출, (b) `extracted.code_blocks`/`tables`를 별도 구조화 메타로 검색에 활용, (c) Phase 9.9(증분 처리) 또는 9.10(GitHub webhook).
@@ -73,6 +86,13 @@
 - [x] 7.9 Confluence outbound_links → 결정론적 링크 그래프 (D-039)
 - [x] 7.10 LLM classifier/graph_extractor 제거 — 결정론적 파이프라인 확정 (D-040)
 - [x] 7.11 구조화 추출 → 청커 직결 + 코드블록/테이블 원자 보호 (D-041)
+- [x] 7.12 ExtractionUnit 빌더 — 추출 전용 듀얼 그래뉼러리티(target=1500/max=2400 토큰) + chunk ↔ unit 조인 키(`section_index`) (PR-1, PR-2 / 2026-04-28)
+- [x] 7.13 결정론 본문 추출기 — API/Jira ON, bold/table OFF (Option A 보수적 디폴트) (PR-3 / 2026-04-28)
+- [x] 7.14 LLM 의미 관계 추출기 — 9개 관계 + 7개 엔티티 어휘 고정, opt-in (PR-4 / 2026-04-28)
+- [x] 7.15 graph_vocabulary 단일 출처 + 플래너 시스템 프롬프트 어휘 가이드 (PR-5 / 2026-04-28)
+- [ ] 7.16 검색 품질 측정 도구 — 골드 셋 + 자동 채점, ON/OFF 비교, 추출 결과 샘플 덤프 (I-040, **다음 세션 1순위**)
+- [ ] 7.17 그래프 검색 결과 렌더링 개선 — 본문 스니펫 인입(section_index 활용), 경로 서술, 출처 링크 (I-041)
+- [ ] 7.18 메타 축 노드화 — author/space/label 노드 승격 (I-042)
 
 ### Phase 8: 배포
 - [ ] 8.1 패키징 및 사내 배포

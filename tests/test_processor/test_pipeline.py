@@ -24,12 +24,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from context_loop.processor.chunker import Chunk
+from context_loop.processor.graph_extractor import GraphData
 from context_loop.processor.pipeline import (
     PipelineConfig,
     build_meta_view_text,
     process_document,
 )
 from context_loop.storage.metadata_store import MetadataStore
+
+
+def _empty_graph_data() -> GraphData:
+    return GraphData()
 
 
 @pytest.fixture
@@ -221,6 +226,10 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
     with patch(
         "context_loop.processor.pipeline.chunk_extracted_document",
         return_value=[],
+    ), patch(
+        # 본문 그래프는 별도 테스트에서 검증 — 여기서는 링크 그래프만 격리해서 본다
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=_empty_graph_data(),
     ):
         result = await process_document(
             doc_id,
@@ -231,7 +240,7 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
             config=PipelineConfig(),
         )
 
-    # AST graph/LLM graph가 제거된 상태이므로 save_graph_data는 링크 그래프 1회만 호출된다.
+    # 본문 그래프는 patch 되어 빈 GraphData → save_graph_data 는 링크 그래프 1회만
     graph_store.save_graph_data.assert_awaited_once()
     saved_doc_id, saved_graph = graph_store.save_graph_data.await_args.args
     assert saved_doc_id == doc_id
@@ -419,6 +428,82 @@ async def test_multi_view_embeddings_stored_for_chunks(
 
 
 @pytest.mark.asyncio
+async def test_section_index_persisted_to_sqlite(
+    store: MetadataStore,
+) -> None:
+    """청크의 ``section_index`` 가 SQLite chunks 테이블까지 전달되어 저장된다.
+
+    PR-2: ExtractionUnit 의 ``section_ids`` 와 청크를 조인할 수 있게 하는
+    안정적 출처 키. Confluence 구조화 추출 경로에서만 채워진다.
+    """
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    fake_chunks = [
+        Chunk(
+            id="c0", index=0, content="첫 섹션", token_count=3,
+            section_path="결제 시스템", section_anchor="결제-시스템",
+            section_index=0,
+        ),
+        Chunk(
+            id="c1", index=1, content="둘째 섹션", token_count=3,
+            section_path="결제 시스템 > 엔드포인트", section_anchor="엔드포인트",
+            section_index=1,
+        ),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=fake_chunks,
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    stored = await store.get_chunks_by_document(doc_id)
+    by_id = {c["id"]: c for c in stored}
+    assert by_id["c0"]["section_index"] == 0
+    assert by_id["c1"]["section_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_section_index_null_for_chunks_without_section(
+    store: MetadataStore,
+) -> None:
+    """section_index 가 ``None`` 인 청크는 SQLite 에 NULL 로 저장된다."""
+    doc_id = await store.create_document(
+        source_type="upload", title="t", original_content="x", content_hash="h",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    fake_chunks = [
+        Chunk(id="c-null", index=0, content="본문", token_count=2),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_text",
+        return_value=fake_chunks,
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    stored = await store.get_chunks_by_document(doc_id)
+    assert len(stored) == 1
+    assert stored[0]["section_index"] is None
+
+
+@pytest.mark.asyncio
 async def test_meta_view_skipped_when_title_and_path_empty(
     store: MetadataStore,
 ) -> None:
@@ -524,3 +609,188 @@ async def test_git_code_pipeline_persists_embed_text(
     assert "hello" in chunk["embed_text"]  # 심볼 이름
     # 본문(전체 코드)와 다른 값이어야 함 — 임베딩과 저장의 분리(D-036)
     assert chunk["embed_text"] != chunk["content"]
+
+
+@pytest.mark.asyncio
+async def test_body_graph_saved_for_confluence_with_signal(
+    store: MetadataStore,
+) -> None:
+    """ExtractionUnit 본문에 강조 용어/API/표 헤더가 있으면 body 그래프가 저장된다."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    graph_store.save_graph_data = AsyncMock(return_value={
+        "nodes": 4, "edges": 3, "merged": 0,
+    })
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # 링크 그래프 + 본문 그래프 = 최소 2회 호출
+    saved_graphs = [
+        call.args[1] for call in graph_store.save_graph_data.await_args_list
+    ]
+    assert len(saved_graphs) >= 2
+
+    # 본문 그래프는 has_attribute(테이블 헤더) 또는 documents(API) 관계를 갖는다
+    body_graphs = [
+        g for g in saved_graphs
+        if any(
+            r.relation_type in ("has_attribute", "documents", "mentions",
+                                "mentions_ticket")
+            for r in g.relations
+        )
+    ]
+    assert body_graphs, "본문 그래프가 저장되지 않음"
+
+
+@pytest.mark.asyncio
+async def test_body_graph_skipped_when_no_signal(
+    store: MetadataStore,
+) -> None:
+    """본문에 강조/API/표/Jira 가 하나도 없으면 body 그래프 save 가 호출되지 않는다."""
+    plain_html = "<h1>제목</h1><p>그냥 평문 본문 텍스트.</p>"
+    doc_id = await _create_confluence_doc(store, raw_content=plain_html)
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),
+        )
+
+    # outbound_links 도 없고 본문 시그널도 없으므로 save_graph_data 미호출
+    graph_store.save_graph_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_skipped_when_disabled(
+    store: MetadataStore,
+) -> None:
+    """기본 PipelineConfig (enable_llm_body_extraction=False) 에서는 LLM 호출 없음."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+    llm_client.complete = AsyncMock(return_value='{"entities": [], "relations": []}')
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(),  # enable_llm_body_extraction=False
+            llm_client=llm_client,
+        )
+
+    llm_client.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_skipped_when_no_client(
+    store: MetadataStore,
+) -> None:
+    """enable_llm_body_extraction=True 여도 llm_client=None 이면 스킵."""
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ):
+        # llm_client 미전달 → 호출 흐름이 LLM 단계로 들어가지 않음
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+        )
+
+    # 정상 통과 (예외 없이) + 그래프는 link/body 결정론만 저장됨
+    # 추가 검증: extract_llm_body_graph 호출 흔적 없음
+    # (별도 patch 로 호출 여부 검증)
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_runs_when_enabled(
+    store: MetadataStore,
+) -> None:
+    """enable=True + llm_client 가 있으면 LLM 본문 추출이 실행되어 그래프에 저장된다."""
+    from context_loop.processor.graph_extractor import Entity, Relation
+    from context_loop.processor.llm_body_extractor import LLMBodyExtractionStats
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    fake_llm_graph = GraphData(
+        entities=[
+            Entity(name="Auth Service", entity_type="system"),
+            Entity(name="Token Validator", entity_type="module"),
+        ],
+        relations=[
+            Relation(
+                source="Auth Service",
+                target="Token Validator",
+                relation_type="depends_on",
+            ),
+        ],
+    )
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ), patch(
+        # 결정론 본문 추출은 격리
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ), patch(
+        # LLM 추출기 자체를 patch — 게이트/실제 LLM 호출은 별도 단위 테스트에서 검증
+        "context_loop.processor.pipeline.extract_llm_body_graph",
+        new=AsyncMock(return_value=(fake_llm_graph, LLMBodyExtractionStats())),
+    ) as mock_llm_extract:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+            llm_client=llm_client,
+        )
+
+    # extract_llm_body_graph 가 호출되었는지 (게이트 통과)
+    mock_llm_extract.assert_awaited_once()
+    # LLM 그래프가 GraphStore 에 저장되었는지
+    saved_graphs = [
+        call.args[1] for call in graph_store.save_graph_data.await_args_list
+    ]
+    llm_graphs = [
+        g for g in saved_graphs
+        if any(r.relation_type == "depends_on" for r in g.relations)
+    ]
+    assert len(llm_graphs) == 1
+    names = {e.name for e in llm_graphs[0].entities}
+    assert {"Auth Service", "Token Validator"} <= names

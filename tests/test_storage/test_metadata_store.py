@@ -227,10 +227,12 @@ async def test_migration_adds_section_columns_to_legacy_chunks(
         assert "section_path" in columns
         assert "section_anchor" in columns
         assert "embed_text" in columns
+        assert "section_index" in columns
 
         # 기존 row는 빈 문자열로 채워짐 (DEFAULT '')
         cursor = await store.db.execute(
-            "SELECT section_path, section_anchor, embed_text FROM chunks WHERE id = ?",
+            "SELECT section_path, section_anchor, embed_text, section_index "
+            "FROM chunks WHERE id = ?",
             ("legacy-c1",),
         )
         row = await cursor.fetchone()
@@ -238,6 +240,8 @@ async def test_migration_adds_section_columns_to_legacy_chunks(
         assert row["section_path"] == ""
         assert row["section_anchor"] == ""
         assert row["embed_text"] == ""
+        # section_index 는 ALTER 시 DEFAULT 가 없어 NULL
+        assert row["section_index"] is None
     finally:
         await store.close()
 
@@ -269,6 +273,7 @@ async def test_chunks_crud(store: MetadataStore) -> None:
         content="첫 번째 청크", token_count=10,
         section_path="문서 > 개요", section_anchor="개요",
         embed_text="hello\nfoo()\nDocstring",
+        section_index=3,
     )
     await store.create_chunk(
         chunk_id="c2", document_id=doc_id, chunk_index=1,
@@ -281,11 +286,13 @@ async def test_chunks_crud(store: MetadataStore) -> None:
     assert chunks[0]["section_path"] == "문서 > 개요"
     assert chunks[0]["section_anchor"] == "개요"
     assert chunks[0]["embed_text"] == "hello\nfoo()\nDocstring"
+    assert chunks[0]["section_index"] == 3
     assert chunks[1]["chunk_index"] == 1
-    # 선택 인자 생략 시 기본값 ''
+    # 선택 인자 생략 시 기본값 (section_index 는 NULL)
     assert chunks[1]["section_path"] == ""
     assert chunks[1]["section_anchor"] == ""
     assert chunks[1]["embed_text"] == ""
+    assert chunks[1]["section_index"] is None
 
     await store.delete_chunks_by_document(doc_id)
     assert await store.get_chunks_by_document(doc_id) == []

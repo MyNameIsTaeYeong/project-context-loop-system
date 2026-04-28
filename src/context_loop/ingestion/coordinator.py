@@ -33,6 +33,7 @@ from context_loop.storage.metadata_store import MetadataStore
 if TYPE_CHECKING:
     from langchain_core.embeddings import Embeddings
 
+    from context_loop.processor.llm_client import LLMClient
     from context_loop.storage.graph_store import GraphStore
     from context_loop.storage.vector_store import VectorStore
 
@@ -89,6 +90,7 @@ class CoordinatorAgent:
         vector_store: VectorStore | None = None,
         graph_store: GraphStore | None = None,
         embedding_client: Embeddings | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -97,6 +99,9 @@ class CoordinatorAgent:
         self._vector_store = vector_store
         self._graph_store = graph_store
         self._embedding_client = embedding_client
+        # 옵셔널 LLM 클라이언트 — process_document 의 LLM 본문 추출 단계에 전달.
+        # PipelineConfig.enable_llm_body_extraction 도 True 여야 실제 호출됨.
+        self._llm_client = llm_client
 
     # --- Public API ---
 
@@ -303,6 +308,7 @@ class CoordinatorAgent:
                 graph_store=self._graph_store,  # type: ignore[arg-type]
                 embedding_client=self._embedding_client,  # type: ignore[arg-type]
                 config=pipeline_config,
+                llm_client=self._llm_client,
             )
             logger.info(
                 "파이프라인 처리 완료: document_id=%d, method=%s, chunks=%d, nodes=%d",

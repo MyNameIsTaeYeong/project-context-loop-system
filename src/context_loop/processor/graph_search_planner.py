@@ -16,6 +16,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.processor.graph_vocabulary import (
+    format_entity_types_for_prompt,
+    format_intent_mapping_for_prompt,
+    format_relation_types_for_prompt,
+)
 from context_loop.processor.llm_client import LLMClient, extract_json
 from context_loop.storage.graph_store import GraphStore
 
@@ -23,32 +28,47 @@ logger = logging.getLogger(__name__)
 
 _PLAN_SYSTEM_PROMPT = """\
 당신은 지식 그래프 탐색 전문가입니다.
-사용자의 질의와 그래프 구조 정보를 분석하여 어떤 엔티티를 중심으로 탐색할지 계획합니다.
+사용자의 질의와 그래프 구조 정보를 분석하여 어떤 엔티티를 중심으로 탐색할지
+계획합니다. 그래프에는 여러 추출기(링크 / 결정론 본문 / LLM 의미)가 만든
+다양한 의미 관계가 들어 있으며, ``focus_relations`` 로 의도에 맞는 관계를
+좁혀 탐색하면 더 정확한 컨텍스트를 얻을 수 있습니다.
 
-규칙:
-- 그래프에 실제 존재하는 엔티티 이름만 사용하세요.
+# Entity types (그래프에 등장 가능)
+{entity_types}
+
+# Relation types (그래프에 등장 가능)
+{relation_types}
+
+# 질의 의도 → 주목할 관계 (focus_relations 힌트)
+{intent_mapping}
+
+# 규칙
+- 그래프에 실제 존재하는 엔티티 이름만 사용하세요 (스키마 요약에 등장한 이름).
 - 질의와 관련 없는 엔티티는 포함하지 마세요.
-- 관련 엔티티가 없으면 빈 계획을 반환하세요.
-- 탐색 깊이(depth)는 1~2 사이로 설정하세요.
+- 관련 엔티티가 없으면 ``should_search=false`` 와 빈 ``search_steps`` 를 반환하세요.
+- 탐색 깊이(``depth``) 는 1~2 사이로 설정하세요 (단순 직접 관계는 1, 2-홉
+  추론이 필요하면 2).
+- ``focus_relations`` 는 위 매핑 가이드를 참고해 채우세요. 비어 있으면 모든
+  관계가 표시됩니다 — 의도가 명확하면 반드시 좁히세요.
+- ``focus_relations`` 에는 위 Relation types 목록의 정확한 이름만 사용하세요.
 
-반드시 아래 JSON 형식으로만 응답하세요:
+# 응답 형식 (JSON 만, 다른 텍스트 금지)
 ```json
-{
-  "should_search": true/false,
+{{
+  "should_search": true,
   "reasoning": "탐색 필요 여부에 대한 간단한 이유",
   "search_steps": [
-    {
+    {{
       "entity_name": "탐색 시작 엔티티 이름",
       "depth": 1,
-      "focus_relations": ["relation_type1"]
-    }
+      "focus_relations": ["depends_on"]
+    }}
   ]
-}
+}}
 ```
 
-- should_search: 그래프 탐색이 질의 답변에 도움이 되는지 여부
-- search_steps: 탐색할 엔티티 목록 (최대 3개)
-- focus_relations: 특히 주목할 관계 유형 (빈 배열이면 모든 관계)
+- ``search_steps`` 는 최대 3개.
+- ``should_search=false`` 인 경우 ``search_steps`` 는 빈 배열.
 """
 
 _PLAN_USER_TEMPLATE = """\
@@ -58,6 +78,19 @@ _PLAN_USER_TEMPLATE = """\
 ## 그래프 구조
 {schema}
 """
+
+
+def _render_system_prompt() -> str:
+    """어휘 가이드를 템플릿에 끼워 시스템 프롬프트를 만든다.
+
+    어휘는 ``graph_vocabulary`` 단일 출처에서 가져온다 — 추출기가 새 entity/
+    relation 타입을 도입하면 거기 추가만 하면 자동으로 플래너가 인식한다.
+    """
+    return _PLAN_SYSTEM_PROMPT.format(
+        entity_types=format_entity_types_for_prompt(),
+        relation_types=format_relation_types_for_prompt(),
+        intent_mapping=format_intent_mapping_for_prompt(),
+    )
 
 
 @dataclass
@@ -120,7 +153,7 @@ async def plan_graph_search(
     try:
         response = await llm_client.complete(
             prompt,
-            system=_PLAN_SYSTEM_PROMPT,
+            system=_render_system_prompt(),
             max_tokens=512,
             temperature=0.0,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},

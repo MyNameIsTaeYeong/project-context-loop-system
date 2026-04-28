@@ -603,6 +603,7 @@ def _make_recording_process_document(
         graph_store: Any,
         embedding_client: Any,
         config: Any = None,
+        llm_client: Any = None,
     ) -> dict[str, Any]:
         called.append(document_id)
         if document_id in fail:
@@ -695,6 +696,7 @@ async def test_phase2_failure_isolated_per_doc(stores, monkeypatch) -> None:
     async def fake_proc(
         document_id: int, *, meta_store: Any, vector_store: Any,
         graph_store: Any, embedding_client: Any, config: Any = None,
+        llm_client: Any = None,
     ) -> dict[str, Any]:
         call_log.append(document_id)
         if len(call_log) == 2:
@@ -768,6 +770,7 @@ async def test_phase2_respects_concurrency_bound(stores, monkeypatch) -> None:
     async def slow_proc(
         document_id: int, *, meta_store: Any, vector_store: Any,
         graph_store: Any, embedding_client: Any, config: Any = None,
+        llm_client: Any = None,
     ) -> dict[str, Any]:
         nonlocal in_flight, max_in_flight, overlap_observed
         in_flight += 1
@@ -813,6 +816,7 @@ async def test_phase2_retries_previously_failed_docs(stores, monkeypatch) -> Non
     async def fake_proc_1(
         document_id: int, *, meta_store: Any, vector_store: Any,
         graph_store: Any, embedding_client: Any, config: Any = None,
+        llm_client: Any = None,
     ) -> dict[str, Any]:
         call_log_1.append(document_id)
         # 첫 실행에서 page_id=200 을 가진 doc (두 번째 처리) 실패
@@ -840,6 +844,7 @@ async def test_phase2_retries_previously_failed_docs(stores, monkeypatch) -> Non
     async def fake_proc_2(
         document_id: int, *, meta_store: Any, vector_store: Any,
         graph_store: Any, embedding_client: Any, config: Any = None,
+        llm_client: Any = None,
     ) -> dict[str, Any]:
         call_log_2.append(document_id)
         return {"id": document_id}

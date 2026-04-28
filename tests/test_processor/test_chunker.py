@@ -295,3 +295,52 @@ def test_chunk_extracted_document_empty_sections_falls_back_to_plain_text() -> N
     assert chunks[0].section_path == "제목"
     # 폴백 경로에서는 anchor가 비어 있다 (ExtractedDocument 섹션을 쓰지 않으므로)
     assert chunks[0].section_anchor == ""
+    # section_index는 폴백 경로에선 None
+    assert chunks[0].section_index is None
+
+
+def test_chunk_extracted_document_populates_section_index() -> None:
+    """청크에 유래 섹션의 인덱스가 ``section_index`` 로 채워진다.
+
+    ExtractionUnit 의 ``section_ids`` 와 조인해 청크-unit 매핑을 복원할 때 쓰인다.
+    """
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[
+            _make_section(1, "S0", "본문 0.", path=["S0"]),
+            _make_section(2, "S1", "본문 1.", path=["S0", "S1"]),
+            _make_section(2, "S2", "본문 2.", path=["S0", "S2"]),
+        ],
+    )
+    chunks = chunk_extracted_document(extracted, chunk_size=512)
+
+    by_path = {c.section_path: c for c in chunks}
+    assert by_path["S0"].section_index == 0
+    assert by_path["S0 > S1"].section_index == 1
+    assert by_path["S0 > S2"].section_index == 2
+
+
+def test_section_index_propagates_across_split_chunks() -> None:
+    """큰 섹션이 여러 청크로 나뉘어도 모든 청크가 같은 section_index 를 갖는다."""
+    body = " ".join(f"word{i}" for i in range(400))
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[
+            _make_section(1, "First", "짧은 본문.", path=["First"]),
+            _make_section(1, "Big", body, path=["Big"]),
+        ],
+    )
+    chunks = chunk_extracted_document(extracted, chunk_size=80, chunk_overlap=10)
+
+    big_chunks = [c for c in chunks if c.section_path == "Big"]
+    assert len(big_chunks) > 1
+    for c in big_chunks:
+        assert c.section_index == 1
+
+
+def test_chunk_text_default_section_index_is_none() -> None:
+    """헤딩 정규식 기반 청킹은 ExtractedDocument 와 무관 → section_index None."""
+    chunks = chunk_text("# T\n\n본문.", chunk_size=512)
+    assert len(chunks) >= 1
+    for c in chunks:
+        assert c.section_index is None

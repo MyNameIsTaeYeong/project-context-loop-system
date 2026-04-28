@@ -4,6 +4,50 @@
 
 ## 미해결
 
+### I-040: 검색 품질 측정 부재 — **다음 세션 1순위**
+- Phase 7.8 (2026-04-28) 이후 그래프 추출 인프라가 크게 강화됨 (ExtractionUnit, 결정론 본문, LLM 의미 관계, 어휘 가이드). 그러나 이 변화가 **사용자 질의에 대한 검색 품질을 실제로 끌어올렸는지** 측정하는 도구가 없다.
+- 추측 누적을 끊고 데이터 기반 의사결정을 시작하기 위해 다음 세션의 1순위.
+- 측정해야 할 항목:
+  - 같은 질의 셋(20~50개)을 **인덱싱 전후** / **`enable_llm_body_extraction` ON/OFF** 비교
+  - 핵심 메트릭:
+    - 정답 적중률 (사람 평가 기준 정확/누락/환각)
+    - 그래프 활용 빈도 (`should_search=true` 비율, `focus_relations` 정확도)
+    - 출처 정확성 (인용된 섹션이 실제 답을 포함하는가)
+    - 토큰 비용 (인덱싱 + 질의)
+    - 응답 지연
+  - 결정론 추출기 토글 재평가: PR-3 의 bold/table 을 다시 ON 할지 (현재 OFF 가 보수적 디폴트)
+  - LLM 추출 ROI: enable=True 비용 대비 품질 향상이 충분한가
+- 측정 도구 후보:
+  - 골드 셋 + 자동 채점 스크립트 (사람 평가 30개 우선)
+  - 그래프 통계 CLI (entity_type 분포, 평균 차수, drop 비율)
+  - LLM 추출 결과 샘플 덤프 (특정 문서 → 추출된 entities/relations 출력)
+- 측정 후 액션:
+  - 결과 좋다 → 운영 안정화, 메타 노드화 등 보강 작업
+  - 결과 부족하다 → 검색 결과 렌더링 (I-041) 또는 추출 파라미터 튜닝
+  - LLM 추출 효과 미미 → opt-in 유지 + 분류 게이트로 비용 절감
+
+### I-041: 그래프 검색 결과 렌더링 빈약
+- `execute_graph_search` 의 출력이 `A --[rel]--> B` 단순 불릿. PR-4 가 추출한 의미 관계가 사용자에게 가치 있게 전달되지 않음.
+- 사용자 처음 보고 "그래프가 유의미하지 않다" 의 6가지 원인 중 (5) 부분 — 추출 강화는 되었으나 렌더링은 그대로.
+- 개선안:
+  - 각 엣지에 본문 스니펫 (`section_index` ↔ chunks 조인 활용 — PR-2 키의 첫 사용처)
+  - 경로 서술 (`Auth Service ──(depends_on)→ Token Validator ──(owned_by)→ Platform Team`)
+  - 출처 섹션 anchor 링크 노출
+  - 노드별 연결 차수로 중요도 표시
+- 작업량: 중간 PR. I-040 (측정) 후 우선순위 결정.
+
+### I-042: 메타 축 부재 (author / space / label / time)
+- 현재 그래프엔 도메인 엔티티 + 의미 관계만 있음. 문서 메타데이터(`author`, `space`, `label`, `updated_at`)가 노드/엣지로 등재되지 않아 "팀 X 가 소유한 문서", "최근 업데이트된 결제 관련 문서" 같은 질의를 답할 구조가 없다.
+- 사용자 처음 보고 6가지 원인 중 (4).
+- 작업량: 작은 PR. metadata_store 의 `documents` 테이블 컬럼을 그대로 활용해 노드 승격.
+
+### I-043: 관계 cross-document 출처 보존 (NetworkX last-write-wins)
+- `nx.DiGraph` 가 같은 (src, tgt) 사이 엣지 1개만 허용. 두 문서가 같은 관계(`Auth Service --depends_on--> Token Validator`)를 추출하면 SQLite 엔 2 rows 지만 NetworkX 엔 1 edge 로 마지막 쓰기 메타데이터만 살아남음.
+- "여러 문서가 동의하는 관계" 신호와 출처 추적 손실.
+- 해결안 Option A (가성비 권장): 엣지에 `source_document_ids: set[int]` 누적 보존, DiGraph 유지로 검색 코드 호환.
+- 해결안 Option B: `nx.MultiDiGraph` 로 전환 (검색 코드 광범위 변경).
+- 작업량: Option A 는 작음.
+
 ### I-004: LLM Classifier 프롬프트 설계
 - 문서를 chunk/graph/hybrid로 판정하는 프롬프트의 정확도와 비용 최적화 필요
 - Phase 3.1 시작 시 프로토타이핑 및 테스트 필요
@@ -107,6 +151,20 @@
 - 우선순위: 중간. 현재는 fallback으로 문제 없음.
 
 ## 해결됨
+
+### I-039: 그래프 컨텍스트 강화 — 본문 의미 관계 추출 → 해결 (2026-04-28, 브랜치 `claude/improve-graph-context-veDSQ`)
+- **증상**: Confluence 그래프가 `outbound_links` 만 사용해 의미 관계가 `references / mentions_user / mentions_ticket / has_attachment` 4종뿐. 사용자 보고 "그래프가 질의 시 유의미한 컨텍스트로 보이지 않음".
+- **6가지 원인 진단**: (1) 본문 의미 그래프 부재 (2) 관계 의미 소실 (3) 엔티티 병합 키 불안정 (4) 메타 축 부재 (5) 검색 결과 렌더링 빈약 (6) LLM 플래너 스키마 인식 얕음.
+- **이번 세션 해결: (1)(2)(6)**.
+- **PR-1 ExtractionUnit (`9be0a2d`)**: 추출 전용 입자도(target=1500/max=2400 토큰). 후위 순회 merged_tokens → top-down 응축/분할/흡수 4규칙. 안정적 `section_id = f"{document_id}:{section_index}"` + breadcrumb(`# 문서:`, `## 위치:`, 머리말). 기존 chunker 와 분리. 테스트 21건.
+- **PR-2 chunk ↔ unit 조인 키 (`b1ee655`)**: `chunks.section_index INTEGER` 컬럼 + idempotent 마이그레이션. 향후 검색 시 그래프 결과 → 본문 스니펫 인입의 인프라 (I-041 에서 사용).
+- **PR-3 결정론 본문 추출기 + Option A (`1516b33`, `5f15029`)**: `body_extractor.py` 4가지 시그널(API/Jira/bold/table). 회고 후 보수적 기본값 — API/Jira ON, bold/table OFF (작성 컨벤션 의존 + 추상 헤더 노이즈).
+- **PR-4 LLM 본문 추출기 (`2a54998`)**: `llm_body_extractor.py`. 9개 의미 관계(depends_on/implements/calls/owned_by/supersedes/has_part/uses/provides/documented_in) + 7개 엔티티 어휘 고정. 어휘 외 / 끝점 누락 / self-loop 검증 드롭. 단위 격리 + 비용 게이트. **opt-in** (`PipelineConfig.enable_llm_body_extraction=True` + `llm_client` 둘 다 전달 시).
+- **perf 7500배 (`266bc82`)**: cProfile 진단 결과 `tiktoken/load.py:read_file` 가 매 호출 vocab 재다운로드 시도(357 sections × 38ms = 13.6s). `chunker._get_tokenizer` 에 `lru_cache` 적용 + `_Node.own_body` 캐시 + `_render_subtree/_dfs` 단일 walk 통합. 13447ms → 1.8ms.
+- **호출 체인 통합 (`cbd7693`)**: `process_document(llm_client=...)` 4개 사이트 전파.
+- **fix 빈 응답 (`bd52f5a`)**: Qwen3 reasoning 모델이 `<think>` 사고에 max_tokens 소진 → `extract_json` 스트립 후 빈 응답. `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` 적용 + max_tokens 1024 → 2048. (`graph_search_planner` 와 동일 처방)
+- **PR-5 graph_vocabulary + 플래너 시스템 프롬프트 (`f0a7c6d`)**: `graph_vocabulary.py` 단일 출처(12 entity + 19 relation + 7 intent→relation 매핑). 추출기 어휘 ⊆ vocab 강제 테스트로 미래 누락 자동 검출. `_render_system_prompt()` 동적 렌더 → LLM 플래너가 어휘 의미 + 의도 매핑 가이드 인식. "Auth Service 의존?" → `focus_relations=["depends_on", "uses", "calls"]` 정확 선택.
+- **잔존 갭 (분리)**: I-040 (검색 품질 측정), I-041 (렌더링), I-042 (메타 축), I-043 (cross-doc 관계 출처).
 
 ### I-035: Phase 2 인덱싱 자동화 + 동시성 + 실패 재시도 → 해결 (2026-04-24, D-044)
 - **증상**: 싱크 후 문서는 meta 에 저장되지만 벡터/그래프 인덱싱은 수동 "Process" 버튼 필요. Phase 2 가 직렬이라 대량 싱크 시 느림. 인덱싱 실패 문서는 `status='failed'` 로 stuck.
