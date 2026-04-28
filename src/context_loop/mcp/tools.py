@@ -21,7 +21,7 @@ def register_tools(mcp: FastMCP) -> None:
         query: str,
         max_chunks: int = 10,
         include_graph: bool = True,
-        include_source_code: bool = False,
+        include_source_code: bool = True,
     ) -> str:
         """질의 문자열로 관련 사내 지식 컨텍스트를 검색·조립하여 반환한다.
 

@@ -48,7 +48,7 @@ class ChatRequest(BaseModel):
     query: str
     max_chunks: int = 10
     include_graph: bool = True
-    include_source_code: bool = False
+    include_source_code: bool = True
 
 
 @router.get("/chat")
