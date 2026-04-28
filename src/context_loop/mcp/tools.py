@@ -21,6 +21,7 @@ def register_tools(mcp: FastMCP) -> None:
         query: str,
         max_chunks: int = 10,
         include_graph: bool = True,
+        include_source_code: bool = False,
     ) -> str:
         """질의 문자열로 관련 사내 지식 컨텍스트를 검색·조립하여 반환한다.
 
@@ -30,6 +31,7 @@ def register_tools(mcp: FastMCP) -> None:
             query: 검색 질의 문자열.
             max_chunks: 반환할 최대 청크 수.
             include_graph: 그래프 컨텍스트 포함 여부.
+            include_source_code: code_doc/code_summary 의 원본 git_code 소스 첨부 여부.
         """
         from context_loop.mcp.context_assembler import assemble_context
         from context_loop.mcp.server import (
@@ -51,6 +53,7 @@ def register_tools(mcp: FastMCP) -> None:
             reranker_client=_reranker_client,
             max_chunks=max_chunks,
             include_graph=include_graph,
+            include_source_code=include_source_code,
             similarity_threshold=_config.get("search.similarity_threshold", 0.0) if _config else 0.0,
             rerank_enabled=_config.get("search.reranker_enabled", False) if _config else False,
             rerank_top_k=_config.get("search.reranker_top_k", None) if _config else None,

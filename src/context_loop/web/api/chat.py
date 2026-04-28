@@ -48,6 +48,7 @@ class ChatRequest(BaseModel):
     query: str
     max_chunks: int = 10
     include_graph: bool = True
+    include_source_code: bool = False
 
 
 @router.get("/chat")
@@ -85,6 +86,7 @@ async def chat_api(
         reranker_client=reranker_client,
         max_chunks=body.max_chunks,
         include_graph=body.include_graph,
+        include_source_code=body.include_source_code,
         similarity_threshold=config.get("search.similarity_threshold", 0.0),
         rerank_enabled=config.get("search.reranker_enabled", False),
         rerank_top_k=config.get("search.reranker_top_k", None),
