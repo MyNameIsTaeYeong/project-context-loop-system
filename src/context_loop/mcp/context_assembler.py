@@ -100,30 +100,26 @@ async def assemble_context(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. LLM 기반 리랭킹
-    if chunk_results and rerank_enabled and llm_client:
-        chunk_results = await rerank(
-            query, chunk_results, llm_client, top_k=rerank_top_k,
-        )
-        if rerank_score_threshold > 0:
-            chunk_results = [
-                c for c in chunk_results
-                if c.get("rerank_score", 0) >= rerank_score_threshold
-            ]
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (LLM 호출 두 건을 동시에 처리).
+    chunk_results, graph_result = await _rerank_and_search_graph(
+        query, chunk_results,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        embedding_client=embedding_client,
+        query_embedding=query_embedding,
+        rerank_enabled=rerank_enabled,
+        rerank_top_k=rerank_top_k,
+        rerank_score_threshold=rerank_score_threshold,
+        include_graph=include_graph,
+    )
 
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 3. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
-    if include_graph and llm_client:
-        graph_result = await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-        if graph_result:
-            sections.append(graph_result.text)
+    # 3. 그래프 탐색 결과 처리
+    if graph_result:
+        sections.append(graph_result.text)
 
     # 4. Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:
@@ -259,6 +255,49 @@ async def _search_graph_with_llm(
         return None
 
 
+async def _rerank_and_search_graph(
+    query: str,
+    chunk_results: list[dict[str, Any]],
+    *,
+    graph_store: GraphStore,
+    llm_client: Any,
+    embedding_client: Any,
+    query_embedding: list[float] | None,
+    rerank_enabled: bool,
+    rerank_top_k: int | None,
+    rerank_score_threshold: float,
+    include_graph: bool,
+) -> tuple[list[dict[str, Any]], GraphSearchResult | None]:
+    """리랭킹과 그래프 탐색을 병렬 실행한다.
+
+    리랭킹은 chunk_results, 그래프 계획은 query_embedding 에만 의존하므로
+    서로 무관한 두 LLM 호출을 동시에 보내 응답 지연을 줄인다.
+    """
+    async def _maybe_rerank() -> list[dict[str, Any]]:
+        if not (chunk_results and rerank_enabled and llm_client):
+            return chunk_results
+        reranked = await rerank(
+            query, chunk_results, llm_client, top_k=rerank_top_k,
+        )
+        if rerank_score_threshold > 0:
+            reranked = [
+                c for c in reranked
+                if c.get("rerank_score", 0) >= rerank_score_threshold
+            ]
+        return reranked
+
+    async def _maybe_graph() -> GraphSearchResult | None:
+        if not (include_graph and llm_client):
+            return None
+        return await _search_graph_with_llm(
+            query, graph_store, llm_client,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
+        )
+
+    return await asyncio.gather(_maybe_rerank(), _maybe_graph())
+
+
 async def assemble_context_with_sources(
     query: str,
     *,
@@ -316,33 +355,17 @@ async def assemble_context_with_sources(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. 리랭킹과 그래프 탐색을 병렬 실행한다.
-    #    리랭킹은 chunk_results, 그래프 계획은 query_embedding 에만 의존하므로
-    #    서로 무관한 두 LLM 호출을 동시에 보내 응답 지연을 줄인다.
-    async def _maybe_rerank() -> list[dict[str, Any]]:
-        if not (chunk_results and rerank_enabled and llm_client):
-            return chunk_results
-        reranked = await rerank(
-            query, chunk_results, llm_client, top_k=rerank_top_k,
-        )
-        if rerank_score_threshold > 0:
-            reranked = [
-                c for c in reranked
-                if c.get("rerank_score", 0) >= rerank_score_threshold
-            ]
-        return reranked
-
-    async def _maybe_graph() -> GraphSearchResult | None:
-        if not (include_graph and llm_client):
-            return None
-        return await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-
-    chunk_results, graph_result = await asyncio.gather(
-        _maybe_rerank(), _maybe_graph(),
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (LLM 호출 두 건을 동시에 처리).
+    chunk_results, graph_result = await _rerank_and_search_graph(
+        query, chunk_results,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        embedding_client=embedding_client,
+        query_embedding=query_embedding,
+        rerank_enabled=rerank_enabled,
+        rerank_top_k=rerank_top_k,
+        rerank_score_threshold=rerank_score_threshold,
+        include_graph=include_graph,
     )
 
     if chunk_results:
