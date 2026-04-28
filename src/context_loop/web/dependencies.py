@@ -8,6 +8,7 @@ from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.processor.llm_client import LLMClient
+from context_loop.processor.reranker_client import RerankerClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -41,3 +42,8 @@ def get_llm_client(request: Request) -> LLMClient:
 def get_embedding_client(request: Request) -> Embeddings:
     """앱 시작 시 생성된 임베딩 클라이언트를 반환한다."""
     return request.app.state.embedding_client
+
+
+def get_reranker_client(request: Request) -> RerankerClient | None:
+    """앱 시작 시 생성된 리랭커 클라이언트를 반환한다 (미설정 시 None)."""
+    return request.app.state.reranker_client

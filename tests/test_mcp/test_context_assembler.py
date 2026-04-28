@@ -435,14 +435,9 @@ async def test_assemble_context_with_reranking(stores) -> None:
 
     embed_client = _make_embedding_client([0.9, 0.1])
 
-    # LLM이 chunk_1(핵심 답변)에 높은 점수를 부여
-    rerank_response = json.dumps([
-        {"index": 0, "score": 3},
-        {"index": 1, "score": 9},
-    ])
-    llm = AsyncMock()
-    # LLM은 리랭킹 호출과 그래프 탐색 호출 모두 처리
-    llm.complete = AsyncMock(return_value=rerank_response)
+    # 리랭커가 chunk_1(핵심 답변)에 높은 점수를 부여
+    reranker = AsyncMock()
+    reranker.rerank = AsyncMock(return_value=[0.3, 0.9])
 
     result = await assemble_context(
         query="핵심 정보",
@@ -450,7 +445,7 @@ async def test_assemble_context_with_reranking(stores) -> None:
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=embed_client,
-        llm_client=llm,
+        reranker_client=reranker,
         include_graph=False,
         rerank_enabled=True,
         rerank_top_k=2,
@@ -478,12 +473,9 @@ async def test_assemble_context_rerank_score_threshold(stores) -> None:
     )
 
     embed_client = _make_embedding_client([0.9, 0.1])
-    rerank_response = json.dumps([
-        {"index": 0, "score": 8},
-        {"index": 1, "score": 2},  # threshold(4.0) 미만
-    ])
-    llm = AsyncMock()
-    llm.complete = AsyncMock(return_value=rerank_response)
+    reranker = AsyncMock()
+    # threshold(0.4) 미만인 0.2 는 제외 대상
+    reranker.rerank = AsyncMock(return_value=[0.8, 0.2])
 
     assembled = await assemble_context_with_sources(
         query="관련 질의",
@@ -491,12 +483,12 @@ async def test_assemble_context_rerank_score_threshold(stores) -> None:
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=embed_client,
-        llm_client=llm,
+        reranker_client=reranker,
         include_graph=False,
         rerank_enabled=True,
-        rerank_score_threshold=4.0,
+        rerank_score_threshold=0.4,
     )
-    # 점수 2인 "무관한 잡음"은 제외되어야 함
+    # 점수 0.2인 "무관한 잡음"은 제외되어야 함
     assert "관련 내용" in assembled.context_text
     assert "무관한 잡음" not in assembled.context_text
 
