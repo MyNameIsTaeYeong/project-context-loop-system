@@ -63,6 +63,25 @@ def _build_llm_client(config: Config):
     return OpenAIClient(api_key=api_key or "")
 
 
+def _build_reranker_client(config: Config):
+    """설정에 따라 전용 리랭커 클라이언트를 생성한다.
+
+    ``reranker.endpoint`` 가 비어 있으면 None 을 반환해 리랭킹 단계를 스킵한다.
+    """
+    from context_loop.processor.reranker_client import EndpointRerankerClient
+
+    endpoint = config.get("reranker.endpoint", "") or ""
+    model = config.get("reranker.model", "") or ""
+    if not endpoint or not model:
+        return None
+    return EndpointRerankerClient(
+        endpoint=endpoint,
+        model=model,
+        api_key=config.get("reranker.api_key", "") or "",
+        headers=config.get("reranker.headers") or None,
+    )
+
+
 def _build_embedding_client(config: Config):
     """설정에 따라 임베딩 클라이언트를 생성한다."""
     from context_loop.processor.embedder import EndpointEmbeddingClient, LocalEmbeddingClient
@@ -108,6 +127,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     llm_client = _build_llm_client(config)
     embedding_client = _build_embedding_client(config)
+    reranker_client = _build_reranker_client(config)
 
     app.state.config = config
     app.state.meta_store = meta_store
@@ -115,6 +135,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.graph_store = graph_store
     app.state.llm_client = llm_client
     app.state.embedding_client = embedding_client
+    app.state.reranker_client = reranker_client
 
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield

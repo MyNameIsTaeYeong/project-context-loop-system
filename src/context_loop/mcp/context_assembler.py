@@ -9,6 +9,7 @@ LLM 기반 리랭커로 검색 결과의 정밀도를 높인다.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,6 +21,7 @@ from context_loop.processor.graph_search_planner import (
 )
 from context_loop.processor.query_expander import expand_query_embedding
 from context_loop.processor.reranker import rerank
+from context_loop.processor.reranker_client import RerankerClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -52,6 +54,7 @@ async def assemble_context(
     graph_store: GraphStore,
     embedding_client: Any,
     llm_client: Any = None,
+    reranker_client: RerankerClient | None = None,
     max_chunks: int = 10,
     include_graph: bool = True,
     similarity_threshold: float = 0.0,
@@ -72,13 +75,14 @@ async def assemble_context(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트 (Embeddings 인터페이스).
-        llm_client: LLM 클라이언트 (그래프 탐색 계획용 + 리랭킹용). None이면 스킵.
+        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        reranker_client: 전용 리랭커 모델 클라이언트. None이면 리랭킹 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
         similarity_threshold: 최소 코사인 유사도 (이 값 미만 제외, 0이면 필터링 없음).
-        rerank_enabled: LLM 기반 리랭커 사용 여부.
+        rerank_enabled: 전용 리랭커 사용 여부.
         rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
-        rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
+        rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
         include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
 
@@ -99,30 +103,27 @@ async def assemble_context(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. LLM 기반 리랭킹
-    if chunk_results and rerank_enabled and llm_client:
-        chunk_results = await rerank(
-            query, chunk_results, llm_client, top_k=rerank_top_k,
-        )
-        if rerank_score_threshold > 0:
-            chunk_results = [
-                c for c in chunk_results
-                if c.get("rerank_score", 0) >= rerank_score_threshold
-            ]
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (모델 호출 두 건을 동시에 처리).
+    chunk_results, graph_result = await _rerank_and_search_graph(
+        query, chunk_results,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        reranker_client=reranker_client,
+        embedding_client=embedding_client,
+        query_embedding=query_embedding,
+        rerank_enabled=rerank_enabled,
+        rerank_top_k=rerank_top_k,
+        rerank_score_threshold=rerank_score_threshold,
+        include_graph=include_graph,
+    )
 
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 3. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
-    if include_graph and llm_client:
-        graph_result = await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-        if graph_result:
-            sections.append(graph_result.text)
+    # 3. 그래프 탐색 결과 처리
+    if graph_result:
+        sections.append(graph_result.text)
 
     # 4. Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:
@@ -258,6 +259,50 @@ async def _search_graph_with_llm(
         return None
 
 
+async def _rerank_and_search_graph(
+    query: str,
+    chunk_results: list[dict[str, Any]],
+    *,
+    graph_store: GraphStore,
+    llm_client: Any,
+    reranker_client: RerankerClient | None,
+    embedding_client: Any,
+    query_embedding: list[float] | None,
+    rerank_enabled: bool,
+    rerank_top_k: int | None,
+    rerank_score_threshold: float,
+    include_graph: bool,
+) -> tuple[list[dict[str, Any]], GraphSearchResult | None]:
+    """리랭킹과 그래프 탐색을 병렬 실행한다.
+
+    리랭킹은 chunk_results, 그래프 계획은 query_embedding 에만 의존하므로
+    서로 무관한 두 외부 호출을 동시에 보내 응답 지연을 줄인다.
+    """
+    async def _maybe_rerank() -> list[dict[str, Any]]:
+        if not (chunk_results and rerank_enabled and reranker_client):
+            return chunk_results
+        reranked = await rerank(
+            query, chunk_results, reranker_client, top_k=rerank_top_k,
+        )
+        if rerank_score_threshold > 0:
+            reranked = [
+                c for c in reranked
+                if c.get("rerank_score", 0) >= rerank_score_threshold
+            ]
+        return reranked
+
+    async def _maybe_graph() -> GraphSearchResult | None:
+        if not (include_graph and llm_client):
+            return None
+        return await _search_graph_with_llm(
+            query, graph_store, llm_client,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
+        )
+
+    return await asyncio.gather(_maybe_rerank(), _maybe_graph())
+
+
 async def assemble_context_with_sources(
     query: str,
     *,
@@ -266,6 +311,7 @@ async def assemble_context_with_sources(
     graph_store: GraphStore,
     embedding_client: Any,
     llm_client: Any = None,
+    reranker_client: RerankerClient | None = None,
     max_chunks: int = 10,
     include_graph: bool = True,
     similarity_threshold: float = 0.0,
@@ -286,13 +332,14 @@ async def assemble_context_with_sources(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트.
-        llm_client: LLM 클라이언트 (그래프 탐색 계획용 + 리랭킹용). None이면 스킵.
+        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        reranker_client: 전용 리랭커 모델 클라이언트. None이면 리랭킹 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
         similarity_threshold: 최소 코사인 유사도 (이 값 미만 제외, 0이면 필터링 없음).
-        rerank_enabled: LLM 기반 리랭커 사용 여부.
+        rerank_enabled: 전용 리랭커 사용 여부.
         rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
-        rerank_score_threshold: 리랭크 점수 최소값 (0~10, 이 값 미만 제외).
+        rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
         include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
 
@@ -315,16 +362,19 @@ async def assemble_context_with_sources(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. LLM 기반 리랭킹
-    if chunk_results and rerank_enabled and llm_client:
-        chunk_results = await rerank(
-            query, chunk_results, llm_client, top_k=rerank_top_k,
-        )
-        if rerank_score_threshold > 0:
-            chunk_results = [
-                c for c in chunk_results
-                if c.get("rerank_score", 0) >= rerank_score_threshold
-            ]
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (모델 호출 두 건을 동시에 처리).
+    chunk_results, graph_result = await _rerank_and_search_graph(
+        query, chunk_results,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        reranker_client=reranker_client,
+        embedding_client=embedding_client,
+        query_embedding=query_embedding,
+        rerank_enabled=rerank_enabled,
+        rerank_top_k=rerank_top_k,
+        rerank_score_threshold=rerank_score_threshold,
+        include_graph=include_graph,
+    )
 
     if chunk_results:
         lines = []
@@ -345,24 +395,18 @@ async def assemble_context_with_sources(
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
-    if include_graph and llm_client:
-        graph_result = await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-        if graph_result:
-            sections.append(graph_result.text)
-            # 그래프 탐색 결과에서 출처 추출
-            existing_doc_ids = {s.document_id for s in sources}
-            for doc_id in graph_result.document_ids:
-                if doc_id not in existing_doc_ids:
-                    if doc_id not in doc_cache:
-                        doc = await meta_store.get_document(doc_id)
-                        doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
-                    title = doc_cache[doc_id]["title"]
-                    sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
+    # 3. 그래프 탐색 결과 처리 (쿼리 임베딩으로 관련 스키마 생성)
+    if graph_result:
+        sections.append(graph_result.text)
+        # 그래프 탐색 결과에서 출처 추출
+        existing_doc_ids = {s.document_id for s in sources}
+        for doc_id in graph_result.document_ids:
+            if doc_id not in existing_doc_ids:
+                if doc_id not in doc_cache:
+                    doc = await meta_store.get_document(doc_id)
+                    doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
+                title = doc_cache[doc_id]["title"]
+                sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
 
     # Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:

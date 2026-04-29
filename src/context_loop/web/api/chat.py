@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from context_loop.config import Config
 from context_loop.mcp.context_assembler import assemble_context_with_sources
 from context_loop.processor.llm_client import LLMClient
+from context_loop.processor.reranker_client import RerankerClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -24,6 +25,7 @@ from context_loop.web.dependencies import (
     get_graph_store,
     get_llm_client,
     get_meta_store,
+    get_reranker_client,
     get_templates,
     get_vector_store,
 )
@@ -46,6 +48,7 @@ class ChatRequest(BaseModel):
     query: str
     max_chunks: int = 10
     include_graph: bool = True
+    include_source_code: bool = True
 
 
 @router.get("/chat")
@@ -63,6 +66,7 @@ async def chat_api(
     graph_store: GraphStore = Depends(get_graph_store),
     llm_client: LLMClient = Depends(get_llm_client),
     embedding_client: Embeddings = Depends(get_embedding_client),
+    reranker_client: RerankerClient | None = Depends(get_reranker_client),
     config: Config = Depends(get_config),
 ):
     """RAG 파이프라인으로 질의응답을 수행한다.
@@ -79,8 +83,10 @@ async def chat_api(
         graph_store=graph_store,
         embedding_client=embedding_client,
         llm_client=llm_client,
+        reranker_client=reranker_client,
         max_chunks=body.max_chunks,
         include_graph=body.include_graph,
+        include_source_code=body.include_source_code,
         similarity_threshold=config.get("search.similarity_threshold", 0.0),
         rerank_enabled=config.get("search.reranker_enabled", False),
         rerank_top_k=config.get("search.reranker_top_k", None),
@@ -94,7 +100,7 @@ async def chat_api(
     else:
         prompt = f"## 컨텍스트\n\n{assembled.context_text}\n\n## 질문\n\n{body.query}"
         try:
-            answer = await llm_client.complete(prompt, system=_SYSTEM_PROMPT, max_tokens=2048)
+            answer = await llm_client.complete(prompt, system=_SYSTEM_PROMPT, max_tokens=8192)
         except Exception:
             logger.exception("LLM 호출 실패")
             answer = "LLM 호출 중 오류가 발생했습니다. 설정을 확인해 주세요."
