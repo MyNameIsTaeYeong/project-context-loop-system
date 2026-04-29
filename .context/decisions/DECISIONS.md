@@ -691,3 +691,43 @@
   - 테스트 누적 +31 (Phase 2 11건 + CQL helpers 11건 + 파싱 계층 4건 + MCP 필수 파라미터 5건), 최종 178 passed. 회귀 없음.
 - **관련 이슈**: I-031 (MCP 필수 파라미터), I-032 (structuredContent + envelope 변종), I-033 (BFS → CQL), I-034 (페이지네이션 서버 cap), I-035 (Phase 2 자동화 + 동시성 + 실패 재시도) 모두 이 결정의 구성요소로 해결.
 
+---
+
+## D-045: /api/chat 성능 최적화 — 리랭킹/그래프 LLM 호출 병렬화 + 전용 cross-encoder 리랭커 도입
+
+- **일시**: 2026-04-29
+- **맥락**: 사용자 보고 — `/api/chat` 응답이 느림. 추적 결과 RAG 파이프라인이 LLM 호출 4건(HyDE / 그래프 탐색 계획 / 리랭킹 / 최종 답변)을 직렬로 수행. 의존성 분석 결과 "리랭킹"과 "그래프 탐색 계획"은 서로 무관 — 동시 실행 가능. 이어 사용자 후속 요청으로 LLM 기반 리랭커(D-021 의 일부) 자체를 dedicated cross-encoder 리랭커 API 호출로 교체. 두 변경은 독립이지만 같은 세션의 단일 성능 개선 흐름이라 한 결정으로 묶는다.
+- **결정**:
+  1. **리랭킹 ↔ 그래프 탐색 병렬화 (`asyncio.gather`)**:
+     - `mcp/context_assembler.py` 에 모듈 내부 헬퍼 `_rerank_and_search_graph(query, chunk_results, *, graph_store, llm_client, reranker_client, embedding_client, query_embedding, rerank_enabled, rerank_top_k, rerank_score_threshold, include_graph) -> tuple[list, GraphSearchResult|None]` 신설.
+     - 내부 두 보조 코루틴 `_maybe_rerank()` / `_maybe_graph()` 를 `asyncio.gather` 로 동시 실행. 각 코루틴은 활성화 조건(`rerank_enabled and reranker_client`, `include_graph and llm_client`) 미충족 시 즉시 무동작 결과 반환.
+     - `assemble_context` 와 `assemble_context_with_sources` 양쪽에서 동일 헬퍼 호출 — 검색 파이프라인 한 곳 수정으로 두 호출 경로 동기 유지.
+  2. **전용 리랭커 모델 클라이언트 도입 — D-021 의 LLM 기반 리랭커 대체**:
+     - `processor/reranker_client.py` 신규: `RerankerClient` ABC + `EndpointRerankerClient` (Cohere/Jina/TEI 호환). 요청 본문 `{"model", "query", "documents"}`. 응답은 4가지 형식 자동 정규화하는 `parse_rerank_response(data, n)`:
+       - Cohere/Jina dict: `{"results": [{"index", "relevance_score"}, ...]}`
+       - TEI list-of-dict: `[{"index", "score"}, ...]`
+       - dict ordered scores: `{"scores": [float, ...]}`
+       - list ordered scores: `[float, ...]`
+     - `processor/reranker.py` 단순화 130 → 80 라인: LLM 시스템 프롬프트, JSON 추출, 정규식 fallback, 점수 클램핑(0~10) 모두 제거. `reranker_client.rerank(query, documents)` 단일 호출 후 `chunk["rerank_score"]` 매핑 + 정렬 + top_k.
+     - 점수 의미 변경: 0~10 (LLM scoring) → 0~1 (cross-encoder 모델 의존). `config.search.reranker_score_threshold` 기본값 4.0 → 0.3.
+     - config 신규 섹션 `reranker:` (`endpoint`, `model`, `api_key`, `headers`) — 기존 `llm:` 섹션과 동일 스타일.
+     - `_build_reranker_client(config)` (web/app.py): `endpoint` 또는 `model` 미설정 시 None 반환 → 리랭킹 단계 자동 스킵 (graceful degradation, LLM 클라이언트와 분리되어 LLM 만 있는 환경에서도 영향 없음).
+     - DI 배선: `app.state.reranker_client` → `Depends(get_reranker_client)` → `/api/chat`. MCP 경로는 `mcp/server._reranker_client` 전역.
+  3. **`include_source_code` 파라미터 호출자 누락 수정 + 기본값 True**:
+     - `assemble_context*` 의 `include_source_code` 파라미터가 `/api/chat`, MCP `search_context` 양쪽에서 전달되지 않아 항상 False 로 동작 — code_doc/code_summary 의 원본 git 소스 첨부 기능이 사실상 죽어 있던 상태였음.
+     - `ChatRequest.include_source_code: bool = True` 추가, MCP `search_context(..., include_source_code: bool = True)` 추가. 두 사이트 모두 어셈블러로 전달.
+     - 기본값 True (`include_graph` 와 같은 패턴) — 코드 문서가 핵심 use case 라 기본 첨부가 자연스럽다는 사용자 지시.
+  4. **응답 max_tokens 상향**: `/api/chat` 답변 생성 `LLMClient.complete(max_tokens=2048 → 8192)`. 답변 잘림 방지.
+- **이유**:
+  - **병렬화 ROI 가 가장 큼**: 4건의 LLM 호출 중 가장 무거운 두 건(rerank + graph plan)이 정확히 서로 무관. 변경 비용은 헬퍼 1개와 `asyncio.gather` 한 줄. RTT 한 번 분량(보통 수백 ms ~ 수 초) 단축이 4건 전부 직렬화된 흐름의 체감 응답성을 크게 개선.
+  - **전용 리랭커가 LLM 기반보다 우월**: cross-encoder 는 (a) 비용이 LLM 1/10~1/100, (b) 지연이 ms 단위, (c) 결과 품질이 본래 ranking 용 학습 모델이라 더 정확. D-021 에서 도입한 LLM 기반은 "별도 모델 인프라 없이도" 라는 임시 처방이었고, 사용자가 이제 dedicated 모델 인프라를 갖춰 본래 의도된 cross-encoder 로 자연스럽게 이행. JSON 파싱 / `<think>` 스트립 / 토큰 절삭 등 LLM 기반의 잡기 어려운 실패 모드가 모두 사라짐.
+  - **헬퍼 추출이 두 호출 경로 분기 위험을 차단**: `assemble_context` (MCP) 와 `assemble_context_with_sources` (/api/chat) 가 거의 같은 검색 파이프라인을 중복 구현 중. 한쪽만 수정하면 누락이 구조적으로 발생 — 이번 세션에서도 1차 커밋은 후자만 수정해 MCP 경로가 직렬로 남았음. 헬퍼 추출 후엔 한 곳만 고치면 양쪽이 동기화. 코드 길이는 두 함수에 같은 블록을 두 번 쓰는 것보다 짧음.
+  - **응답 형식 다중 지원 = 인프라 호환성**: dedicated 리랭커는 제공자별 스펙이 갈림(Cohere/Jina/TEI/자체구현). 한 곳(`parse_rerank_response`)에서 4가지 형식을 모두 흡수하면 사내 모델 서버 변경 시 코드 수정 없이 config 만 바꿔 끼울 수 있음.
+  - **`include_source_code` 파라미터 누락은 명백한 버그**: 어셈블러에 매개변수가 존재하는데 호출자에서 전달이 빠진 형태 — 9.7 Phase 에서 추가된 기능이 실제로는 호출 경로에서 도달 불가능했음. 기본값을 True 로 둔 것은 사용자가 이 기능을 항상 켜고 쓰는 사용 패턴을 명시한 것으로, 비용 측면(컨텍스트 길이 증가)을 인지한 의식적 선택.
+- **영향**:
+  - 신규: `processor/reranker_client.py`, `tests/test_processor/test_reranker_client.py`
+  - 변경: `processor/reranker.py` (대폭 단순화), `mcp/context_assembler.py`, `mcp/server.py`, `mcp/tools.py`, `web/app.py`, `web/dependencies.py`, `web/api/chat.py`, `config/default.yaml`, `tests/test_processor/test_reranker.py` (재작성), `tests/test_mcp/test_context_assembler.py` (rerank 테스트 2건 갱신).
+  - 테스트 누적 +18 (rerank 9 + reranker_client 9), processor + mcp 262 passed. 회귀 없음.
+  - 브랜치 `claude/optimize-chat-api-performance-vODmW`, 커밋 `5e9f3d9` `98a8c47` `6da5aa7` `34f9aaf` `40e6928` `e22cf26`.
+- **관련 결정**: D-021 (LLM 기반 리랭커 도입 — 본 결정으로 LLM 호출은 cross-encoder 호출로 교체. score_threshold 의 0~10 범위 컨벤션은 0~1 로 변경됨), D-022 (HyDE).
+

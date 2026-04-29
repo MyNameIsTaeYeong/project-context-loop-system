@@ -48,6 +48,18 @@
 - 해결안 Option B: `nx.MultiDiGraph` 로 전환 (검색 코드 광범위 변경).
 - 작업량: Option A 는 작음.
 
+### I-044: HyDE 단계 임베딩-LLM 병렬화
+- D-045 에서 rerank ↔ graph plan 병렬화는 적용했지만 `expand_query_embedding` 내부의 "원본 쿼리 임베딩" 과 "HyDE 가상 문서 LLM 생성" 은 여전히 직렬.
+- 두 호출 모두 `query` 만 의존하므로 `asyncio.gather` 로 묶을 수 있음.
+- 단, HyDE (`search.hyde_enabled=true`) 활성화 시에만 효과 — 현재 기본 false 라 우선순위 낮음.
+- 작업량: 작음. `processor/query_expander.py:expand_query_embedding` 만 수정.
+
+### I-045: /api/chat 스트리밍 응답
+- 최종 답변 LLM 호출의 첫 토큰 지연(TTFB) 단축은 병렬화로 해결되지 않음 — 스트리밍 응답으로 전환 필요.
+- 현재 `LLMClient.complete` 자체는 내부적으로 `stream=True` 지만 응답을 전부 받은 뒤 한 번에 반환 (`/api/chat` 도 한 번에 JSON 응답).
+- SSE 기반 스트리밍 엔드포인트(`/api/chat/stream`) 신설 + 프론트엔드 `chat.js` 의 streaming 수신 처리 필요.
+- 작업량: 중간. 백엔드 SSE 라우트 + `LLMClient` 에 `stream_complete()` 추가 + 프론트엔드 EventSource 연동.
+
 ### I-004: LLM Classifier 프롬프트 설계
 - 문서를 chunk/graph/hybrid로 판정하는 프롬프트의 정확도와 비용 최적화 필요
 - Phase 3.1 시작 시 프로토타이핑 및 테스트 필요
