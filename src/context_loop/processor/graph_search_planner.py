@@ -156,7 +156,7 @@ async def plan_graph_search(
             system=_render_system_prompt(),
             max_tokens=512,
             temperature=0.0,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            reasoning_mode="off",
         )
         plan_data = extract_json(response)
     except Exception:
