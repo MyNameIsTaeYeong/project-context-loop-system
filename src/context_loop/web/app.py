@@ -54,6 +54,7 @@ def _build_llm_client(config: Config):
             model=config.get("llm.model", ""),
             api_key=config.get("llm.api_key", ""),
             headers=config.get("llm.headers") or None,
+            reasoning_profiles=config.get("llm.reasoning_profiles") or None,
         )
     if provider == "anthropic":
         api_key = get_token("anthropic", "api_key")

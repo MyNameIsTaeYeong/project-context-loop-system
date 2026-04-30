@@ -70,7 +70,7 @@ class TestEndpointLLMClient:
         assert messages[1] == {"role": "user", "content": "테스트"}
 
     async def test_extra_body_passed(self) -> None:
-        """extra_body가 전달된다."""
+        """명시적 extra_body가 그대로 전달된다."""
         client, mock = _make_client()
         _setup_response(mock, "응답")
 
@@ -82,6 +82,71 @@ class TestEndpointLLMClient:
         call_kwargs = mock.chat.completions.create.call_args.kwargs
         assert call_kwargs["extra_body"] == {
             "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    async def test_reasoning_mode_uses_profile(self) -> None:
+        """reasoning_mode가 reasoning_profiles의 extra_body로 매핑된다."""
+        client = EndpointLLMClient(
+            "http://test/v1",
+            "model-a",
+            reasoning_profiles={
+                "off": {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+                "low": {"extra_body": {"chat_template_kwargs": {"reasoning_effort": "low"}}},
+            },
+        )
+        mock = AsyncMock()
+        client._client = mock
+        _setup_response(mock, "응답")
+
+        await client.complete("테스트", reasoning_mode="off")
+
+        assert mock.chat.completions.create.call_args.kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    async def test_reasoning_mode_unknown_profile_omitted(self) -> None:
+        """프로파일에 없는 reasoning_mode는 extra_body를 추가하지 않는다."""
+        client = EndpointLLMClient(
+            "http://test/v1", "model-a", reasoning_profiles={"off": {"extra_body": {}}},
+        )
+        mock = AsyncMock()
+        client._client = mock
+        _setup_response(mock, "응답")
+
+        await client.complete("테스트", reasoning_mode="medium")
+
+        assert "extra_body" not in mock.chat.completions.create.call_args.kwargs
+
+    async def test_reasoning_mode_without_profiles_noop(self) -> None:
+        """reasoning_profiles가 없으면 reasoning_mode는 무시된다."""
+        client, mock = _make_client()
+        _setup_response(mock, "응답")
+
+        await client.complete("테스트", reasoning_mode="off")
+
+        assert "extra_body" not in mock.chat.completions.create.call_args.kwargs
+
+    async def test_explicit_extra_body_overrides_profile(self) -> None:
+        """명시적 extra_body가 reasoning_mode 프로파일보다 우선한다."""
+        client = EndpointLLMClient(
+            "http://test/v1",
+            "model-a",
+            reasoning_profiles={
+                "off": {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+            },
+        )
+        mock = AsyncMock()
+        client._client = mock
+        _setup_response(mock, "응답")
+
+        await client.complete(
+            "테스트",
+            reasoning_mode="off",
+            extra_body={"override": True},
+        )
+
+        assert mock.chat.completions.create.call_args.kwargs["extra_body"] == {
+            "override": True,
         }
 
     def test_headers_passed_to_openai_client(self) -> None:

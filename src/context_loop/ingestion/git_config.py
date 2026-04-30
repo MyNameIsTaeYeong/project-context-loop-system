@@ -92,6 +92,13 @@ class GitSourceConfig:
         default_factory=LLMEndpointConfig, repr=False
     )
 
+    # 글로벌 reasoning 프로파일 (llm.reasoning_profiles 섹션에서 로드).
+    # 모델별 reasoning 페이로드 매핑이며 모든 git 에이전트 LLM 클라이언트에
+    # 그대로 전달된다.
+    _reasoning_profiles: dict[str, dict[str, Any]] = field(
+        default_factory=dict, repr=False
+    )
+
     def get_category_list(self) -> list[CategoryConfig]:
         """카테고리 목록을 반환한다."""
         return list(self.categories.values())
@@ -157,6 +164,7 @@ class GitSourceConfig:
             api_key=cfg.api_key or "none",
             timeout=timeout,
             headers=cfg.headers or None,
+            reasoning_profiles=self._reasoning_profiles or None,
         )
 
     def validate(self) -> list[str]:
@@ -289,6 +297,13 @@ def load_git_source_config(config: Config) -> GitSourceConfig:
         headers=global_headers,
     )
 
+    reasoning_profiles_raw = config.get("llm.reasoning_profiles") or {}
+    reasoning_profiles = (
+        {str(k): dict(v) for k, v in reasoning_profiles_raw.items() if isinstance(v, dict)}
+        if isinstance(reasoning_profiles_raw, dict)
+        else {}
+    )
+
     return GitSourceConfig(
         enabled=bool(git_raw.get("enabled", False)),
         sync_interval_minutes=git_raw.get("sync_interval_minutes", 60),
@@ -298,4 +313,5 @@ def load_git_source_config(config: Config) -> GitSourceConfig:
         categories=categories,
         processing=processing,
         _global_llm=global_llm,
+        _reasoning_profiles=reasoning_profiles,
     )
