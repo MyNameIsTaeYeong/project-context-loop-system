@@ -15,10 +15,6 @@ function chatApp() {
             this.loading = true;
             this.scrollToBottom();
 
-            // 스트림 토큰을 이어 붙일 빈 어시스턴트 메시지를 미리 push
-            var assistant = { role: 'assistant', content: '', sources: [] };
-            this.messages.push(assistant);
-
             try {
                 var response = await fetch('/api/chat', {
                     method: 'POST',
@@ -28,53 +24,21 @@ function chatApp() {
                 if (!response.ok) {
                     throw new Error('HTTP ' + response.status);
                 }
-                await this._consumeNdjsonStream(response, assistant);
-                if (!assistant.content) {
-                    assistant.content = '응답을 받지 못했습니다.';
-                }
+                var data = await response.json();
+                this.messages.push({
+                    role: 'assistant',
+                    content: data.answer || '응답을 받지 못했습니다.',
+                    sources: data.sources || []
+                });
             } catch (err) {
-                assistant.content = '오류가 발생했습니다: ' + err.message;
+                this.messages.push({
+                    role: 'assistant',
+                    content: '오류가 발생했습니다: ' + err.message,
+                    sources: []
+                });
             } finally {
                 this.loading = false;
                 this.scrollToBottom();
-            }
-        },
-
-        async _consumeNdjsonStream(response, assistant) {
-            var reader = response.body.getReader();
-            var decoder = new TextDecoder();
-            var buffer = '';
-            while (true) {
-                var chunk = await reader.read();
-                if (chunk.done) break;
-                buffer += decoder.decode(chunk.value, { stream: true });
-                var newlineIdx;
-                while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
-                    var line = buffer.slice(0, newlineIdx).trim();
-                    buffer = buffer.slice(newlineIdx + 1);
-                    if (!line) continue;
-                    this._handleEvent(line, assistant);
-                }
-            }
-            // 버퍼에 남은 마지막 라인 처리
-            var tail = buffer.trim();
-            if (tail) this._handleEvent(tail, assistant);
-        },
-
-        _handleEvent(line, assistant) {
-            var event;
-            try {
-                event = JSON.parse(line);
-            } catch (e) {
-                return;
-            }
-            if (event.type === 'sources') {
-                assistant.sources = event.sources || [];
-            } else if (event.type === 'delta') {
-                assistant.content += (event.content || '');
-                this.scrollToBottom();
-            } else if (event.type === 'error') {
-                assistant.content = event.content || '오류가 발생했습니다.';
             }
         },
 

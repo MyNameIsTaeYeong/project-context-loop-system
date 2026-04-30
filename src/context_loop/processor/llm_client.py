@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
 from typing import Any
 
 
@@ -45,39 +44,6 @@ class LLMClient(ABC):
         Returns:
             LLM 응답 문자열.
         """
-
-    async def stream(
-        self,
-        prompt: str,
-        *,
-        system: str | None = None,
-        max_tokens: int = 1024,
-        temperature: float = 0.0,
-        reasoning_mode: str | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[str]:
-        """텍스트 완성 응답을 토큰/청크 단위로 스트리밍한다.
-
-        기본 구현은 ``complete()`` 호출 후 결과를 한 번에 yield 한다.
-        토큰 단위 스트리밍을 지원하는 클라이언트는 이 메서드를 오버라이드한다.
-
-        Args:
-            prompt, system, max_tokens, temperature, reasoning_mode, kwargs:
-                ``complete()`` 와 동일.
-
-        Yields:
-            응답 문자열 청크.
-        """
-        result = await self.complete(
-            prompt,
-            system=system,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            reasoning_mode=reasoning_mode,
-            **kwargs,
-        )
-        if result:
-            yield result
 
 
 class AnthropicClient(LLMClient):
@@ -217,34 +183,6 @@ class EndpointLLMClient(LLMClient):
         reasoning_mode: str | None = None,
         **kwargs: Any,
     ) -> str:
-        parts: list[str] = []
-        async for chunk in self.stream(
-            prompt,
-            system=system,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            reasoning_mode=reasoning_mode,
-            **kwargs,
-        ):
-            parts.append(chunk)
-        return "".join(parts)
-
-    async def stream(
-        self,
-        prompt: str,
-        *,
-        system: str | None = None,
-        max_tokens: int = 1024,
-        temperature: float = 0.0,
-        reasoning_mode: str | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[str]:
-        """OpenAI 호환 서버에서 토큰 청크를 그대로 스트리밍한다.
-
-        ``complete()`` 는 이 메서드의 결과를 누적해 단일 문자열로 반환한다.
-        스트리밍 수신은 토큰이 지속적으로 흐르므로 중간 프록시/서버의 idle
-        timeout에 걸리지 않고 긴 응답도 안전하게 수신할 수 있다.
-        """
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -260,14 +198,18 @@ class EndpointLLMClient(LLMClient):
         if extra_body is not None:
             api_kwargs["extra_body"] = extra_body
 
+        # 스트리밍 수신: 토큰이 지속적으로 흐르므로 중간 프록시/서버의
+        # idle timeout에 걸리지 않고 긴 응답도 안전하게 수신할 수 있다.
         stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
+        parts: list[str] = []
         async for chunk in stream:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             content = getattr(delta, "content", None)
             if content:
-                yield content
+                parts.append(content)
+        return "".join(parts)
 
     def _resolve_extra_body(
         self,

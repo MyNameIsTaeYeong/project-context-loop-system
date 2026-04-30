@@ -143,13 +143,7 @@ llm:
         chat_template_kwargs:
           enable_thinking: false
 
-    # Qwen3 thinking 모드 활성화 (Qwen은 on/off 만 지원하므로 모든 단계가 동일)
-    high:
-      extra_body:
-        chat_template_kwargs:
-          enable_thinking: true
-
-    # DeepSeek 예시 (모델 교체 시 위 'off'/'high'를 다음으로 갈아끼움):
+    # DeepSeek 예시 (모델 교체 시 위 'off'를 다음으로 갈아끼움):
     # off:
     #   extra_body:
     #     chat_template_kwargs:
