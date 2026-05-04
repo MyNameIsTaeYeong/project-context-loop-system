@@ -124,7 +124,7 @@ async def chat_api(
             async for chunk in llm_client.stream(
                 prompt,
                 system=_SYSTEM_PROMPT,
-                max_tokens=8192,
+                max_tokens=16384,
                 reasoning_mode="high",
             ):
                 yield _ndjson({"type": "delta", "content": chunk})
