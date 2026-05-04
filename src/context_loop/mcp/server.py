@@ -100,7 +100,7 @@ def run_stdio() -> None:
 
     async def _run() -> None:
         await _initialize()
-        await mcp.run_async(transport="stdio")
+        await mcp.run_stdio_async()
 
     asyncio.run(_run())
 
@@ -110,6 +110,7 @@ def run_sse(port: int = 3001) -> None:
 
     async def _run() -> None:
         await _initialize()
-        await mcp.run_async(transport="sse", sse_params={"port": port})
+        mcp.settings.port = port
+        await mcp.run_sse_async()
 
     asyncio.run(_run())
