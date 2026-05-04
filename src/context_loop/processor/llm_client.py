@@ -10,10 +10,14 @@ config.yaml의 llm.provider 설정에 따라 적절한 구현체를 반환한다
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class LLMClient(ABC):
@@ -28,6 +32,7 @@ class LLMClient(ABC):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         reasoning_mode: str | None = None,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> str:
         """텍스트 완성 요청을 보내고 응답 문자열을 반환한다.
@@ -40,6 +45,8 @@ class LLMClient(ABC):
             reasoning_mode: reasoning 프로파일 이름 (예: "off"). 모델별 실제
                 페이로드(extra_body 등)는 클라이언트가 설정에서 매핑한다.
                 지원하지 않는 클라이언트는 무시한다.
+            purpose: 호출 목적 식별자 (예: "answer_generation"). 타이밍 로그에
+                포함되어 어느 단계가 오래 걸리는지 식별하는 데 사용된다.
             **kwargs: 구현체별 추가 파라미터 (예: extra_body).
 
         Returns:
@@ -54,6 +61,7 @@ class LLMClient(ABC):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         reasoning_mode: str | None = None,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """텍스트 완성 응답을 토큰/청크 단위로 스트리밍한다.
@@ -62,8 +70,8 @@ class LLMClient(ABC):
         토큰 단위 스트리밍을 지원하는 클라이언트는 이 메서드를 오버라이드한다.
 
         Args:
-            prompt, system, max_tokens, temperature, reasoning_mode, kwargs:
-                ``complete()`` 와 동일.
+            prompt, system, max_tokens, temperature, reasoning_mode, purpose,
+                kwargs: ``complete()`` 와 동일.
 
         Yields:
             응답 문자열 청크.
@@ -74,6 +82,7 @@ class LLMClient(ABC):
             max_tokens=max_tokens,
             temperature=temperature,
             reasoning_mode=reasoning_mode,
+            purpose=purpose,
             **kwargs,
         )
         if result:
@@ -101,6 +110,7 @@ class AnthropicClient(LLMClient):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         reasoning_mode: str | None = None,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> str:
         del reasoning_mode  # Anthropic 클라이언트는 미지원, 무시
@@ -115,8 +125,19 @@ class AnthropicClient(LLMClient):
         if temperature != 0.0:
             api_kwargs["temperature"] = temperature
 
-        response = await self._client.messages.create(**api_kwargs)
-        return response.content[0].text  # type: ignore[index,union-attr]
+        prompt_chars = len(prompt) + (len(system) if system else 0)
+        start = time.perf_counter()
+        try:
+            response = await self._client.messages.create(**api_kwargs)
+            text = response.content[0].text  # type: ignore[index,union-attr]
+            return text
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "LLM call | purpose=%s | provider=anthropic | model=%s | "
+                "elapsed_ms=%.1f | prompt_chars=%d",
+                purpose or "unspecified", self._model, elapsed_ms, prompt_chars,
+            )
 
 
 class OpenAIClient(LLMClient):
@@ -140,6 +161,7 @@ class OpenAIClient(LLMClient):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         reasoning_mode: str | None = None,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> str:
         del reasoning_mode  # OpenAI 클라이언트는 미지원, 무시
@@ -147,13 +169,24 @@ class OpenAIClient(LLMClient):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,  # type: ignore[arg-type]
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        return response.choices[0].message.content or ""
+
+        prompt_chars = len(prompt) + (len(system) if system else 0)
+        start = time.perf_counter()
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,  # type: ignore[arg-type]
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return response.choices[0].message.content or ""
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "LLM call | purpose=%s | provider=openai | model=%s | "
+                "elapsed_ms=%.1f | prompt_chars=%d",
+                purpose or "unspecified", self._model, elapsed_ms, prompt_chars,
+            )
 
 
 class EndpointLLMClient(LLMClient):
@@ -215,8 +248,10 @@ class EndpointLLMClient(LLMClient):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         reasoning_mode: str | None = None,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> str:
+        # stream() 가 자체적으로 타이밍을 로깅하므로 여기서는 별도 로그 없음.
         parts: list[str] = []
         async for chunk in self.stream(
             prompt,
@@ -224,6 +259,7 @@ class EndpointLLMClient(LLMClient):
             max_tokens=max_tokens,
             temperature=temperature,
             reasoning_mode=reasoning_mode,
+            purpose=purpose,
             **kwargs,
         ):
             parts.append(chunk)
@@ -237,6 +273,7 @@ class EndpointLLMClient(LLMClient):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         reasoning_mode: str | None = None,
+        purpose: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """OpenAI 호환 서버에서 토큰 청크를 그대로 스트리밍한다.
@@ -260,14 +297,34 @@ class EndpointLLMClient(LLMClient):
         if extra_body is not None:
             api_kwargs["extra_body"] = extra_body
 
-        stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            content = getattr(delta, "content", None)
-            if content:
-                yield content
+        prompt_chars = len(prompt) + (len(system) if system else 0)
+        start = time.perf_counter()
+        ttft_ms: float | None = None
+        chunk_count = 0
+        output_chars = 0
+        try:
+            stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content:
+                    if ttft_ms is None:
+                        ttft_ms = (time.perf_counter() - start) * 1000
+                    chunk_count += 1
+                    output_chars += len(content)
+                    yield content
+        finally:
+            total_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "LLM call | purpose=%s | provider=endpoint | model=%s | "
+                "ttft_ms=%.1f | total_ms=%.1f | chunks=%d | "
+                "prompt_chars=%d | output_chars=%d",
+                purpose or "unspecified", self._model,
+                ttft_ms if ttft_ms is not None else -1.0,
+                total_ms, chunk_count, prompt_chars, output_chars,
+            )
 
     def _resolve_extra_body(
         self,

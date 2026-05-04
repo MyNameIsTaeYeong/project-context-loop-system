@@ -157,6 +157,7 @@ async def plan_graph_search(
             max_tokens=512,
             temperature=0.0,
             reasoning_mode="off",
+            purpose="graph_search_planner",
         )
         plan_data = extract_json(response)
     except Exception:

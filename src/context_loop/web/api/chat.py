@@ -126,6 +126,7 @@ async def chat_api(
                 system=_SYSTEM_PROMPT,
                 max_tokens=16384,
                 reasoning_mode="high",
+                purpose="answer_generation",
             ):
                 yield _ndjson({"type": "delta", "content": chunk})
         except Exception:
