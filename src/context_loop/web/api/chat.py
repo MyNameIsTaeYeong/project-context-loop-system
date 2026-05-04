@@ -76,13 +76,13 @@ async def chat_api(
 
     1. 질의를 임베딩하여 관련 컨텍스트를 검색·조립한다.
     2. 컨텍스트와 함께 LLM에 질의하여 답변 토큰을 스트리밍 한다.
-    3. NDJSON 라인 형식으로 출처/델타/완료 이벤트를 차례로 전송한다.
+    3. 답변 완료 직후 출처(sources) 이벤트를 보내고 done 으로 종료한다.
 
     이벤트 스키마(한 줄당 한 JSON)::
 
+        {"type": "delta", "content": "토큰..."}
+        {"type": "delta", "content": "토큰..."}
         {"type": "sources", "sources": [...]}
-        {"type": "delta", "content": "토큰..."}
-        {"type": "delta", "content": "토큰..."}
         {"type": "done"}
         # 오류 시:
         {"type": "error", "content": "..."}
@@ -109,14 +109,13 @@ async def chat_api(
     sources_payload = [asdict(s) for s in assembled.sources]
 
     async def event_stream() -> AsyncIterator[str]:
-        yield _ndjson({"type": "sources", "sources": sources_payload})
-
         if not assembled.context_text:
             yield _ndjson({
                 "type": "delta",
                 "content": "등록된 문서에서 관련 정보를 찾을 수 없습니다. "
                            "문서를 먼저 등록하고 처리해 주세요.",
             })
+            yield _ndjson({"type": "sources", "sources": sources_payload})
             yield _ndjson({"type": "done"})
             return
 
@@ -136,6 +135,8 @@ async def chat_api(
                 "content": "LLM 호출 중 오류가 발생했습니다. 설정을 확인해 주세요.",
             })
             return
+        # 답변 완료 후 출처 표시
+        yield _ndjson({"type": "sources", "sources": sources_payload})
         yield _ndjson({"type": "done"})
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")

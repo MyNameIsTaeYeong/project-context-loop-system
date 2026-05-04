@@ -98,7 +98,9 @@ async def test_chat_api_no_documents(chat_client: AsyncClient) -> None:
     assert resp.headers["content-type"].startswith("application/x-ndjson")
     events = _parse_ndjson(resp.text)
     types = [e["type"] for e in events]
-    assert types[0] == "sources"
+    # 답변 완료 후 sources, 마지막에 done
+    assert "sources" in types
+    assert types.index("sources") > types.index("delta")
     assert types[-1] == "done"
     assert _collect_answer(events)  # 안내 메시지가 비어 있지 않음
     assert _collect_sources(events) == []
