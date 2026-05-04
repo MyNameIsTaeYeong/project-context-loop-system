@@ -303,12 +303,12 @@ async def _call_llm(
 ) -> dict[str, Any]:
     """unit 하나에 대해 LLM 호출 → JSON 파싱.
 
-    ``extra_body`` 의 ``enable_thinking=False`` 는 Qwen3 등 reasoning 모델의
-    ``<think>...</think>`` 사고 모드를 비활성화한다. 사고 모드가 켜진 채로
-    JSON 추출 프롬프트를 받으면 모델이 ``max_tokens`` 예산을 사고에 모두
-    소진하고 실제 JSON 답변이 비거나 잘리는 문제를 방지한다 (
-    ``graph_search_planner`` 와 같은 처방). ``extra_body`` 를 지원하지
-    않는 클라이언트(Anthropic, OpenAI) 는 ``**kwargs`` 로 무시한다.
+    ``reasoning_mode="off"`` 는 Qwen3/DeepSeek 등 reasoning 모델의 사고 모드를
+    비활성화한다. 사고 모드가 켜진 채로 JSON 추출 프롬프트를 받으면 모델이
+    ``max_tokens`` 예산을 사고에 모두 소진하고 실제 JSON 답변이 비거나 잘리는
+    문제를 방지한다 (``graph_search_planner`` 와 같은 처방). 모델별 실제
+    페이로드는 ``llm.reasoning_profiles`` 설정에서 매핑하며, 미지원 클라이언트
+    (Anthropic, OpenAI) 는 인자를 무시한다.
     """
     system = _SYSTEM_PROMPT_TEMPLATE.format(
         entity_types=_format_vocab(cfg.allowed_entity_types),
@@ -320,7 +320,7 @@ async def _call_llm(
         system=system,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        reasoning_mode="off",
     )
     payload = extract_json(response)
     if not isinstance(payload, dict):

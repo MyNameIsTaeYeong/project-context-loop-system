@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -15,6 +15,30 @@ from context_loop.storage.vector_store import VectorStore
 from context_loop.web.app import create_app
 
 _DIM = 4  # 테스트용 임베딩 차원
+
+
+def _stream_returning(*chunks: str):
+    """``llm_client.stream`` mock을 만든다 (async generator)."""
+    async def _gen(*_args, **_kwargs):
+        for chunk in chunks:
+            yield chunk
+    return MagicMock(side_effect=_gen)
+
+
+def _parse_ndjson(body: str) -> list[dict]:
+    """응답 본문을 NDJSON 이벤트 리스트로 파싱한다."""
+    return [json.loads(line) for line in body.splitlines() if line.strip()]
+
+
+def _collect_answer(events: list[dict]) -> str:
+    return "".join(e.get("content", "") for e in events if e.get("type") == "delta")
+
+
+def _collect_sources(events: list[dict]) -> list[dict]:
+    for e in events:
+        if e.get("type") == "sources":
+            return e.get("sources", [])
+    return []
 
 
 @pytest.fixture
@@ -30,10 +54,13 @@ async def chat_stores(tmp_path: Path):
 
 @pytest.fixture
 async def chat_client(chat_stores):
+    from context_loop.config import Config
+
     meta_store, vector_store, graph_store = chat_stores
 
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="테스트 답변입니다.")
+    mock_llm.stream = _stream_returning("테스트 답변입니다.")
 
     mock_embedding = AsyncMock()
     mock_embedding.aembed_query = AsyncMock(return_value=[1.0, 0.0, 0.0, 0.0])
@@ -44,6 +71,8 @@ async def chat_client(chat_stores):
     app.state.graph_store = graph_store
     app.state.llm_client = mock_llm
     app.state.embedding_client = mock_embedding
+    app.state.reranker_client = None
+    app.state.config = Config()
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -60,20 +89,25 @@ async def test_chat_page(chat_client: AsyncClient) -> None:
 
 
 async def test_chat_api_no_documents(chat_client: AsyncClient) -> None:
-    """문서가 없으면 안내 메시지를 반환한다."""
+    """문서가 없으면 안내 메시지를 NDJSON 스트림으로 반환한다."""
     resp = await chat_client.post(
         "/api/chat",
         json={"query": "테스트 질문"},
     )
     assert resp.status_code == 200
-    data = resp.json()
-    assert "answer" in data
-    assert "sources" in data
-    assert isinstance(data["sources"], list)
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    events = _parse_ndjson(resp.text)
+    types = [e["type"] for e in events]
+    # 답변 완료 후 sources, 마지막에 done
+    assert "sources" in types
+    assert types.index("sources") > types.index("delta")
+    assert types[-1] == "done"
+    assert _collect_answer(events)  # 안내 메시지가 비어 있지 않음
+    assert _collect_sources(events) == []
 
 
 async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: AsyncClient) -> None:
-    """문서가 있으면 답변과 출처를 반환한다."""
+    """문서가 있으면 답변 토큰 스트림과 출처를 반환한다."""
     meta_store, vector_store, _ = chat_stores
 
     doc_id = await meta_store.create_document(
@@ -89,16 +123,27 @@ async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: Asy
         metadatas=[{"document_id": doc_id, "chunk_index": 0}],
     )
 
+    # 토큰 단위 스트림 모의
+    app = chat_client._transport.app  # type: ignore[attr-defined]
+    app.state.llm_client.stream = _stream_returning("테스트 ", "답변", "입니다.")
+
     resp = await chat_client.post(
         "/api/chat",
         json={"query": "테스트 질문"},
     )
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["answer"] == "테스트 답변입니다."
-    assert len(data["sources"]) >= 1
-    assert data["sources"][0]["title"] == "테스트 문서"
-    assert data["sources"][0]["document_id"] == doc_id
+    events = _parse_ndjson(resp.text)
+    assert _collect_answer(events) == "테스트 답변입니다."
+    sources = _collect_sources(events)
+    assert len(sources) >= 1
+    assert sources[0]["title"] == "테스트 문서"
+    assert sources[0]["document_id"] == doc_id
+    # 마지막 이벤트는 done
+    assert events[-1]["type"] == "done"
+
+    # reasoning_mode="high" 가 LLM 스트리밍 호출에 전달되었는지 확인
+    call_kwargs = app.state.llm_client.stream.call_args.kwargs
+    assert call_kwargs.get("reasoning_mode") == "high"
 
 
 async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient) -> None:
@@ -123,25 +168,25 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
         ],
     ))
 
-    # LLM mock: 첫 호출은 그래프 탐색 계획, 두 번째는 최종 답변
+    # 그래프 탐색 계획용 complete + 최종 답변용 stream 분리
     app = chat_client._transport.app  # type: ignore[attr-defined]
     plan_response = json.dumps({
         "should_search": True,
         "reasoning": "Gateway 구조 파악 필요",
         "search_steps": [{"entity_name": "Gateway", "depth": 1, "focus_relations": []}],
     })
-    app.state.llm_client.complete = AsyncMock(
-        side_effect=[plan_response, "테스트 답변입니다."]
-    )
+    app.state.llm_client.complete = AsyncMock(side_effect=[plan_response])
+    app.state.llm_client.stream = _stream_returning("테스트 답변입니다.")
 
     resp = await chat_client.post(
         "/api/chat",
         json={"query": "Gateway"},
     )
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["answer"] == "테스트 답변입니다."
+    events = _parse_ndjson(resp.text)
+    assert _collect_answer(events) == "테스트 답변입니다."
     # 그래프 탐색에서 출처가 추출되어야 한다
-    assert len(data["sources"]) >= 1
-    assert data["sources"][0]["title"] == "아키텍처 문서"
-    assert data["sources"][0]["document_id"] == doc_id
+    sources = _collect_sources(events)
+    assert len(sources) >= 1
+    assert sources[0]["title"] == "아키텍처 문서"
+    assert sources[0]["document_id"] == doc_id

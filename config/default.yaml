@@ -132,6 +132,40 @@ llm:
   api_key_storage: "keyring"       # provider: "openai" | "anthropic"일 때 keyring 사용
   classifier_prompt: "default"
 
+  # Reasoning(thinking) 프로파일.
+  # 호출부는 reasoning_mode="off" 같은 의도만 전달하고, 모델별 실제 페이로드는
+  # 여기서 매핑한다. 모델 교체 시 호출부 수정 없이 이 블록만 갈아끼우면 된다.
+  # 키는 자유롭게 정의 (예: "off", "low", "medium", "high"). 매칭되는 키가 없으면 무시.
+  reasoning_profiles:
+    # Qwen3 (기본): thinking 모드 비활성화로 JSON 추출 응답 안정화
+    off:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+    # Qwen3 thinking 모드 활성화 (Qwen은 on/off 만 지원하므로 모든 단계가 동일)
+    high:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+    # DeepSeek 예시 (모델 교체 시 위 'off'/'high'를 다음으로 갈아끼움):
+    # off:
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       thinking: false
+    #       reasoning_effort: "low"
+    # low:
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       thinking: true
+    #       reasoning_effort: "low"
+    # high:
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       thinking: true
+    #       reasoning_effort: "high"
+
 reranker:
   endpoint: ""                     # 리랭커 API 엔드포인트 (예: "http://localhost:8080/rerank")
   model: ""                        # 사용할 리랭커 모델 ID
