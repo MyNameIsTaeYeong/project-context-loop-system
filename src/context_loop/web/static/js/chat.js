@@ -15,9 +15,11 @@ function chatApp() {
             this.loading = true;
             this.scrollToBottom();
 
-            // 스트림 토큰을 이어 붙일 빈 어시스턴트 메시지를 미리 push
-            var assistant = { role: 'assistant', content: '', sources: [] };
-            this.messages.push(assistant);
+            // 스트림 토큰을 이어 붙일 빈 어시스턴트 메시지를 미리 push.
+            // push 후 배열 안의 참조(Alpine 반응성 Proxy)를 다시 받아와야
+            // 이후 mutation 이 DOM 갱신을 트리거한다.
+            this.messages.push({ role: 'assistant', content: '', sources: [] });
+            var assistant = this.messages[this.messages.length - 1];
 
             try {
                 var response = await fetch('/api/chat', {
