@@ -35,14 +35,40 @@
 
     <table>
         <thead>
-            <tr><th>Repository</th><th>Branch</th><th>Products</th></tr>
+            <tr><th>Repository</th><th>Branch</th><th>Products</th><th>Actions</th></tr>
         </thead>
         <tbody>
             {% for repo in git_config.repositories %}
             <tr>
                 <td><code>{{ repo.url }}</code></td>
                 <td>{{ repo.branch }}</td>
-                <td>{{ repo.products | list | join(', ') }}</td>
+                <td>
+                    {% for product_name in repo.products %}
+                    <span style="display: inline-flex; align-items: center; gap: 0.25rem; margin-right: 0.5rem;">
+                        <code>{{ product_name }}</code>
+                        <button type="button"
+                                class="secondary outline"
+                                style="padding: 0.1rem 0.4rem; font-size: 0.75rem; margin: 0;"
+                                hx-delete="/api/git-sync/repositories/products?url={{ repo.url | urlencode }}&product={{ product_name | urlencode }}"
+                                hx-confirm="레포 '{{ repo.url }}' 의 product '{{ product_name }}' 싱크 결과(파생 문서 포함)를 모두 삭제할까요?"
+                                hx-swap="none"
+                                hx-on::after-request="if(event.detail.successful){ document.getElementById('git-doc-list').dispatchEvent(new Event('refresh')); }">
+                            Purge
+                        </button>
+                    </span>
+                    {% endfor %}
+                </td>
+                <td>
+                    <button type="button"
+                            class="contrast outline"
+                            style="padding: 0.2rem 0.6rem; font-size: 0.8rem; margin: 0;"
+                            hx-delete="/api/git-sync/repositories?url={{ repo.url | urlencode }}"
+                            hx-confirm="레포 '{{ repo.url }}' 의 모든 싱크 결과와 로컬 clone 디렉토리를 삭제할까요?"
+                            hx-swap="none"
+                            hx-on::after-request="if(event.detail.successful){ document.getElementById('git-doc-list').dispatchEvent(new Event('refresh')); }">
+                        Purge Repo
+                    </button>
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -118,7 +144,7 @@
     {% endif %}
     <div id="git-doc-list"
          hx-get="/partials/git-sync/documents"
-         hx-trigger="load"
+         hx-trigger="load, refresh"
          hx-swap="innerHTML">
         <p aria-busy="true">Loading documents...</p>
     </div>

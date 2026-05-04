@@ -11,12 +11,17 @@ import asyncio
 import fnmatch
 import hashlib
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from context_loop.config import Config
 from context_loop.storage.metadata_store import MetadataStore
+
+if TYPE_CHECKING:
+    from context_loop.storage.graph_store import GraphStore
+    from context_loop.storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -609,3 +614,130 @@ def group_files_by_directory(
             merged.setdefault(dir_path, []).extend(dir_files)
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Purge — 싱크된 결과 일괄 삭제
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PurgeResult:
+    """싱크 결과 삭제 작업의 집계."""
+
+    repo_url: str
+    product: str | None = None
+    deleted_git_code: int = 0
+    deleted_derived: int = 0
+    deleted_clone_dir: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo_url": self.repo_url,
+            "product": self.product,
+            "deleted_git_code": self.deleted_git_code,
+            "deleted_derived": self.deleted_derived,
+            "deleted_clone_dir": self.deleted_clone_dir,
+        }
+
+
+async def purge_synced_results(
+    *,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    repo_url: str,
+    product: str | None = None,
+    data_dir: Path | None = None,
+) -> PurgeResult:
+    """레포(또는 레포 안의 상품) 단위로 싱크된 결과를 모두 삭제한다.
+
+    삭제 범위:
+    1. 매칭되는 ``git_code`` 문서.
+    2. 그 git_code 만을 source로 가지는 파생 문서
+       (``code_doc`` / ``code_summary`` / ``code_file_summary``).
+       다른 레포·상품의 git_code도 함께 source로 가지는 파생은 살려두고
+       FK CASCADE 로 dangling ``document_sources`` 행만 정리되게 둔다.
+    3. (product 미지정 + ``data_dir`` 제공 시) 로컬 clone 디렉토리.
+
+    파생 문서를 먼저 cascade로 지워야 git_code 삭제 시 벡터/그래프
+    잔존이 남지 않는다.
+
+    Args:
+        meta_store: 초기화된 MetadataStore.
+        vector_store: 초기화된 VectorStore.
+        graph_store: 초기화된 GraphStore.
+        repo_url: 대상 레포 URL.
+        product: 지정 시 해당 상품의 git_code만 삭제. None이면 레포 전체.
+        data_dir: 애플리케이션 데이터 디렉토리. product가 None이고 이 값이
+            제공되면 ``<data_dir>/git_repos/<repo_name>`` 도 삭제한다.
+
+    Returns:
+        삭제 집계 ``PurgeResult``.
+    """
+    from context_loop.storage.cascade import delete_document_cascade
+
+    result = PurgeResult(repo_url=repo_url, product=product)
+
+    # 1. 대상 git_code 수집
+    all_git_docs = await meta_store.list_documents(source_type="git_code")
+    target_git_docs = [
+        d for d in all_git_docs
+        if d.get("url") == repo_url
+        and (product is None or d.get("author") == product)
+    ]
+    target_git_ids: set[int] = {d["id"] for d in target_git_docs}
+
+    if not target_git_ids and not (product is None and data_dir is not None):
+        logger.info(
+            "purge: 대상 없음 (url=%s, product=%s)", repo_url, product,
+        )
+        return result
+
+    # 2. 영향받는 파생 문서 후보 수집 (git_code → 파생 역방향)
+    candidate_derived_ids: set[int] = set()
+    for git_id in target_git_ids:
+        refs = await meta_store.get_documents_by_source(git_id)
+        for ref in refs:
+            candidate_derived_ids.add(ref["doc_id"])
+
+    # 3. 모든 source가 삭제 대상인 파생 문서만 cascade 삭제
+    for derived_id in candidate_derived_ids:
+        sources = await meta_store.get_document_sources(derived_id)
+        source_ids = {s["source_doc_id"] for s in sources}
+        if not source_ids or not source_ids.issubset(target_git_ids):
+            continue
+        if await delete_document_cascade(
+            derived_id,
+            meta_store=meta_store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+        ):
+            result.deleted_derived += 1
+
+    # 4. git_code cascade 삭제
+    for git_id in target_git_ids:
+        if await delete_document_cascade(
+            git_id,
+            meta_store=meta_store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+        ):
+            result.deleted_git_code += 1
+
+    # 5. 로컬 clone 디렉토리 삭제 (레포 전체 purge 시에만)
+    if product is None and data_dir is not None:
+        clone_dir = _repo_clone_dir(data_dir, repo_url)
+        if clone_dir.exists():
+            shutil.rmtree(clone_dir)
+            result.deleted_clone_dir = True
+            logger.info("로컬 clone 디렉토리 제거: %s", clone_dir)
+
+    logger.info(
+        "purge 완료: url=%s, product=%s, git_code=%d, 파생=%d, clone=%s",
+        repo_url, product,
+        result.deleted_git_code,
+        result.deleted_derived,
+        result.deleted_clone_dir,
+    )
+    return result

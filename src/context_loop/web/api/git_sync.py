@@ -8,11 +8,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.git_config import GitSourceConfig, load_git_source_config
+from context_loop.ingestion.git_repository import purge_synced_results
 from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
@@ -187,6 +188,90 @@ async def start_sync(
     ))
 
     return {"status": "started"}
+
+
+def _validate_repo_url(git_config: GitSourceConfig, repo_url: str) -> None:
+    """요청된 repo_url이 설정된 레포 중 하나인지 검증한다."""
+    if not any(repo.url == repo_url for repo in git_config.repositories):
+        raise HTTPException(
+            404, f"설정에 등록되지 않은 레포지토리입니다: {repo_url}",
+        )
+
+
+def _validate_product(
+    git_config: GitSourceConfig, repo_url: str, product: str,
+) -> None:
+    """요청된 product가 해당 레포에 정의되어 있는지 검증한다."""
+    repo = next(
+        (r for r in git_config.repositories if r.url == repo_url), None,
+    )
+    if repo is None:
+        raise HTTPException(
+            404, f"설정에 등록되지 않은 레포지토리입니다: {repo_url}",
+        )
+    if product not in repo.products:
+        raise HTTPException(
+            404,
+            f"레포지토리 '{repo_url}'에 정의되지 않은 product 입니다: {product}",
+        )
+
+
+@router.delete("/api/git-sync/repositories")
+async def purge_repository(
+    url: str = Query(..., description="삭제 대상 레포지토리 URL"),
+    config: Config = Depends(get_config),
+    meta_store: MetadataStore = Depends(get_meta_store),
+    vector_store: VectorStore = Depends(get_vector_store),
+    graph_store: GraphStore = Depends(get_graph_store),
+):
+    """레포 단위로 싱크된 모든 결과(파생 문서·로컬 clone 포함)를 삭제한다.
+
+    싱크가 진행 중이면 충돌을 피하기 위해 409를 반환한다.
+    """
+    if _sync_status.state == "running":
+        raise HTTPException(409, "동기화가 진행 중일 때는 삭제할 수 없습니다.")
+
+    git_config = load_git_source_config(config)
+    _validate_repo_url(git_config, url)
+
+    result = await purge_synced_results(
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        repo_url=url,
+        data_dir=config.data_dir,
+    )
+    return result.to_dict()
+
+
+@router.delete("/api/git-sync/repositories/products")
+async def purge_repository_product(
+    url: str = Query(..., description="대상 레포지토리 URL"),
+    product: str = Query(..., description="삭제 대상 product 이름"),
+    config: Config = Depends(get_config),
+    meta_store: MetadataStore = Depends(get_meta_store),
+    vector_store: VectorStore = Depends(get_vector_store),
+    graph_store: GraphStore = Depends(get_graph_store),
+):
+    """레포 안의 단일 product 싱크 결과만 삭제한다.
+
+    로컬 clone 디렉토리는 유지한다 (같은 레포의 다른 product 가 사용 중).
+    싱크가 진행 중이면 409.
+    """
+    if _sync_status.state == "running":
+        raise HTTPException(409, "동기화가 진행 중일 때는 삭제할 수 없습니다.")
+
+    git_config = load_git_source_config(config)
+    _validate_product(git_config, url, product)
+
+    result = await purge_synced_results(
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        repo_url=url,
+        product=product,
+    )
+    return result.to_dict()
 
 
 async def _run_sync(
