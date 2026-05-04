@@ -416,7 +416,7 @@ async def run_verification(
     section("8. context_assembler — 원본 소스 코드 첨부")
 
     code_doc_ids = {cd["id"] for cd in code_docs}
-    source_text = await _fetch_and_format_source_code(code_doc_ids, store)
+    source_text, _ = await _fetch_and_format_source_code(code_doc_ids, store)
 
     ok = source_text is not None
     check("원본 소스 코드 섹션 생성됨", ok)
@@ -442,8 +442,8 @@ async def run_verification(
         source_type="manual", title="일반 문서",
         original_content="일반 내용", content_hash="h_manual",
     )
-    empty_result = await _fetch_and_format_source_code({manual_id}, store)
-    ok = empty_result is None
+    empty_text, empty_sources = await _fetch_and_format_source_code({manual_id}, store)
+    ok = empty_text is None and empty_sources == []
     check("일반 문서 → 소스 코드 없음 (None)", ok)
     all_ok &= ok
 

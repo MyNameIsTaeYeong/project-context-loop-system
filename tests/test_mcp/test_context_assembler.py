@@ -599,12 +599,14 @@ async def test_fetch_and_format_source_code(stores) -> None:
     )
     await meta_store.add_document_source(doc_id, git_id, "src/main.py")
 
-    result = await _fetch_and_format_source_code({doc_id}, meta_store)
-    assert result is not None
-    assert "원본 소스 코드" in result
-    assert "main.py" in result
-    assert "print('hello')" in result
-    assert "```py" in result  # 확장자 기반 언어 힌트
+    text, sources = await _fetch_and_format_source_code({doc_id}, meta_store)
+    assert text is not None
+    assert "원본 소스 코드" in text
+    assert "main.py" in text
+    assert "print('hello')" in text
+    assert "```py" in text  # 확장자 기반 언어 힌트
+    assert [s.document_id for s in sources] == [git_id]
+    assert sources[0].title == "main.py"
 
 
 @pytest.mark.asyncio
@@ -620,8 +622,9 @@ async def test_fetch_and_format_source_code_no_sources(stores) -> None:
         content_hash="h_cd2",
     )
 
-    result = await _fetch_and_format_source_code({doc_id}, meta_store)
-    assert result is None
+    text, sources = await _fetch_and_format_source_code({doc_id}, meta_store)
+    assert text is None
+    assert sources == []
 
 
 @pytest.mark.asyncio
@@ -636,8 +639,9 @@ async def test_fetch_and_format_source_code_non_code_doc(stores) -> None:
         content_hash="h_mn1",
     )
 
-    result = await _fetch_and_format_source_code({doc_id}, meta_store)
-    assert result is None
+    text, sources = await _fetch_and_format_source_code({doc_id}, meta_store)
+    assert text is None
+    assert sources == []
 
 
 @pytest.mark.asyncio
@@ -663,10 +667,12 @@ async def test_fetch_and_format_source_code_deduplicates(stores) -> None:
     await meta_store.add_document_source(doc_id1, git_id, "src/shared.go")
     await meta_store.add_document_source(doc_id2, git_id, "src/shared.go")
 
-    result = await _fetch_and_format_source_code({doc_id1, doc_id2}, meta_store)
-    assert result is not None
+    text, sources = await _fetch_and_format_source_code({doc_id1, doc_id2}, meta_store)
+    assert text is not None
     # shared.go가 한 번만 나와야 함
-    assert result.count("shared.go") == 2  # 제목 + file_path 각 1번
+    assert text.count("shared.go") == 2  # 제목 + file_path 각 1번
+    # 동일 git_code는 sources에도 한 번만 포함
+    assert [s.document_id for s in sources] == [git_id]
 
 
 @pytest.mark.asyncio
@@ -757,6 +763,10 @@ async def test_assemble_context_with_sources_include_source_code(stores) -> None
     )
     assert "원본 소스 코드" in assembled.context_text
     assert "def helper(): pass" in assembled.context_text
+    # 원본 git_code도 sources에 포함되어야 한다.
+    source_ids = {s.document_id for s in assembled.sources}
+    assert doc_id in source_ids  # 청크 출처
+    assert git_id in source_ids  # 첨부된 원본 소스 출처
 
 
 @pytest.mark.asyncio
