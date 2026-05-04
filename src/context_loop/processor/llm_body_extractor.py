@@ -321,6 +321,7 @@ async def _call_llm(
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
         reasoning_mode="off",
+        purpose="body_extraction",
     )
     payload = extract_json(response)
     if not isinstance(payload, dict):
