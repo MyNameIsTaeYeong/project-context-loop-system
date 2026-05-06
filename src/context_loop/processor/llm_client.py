@@ -368,7 +368,7 @@ class EndpointLLMClient(LLMClient):
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = getattr(delta, "reasoning", None)
                 if isinstance(reasoning, str) and reasoning:
                     if ttft_ms is None:
                         ttft_ms = (time.perf_counter() - start) * 1000
