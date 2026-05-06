@@ -50,7 +50,10 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from context_loop.processor.llm_client import LLMClient
 
 # 프로젝트 루트를 sys.path 에 추가
 project_root = Path(__file__).resolve().parent.parent
@@ -58,51 +61,15 @@ sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, GoldSet, save_gold_set  # noqa: E402
+from context_loop.eval.llm import build_llm_client  # noqa: E402
 from context_loop.eval.synth import (  # noqa: E402
     filter_question,
     generate_questions,
     stratified_sample,
 )
-from context_loop.processor.llm_client import (  # noqa: E402
-    EndpointLLMClient,
-    LLMClient,
-)
 from context_loop.storage.metadata_store import MetadataStore  # noqa: E402
 
 logger = logging.getLogger("build_synthetic_gold_set")
-
-
-# ---------------------------------------------------------------------------
-# LLM client builders (override-aware)
-# ---------------------------------------------------------------------------
-
-
-def _build_llm_from_args(
-    config: Config,
-    *,
-    endpoint_arg: str,
-    model_arg: str,
-    api_key_arg: str,
-) -> LLMClient:
-    """CLI 인자가 있으면 그 값으로, 없으면 config 의 llm.* 로 클라이언트 생성.
-
-    이 시스템은 endpoint 방식만 가정한다 (사내 LLM 엔드포인트 전제).
-    """
-    endpoint = endpoint_arg or config.get("llm.endpoint", "")
-    model = model_arg or config.get("llm.model", "")
-    api_key = api_key_arg or config.get("llm.api_key", "") or ""
-    if not endpoint or not model:
-        raise ValueError(
-            "LLM endpoint/model 이 비어 있습니다. --*-endpoint/--*-model 을 지정하거나 "
-            "config 의 llm.endpoint/llm.model 을 채우세요.",
-        )
-    return EndpointLLMClient(
-        endpoint=endpoint,
-        model=model,
-        api_key=api_key,
-        headers=config.get("llm.headers") or None,
-        reasoning_profiles=config.get("llm.reasoning_profiles") or None,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -375,14 +342,25 @@ def main() -> None:
         "--reasoning-mode", default="off",
         help="LLM reasoning_mode 프로파일 (config.llm.reasoning_profiles 키, 기본 'off')",
     )
-    # Generator 분리 옵션
+    # Generator/Judge 분리 옵션 — override 가 모두 비면 config.llm.* 그대로 사용.
+    # config 의 llm.headers / llm.reasoning_profiles 가 자동 적용되므로
+    # 사내 LLM 게이트웨이의 커스텀 헤더 + Qwen3 등 reasoning 페이로드도
+    # 별도 인자 없이 동작한다.
     parser.add_argument("--generator-endpoint", default="")
     parser.add_argument("--generator-model", default="")
     parser.add_argument("--generator-api-key", default="")
-    # Judge 분리 옵션
+    parser.add_argument(
+        "--generator-headers", default="",
+        help="Generator 전용 헤더 JSON (예: '{\"X-Org-Id\":\"abc\"}'). "
+             "미지정 시 config.llm.headers 사용.",
+    )
     parser.add_argument("--judge-endpoint", default="")
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--judge-api-key", default="")
+    parser.add_argument(
+        "--judge-headers", default="",
+        help="Judge 전용 헤더 JSON. 미지정 시 config.llm.headers 사용.",
+    )
 
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -391,22 +369,24 @@ def main() -> None:
 
     config = Config(config_path=Path(args.config) if args.config else None)
 
-    generator = _build_llm_from_args(
+    generator = build_llm_client(
         config,
-        endpoint_arg=args.generator_endpoint,
-        model_arg=args.generator_model,
-        api_key_arg=args.generator_api_key,
+        endpoint_override=args.generator_endpoint,
+        model_override=args.generator_model,
+        api_key_override=args.generator_api_key,
+        headers_override_json=args.generator_headers,
     )
-    judge = _build_llm_from_args(
+    judge = build_llm_client(
         config,
-        endpoint_arg=args.judge_endpoint,
-        model_arg=args.judge_model,
-        api_key_arg=args.judge_api_key,
+        endpoint_override=args.judge_endpoint,
+        model_override=args.judge_model,
+        api_key_override=args.judge_api_key,
+        headers_override_json=args.judge_headers,
     )
 
-    if (
-        not args.judge_endpoint and not args.judge_model
-        and not args.generator_endpoint and not args.generator_model
+    if not (
+        args.generator_endpoint or args.generator_model
+        or args.judge_endpoint or args.judge_model
     ):
         logger.warning(
             "Generator 와 Judge 가 같은 모델입니다 — 자기 평가 편향 가능. "

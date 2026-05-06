@@ -40,6 +40,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
+from context_loop.eval.llm import build_llm_client  # noqa: E402
 from context_loop.eval.metrics import (  # noqa: E402
     aggregate,
     hit_at_k,
@@ -326,6 +327,8 @@ def _build_clients(config: Config) -> tuple[Any, Any, Any]:
     )
 
 
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -351,17 +354,17 @@ async def run(args: argparse.Namespace) -> int:
 
     llm_client, embedding_client, reranker_client = _build_clients(config)
 
-    # Judge 는 옵션 — 별도 엔드포인트 또는 같은 LLM 재사용
+    # Judge 는 옵션 — 별도 엔드포인트 또는 같은 LLM 재사용.
+    # _build_judge_llm 이 config.llm.headers / reasoning_profiles 를 자동 주입한다.
     judge: LLMClient | None = None
     if args.judge:
         if args.judge_endpoint and args.judge_model:
-            from context_loop.processor.llm_client import EndpointLLMClient
-            judge = EndpointLLMClient(
-                endpoint=args.judge_endpoint,
-                model=args.judge_model,
-                api_key=args.judge_api_key or "",
-                headers=config.get("llm.headers") or None,
-                reasoning_profiles=config.get("llm.reasoning_profiles") or None,
+            judge = build_llm_client(
+                config,
+                endpoint_override=args.judge_endpoint,
+                model_override=args.judge_model,
+                api_key_override=args.judge_api_key,
+                headers_override_json=args.judge_headers,
             )
         else:
             logger.warning(
@@ -521,12 +524,21 @@ def main() -> None:
         "--judge", action="store_true",
         help="Judge LLM 으로 응답 품질 0~5 점 채점 (느림, 비용 발생)",
     )
+    # Judge override 가 모두 비면 시스템 LLM 재사용 (편향 경고 표시).
+    # 별도 엔드포인트 지정 시 config.llm.headers / reasoning_profiles 자동 주입,
+    # --judge-headers JSON 으로 헤더 통째 교체 가능.
     parser.add_argument("--judge-endpoint", default="")
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--judge-api-key", default="")
     parser.add_argument(
+        "--judge-headers", default="",
+        help="Judge 전용 헤더 JSON (예: '{\"X-Org-Id\":\"abc\"}'). "
+             "미지정 시 config.llm.headers 사용.",
+    )
+    parser.add_argument(
         "--reasoning-mode", default="off",
-        help="LLM reasoning_mode (Judge 호출에 적용, 기본 'off')",
+        help="LLM reasoning_mode (config.llm.reasoning_profiles 키, "
+             "Judge 호출에 적용, 기본 'off')",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
