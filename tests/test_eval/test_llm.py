@@ -223,6 +223,71 @@ def test_build_llm_client_empty_headers_dict_clears_config_headers(
     assert captured["headers"] == {}
 
 
+def test_build_llm_client_reasoning_profiles_override(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """reasoning_profiles_override 가 임시 적용 후 finally 에서 복원된다."""
+    captured: dict[str, Any] = {}
+
+    def fake_builder(cfg: Config) -> object:
+        captured["reasoning"] = cfg.get("llm.reasoning_profiles")
+        return object()
+
+    stub_web_app.side_effect = fake_builder
+    deepseek_profiles = {
+        "off": {"extra_body": {"chat_template_kwargs": {"thinking": False}}},
+    }
+    build_llm_client(
+        config,
+        endpoint_override="http://x/v1",
+        model_override="m",
+        reasoning_profiles_override=deepseek_profiles,
+    )
+    assert captured["reasoning"] == deepseek_profiles
+    # 복원
+    assert config.get("llm.reasoning_profiles") == {
+        "off": {"extra_body": {"enable_thinking": False}},
+    }
+
+
+def test_build_llm_client_reasoning_profiles_only_override(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """reasoning_profiles 만 override 해도 동작한다 (다른 키는 config 값 유지)."""
+    captured: dict[str, Any] = {}
+
+    def fake_builder(cfg: Config) -> object:
+        captured["endpoint"] = cfg.get("llm.endpoint")
+        captured["model"] = cfg.get("llm.model")
+        captured["reasoning"] = cfg.get("llm.reasoning_profiles")
+        return object()
+
+    stub_web_app.side_effect = fake_builder
+    new_profiles = {"off": {"extra_body": {"thinking": False}}}
+    build_llm_client(config, reasoning_profiles_override=new_profiles)
+
+    # endpoint/model 은 config 그대로
+    assert captured["endpoint"] == "http://default-endpoint/v1"
+    assert captured["model"] == "default-model"
+    # reasoning 만 override
+    assert captured["reasoning"] == new_profiles
+
+
+def test_build_llm_client_empty_reasoning_dict_clears_profiles(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """``reasoning_profiles_override={}`` 는 매핑 없이 호출 (reasoning_mode 무시됨)."""
+    captured: dict[str, Any] = {}
+
+    def fake_builder(cfg: Config) -> object:
+        captured["reasoning"] = cfg.get("llm.reasoning_profiles")
+        return object()
+
+    stub_web_app.side_effect = fake_builder
+    build_llm_client(config, model_override="m", reasoning_profiles_override={})
+    assert captured["reasoning"] == {}
+
+
 def test_build_llm_client_forces_endpoint_provider(
     config: Config, stub_web_app: MagicMock,
 ) -> None:
@@ -257,6 +322,7 @@ def _capture_builder() -> tuple[list[dict[str, Any]], Any]:
             "model": cfg.get("llm.model"),
             "api_key": cfg.get("llm.api_key"),
             "headers": cfg.get("llm.headers"),
+            "reasoning": cfg.get("llm.reasoning_profiles"),
         })
         return object()
 
@@ -373,7 +439,61 @@ def test_build_eval_llm_client_role_headers_not_dict_raises(
     config.set("eval.generator.model", "m")
     config.set("eval.generator.headers", "not-a-dict")
 
-    with pytest.raises(ValueError, match="dict 이어야 합니다"):
+    with pytest.raises(ValueError, match="headers 는 dict 이어야 합니다"):
+        build_eval_llm_client(config, "generator")
+    stub_web_app.assert_not_called()
+
+
+def test_build_eval_llm_client_uses_role_reasoning_profiles(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """config.eval.{role}.reasoning_profiles 가 빌더에 반영된다."""
+    deepseek_profiles = {
+        "off": {"extra_body": {"chat_template_kwargs": {"thinking": False}}},
+        "high": {"extra_body": {"chat_template_kwargs": {"reasoning_effort": "high"}}},
+    }
+    config.set("eval.judge.endpoint", "http://judge/v1")
+    config.set("eval.judge.model", "deepseek-chat")
+    config.set("eval.judge.reasoning_profiles", deepseek_profiles)
+
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(config, "judge")
+
+    assert captured[0]["reasoning"] == deepseek_profiles
+    # 호출 종료 후엔 system 의 reasoning_profiles 로 복원
+    assert config.get("llm.reasoning_profiles") == {
+        "off": {"extra_body": {"enable_thinking": False}},
+    }
+
+
+def test_build_eval_llm_client_falls_back_to_llm_reasoning_when_role_empty(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """role 의 reasoning_profiles 가 비면 llm.reasoning_profiles 사용."""
+    config.set("eval.generator.endpoint", "http://gen/v1")
+    config.set("eval.generator.model", "gen-m")
+    # eval.generator.reasoning_profiles 는 비움 (default {})
+
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(config, "generator")
+
+    # llm.reasoning_profiles 그대로 (config fixture 의 값)
+    assert captured[0]["reasoning"] == {
+        "off": {"extra_body": {"enable_thinking": False}},
+    }
+
+
+def test_build_eval_llm_client_role_reasoning_not_dict_raises(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """config.eval.{role}.reasoning_profiles 가 dict 가 아니면 명확한 에러."""
+    config.set("eval.generator.endpoint", "http://x/v1")
+    config.set("eval.generator.model", "m")
+    config.set("eval.generator.reasoning_profiles", "not-a-dict")
+
+    with pytest.raises(ValueError, match="reasoning_profiles 는 dict 이어야 합니다"):
         build_eval_llm_client(config, "generator")
     stub_web_app.assert_not_called()
 

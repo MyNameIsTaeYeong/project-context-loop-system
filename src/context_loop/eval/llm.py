@@ -53,6 +53,7 @@ def build_llm_client(
     model_override: str = "",
     api_key_override: str = "",
     headers_override: dict[str, str] | None = None,
+    reasoning_profiles_override: dict[str, dict[str, Any]] | None = None,
 ) -> LLMClient:
     """``web.app._build_llm_client`` 를 그대로 재사용해 LLM 클라이언트를 생성한다.
 
@@ -62,8 +63,6 @@ def build_llm_client(
       프로파일까지 한 번에 적용된다.
     - override 가 하나라도 있으면 ``llm.provider`` 를 ``"endpoint"`` 로 강제하고
       해당 키만 임시 덮어쓴 뒤 빌더 호출, finally 에서 원복.
-    - reasoning_profiles 는 항상 config 의 값을 따른다 (모델 family 별 매핑이라
-      override 시점에 별도 인자로 받기엔 표현이 어색하기 때문).
 
     Args:
         config: 베이스 ``Config``. 함수 호출 후 원래 상태로 복원된다.
@@ -73,6 +72,11 @@ def build_llm_client(
         headers_override: ``llm.headers`` 임시 값 (dict). 기본 헤더와
             머지하지 않고 통째로 교체. ``None`` 이면 ``config.llm.headers``
             그대로 사용. 빈 dict ``{}`` 는 헤더 없이 호출.
+        reasoning_profiles_override: ``llm.reasoning_profiles`` 임시 값.
+            모델 family 별 reasoning 페이로드 매핑이 다를 때 사용
+            (예: Qwen3 의 ``enable_thinking`` vs DeepSeek 의 ``thinking``).
+            ``None`` 이면 ``config.llm.reasoning_profiles`` 그대로 사용.
+            빈 dict ``{}`` 는 reasoning 매핑 없이 호출 (``reasoning_mode`` 무시됨).
 
     Returns:
         ``LLMClient`` 인스턴스.
@@ -85,6 +89,7 @@ def build_llm_client(
         or model_override
         or api_key_override
         or headers_override is not None
+        or reasoning_profiles_override is not None
     )
     if not has_override:
         return _build_llm_client(config)
@@ -95,6 +100,7 @@ def build_llm_client(
         "model": config.get("llm.model"),
         "api_key": config.get("llm.api_key"),
         "headers": config.get("llm.headers"),
+        "reasoning_profiles": config.get("llm.reasoning_profiles"),
     }
     try:
         config.set("llm.provider", "endpoint")
@@ -106,6 +112,8 @@ def build_llm_client(
             config.set("llm.api_key", api_key_override)
         if headers_override is not None:
             config.set("llm.headers", headers_override)
+        if reasoning_profiles_override is not None:
+            config.set("llm.reasoning_profiles", reasoning_profiles_override)
         return _build_llm_client(config)
     finally:
         for k, v in saved.items():
@@ -153,6 +161,7 @@ def build_eval_llm_client(
     role_model = config.get(f"{role_path}.model", "") or ""
     role_api_key = config.get(f"{role_path}.api_key", "") or ""
     role_headers_raw = config.get(f"{role_path}.headers") or {}
+    role_reasoning_raw = config.get(f"{role_path}.reasoning_profiles") or {}
 
     final_endpoint = endpoint_override or role_endpoint
     final_model = model_override or role_model
@@ -165,11 +174,27 @@ def build_eval_llm_client(
     elif role_headers_raw:
         if not isinstance(role_headers_raw, dict):
             raise ValueError(
-                f"config.{role_path}.headers 는 dict 이어야 합니다 — got {type(role_headers_raw).__name__}",
+                f"config.{role_path}.headers 는 dict 이어야 합니다 — "
+                f"got {type(role_headers_raw).__name__}",
             )
         final_headers = {str(k): str(v) for k, v in role_headers_raw.items()}
     else:
         final_headers = None  # build_llm_client 가 config.llm.headers 를 그대로 사용
+
+    # reasoning_profiles 우선순위:
+    # config.eval.{role}.reasoning_profiles (dict) > None (= llm.reasoning_profiles)
+    # 모델 family 가 system 과 다를 때 (예: system=Qwen3, judge=DeepSeek) 별도
+    # 매핑이 필요하므로 role 단위 override 를 지원한다.
+    final_reasoning: dict[str, dict[str, Any]] | None
+    if role_reasoning_raw:
+        if not isinstance(role_reasoning_raw, dict):
+            raise ValueError(
+                f"config.{role_path}.reasoning_profiles 는 dict 이어야 합니다 — "
+                f"got {type(role_reasoning_raw).__name__}",
+            )
+        final_reasoning = role_reasoning_raw
+    else:
+        final_reasoning = None  # build_llm_client 가 config.llm.reasoning_profiles 사용
 
     return build_llm_client(
         config,
@@ -177,6 +202,7 @@ def build_eval_llm_client(
         model_override=final_model,
         api_key_override=final_api_key,
         headers_override=final_headers,
+        reasoning_profiles_override=final_reasoning,
     )
 
 

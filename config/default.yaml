@@ -184,18 +184,22 @@ eval:
   # (scripts/build_synthetic_gold_set.py + scripts/eval_search.py 가 사용).
   # 자기 평가 편향을 줄이려면 generator/judge 를 system 모델 (llm.*) 과
   # 다른 family 의 모델로 분리하는 것을 권장한다.
-  # 각 키가 비어 있으면 상위 llm.* 값으로 폴백하며, headers 도 빈 dict 면
-  # llm.headers 가 그대로 적용된다. reasoning_profiles 는 항상 llm.* 공유.
+  # 각 키가 비어 있으면 상위 llm.* 값으로 폴백한다 (headers/reasoning_profiles 포함).
+  # reasoning_profiles 는 모델 family 별로 페이로드 형식이 다르므로 (Qwen3 의
+  # enable_thinking vs DeepSeek 의 thinking 등), generator/judge 가 system 과
+  # 다른 family 라면 여기서 별도 매핑을 정의하는 것이 안전하다.
   generator:                       # 골드셋 질의 합성
     endpoint: ""                   # 예: "http://strong-model:8080/v1"
     model: ""                      # 예: "gpt-4o" 또는 "claude-sonnet-4"
     api_key: ""
     headers: {}                    # 예: {X-Org-Id: "abc"}
+    reasoning_profiles: {}         # 예: {off: {extra_body: {chat_template_kwargs: {thinking: false}}}}
   judge:                           # 답변 가능성·품질 채점
     endpoint: ""                   # 예: "http://other-family:8080/v1"
     model: ""                      # generator 와 다른 family 권장
     api_key: ""
     headers: {}
+    reasoning_profiles: {}         # generator 와 다른 family 라면 별도 매핑
 
 storage:
   vector_db: "chromadb"
