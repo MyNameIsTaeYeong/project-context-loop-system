@@ -88,6 +88,35 @@ class LLMClient(ABC):
         if result:
             yield result
 
+    async def stream_events(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        reasoning_mode: str | None = None,
+        purpose: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, str]]:
+        """추론(thinking)과 본문 응답을 분리한 이벤트 스트림.
+
+        각 이벤트는 ``{"kind": "reasoning" | "content", "content": "..."}``
+        형태의 dict 이다. 기본 구현은 ``stream()`` 결과를 모두 ``"content"`` 로
+        분류한다. 추론 토큰을 별도 노출하는 클라이언트는 이 메서드를
+        오버라이드한다.
+        """
+        async for chunk in self.stream(
+            prompt,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_mode=reasoning_mode,
+            purpose=purpose,
+            **kwargs,
+        ):
+            yield {"kind": "content", "content": chunk}
+
 
 class AnthropicClient(LLMClient):
     """Anthropic Claude API 클라이언트.
@@ -276,11 +305,41 @@ class EndpointLLMClient(LLMClient):
         purpose: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """OpenAI 호환 서버에서 토큰 청크를 그대로 스트리밍한다.
+        """OpenAI 호환 서버에서 본문 토큰 청크를 그대로 스트리밍한다.
 
         ``complete()`` 는 이 메서드의 결과를 누적해 단일 문자열로 반환한다.
-        스트리밍 수신은 토큰이 지속적으로 흐르므로 중간 프록시/서버의 idle
-        timeout에 걸리지 않고 긴 응답도 안전하게 수신할 수 있다.
+        추론 토큰은 본문이 아니므로 이 스트림에서 제외된다. 추론까지 받고
+        싶으면 ``stream_events()`` 를 사용한다.
+        """
+        async for event in self.stream_events(
+            prompt,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_mode=reasoning_mode,
+            purpose=purpose,
+            **kwargs,
+        ):
+            if event["kind"] == "content":
+                yield event["content"]
+
+    async def stream_events(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        reasoning_mode: str | None = None,
+        purpose: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, str]]:
+        """추론(thinking)과 본문을 분리한 이벤트 스트림을 반환한다.
+
+        vLLM 등 reasoning 모델은 OpenAI 호환 응답에 ``delta.reasoning_content``
+        필드로 추론 토큰을 별도 전송한다. 본 메서드는 이를 ``"reasoning"``
+        이벤트로, 일반 ``delta.content`` 는 ``"content"`` 이벤트로 분리해 yield
+        한다.
         """
         messages: list[dict[str, str]] = []
         if system:
@@ -302,28 +361,35 @@ class EndpointLLMClient(LLMClient):
         ttft_ms: float | None = None
         chunk_count = 0
         output_chars = 0
+        reasoning_chars = 0
         try:
             stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
             async for chunk in stream:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if isinstance(reasoning, str) and reasoning:
+                    if ttft_ms is None:
+                        ttft_ms = (time.perf_counter() - start) * 1000
+                    reasoning_chars += len(reasoning)
+                    yield {"kind": "reasoning", "content": reasoning}
                 content = getattr(delta, "content", None)
-                if content:
+                if isinstance(content, str) and content:
                     if ttft_ms is None:
                         ttft_ms = (time.perf_counter() - start) * 1000
                     chunk_count += 1
                     output_chars += len(content)
-                    yield content
+                    yield {"kind": "content", "content": content}
         finally:
             total_ms = (time.perf_counter() - start) * 1000
             logger.info(
                 "LLM call | purpose=%s | provider=endpoint | model=%s | "
                 "ttft_ms=%.1f | total_ms=%.1f | chunks=%d | "
-                "prompt_chars=%d | output_chars=%d",
+                "prompt_chars=%d | output_chars=%d | reasoning_chars=%d",
                 purpose or "unspecified", self._model,
                 ttft_ms if ttft_ms is not None else -1.0,
-                total_ms, chunk_count, prompt_chars, output_chars,
+                total_ms, chunk_count, prompt_chars, output_chars, reasoning_chars,
             )
 
     def _resolve_extra_body(

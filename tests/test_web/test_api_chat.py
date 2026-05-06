@@ -25,6 +25,23 @@ def _stream_returning(*chunks: str):
     return MagicMock(side_effect=_gen)
 
 
+def _stream_events_returning(*events: dict | str):
+    """``llm_client.stream_events`` mock을 만든다 (async generator).
+
+    문자열을 넘기면 ``{"kind": "content", "content": ...}`` 로 처리한다.
+    추론 이벤트가 필요하면 dict 형태로 직접 넘긴다.
+    """
+    normalized = [
+        e if isinstance(e, dict) else {"kind": "content", "content": e}
+        for e in events
+    ]
+
+    async def _gen(*_args, **_kwargs):
+        for event in normalized:
+            yield event
+    return MagicMock(side_effect=_gen)
+
+
 def _parse_ndjson(body: str) -> list[dict]:
     """응답 본문을 NDJSON 이벤트 리스트로 파싱한다."""
     return [json.loads(line) for line in body.splitlines() if line.strip()]
@@ -32,6 +49,10 @@ def _parse_ndjson(body: str) -> list[dict]:
 
 def _collect_answer(events: list[dict]) -> str:
     return "".join(e.get("content", "") for e in events if e.get("type") == "delta")
+
+
+def _collect_reasoning(events: list[dict]) -> str:
+    return "".join(e.get("content", "") for e in events if e.get("type") == "reasoning")
 
 
 def _collect_sources(events: list[dict]) -> list[dict]:
@@ -61,6 +82,7 @@ async def chat_client(chat_stores):
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="테스트 답변입니다.")
     mock_llm.stream = _stream_returning("테스트 답변입니다.")
+    mock_llm.stream_events = _stream_events_returning("테스트 답변입니다.")
 
     mock_embedding = AsyncMock()
     mock_embedding.aembed_query = AsyncMock(return_value=[1.0, 0.0, 0.0, 0.0])
@@ -123,9 +145,15 @@ async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: Asy
         metadatas=[{"document_id": doc_id, "chunk_index": 0}],
     )
 
-    # 토큰 단위 스트림 모의
+    # 토큰 단위 스트림 모의 (추론 + 본문)
     app = chat_client._transport.app  # type: ignore[attr-defined]
-    app.state.llm_client.stream = _stream_returning("테스트 ", "답변", "입니다.")
+    app.state.llm_client.stream_events = _stream_events_returning(
+        {"kind": "reasoning", "content": "질문 분석... "},
+        {"kind": "reasoning", "content": "근거 검토 완료."},
+        "테스트 ",
+        "답변",
+        "입니다.",
+    )
 
     resp = await chat_client.post(
         "/api/chat",
@@ -134,6 +162,7 @@ async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: Asy
     assert resp.status_code == 200
     events = _parse_ndjson(resp.text)
     assert _collect_answer(events) == "테스트 답변입니다."
+    assert _collect_reasoning(events) == "질문 분석... 근거 검토 완료."
     sources = _collect_sources(events)
     assert len(sources) >= 1
     assert sources[0]["title"] == "테스트 문서"
@@ -142,7 +171,7 @@ async def test_chat_api_returns_answer_and_sources(chat_stores, chat_client: Asy
     assert events[-1]["type"] == "done"
 
     # reasoning_mode="high" 가 LLM 스트리밍 호출에 전달되었는지 확인
-    call_kwargs = app.state.llm_client.stream.call_args.kwargs
+    call_kwargs = app.state.llm_client.stream_events.call_args.kwargs
     assert call_kwargs.get("reasoning_mode") == "high"
 
 
@@ -177,6 +206,7 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
     })
     app.state.llm_client.complete = AsyncMock(side_effect=[plan_response])
     app.state.llm_client.stream = _stream_returning("테스트 답변입니다.")
+    app.state.llm_client.stream_events = _stream_events_returning("테스트 답변입니다.")
 
     resp = await chat_client.post(
         "/api/chat",

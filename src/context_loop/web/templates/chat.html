@@ -19,6 +19,13 @@
                 <div style="display: flex; align-items: flex-start; gap: 0.5rem;">
                     <strong x-text="msg.role === 'user' ? 'Q' : 'A'" style="min-width: 1.5rem; text-align: center; padding: 0.15rem 0.4rem; border-radius: 0.25rem; font-size: 0.8rem;" :style="msg.role === 'user' ? 'background:#e2e3e5;color:#383d41' : 'background:#d4edda;color:#155724'"></strong>
                     <div style="flex: 1;">
+                        <!-- 추론 과정 (접을 수 있음) -->
+                        <template x-if="msg.reasoning">
+                            <details class="chat-reasoning" style="margin-bottom: 0.5rem; padding: 0.5rem; background: var(--pico-card-background-color); border-radius: 0.25rem; font-size: 0.85rem;" :open="msg.role === 'assistant' && !msg.content">
+                                <summary style="cursor: pointer; color: var(--pico-muted-color);">추론 과정</summary>
+                                <div x-html="renderMarkdown(msg.reasoning)" style="margin-top: 0.5rem; white-space: pre-wrap; color: var(--pico-muted-color);"></div>
+                            </details>
+                        </template>
                         <div x-html="renderMarkdown(msg.content)"></div>
                         <!-- 출처 표시 -->
                         <template x-if="msg.sources && msg.sources.length > 0">
