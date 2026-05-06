@@ -201,19 +201,6 @@ eval:
     headers: {}
     reasoning_profiles: {}         # generator 와 다른 family 라면 별도 매핑
 
-  # 골드셋 합성 파라미터 (scripts/build_synthetic_gold_set.py).
-  # CLI 인자가 있으면 그쪽이 우선, 없으면 여기 값을 사용.
-  synth:
-    output: "eval/gold_set.yaml"   # 저장 경로 (--output 으로 일회성 변경 가능)
-    n_chunks: 30                   # 샘플링할 청크 수
-    questions_per_chunk: 2         # 청크당 생성 질문 수
-    source_types: []               # 빈 배열이면 전체 (예: ["git_code", "confluence"])
-    n_distractors: 2               # 일반성 게이트의 무관 청크 수
-    min_chars: 200                 # 최소 청크 길이 (그 미만은 후보 제외)
-    max_chars: 8000                # 최대 청크 길이 (그 초과는 후보 제외)
-    reasoning_mode: "off"          # generator/judge 호출 시 reasoning_mode 프로파일 키
-    seed: null                     # 랜덤 시드 (null = 결정론적 정렬 순서)
-
 storage:
   vector_db: "chromadb"
   graph_db: "networkx"

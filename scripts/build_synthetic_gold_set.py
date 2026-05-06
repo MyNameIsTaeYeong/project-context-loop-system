@@ -63,10 +63,8 @@ from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, GoldSet, save_gold_set  # noqa: E402
 from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.synth import (  # noqa: E402
-    SynthRunConfig,
     filter_question,
     generate_questions,
-    resolve_synth_run_config,
     stratified_sample,
 )
 from context_loop.storage.metadata_store import MetadataStore  # noqa: E402
@@ -137,15 +135,24 @@ async def load_candidate_chunks(
 
 
 async def build(
-    run_config: SynthRunConfig,
     *,
     config: Config,
+    n_chunks: int,
+    questions_per_chunk: int,
+    output_path: Path,
+    source_types: list[str] | None,
+    seed: int | None,
+    apply_filter: bool,
+    n_distractors: int,
     generator: LLMClient,
     judge: LLMClient,
+    reasoning_mode: str | None,
+    min_chars: int,
+    max_chars: int,
 ) -> GoldSet:
-    """``SynthRunConfig`` 에 정의된 파라미터로 전체 파이프라인 실행."""
+    """전체 파이프라인 실행."""
 
-    rng = random.Random(run_config.seed)
+    rng = random.Random(seed)
 
     store = MetadataStore(config.data_dir / "metadata.db")
     await store.initialize()
@@ -153,27 +160,22 @@ async def build(
     try:
         candidates = await load_candidate_chunks(
             store,
-            source_types=run_config.source_types,
-            min_chars=run_config.min_chars,
-            max_chars=run_config.max_chars,
+            source_types=source_types,
+            min_chars=min_chars,
+            max_chars=max_chars,
         )
         if not candidates:
             raise RuntimeError("후보 청크가 없습니다. 인덱싱된 문서가 있는지 확인하세요.")
 
         sampled = stratified_sample(
-            candidates, n_total=run_config.n_chunks,
-            key="source_type", rng=rng,
+            candidates, n_total=n_chunks, key="source_type", rng=rng,
         )
         logger.info(
-            "청크 샘플링 완료 — sampled=%d (요청 %d)",
-            len(sampled), run_config.n_chunks,
+            "청크 샘플링 완료 — sampled=%d (요청 %d)", len(sampled), n_chunks,
         )
 
         # 일반성 게이트용 distractor 풀: 샘플과 다른 문서의 청크에서 무작위 추출
-        distractor_pool = [
-            c for c in candidates
-            if c["chunk_id"] not in {s["chunk_id"] for s in sampled}
-        ]
+        distractor_pool = [c for c in candidates if c["chunk_id"] not in {s["chunk_id"] for s in sampled}]
         rng.shuffle(distractor_pool)
 
         items: list[GoldItem] = []
@@ -189,9 +191,9 @@ async def build(
 
             generated = await generate_questions(
                 chunk["content"],
-                n=run_config.questions_per_chunk,
+                n=questions_per_chunk,
                 generator=generator,
-                reasoning_mode=run_config.reasoning_mode,
+                reasoning_mode=reasoning_mode,
             )
             stats["generated"] += len(generated)
 
@@ -204,16 +206,14 @@ async def build(
             same_type_distractors = [
                 c for c in distractor_pool
                 if c["source_type"] == chunk["source_type"]
-            ][: run_config.n_distractors]
-            if len(same_type_distractors) < run_config.n_distractors:
+            ][:n_distractors]
+            if len(same_type_distractors) < n_distractors:
                 # 부족하면 다른 type 으로 채움
                 fill = [c for c in distractor_pool if c not in same_type_distractors]
-                same_type_distractors += fill[
-                    : run_config.n_distractors - len(same_type_distractors)
-                ]
+                same_type_distractors += fill[: n_distractors - len(same_type_distractors)]
 
             for j, gq in enumerate(generated):
-                if not run_config.apply_filter:
+                if not apply_filter:
                     items.append(GoldItem(
                         id=f"q{len(items) + 1:04d}",
                         query=gq.query,
@@ -232,7 +232,7 @@ async def build(
                     chunk["content"],
                     [d["content"] for d in same_type_distractors],
                     judge=judge,
-                    reasoning_mode=run_config.reasoning_mode,
+                    reasoning_mode=reasoning_mode,
                 )
                 if not report.passed:
                     key = f"fail_{report.reason}" if report.reason else "fail_parse"
@@ -264,18 +264,17 @@ async def build(
             metadata={
                 "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "n_chunks_sampled": len(sampled),
-                "questions_per_chunk": run_config.questions_per_chunk,
-                "filter_applied": run_config.apply_filter,
-                "seed": run_config.seed,
-                "source_types": run_config.source_types or [],
+                "questions_per_chunk": questions_per_chunk,
+                "filter_applied": apply_filter,
+                "seed": seed,
+                "source_types": source_types or [],
                 "stats": stats,
-                **run_config.metadata,
             },
         )
-        save_gold_set(gold, run_config.output_path)
+        save_gold_set(gold, output_path)
         logger.info(
             "골드셋 저장 — path=%s, items=%d, stats=%s",
-            run_config.output_path, len(items), stats,
+            output_path, len(items), stats,
         )
         return gold
 
@@ -297,57 +296,53 @@ def _setup_logging(verbose: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="검색 평가용 합성 골드셋 생성 (LLM 기반). "
-                    "운영 디폴트는 config.eval.synth.* / eval.generator.* / "
-                    "eval.judge.* 에 두고, 아래 인자는 일회성 override 로 사용.",
+        description="검색 평가용 합성 골드셋 생성 (LLM 기반)",
     )
     parser.add_argument(
         "--config", "-c", default="",
         help="사용자 config 파일 경로 (미지정 시 ~/.context-loop/config.yaml)",
     )
-    # 합성 파라미터 — 미지정 시 config.eval.synth.* 사용
     parser.add_argument(
-        "--output", "-o", default=None,
-        help="저장 경로. 미지정 시 config.eval.synth.output.",
+        "--output", "-o", default="eval/gold_set.yaml",
+        help="저장 경로 (기본: eval/gold_set.yaml)",
     )
     parser.add_argument(
-        "--n-chunks", type=int, default=None,
-        help="샘플링할 청크 수. 미지정 시 config.eval.synth.n_chunks.",
+        "--n-chunks", type=int, default=30,
+        help="샘플링할 청크 수 (기본 30)",
     )
     parser.add_argument(
-        "--questions-per-chunk", type=int, default=None,
-        help="청크당 생성 질문 수. 미지정 시 config.eval.synth.questions_per_chunk.",
+        "--questions-per-chunk", type=int, default=2,
+        help="청크당 생성 질문 수 (기본 2)",
     )
     parser.add_argument(
-        "--source-types", default=None,
-        help="쉼표 구분 source_type 화이트리스트 (예: 'git_code,confluence'). "
-             "미지정 시 config.eval.synth.source_types (빈 배열 = 전체).",
+        "--source-types", default="",
+        help="쉼표로 구분된 source_type 화이트리스트 (예: 'git_code,confluence'). 빈 값이면 전체.",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
-        help="랜덤 시드. 미지정 시 config.eval.synth.seed (null = 결정론적 정렬).",
+        help="랜덤 시드 (재현성). 미지정 시 결정론적 정렬 순서로 샘플링.",
     )
     parser.add_argument(
         "--no-filter", action="store_true",
-        help="품질 게이트 강제 OFF (디버그 전용 — config 무시).",
+        help="품질 게이트 비활성화 (디버그/탐색용 — 운영 골드셋에는 사용 금지).",
     )
     parser.add_argument(
-        "--n-distractors", type=int, default=None,
-        help="일반성 게이트의 무관 청크 수. 미지정 시 config.eval.synth.n_distractors.",
+        "--n-distractors", type=int, default=2,
+        help="일반성 게이트의 무관 청크 수 (기본 2)",
     )
     parser.add_argument(
-        "--min-chars", type=int, default=None,
-        help="최소 청크 길이. 미지정 시 config.eval.synth.min_chars.",
+        "--min-chars", type=int, default=200,
+        help="최소 청크 길이 (그 미만은 후보 제외, 기본 200자)",
     )
     parser.add_argument(
-        "--max-chars", type=int, default=None,
-        help="최대 청크 길이. 미지정 시 config.eval.synth.max_chars.",
+        "--max-chars", type=int, default=8000,
+        help="최대 청크 길이 (그 초과는 후보 제외, 기본 8000자)",
     )
     parser.add_argument(
-        "--reasoning-mode", default=None,
-        help="LLM reasoning_mode 프로파일 키. 미지정 시 config.eval.synth.reasoning_mode.",
+        "--reasoning-mode", default="off",
+        help="LLM reasoning_mode 프로파일 (config.llm.reasoning_profiles 키, 기본 'off')",
     )
-    # Generator/Judge — 운영 디폴트는 config.eval.{generator,judge}.* 에 둔다.
+    # Generator/Judge 는 운영 디폴트를 config.eval.{generator,judge}.* 에 둔다.
     # 아래 CLI 인자는 일회성 실험용 override — 미지정 시 config 값 사용,
     # config 도 비어 있으면 상위 llm.* 로 폴백한다.
     parser.add_argument("--generator-endpoint", default="")
@@ -373,28 +368,6 @@ def main() -> None:
     _setup_logging(args.verbose)
 
     config = Config(config_path=Path(args.config) if args.config else None)
-
-    # 합성 파라미터 합성 (CLI > config.eval.synth.*)
-    run_config = resolve_synth_run_config(
-        config,
-        output=args.output,
-        n_chunks=args.n_chunks,
-        questions_per_chunk=args.questions_per_chunk,
-        source_types=args.source_types,
-        n_distractors=args.n_distractors,
-        min_chars=args.min_chars,
-        max_chars=args.max_chars,
-        reasoning_mode=args.reasoning_mode,
-        seed=args.seed,
-        no_filter=args.no_filter,
-    )
-    logger.info(
-        "Synth run config — output=%s, n_chunks=%d, qpc=%d, source_types=%s, "
-        "filter=%s, reasoning=%s, seed=%s",
-        run_config.output_path, run_config.n_chunks,
-        run_config.questions_per_chunk, run_config.source_types,
-        run_config.apply_filter, run_config.reasoning_mode, run_config.seed,
-    )
 
     generator = build_eval_llm_client(
         config, "generator",
@@ -428,11 +401,22 @@ def main() -> None:
             "--generator-* / --judge-* 인자를 사용하세요.",
         )
 
+    source_types = [s.strip() for s in args.source_types.split(",") if s.strip()] or None
+
     asyncio.run(build(
-        run_config,
         config=config,
+        n_chunks=args.n_chunks,
+        questions_per_chunk=args.questions_per_chunk,
+        output_path=Path(args.output),
+        source_types=source_types,
+        seed=args.seed,
+        apply_filter=not args.no_filter,
+        n_distractors=args.n_distractors,
         generator=generator,
         judge=judge,
+        reasoning_mode=args.reasoning_mode,
+        min_chars=args.min_chars,
+        max_chars=args.max_chars,
     ))
 
 

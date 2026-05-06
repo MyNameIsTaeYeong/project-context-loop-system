@@ -1,18 +1,16 @@
 """골드셋 합성 헬퍼 테스트.
 
-LLM 호출은 stub 으로 대체하고 결정론적 부분(파싱, 누출 탐지, 샘플링,
-config 합성)에 집중한다.
+LLM 호출은 stub 으로 대체하고 결정론적 부분(파싱, 누출 탐지, 샘플링)에
+집중한다.
 """
 
 from __future__ import annotations
 
 import random
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from context_loop.config import Config
 from context_loop.eval.synth import (
     extract_unique_tokens,
     filter_question,
@@ -20,7 +18,6 @@ from context_loop.eval.synth import (
     has_identifier_leakage,
     parse_generated_questions,
     parse_yes_no,
-    resolve_synth_run_config,
     stratified_sample,
 )
 
@@ -349,113 +346,3 @@ async def test_filter_question_parse_error() -> None:
     )
     assert report.passed is False
     assert report.reason == "parse_error"
-
-
-# ---------------------------------------------------------------------------
-# resolve_synth_run_config — CLI args + config.eval.synth.* 합성
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def empty_config(tmp_path: Path) -> Config:
-    """기본 default.yaml 만 로드된 Config (사용자 override 없음)."""
-    return Config(config_path=tmp_path / "user.yaml")
-
-
-def test_resolve_uses_defaults_when_nothing_provided(empty_config: Config) -> None:
-    """CLI 미지정 + config 미override → default.yaml 의 값 그대로."""
-    rc = resolve_synth_run_config(empty_config)
-    assert rc.output_path == Path("eval/gold_set.yaml")
-    assert rc.n_chunks == 30
-    assert rc.questions_per_chunk == 2
-    assert rc.source_types is None  # 빈 배열은 None 으로 정규화
-    assert rc.n_distractors == 2
-    assert rc.min_chars == 200
-    assert rc.max_chars == 8000
-    assert rc.reasoning_mode == "off"
-    assert rc.seed is None
-    assert rc.apply_filter is True
-
-
-def test_resolve_uses_config_when_set(empty_config: Config) -> None:
-    """config.eval.synth.* 가 default.yaml 값을 덮는다."""
-    empty_config.set("eval.synth.n_chunks", 100)
-    empty_config.set("eval.synth.questions_per_chunk", 5)
-    empty_config.set("eval.synth.source_types", ["git_code", "confluence"])
-    empty_config.set("eval.synth.min_chars", 500)
-    empty_config.set("eval.synth.seed", 42)
-    empty_config.set("eval.synth.output", "custom/gold.yaml")
-
-    rc = resolve_synth_run_config(empty_config)
-    assert rc.n_chunks == 100
-    assert rc.questions_per_chunk == 5
-    assert rc.source_types == ["git_code", "confluence"]
-    assert rc.min_chars == 500
-    assert rc.seed == 42
-    assert rc.output_path == Path("custom/gold.yaml")
-
-
-def test_resolve_cli_overrides_config(empty_config: Config) -> None:
-    """CLI 인자가 config 보다 우선."""
-    empty_config.set("eval.synth.n_chunks", 100)
-    empty_config.set("eval.synth.source_types", ["confluence"])
-    empty_config.set("eval.synth.seed", 42)
-
-    rc = resolve_synth_run_config(
-        empty_config,
-        n_chunks=10,
-        source_types="git_code",
-        seed=999,
-    )
-    assert rc.n_chunks == 10
-    assert rc.source_types == ["git_code"]
-    assert rc.seed == 999
-
-
-def test_resolve_source_types_csv_parsed_to_list(empty_config: Config) -> None:
-    """CLI source_types 는 콤마 분리 문자열 → list."""
-    rc = resolve_synth_run_config(empty_config, source_types="a, b,c ,")
-    assert rc.source_types == ["a", "b", "c"]  # 공백/빈 항목 제거
-
-
-def test_resolve_empty_cli_source_types_falls_back_to_config(
-    empty_config: Config,
-) -> None:
-    """CLI 가 빈 문자열이면 config 사용."""
-    empty_config.set("eval.synth.source_types", ["confluence"])
-    rc = resolve_synth_run_config(empty_config, source_types="")
-    assert rc.source_types == ["confluence"]
-
-
-def test_resolve_no_filter_flag_overrides_config(empty_config: Config) -> None:
-    """--no-filter 는 항상 게이트 OFF (config 무관)."""
-    rc = resolve_synth_run_config(empty_config, no_filter=True)
-    assert rc.apply_filter is False
-
-
-def test_resolve_no_filter_default_keeps_filter_on(empty_config: Config) -> None:
-    """--no-filter 미지정 → 기본 ON."""
-    rc = resolve_synth_run_config(empty_config)
-    assert rc.apply_filter is True
-
-
-def test_resolve_source_types_invalid_type_in_config_raises(
-    empty_config: Config,
-) -> None:
-    """config 의 source_types 가 list 가 아니면 명확한 에러."""
-    empty_config.set("eval.synth.source_types", "not-a-list")
-    with pytest.raises(ValueError, match="list 이어야 합니다"):
-        resolve_synth_run_config(empty_config)
-
-
-def test_resolve_seed_zero_is_preserved(empty_config: Config) -> None:
-    """seed=0 은 falsy 지만 명시적 값이므로 유지되어야 한다."""
-    rc = resolve_synth_run_config(empty_config, seed=0)
-    assert rc.seed == 0
-
-
-def test_resolve_returns_path_object(empty_config: Config) -> None:
-    """output 은 항상 Path 로 정규화."""
-    rc = resolve_synth_run_config(empty_config, output="some/path.yaml")
-    assert isinstance(rc.output_path, Path)
-    assert rc.output_path == Path("some/path.yaml")
