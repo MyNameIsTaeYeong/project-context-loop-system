@@ -10,7 +10,7 @@ function chatApp() {
             var query = this.input.trim();
             if (!query || this.loading) return;
 
-            this.messages.push({ role: 'user', content: query, sources: [] });
+            this.messages.push({ role: 'user', content: query, reasoning: '', sources: [] });
             this.input = '';
             this.loading = true;
             this.scrollToBottom();
@@ -18,7 +18,7 @@ function chatApp() {
             // 스트림 토큰을 이어 붙일 빈 어시스턴트 메시지를 미리 push.
             // push 후 배열 안의 참조(Alpine 반응성 Proxy)를 다시 받아와야
             // 이후 mutation 이 DOM 갱신을 트리거한다.
-            this.messages.push({ role: 'assistant', content: '', sources: [] });
+            this.messages.push({ role: 'assistant', content: '', reasoning: '', sources: [] });
             var assistant = this.messages[this.messages.length - 1];
 
             try {
@@ -74,6 +74,9 @@ function chatApp() {
                 assistant.sources = event.sources || [];
             } else if (event.type === 'delta') {
                 assistant.content += (event.content || '');
+                this.scrollToBottom();
+            } else if (event.type === 'reasoning') {
+                assistant.reasoning += (event.content || '');
                 this.scrollToBottom();
             } else if (event.type === 'error') {
                 assistant.content = event.content || '오류가 발생했습니다.';

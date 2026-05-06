@@ -51,6 +51,7 @@ async def generate_hypothetical_document(
             system=_HYDE_SYSTEM_PROMPT,
             max_tokens=512,
             temperature=0.7,
+            reasoning_mode="off",
             purpose="hyde_query_expansion",
         )
     except Exception:

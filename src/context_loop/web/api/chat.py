@@ -80,6 +80,7 @@ async def chat_api(
 
     이벤트 스키마(한 줄당 한 JSON)::
 
+        {"type": "reasoning", "content": "추론 토큰..."}
         {"type": "delta", "content": "토큰..."}
         {"type": "delta", "content": "토큰..."}
         {"type": "sources", "sources": [...]}
@@ -121,14 +122,15 @@ async def chat_api(
 
         prompt = f"## 컨텍스트\n\n{assembled.context_text}\n\n## 질문\n\n{body.query}"
         try:
-            async for chunk in llm_client.stream(
+            async for event in llm_client.stream_events(
                 prompt,
                 system=_SYSTEM_PROMPT,
                 max_tokens=16384,
                 reasoning_mode="high",
                 purpose="answer_generation",
             ):
-                yield _ndjson({"type": "delta", "content": chunk})
+                event_type = "reasoning" if event["kind"] == "reasoning" else "delta"
+                yield _ndjson({"type": event_type, "content": event["content"]})
         except Exception:
             logger.exception("LLM 호출 실패")
             yield _ndjson({
