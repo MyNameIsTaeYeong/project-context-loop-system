@@ -13,7 +13,7 @@ from context_loop.config import Config
 from context_loop.ingestion.git_repository import (
     FileInfo,
     ProductScope,
-    SyncResult,
+    _repo_clone_dir,
     clone_or_pull,
     collect_files,
     compute_content_hash,
@@ -24,11 +24,13 @@ from context_loop.ingestion.git_repository import (
     group_files_by_directory,
     match_product,
     parse_product_scopes,
+    purge_synced_results,
     store_git_code,
     sync_repository,
 )
+from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
-
+from context_loop.storage.vector_store import VectorStore
 
 # --- Fixtures ---
 
@@ -483,3 +485,230 @@ class TestSyncRepository:
         r2 = await sync_repository(store, config, repo_config)
         assert len(r2.created) == 1  # new.go
         assert len(r2.updated) == 1  # main.go
+
+
+# --- Purge: 싱크 결과 일괄 삭제 ---
+
+
+@pytest.fixture
+async def stores(tmp_path: Path):
+    """purge 테스트용 격리된 메타·벡터·그래프 스토어."""
+    meta = MetadataStore(tmp_path / "test.db")
+    await meta.initialize()
+    vec = VectorStore(tmp_path)
+    vec.initialize()
+    graph = GraphStore(meta)
+    yield meta, vec, graph
+    await meta.close()
+
+
+async def _seed_git_doc(
+    store: MetadataStore,
+    *,
+    source_id: str,
+    repo_url: str,
+    product: str,
+    content: str = "x",
+) -> int:
+    return await store.create_document(
+        source_type="git_code",
+        source_id=source_id,
+        title=Path(source_id).name,
+        original_content=content,
+        content_hash=compute_content_hash(content),
+        url=repo_url,
+        author=product,
+    )
+
+
+async def _seed_derived(
+    store: MetadataStore,
+    *,
+    source_type: str,
+    source_id: str,
+    sources: list[int],
+) -> int:
+    """파생 문서를 만들고 source 연결을 등록한다."""
+    doc_id = await store.create_document(
+        source_type=source_type,
+        source_id=source_id,
+        title=source_id,
+        original_content="y",
+        content_hash=compute_content_hash(f"{source_id}-{sources}"),
+    )
+    for src_id in sources:
+        await store.add_document_source(doc_id, src_id, file_path=None)
+    return doc_id
+
+
+class TestPurgeSyncedResults:
+    async def test_purge_repository_removes_all_git_code(self, stores) -> None:
+        meta, vec, graph = stores
+        repo = "git@github.com:co/repo.git"
+        a = await _seed_git_doc(
+            meta, source_id="services/vpc/a.go", repo_url=repo, product="vpc",
+        )
+        b = await _seed_git_doc(
+            meta, source_id="services/billing/b.go", repo_url=repo, product="billing",
+        )
+        # 다른 레포는 영향 받지 않아야 한다.
+        other = await _seed_git_doc(
+            meta, source_id="x.go", repo_url="git@github.com:co/other.git",
+            product="vpc",
+        )
+
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url=repo,
+        )
+        assert result.deleted_git_code == 2
+        assert result.deleted_derived == 0
+        assert result.deleted_clone_dir is False
+        assert await meta.get_document(a) is None
+        assert await meta.get_document(b) is None
+        assert await meta.get_document(other) is not None
+
+    async def test_purge_product_scopes_to_one_product(self, stores) -> None:
+        meta, vec, graph = stores
+        repo = "git@github.com:co/repo.git"
+        vpc = await _seed_git_doc(
+            meta, source_id="services/vpc/a.go", repo_url=repo, product="vpc",
+        )
+        billing = await _seed_git_doc(
+            meta, source_id="services/billing/b.go", repo_url=repo, product="billing",
+        )
+
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url=repo,
+            product="vpc",
+        )
+        assert result.deleted_git_code == 1
+        assert result.product == "vpc"
+        assert await meta.get_document(vpc) is None
+        assert await meta.get_document(billing) is not None
+
+    async def test_purge_cascades_derived_with_only_purged_sources(
+        self, stores,
+    ) -> None:
+        meta, vec, graph = stores
+        repo = "git@github.com:co/repo.git"
+        g1 = await _seed_git_doc(
+            meta, source_id="services/vpc/a.go", repo_url=repo, product="vpc",
+        )
+        g2 = await _seed_git_doc(
+            meta, source_id="services/vpc/b.go", repo_url=repo, product="vpc",
+        )
+        # 파생: vpc 소스 두 개에만 의존 → 삭제되어야 함.
+        derived = await _seed_derived(
+            meta,
+            source_type="code_doc",
+            source_id="vpc:architecture",
+            sources=[g1, g2],
+        )
+
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url=repo,
+            product="vpc",
+        )
+        assert result.deleted_git_code == 2
+        assert result.deleted_derived == 1
+        assert await meta.get_document(derived) is None
+
+    async def test_purge_keeps_derived_with_external_sources(self, stores) -> None:
+        meta, vec, graph = stores
+        repo_a = "git@github.com:co/a.git"
+        repo_b = "git@github.com:co/b.git"
+        ga = await _seed_git_doc(
+            meta, source_id="a.go", repo_url=repo_a, product="vpc",
+        )
+        gb = await _seed_git_doc(
+            meta, source_id="b.go", repo_url=repo_b, product="vpc",
+        )
+        # 두 레포의 코드를 함께 참조하는 파생 → repo_a 만 purge 시 살려야 함.
+        cross = await _seed_derived(
+            meta,
+            source_type="code_doc",
+            source_id="vpc:cross",
+            sources=[ga, gb],
+        )
+
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url=repo_a,
+        )
+        assert result.deleted_git_code == 1
+        assert result.deleted_derived == 0
+        assert await meta.get_document(cross) is not None
+        # gb 는 다른 레포 소속이라 그대로 남아야 한다.
+        assert await meta.get_document(gb) is not None
+
+    async def test_purge_repo_removes_local_clone_dir(self, stores, tmp_path: Path) -> None:
+        meta, vec, graph = stores
+        repo = "git@github.com:co/repo.git"
+        await _seed_git_doc(
+            meta, source_id="a.go", repo_url=repo, product="vpc",
+        )
+
+        data_dir = tmp_path / "data"
+        clone_dir = _repo_clone_dir(data_dir, repo)
+        clone_dir.mkdir(parents=True)
+        (clone_dir / "marker.txt").write_text("present")
+
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url=repo,
+            data_dir=data_dir,
+        )
+        assert result.deleted_clone_dir is True
+        assert not clone_dir.exists()
+
+    async def test_purge_product_does_not_remove_clone_dir(
+        self, stores, tmp_path: Path,
+    ) -> None:
+        meta, vec, graph = stores
+        repo = "git@github.com:co/repo.git"
+        await _seed_git_doc(
+            meta, source_id="a.go", repo_url=repo, product="vpc",
+        )
+
+        data_dir = tmp_path / "data"
+        clone_dir = _repo_clone_dir(data_dir, repo)
+        clone_dir.mkdir(parents=True)
+        (clone_dir / "marker.txt").write_text("present")
+
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url=repo,
+            product="vpc",
+            data_dir=data_dir,
+        )
+        # product purge 는 clone 을 절대 건드리지 않는다.
+        assert result.deleted_clone_dir is False
+        assert clone_dir.exists()
+
+    async def test_purge_no_match_returns_zero(self, stores) -> None:
+        meta, vec, graph = stores
+        result = await purge_synced_results(
+            meta_store=meta,
+            vector_store=vec,
+            graph_store=graph,
+            repo_url="git@github.com:co/missing.git",
+            product="ghost",
+        )
+        assert result.deleted_git_code == 0
+        assert result.deleted_derived == 0
+        assert result.deleted_clone_dir is False
