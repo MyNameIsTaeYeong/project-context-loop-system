@@ -75,12 +75,14 @@ class EndpointRerankerClient(RerankerClient):
         }
         total_doc_chars = sum(len(d) for d in documents)
         start = time.perf_counter()
+        scores: list[float] = []
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(self._url, json=body, headers=self._headers)
                 resp.raise_for_status()
                 data = resp.json()
-            return parse_rerank_response(data, len(documents))
+            scores = parse_rerank_response(data, len(documents))
+            return scores
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.info(
@@ -90,6 +92,17 @@ class EndpointRerankerClient(RerankerClient):
                 self._model, elapsed_ms, len(documents),
                 len(query), total_doc_chars,
             )
+            if scores:
+                logger.info(
+                    "Reranker response | model=%s | query=%s",
+                    self._model, query,
+                )
+                for idx, (doc, score) in enumerate(zip(documents, scores)):
+                    logger.info(
+                        "Reranker response | model=%s | idx=%d/%d | "
+                        "score=%.4f | doc=%s",
+                        self._model, idx, len(documents), score, doc,
+                    )
 
 
 def parse_rerank_response(data: Any, n: int) -> list[float]:
