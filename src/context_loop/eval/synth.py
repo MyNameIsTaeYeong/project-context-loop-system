@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from context_loop.config import Config
 from context_loop.processor.llm_client import LLMClient, extract_json
 
 logger = logging.getLogger(__name__)
@@ -343,3 +345,109 @@ def stratified_sample(
                 exhausted.add(k)
 
     return selected
+
+
+# ---------------------------------------------------------------------------
+# 합성 실행 파라미터 — config.eval.synth.* + CLI override 합성
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SynthRunConfig:
+    """build_synthetic_gold_set.py 의 실행 파라미터.
+
+    각 필드의 기본값은 ``config.eval.synth.*`` 에서 로드되며 CLI 인자로
+    덮어쓸 수 있다. ``resolve_synth_run_config`` 가 합성 책임을 진다.
+    """
+
+    output_path: Path
+    n_chunks: int
+    questions_per_chunk: int
+    source_types: list[str] | None
+    n_distractors: int
+    min_chars: int
+    max_chars: int
+    reasoning_mode: str
+    seed: int | None
+    apply_filter: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def resolve_synth_run_config(
+    config: Config,
+    *,
+    output: str | None = None,
+    n_chunks: int | None = None,
+    questions_per_chunk: int | None = None,
+    source_types: str | None = None,
+    n_distractors: int | None = None,
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+    reasoning_mode: str | None = None,
+    seed: int | None = None,
+    no_filter: bool = False,
+) -> SynthRunConfig:
+    """CLI 인자(``None`` = 미지정) + ``config.eval.synth.*`` 를 합성한다.
+
+    우선순위 (높음 → 낮음):
+        1. CLI 인자 (호출 시 ``None`` 이 아닌 값)
+        2. ``config.eval.synth.{key}``
+        3. 마지막 폴백 (default.yaml 의 값과 동일하게 유지)
+
+    ``no_filter`` 만 예외적으로 CLI 플래그(action="store_true")이므로 True 면
+    무조건 게이트 OFF (디버그 전용 — config 무관).
+
+    ``source_types`` CLI 인자는 콤마 분리 문자열, config 는 list. 빈 값은
+    ``None`` (= 전체 소스 사용).
+
+    Args:
+        config: 애플리케이션 Config.
+        output, n_chunks, ...: CLI 인자 값. ``None`` 이면 config 사용.
+        no_filter: True 면 품질 게이트 강제 OFF.
+
+    Returns:
+        ``SynthRunConfig`` — 그대로 ``build()`` 에 넘길 수 있다.
+    """
+    cfg_output = config.get("eval.synth.output", "eval/gold_set.yaml")
+    cfg_n_chunks = config.get("eval.synth.n_chunks", 30)
+    cfg_qpc = config.get("eval.synth.questions_per_chunk", 2)
+    cfg_source_types = config.get("eval.synth.source_types") or []
+    cfg_n_distractors = config.get("eval.synth.n_distractors", 2)
+    cfg_min_chars = config.get("eval.synth.min_chars", 200)
+    cfg_max_chars = config.get("eval.synth.max_chars", 8000)
+    cfg_reasoning = config.get("eval.synth.reasoning_mode", "off")
+    cfg_seed = config.get("eval.synth.seed")  # null 가능
+
+    if source_types is not None and source_types != "":
+        # CLI: 콤마 분리 문자열 → list (빈 값 제거)
+        resolved_source_types: list[str] | None = [
+            s.strip() for s in source_types.split(",") if s.strip()
+        ] or None
+    elif cfg_source_types:
+        if not isinstance(cfg_source_types, list):
+            raise ValueError(
+                f"config.eval.synth.source_types 는 list 이어야 합니다 — "
+                f"got {type(cfg_source_types).__name__}",
+            )
+        resolved_source_types = [str(s) for s in cfg_source_types] or None
+    else:
+        resolved_source_types = None
+
+    return SynthRunConfig(
+        output_path=Path(output if output else cfg_output),
+        n_chunks=int(n_chunks if n_chunks is not None else cfg_n_chunks),
+        questions_per_chunk=int(
+            questions_per_chunk if questions_per_chunk is not None else cfg_qpc,
+        ),
+        source_types=resolved_source_types,
+        n_distractors=int(
+            n_distractors if n_distractors is not None else cfg_n_distractors,
+        ),
+        min_chars=int(min_chars if min_chars is not None else cfg_min_chars),
+        max_chars=int(max_chars if max_chars is not None else cfg_max_chars),
+        reasoning_mode=str(
+            reasoning_mode if reasoning_mode is not None else cfg_reasoning,
+        ),
+        seed=seed if seed is not None else (int(cfg_seed) if cfg_seed is not None else None),
+        apply_filter=not no_filter,
+    )
