@@ -85,6 +85,12 @@ class EndpointEmbeddingClient(Embeddings):
         results: list[list[float]] = []
         total_chars = sum(len(t) for t in texts)
         batch_count = 0
+        for idx, text in enumerate(texts):
+            logger.info(
+                "Embedding text | provider=endpoint | model=%s | "
+                "idx=%d/%d | chars=%d | text=%s",
+                self._model, idx, len(texts), len(text), text,
+            )
         start = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -153,6 +159,12 @@ class LocalEmbeddingClient(Embeddings):
         if not texts:
             return []
         total_chars = sum(len(t) for t in texts)
+        for idx, text in enumerate(texts):
+            logger.info(
+                "Embedding text | provider=local | model=%s | "
+                "idx=%d/%d | chars=%d | text=%s",
+                self._model_name, idx, len(texts), len(text), text,
+            )
         start = time.perf_counter()
         try:
             loop = asyncio.get_event_loop()
