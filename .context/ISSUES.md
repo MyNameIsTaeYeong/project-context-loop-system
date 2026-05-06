@@ -17,22 +17,6 @@
   검색 단계 변경 불필요.
 - I-040 골드셋으로 baseline/after 정량 비교 가능 (도구 준비됨).
 
-### I-047: reasoning_mode='high' 시 generator profile 미적용 (의심)
-- 사용자 보고 (2026-05-06): "reasoning_mode가 high인 경우 generator의
-  프로파일이 안넘어가고 있어요"
-- 트레이스 결과 — 시나리오 분석:
-  - **S1 (작동)**: `eval.generator.reasoning_profiles` 비고 endpoint/model
-    만 override → llm.* 폴백으로 "high" 정상 적용. 검증 완료.
-  - **S2 (의심)**: `eval.generator.reasoning_profiles` 에 일부 키만 정의
-    (예: "off" 만) → 현재 구현은 all-or-nothing 으로 llm.* 의 "high" 미상속.
-    `_resolve_extra_body("high")` 가 None 반환.
-- 다음 세션에서 사용자 config 확인 후 결정. 후보 해법:
-  1. role 의 reasoning_profiles 가 비어 있을 때만 llm.* 폴백 (현재)
-  2. **per-key merge**: `{**llm_profiles, **role_profiles}` — 단 role
-     모델 family 가 다르면 잘못된 페이로드 위험
-  3. role 정의 시 모든 키 명시 강제 + 누락 시 명확한 에러
-- 작업량: 작음 (코어 로직은 한 함수).
-
 ### I-040: 검색 품질 측정 인프라 → **도구 완성 (2026-05-06)**, 운영 검증 단계
 - 합성 골드셋 + 정량 평가 도구 도입 완료. `src/context_loop/eval/`
   (metrics, gold_set, synth, llm) + `scripts/build_synthetic_gold_set.py`

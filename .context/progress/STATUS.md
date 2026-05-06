@@ -12,8 +12,7 @@
 - 테스트 누적 +99 건 (eval/metrics 22 + eval/gold_set 7 + eval/synth 32 + eval/llm 38), 회귀 없음.
 - **미해결 후속**:
   1. **I-046 git_code 멀티뷰 적용** (P0, 다음 세션 1순위) — 본 세션에서 진단만 완료. 적용 PR 은 별도. 골드셋으로 baseline/after 정량 비교 가능.
-  2. **I-047 reasoning_mode='high' 시 generator profile 미적용** — 사용자 보고. `eval.{role}.reasoning_profiles` 가 일부 키만 정의될 때 llm.* per-key 폴백 부재가 의심. 사용자 config 확인 후 결정.
-  3. **I-040 운영 검증** — 사내 환경에서 30~50건 합성 + 사람 검수 + I-046 적용 후 효과 정량화.
+  2. **I-040 운영 검증** — 사내 환경에서 30~50건 합성 + 사람 검수 + I-046 적용 후 효과 정량화.
 
 ## 이전 단계
 - **Phase 7.17(2026-04-29)**: `/api/chat` 성능 최적화 (LLM 호출 병렬화 + 전용 cross-encoder 리랭커 도입). 브랜치 `claude/optimize-chat-api-performance-vODmW`. 6개 커밋 누적.
