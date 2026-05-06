@@ -133,9 +133,18 @@ async def assemble_context(
             sections.append(source_section)
 
     if not sections:
+        logger.info(
+            "Assembled context | query=%s | chars=0 | text=<empty>",
+            query,
+        )
         return "관련 컨텍스트를 찾을 수 없습니다."
 
-    return "\n\n---\n\n".join(sections)
+    context_text = "\n\n---\n\n".join(sections)
+    logger.info(
+        "Assembled context | query=%s | chars=%d | text=%s",
+        query, len(context_text), context_text,
+    )
+    return context_text
 
 
 async def _embed_query(
@@ -419,6 +428,11 @@ async def assemble_context_with_sources(
 
     context_text = "\n\n---\n\n".join(sections) if sections else ""
     sources.sort(key=lambda s: s.similarity, reverse=True)
+    logger.info(
+        "Assembled context | query=%s | chars=%d | sources=%d | text=%s",
+        query, len(context_text), len(sources),
+        context_text if context_text else "<empty>",
+    )
     return AssembledContext(context_text=context_text, sources=sources)
 
 
