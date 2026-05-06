@@ -40,7 +40,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
-from context_loop.eval.llm import build_llm_client  # noqa: E402
+from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.metrics import (  # noqa: E402
     aggregate,
     hit_at_k,
@@ -354,13 +354,18 @@ async def run(args: argparse.Namespace) -> int:
 
     llm_client, embedding_client, reranker_client = _build_clients(config)
 
-    # Judge 는 옵션 — 별도 엔드포인트 또는 같은 LLM 재사용.
-    # _build_judge_llm 이 config.llm.headers / reasoning_profiles 를 자동 주입한다.
+    # Judge 는 옵션 — config.eval.judge.* + CLI override 에서 자동 합성.
+    # 둘 다 비면 system LLM 재사용 (편향 경고).
     judge: LLMClient | None = None
     if args.judge:
-        if args.judge_endpoint and args.judge_model:
-            judge = build_llm_client(
-                config,
+        judge_configured = role_is_configured(
+            config, "judge",
+            endpoint_override=args.judge_endpoint,
+            model_override=args.judge_model,
+        )
+        if judge_configured:
+            judge = build_eval_llm_client(
+                config, "judge",
                 endpoint_override=args.judge_endpoint,
                 model_override=args.judge_model,
                 api_key_override=args.judge_api_key,
@@ -368,8 +373,8 @@ async def run(args: argparse.Namespace) -> int:
             )
         else:
             logger.warning(
-                "--judge 가 켜져 있지만 --judge-endpoint/--judge-model 미지정 → "
-                "기본 llm_client 를 Judge 로 재사용합니다 (자기 평가 편향 가능).",
+                "--judge 가 켜져 있지만 config.eval.judge / --judge-* 가 비어 있어 "
+                "system llm_client 를 Judge 로 재사용합니다 (자기 평가 편향 가능).",
             )
             judge = llm_client
 

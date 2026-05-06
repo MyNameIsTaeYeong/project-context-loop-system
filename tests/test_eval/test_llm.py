@@ -19,7 +19,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from context_loop.config import Config
-from context_loop.eval.llm import _parse_headers_json, build_llm_client
+from context_loop.eval.llm import (
+    _parse_headers_json,
+    build_eval_llm_client,
+    build_llm_client,
+    role_is_configured,
+)
 
 
 @pytest.fixture
@@ -61,6 +66,10 @@ def config(tmp_path: Any) -> Config:
 # ---------------------------------------------------------------------------
 # _parse_headers_json
 # ---------------------------------------------------------------------------
+
+
+def test_parse_headers_json_empty_returns_empty_dict() -> None:
+    assert _parse_headers_json("") == {}
 
 
 def test_parse_headers_json_valid() -> None:
@@ -139,7 +148,7 @@ def test_build_llm_client_override_applies_then_restores(
         endpoint_override="http://override/v1",
         model_override="override-model",
         api_key_override="override-key",
-        headers_override_json='{"X-New": "v"}',
+        headers_override={"X-New": "v"},
     )
 
     # 빌더 호출 시점에는 override 가 반영됨
@@ -199,22 +208,19 @@ def test_build_llm_client_restores_on_builder_exception(
     assert config.data == before
 
 
-def test_build_llm_client_invalid_headers_json_restores_config(
+def test_build_llm_client_empty_headers_dict_clears_config_headers(
     config: Config, stub_web_app: MagicMock,
 ) -> None:
-    """헤더 JSON 파싱 실패해도 config 복원."""
-    before = config.data
+    """``headers_override={}`` 는 빈 dict 로 통째 교체 (헤더 없이 호출)."""
+    captured: dict[str, Any] = {}
 
-    with pytest.raises(ValueError, match="JSON 파싱 실패"):
-        build_llm_client(
-            config,
-            endpoint_override="http://x/v1",
-            headers_override_json="{not valid",
-        )
+    def fake_builder(cfg: Config) -> object:
+        captured["headers"] = cfg.get("llm.headers")
+        return object()
 
-    # 빌더는 호출되지 않음 (헤더 파싱이 빌더 호출 전에 실패)
-    stub_web_app.assert_not_called()
-    assert config.data == before
+    stub_web_app.side_effect = fake_builder
+    build_llm_client(config, model_override="m", headers_override={})
+    assert captured["headers"] == {}
 
 
 def test_build_llm_client_forces_endpoint_provider(
@@ -234,3 +240,169 @@ def test_build_llm_client_forces_endpoint_provider(
     assert captured_provider == ["endpoint"]
     # 복원 후에는 원래대로
     assert config.get("llm.provider") == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# build_eval_llm_client — config.eval.{role}.* + CLI override 합성
+# ---------------------------------------------------------------------------
+
+
+def _capture_builder() -> tuple[list[dict[str, Any]], Any]:
+    """빌더 호출 시점의 config 값을 캡처하는 fake 를 만든다."""
+    captured: list[dict[str, Any]] = []
+
+    def fake(cfg: Config) -> object:
+        captured.append({
+            "endpoint": cfg.get("llm.endpoint"),
+            "model": cfg.get("llm.model"),
+            "api_key": cfg.get("llm.api_key"),
+            "headers": cfg.get("llm.headers"),
+        })
+        return object()
+
+    return captured, fake
+
+
+def test_build_eval_llm_client_uses_role_config(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """CLI override 가 없으면 config.eval.{role}.* 가 반영된다."""
+    config.set("eval.generator.endpoint", "http://gen-server/v1")
+    config.set("eval.generator.model", "gen-model")
+    config.set("eval.generator.api_key", "gen-key")
+    config.set("eval.generator.headers", {"X-Gen": "1"})
+
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(config, "generator")
+
+    assert captured[0]["endpoint"] == "http://gen-server/v1"
+    assert captured[0]["model"] == "gen-model"
+    assert captured[0]["api_key"] == "gen-key"
+    assert captured[0]["headers"] == {"X-Gen": "1"}
+
+
+def test_build_eval_llm_client_falls_back_to_llm_when_role_empty(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """eval.{role}.* 가 비어 있으면 llm.* 그대로 사용 (build_llm_client 가 처리)."""
+    sentinel = object()
+    stub_web_app.return_value = sentinel
+    result = build_eval_llm_client(config, "judge")
+    assert result is sentinel
+    # override 없으니 _build_llm_client(config) 가 그대로 호출됨
+    stub_web_app.assert_called_once_with(config)
+
+
+def test_build_eval_llm_client_cli_overrides_role_config(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """CLI override 가 config.eval.{role}.* 보다 우선한다."""
+    config.set("eval.judge.endpoint", "http://judge-from-config/v1")
+    config.set("eval.judge.model", "judge-config-model")
+
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(
+        config, "judge",
+        endpoint_override="http://cli-override/v1",
+        model_override="cli-model",
+    )
+
+    assert captured[0]["endpoint"] == "http://cli-override/v1"
+    assert captured[0]["model"] == "cli-model"
+
+
+def test_build_eval_llm_client_partial_role_config_falls_through(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """role config 의 일부 키만 채워져 있으면 나머지는 llm.* 폴백."""
+    # endpoint 만 role 에 설정, model 은 비움 → model 은 llm.model 사용
+    config.set("eval.generator.endpoint", "http://gen/v1")
+    # eval.generator.model 은 ""
+
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(config, "generator")
+
+    assert captured[0]["endpoint"] == "http://gen/v1"
+    assert captured[0]["model"] == "default-model"  # llm.model 폴백
+
+
+def test_build_eval_llm_client_cli_headers_json_overrides_role_headers(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """CLI 의 --{role}-headers JSON 이 config.eval.{role}.headers 보다 우선."""
+    config.set("eval.generator.endpoint", "http://gen/v1")
+    config.set("eval.generator.model", "gen-model")
+    config.set("eval.generator.headers", {"X-From-Config": "1"})
+
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(
+        config, "generator",
+        headers_override_json='{"X-From-CLI": "yes"}',
+    )
+
+    assert captured[0]["headers"] == {"X-From-CLI": "yes"}
+
+
+def test_build_eval_llm_client_invalid_role_raises(config: Config) -> None:
+    with pytest.raises(ValueError, match="알 수 없는 role"):
+        build_eval_llm_client(config, "unknown")  # type: ignore[arg-type]
+
+
+def test_build_eval_llm_client_invalid_headers_json_raises(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """헤더 JSON 파싱 실패 시 ValueError, 빌더는 호출되지 않음."""
+    with pytest.raises(ValueError, match="JSON 파싱 실패"):
+        build_eval_llm_client(
+            config, "generator",
+            endpoint_override="http://x/v1",
+            headers_override_json="{not valid",
+        )
+    stub_web_app.assert_not_called()
+
+
+def test_build_eval_llm_client_role_headers_not_dict_raises(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """config.eval.{role}.headers 가 dict 가 아니면 명확한 에러."""
+    config.set("eval.generator.endpoint", "http://x/v1")
+    config.set("eval.generator.model", "m")
+    config.set("eval.generator.headers", "not-a-dict")
+
+    with pytest.raises(ValueError, match="dict 이어야 합니다"):
+        build_eval_llm_client(config, "generator")
+    stub_web_app.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# role_is_configured
+# ---------------------------------------------------------------------------
+
+
+def test_role_is_configured_false_when_all_empty(config: Config) -> None:
+    assert role_is_configured(config, "generator") is False
+    assert role_is_configured(config, "judge") is False
+
+
+def test_role_is_configured_true_with_role_endpoint(config: Config) -> None:
+    config.set("eval.generator.endpoint", "http://x/v1")
+    assert role_is_configured(config, "generator") is True
+
+
+def test_role_is_configured_true_with_role_model(config: Config) -> None:
+    config.set("eval.judge.model", "judge-m")
+    assert role_is_configured(config, "judge") is True
+
+
+def test_role_is_configured_true_with_cli_override(config: Config) -> None:
+    """role config 가 비어도 CLI override 가 있으면 True."""
+    assert role_is_configured(
+        config, "generator", endpoint_override="http://cli/v1",
+    ) is True
+    assert role_is_configured(
+        config, "judge", model_override="cli-m",
+    ) is True

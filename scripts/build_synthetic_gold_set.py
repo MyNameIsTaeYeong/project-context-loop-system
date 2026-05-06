@@ -61,7 +61,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, GoldSet, save_gold_set  # noqa: E402
-from context_loop.eval.llm import build_llm_client  # noqa: E402
+from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.synth import (  # noqa: E402
     filter_question,
     generate_questions,
@@ -342,24 +342,24 @@ def main() -> None:
         "--reasoning-mode", default="off",
         help="LLM reasoning_mode 프로파일 (config.llm.reasoning_profiles 키, 기본 'off')",
     )
-    # Generator/Judge 분리 옵션 — override 가 모두 비면 config.llm.* 그대로 사용.
-    # config 의 llm.headers / llm.reasoning_profiles 가 자동 적용되므로
-    # 사내 LLM 게이트웨이의 커스텀 헤더 + Qwen3 등 reasoning 페이로드도
-    # 별도 인자 없이 동작한다.
+    # Generator/Judge 는 운영 디폴트를 config.eval.{generator,judge}.* 에 둔다.
+    # 아래 CLI 인자는 일회성 실험용 override — 미지정 시 config 값 사용,
+    # config 도 비어 있으면 상위 llm.* 로 폴백한다.
     parser.add_argument("--generator-endpoint", default="")
     parser.add_argument("--generator-model", default="")
     parser.add_argument("--generator-api-key", default="")
     parser.add_argument(
         "--generator-headers", default="",
-        help="Generator 전용 헤더 JSON (예: '{\"X-Org-Id\":\"abc\"}'). "
-             "미지정 시 config.llm.headers 사용.",
+        help="Generator 헤더 JSON (예: '{\"X-Org-Id\":\"abc\"}'). "
+             "미지정 시 config.eval.generator.headers, 그것도 비면 llm.headers.",
     )
     parser.add_argument("--judge-endpoint", default="")
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--judge-api-key", default="")
     parser.add_argument(
         "--judge-headers", default="",
-        help="Judge 전용 헤더 JSON. 미지정 시 config.llm.headers 사용.",
+        help="Judge 헤더 JSON. 미지정 시 config.eval.judge.headers, "
+             "그것도 비면 llm.headers.",
     )
 
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -369,28 +369,36 @@ def main() -> None:
 
     config = Config(config_path=Path(args.config) if args.config else None)
 
-    generator = build_llm_client(
-        config,
+    generator = build_eval_llm_client(
+        config, "generator",
         endpoint_override=args.generator_endpoint,
         model_override=args.generator_model,
         api_key_override=args.generator_api_key,
         headers_override_json=args.generator_headers,
     )
-    judge = build_llm_client(
-        config,
+    judge = build_eval_llm_client(
+        config, "judge",
         endpoint_override=args.judge_endpoint,
         model_override=args.judge_model,
         api_key_override=args.judge_api_key,
         headers_override_json=args.judge_headers,
     )
 
-    if not (
-        args.generator_endpoint or args.generator_model
-        or args.judge_endpoint or args.judge_model
-    ):
+    gen_configured = role_is_configured(
+        config, "generator",
+        endpoint_override=args.generator_endpoint,
+        model_override=args.generator_model,
+    )
+    judge_configured = role_is_configured(
+        config, "judge",
+        endpoint_override=args.judge_endpoint,
+        model_override=args.judge_model,
+    )
+    if not (gen_configured or judge_configured):
         logger.warning(
-            "Generator 와 Judge 가 같은 모델입니다 — 자기 평가 편향 가능. "
-            "--generator-* 와 --judge-* 를 분리하는 것을 권장합니다.",
+            "Generator/Judge 모두 system LLM (llm.*) 과 동일 — 자기 평가 편향 가능. "
+            "config.yaml 의 eval.generator / eval.judge 에 별도 모델을 지정하거나 "
+            "--generator-* / --judge-* 인자를 사용하세요.",
         )
 
     source_types = [s.strip() for s in args.source_types.split(",") if s.strip()] or None

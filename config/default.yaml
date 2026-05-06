@@ -179,6 +179,24 @@ search:
   reranker_score_threshold: 0.3    # 리랭크 점수 최소값 (모델 의존, 보통 0~1 — Cohere/Jina 호환)
   hyde_enabled: false              # HyDE (Hypothetical Document Embedding) 사용 여부
 
+eval:
+  # 검색 품질 평가용 LLM 설정
+  # (scripts/build_synthetic_gold_set.py + scripts/eval_search.py 가 사용).
+  # 자기 평가 편향을 줄이려면 generator/judge 를 system 모델 (llm.*) 과
+  # 다른 family 의 모델로 분리하는 것을 권장한다.
+  # 각 키가 비어 있으면 상위 llm.* 값으로 폴백하며, headers 도 빈 dict 면
+  # llm.headers 가 그대로 적용된다. reasoning_profiles 는 항상 llm.* 공유.
+  generator:                       # 골드셋 질의 합성
+    endpoint: ""                   # 예: "http://strong-model:8080/v1"
+    model: ""                      # 예: "gpt-4o" 또는 "claude-sonnet-4"
+    api_key: ""
+    headers: {}                    # 예: {X-Org-Id: "abc"}
+  judge:                           # 답변 가능성·품질 채점
+    endpoint: ""                   # 예: "http://other-family:8080/v1"
+    model: ""                      # generator 와 다른 family 권장
+    api_key: ""
+    headers: {}
+
 storage:
   vector_db: "chromadb"
   graph_db: "networkx"
