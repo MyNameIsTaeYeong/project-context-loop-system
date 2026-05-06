@@ -1,9 +1,21 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 7.17 — `/api/chat` 성능 최적화 (LLM 호출 병렬화 + 전용 cross-encoder 리랭커 도입)
-- **Step**: 사용자 보고 "/api/chat 응답이 느리다" → RAG 파이프라인 LLM 호출 4건(HyDE / 그래프 plan / 리랭킹 / 답변)의 직렬 실행 진단. 데이터 의존성 분석 결과 리랭킹 ↔ 그래프 계획이 무관함을 확인 → `asyncio.gather` 병렬화. 후속으로 LLM 기반 리랭커(D-021)를 dedicated cross-encoder 모델 호출로 교체 — D-045.
-- **최신(2026-04-29)**: 브랜치 `claude/optimize-chat-api-performance-vODmW`. 6개 커밋 누적.
+- **Phase**: Phase 7.18 — 검색 품질 측정 인프라 (I-040 도구 완성) + git_code 멀티뷰 비대칭 진단 (I-046)
+- **Step**: 사용자 보고 "git sync 기반 검색이 잘 안된다" → git_code 인덱싱 파이프라인 정밀 검토. P0 진단 — `pipeline.py` 의 git_code 분기는 식별자 요약만 임베딩하고 본문 코드는 임베딩 벡터에 들어가지 않음 (Confluence 의 멀티뷰와 비대칭). 적용 PR 은 별도. 같은 세션에 I-040 측정 도구 (합성 골드셋 + 정량 평가) 도입.
+- **최신(2026-05-06)**: 브랜치 `claude/improve-context-search-DOoJw`. 5개 커밋 (+1 revert).
+  1. **합성 골드셋 + 정량 평가 인프라**: `src/context_loop/eval/` 신규 패키지 (metrics / gold_set / synth / llm). `scripts/build_synthetic_gold_set.py` + `scripts/eval_search.py`. LLM 역방향 생성 + 3단계 품질 게이트 (답변 가능성·식별자 누출·일반성). Recall@k / Precision@k / MRR / nDCG@k / hit@k + 옵션 LLM-as-judge.
+  2. **`web/app._build_llm_client` 재사용 패턴**: 기존 스크립트가 `EndpointLLMClient` 직접 빌드하던 것을 `mcp/server.py` 와 동일하게 `_build_llm_client(config)` 재사용으로 정리 → `llm.provider` 분기 + `llm.headers` + `llm.reasoning_profiles` 자동 주입. CLI override 는 `try/finally` 로 임시 config 변경 후 복원 — Generator/Judge 두 번 호출해도 격리 보장.
+  3. **`config.eval.{role}.*` 운영 디폴트화**: 기존 멀티에이전트(worker/synthesizer/orchestrator) 와 동일 패턴. role 별 endpoint/model/api_key/headers/reasoning_profiles. 우선순위 CLI > `eval.{role}.*` > `llm.*` 폴백. `build_eval_llm_client(config, role)` + `role_is_configured()` 헬퍼.
+  4. **role 별 reasoning_profiles**: 모델 family 가 다를 때 (Qwen3 `enable_thinking` vs DeepSeek `thinking`) reasoning 페이로드 매핑을 role 단위로 별도 정의 가능.
+  5. **(revert)** 합성 파라미터 `eval.synth.*` 화는 사용자 요청으로 revert. 합성 파라미터는 CLI 인자 그대로 유지.
+- 테스트 누적 +99 건 (eval/metrics 22 + eval/gold_set 7 + eval/synth 32 + eval/llm 38), 회귀 없음.
+- **미해결 후속**:
+  1. **I-046 git_code 멀티뷰 적용** (P0, 다음 세션 1순위) — 본 세션에서 진단만 완료. 적용 PR 은 별도. 골드셋으로 baseline/after 정량 비교 가능.
+  2. **I-040 운영 검증** — 사내 환경에서 30~50건 합성 + 사람 검수 + I-046 적용 후 효과 정량화.
+
+## 이전 단계
+- **Phase 7.17(2026-04-29)**: `/api/chat` 성능 최적화 (LLM 호출 병렬화 + 전용 cross-encoder 리랭커 도입). 브랜치 `claude/optimize-chat-api-performance-vODmW`. 6개 커밋 누적.
   1. **rerank ↔ graph plan 병렬화**: `_rerank_and_search_graph(...)` 헬퍼로 두 LLM 호출을 `asyncio.gather` 동시 실행. `assemble_context` (MCP) 와 `assemble_context_with_sources` (/api/chat) 양쪽에서 동일 헬퍼 사용 → 두 호출 경로 동기화 누락 위험 제거.
   2. **전용 리랭커 클라이언트 도입**: `processor/reranker_client.py` 신설(`RerankerClient` ABC + `EndpointRerankerClient`). 요청 본문 `{model, query, documents}`, 응답은 4가지 형식(Cohere/Jina dict, TEI list-of-dict, ordered scores dict/list) 자동 정규화. `processor/reranker.py` 130 → 80 라인 단순화 (LLM 시스템 프롬프트, JSON 추출, 정규식 fallback 모두 제거). 점수 의미 변경 0~10 → 0~1, `reranker_score_threshold` 기본값 4.0 → 0.3.
   3. **config 신규 섹션 `reranker:`**: `endpoint`, `model`, `api_key`, `headers` (기존 `llm:` 와 동일 스타일). `_build_reranker_client` 가 `endpoint`/`model` 미설정 시 None 반환 → 리랭킹 자동 스킵 (graceful).
@@ -13,8 +25,6 @@
 - 미해결 후속:
   1. HyDE 단계 임베딩-LLM 병렬화 (HyDE 사용 시에만 효과, 우선순위 낮음).
   2. `/api/chat` 스트리밍 응답 (TTFB 단축, SSE 엔드포인트 별도 작업).
-
-## 이전 단계
 - **Phase 7.12~7.16(2026-04-28)**: 그래프 컨텍스트 고도화 — Extraction Unit + 본문 의미 관계 + 어휘 단일 출처. 브랜치 `claude/improve-graph-context-veDSQ`. 8개 PR 누적.
   1. **PR-1 ExtractionUnit 빌더**: 추출 전용 입자도(target=1500/max=2400 토큰). 후위 순회 merged_tokens → top-down 응축/분할/흡수 4규칙. 안정적 `section_id = f"{document_id}:{section_index}"` + breadcrumb 주입(`# 문서:`, `## 위치:`, 머리말). 기존 chunker 와 분리.
   2. **PR-2 chunk ↔ unit 조인 키**: `chunks.section_index INTEGER` 컬럼 + idempotent 마이그레이션 + pipeline 전달. ExtractionUnit 의 section_ids 와 정수 키로 조인 가능. 향후 검색 시 그래프 결과 → 본문 스니펫 인입의 인프라.

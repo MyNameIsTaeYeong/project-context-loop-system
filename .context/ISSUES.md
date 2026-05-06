@@ -4,27 +4,34 @@
 
 ## 미해결
 
-### I-040: 검색 품질 측정 부재 — **다음 세션 1순위**
-- Phase 7.8 (2026-04-28) 이후 그래프 추출 인프라가 크게 강화됨 (ExtractionUnit, 결정론 본문, LLM 의미 관계, 어휘 가이드). 그러나 이 변화가 **사용자 질의에 대한 검색 품질을 실제로 끌어올렸는지** 측정하는 도구가 없다.
-- 추측 누적을 끊고 데이터 기반 의사결정을 시작하기 위해 다음 세션의 1순위.
-- 측정해야 할 항목:
-  - 같은 질의 셋(20~50개)을 **인덱싱 전후** / **`enable_llm_body_extraction` ON/OFF** 비교
-  - 핵심 메트릭:
-    - 정답 적중률 (사람 평가 기준 정확/누락/환각)
-    - 그래프 활용 빈도 (`should_search=true` 비율, `focus_relations` 정확도)
-    - 출처 정확성 (인용된 섹션이 실제 답을 포함하는가)
-    - 토큰 비용 (인덱싱 + 질의)
-    - 응답 지연
-  - 결정론 추출기 토글 재평가: PR-3 의 bold/table 을 다시 ON 할지 (현재 OFF 가 보수적 디폴트)
-  - LLM 추출 ROI: enable=True 비용 대비 품질 향상이 충분한가
-- 측정 도구 후보:
-  - 골드 셋 + 자동 채점 스크립트 (사람 평가 30개 우선)
-  - 그래프 통계 CLI (entity_type 분포, 평균 차수, drop 비율)
-  - LLM 추출 결과 샘플 덤프 (특정 문서 → 추출된 entities/relations 출력)
-- 측정 후 액션:
-  - 결과 좋다 → 운영 안정화, 메타 노드화 등 보강 작업
-  - 결과 부족하다 → 검색 결과 렌더링 (I-041) 또는 추출 파라미터 튜닝
-  - LLM 추출 효과 미미 → opt-in 유지 + 분류 게이트로 비용 절감
+### I-046: git_code 멀티뷰 임베딩 부재 (P0) — **다음 세션 1순위**
+- 진단 완료 (2026-05-06). `pipeline.py:128-179` (git_code) 가 `181-273`
+  (Confluence/upload) 와 비대칭. Confluence 는 멀티뷰(`#body` + `#meta`)
+  를 ChromaDB 에 별도 엔트리로 저장하는데 git_code 는 `name + signature
+  + docstring` 만 임베딩 — 본문 코드는 임베딩 벡터에 들어가지 않음.
+- 결과: 한국어 자연어 질의가 코드 본문의 도메인 용어와 매칭되지 않음
+  (`_clamp_max_per_tenant` 안의 "rate limit" 등이 실종).
+- 해결 방향: git_code 분기에도 동일한 멀티뷰 적용. body 뷰는 헤더 +
+  코드 본문, meta 뷰는 식별자 요약 (현재의 `embed_texts`).
+  `_search_chunks` 의 `logical_chunk_id` dedup 이미 양쪽 흡수하므로
+  검색 단계 변경 불필요.
+- I-040 골드셋으로 baseline/after 정량 비교 가능 (도구 준비됨).
+
+### I-040: 검색 품질 측정 인프라 → **도구 완성 (2026-05-06)**, 운영 검증 단계
+- 합성 골드셋 + 정량 평가 도구 도입 완료. `src/context_loop/eval/`
+  (metrics, gold_set, synth, llm) + `scripts/build_synthetic_gold_set.py`
+  + `scripts/eval_search.py`.
+- LLM 으로 (질문, 정답 청크) 페어 자동 생성 + 3단계 품질 게이트
+  (답변 가능성 / 식별자 누출 / 일반성). 라벨링 비용 0.
+- Recall@k / Precision@k / MRR / nDCG@k / hit@k + 옵션 LLM-as-judge
+  채점. 99개 단위 테스트 통과.
+- Generator/Judge 는 `config.eval.{role}.*` 에서 (endpoint/model/headers/
+  reasoning_profiles) 별도 정의 가능 — 자기 평가 편향 회피.
+- **남은 일** (운영 검증):
+  - 사내 환경에서 30~50건 합성 → baseline 측정
+  - 골드셋 품질 사람 검수 (10% 샘플)
+  - I-046 (P0 git_code 멀티뷰) 적용 후 after 측정으로 도구 자체 신뢰도
+    검증
 
 ### I-041: 그래프 검색 결과 렌더링 빈약
 - `execute_graph_search` 의 출력이 `A --[rel]--> B` 단순 불릿. PR-4 가 추출한 의미 관계가 사용자에게 가치 있게 전달되지 않음.
