@@ -156,6 +156,7 @@ class AnthropicClient(LLMClient):
 
         prompt_chars = len(prompt) + (len(system) if system else 0)
         start = time.perf_counter()
+        text = ""
         try:
             response = await self._client.messages.create(**api_kwargs)
             text = response.content[0].text  # type: ignore[index,union-attr]
@@ -167,6 +168,11 @@ class AnthropicClient(LLMClient):
                 "elapsed_ms=%.1f | prompt_chars=%d",
                 purpose or "unspecified", self._model, elapsed_ms, prompt_chars,
             )
+            if purpose != "answer_generation" and text:
+                logger.info(
+                    "LLM response | purpose=%s | provider=anthropic | content=%s",
+                    purpose or "unspecified", text,
+                )
 
 
 class OpenAIClient(LLMClient):
@@ -201,6 +207,7 @@ class OpenAIClient(LLMClient):
 
         prompt_chars = len(prompt) + (len(system) if system else 0)
         start = time.perf_counter()
+        text = ""
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
@@ -208,7 +215,8 @@ class OpenAIClient(LLMClient):
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
-            return response.choices[0].message.content or ""
+            text = response.choices[0].message.content or ""
+            return text
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.info(
@@ -216,6 +224,11 @@ class OpenAIClient(LLMClient):
                 "elapsed_ms=%.1f | prompt_chars=%d",
                 purpose or "unspecified", self._model, elapsed_ms, prompt_chars,
             )
+            if purpose != "answer_generation" and text:
+                logger.info(
+                    "LLM response | purpose=%s | provider=openai | content=%s",
+                    purpose or "unspecified", text,
+                )
 
 
 class EndpointLLMClient(LLMClient):
@@ -362,6 +375,8 @@ class EndpointLLMClient(LLMClient):
         chunk_count = 0
         output_chars = 0
         reasoning_chars = 0
+        output_parts: list[str] = []
+        reasoning_parts: list[str] = []
         try:
             stream = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
             async for chunk in stream:
@@ -373,6 +388,7 @@ class EndpointLLMClient(LLMClient):
                     if ttft_ms is None:
                         ttft_ms = (time.perf_counter() - start) * 1000
                     reasoning_chars += len(reasoning)
+                    reasoning_parts.append(reasoning)
                     yield {"kind": "reasoning", "content": reasoning}
                 content = getattr(delta, "content", None)
                 if isinstance(content, str) and content:
@@ -380,6 +396,7 @@ class EndpointLLMClient(LLMClient):
                         ttft_ms = (time.perf_counter() - start) * 1000
                     chunk_count += 1
                     output_chars += len(content)
+                    output_parts.append(content)
                     yield {"kind": "content", "content": content}
         finally:
             total_ms = (time.perf_counter() - start) * 1000
@@ -391,6 +408,17 @@ class EndpointLLMClient(LLMClient):
                 ttft_ms if ttft_ms is not None else -1.0,
                 total_ms, chunk_count, prompt_chars, output_chars, reasoning_chars,
             )
+            if purpose != "answer_generation":
+                output_text = "".join(output_parts)
+                reasoning_text = "".join(reasoning_parts)
+                if output_text or reasoning_text:
+                    logger.info(
+                        "LLM response | purpose=%s | provider=endpoint | "
+                        "reasoning=%s | content=%s",
+                        purpose or "unspecified",
+                        reasoning_text or "<none>",
+                        output_text,
+                    )
 
     def _resolve_extra_body(
         self,
