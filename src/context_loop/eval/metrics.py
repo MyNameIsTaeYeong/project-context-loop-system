@@ -90,16 +90,25 @@ def hit_at_k(retrieved: Sequence[T], relevant: Iterable[T], k: int) -> bool:
     return any(r in rel_set for r in retrieved[:k])
 
 
-def aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
+def aggregate(
+    rows: list[dict[str, float]],
+    *,
+    exclude: Iterable[str] = (),
+) -> dict[str, float]:
     """질의별 메트릭 dict 리스트의 평균을 계산한다.
 
     각 dict 의 모든 숫자 키에 대해 평균을 낸다. 비숫자 키는 무시.
+    ``exclude`` 에 들어간 키는 숫자여도 집계에서 제외한다 — 식별자(예:
+    ``source_document_id``) 처럼 평균에 의미가 없는 컬럼을 거르는 용도.
     """
     if not rows:
         return {}
+    excluded = set(exclude)
     keys: set[str] = set()
     for r in rows:
         for k, v in r.items():
+            if k in excluded:
+                continue
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 keys.add(k)
 
