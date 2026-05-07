@@ -158,3 +158,13 @@ def test_aggregate_handles_missing_keys() -> None:
 
 def test_aggregate_empty() -> None:
     assert aggregate([]) == {}
+
+
+def test_aggregate_exclude_drops_id_columns() -> None:
+    rows = [
+        {"source_document_id": 4720, "recall@5": 1.0},
+        {"source_document_id": 4721, "recall@5": 0.0},
+    ]
+    summary = aggregate(rows, exclude={"source_document_id"})
+    assert "source_document_id" not in summary
+    assert summary["recall@5"] == 0.5
