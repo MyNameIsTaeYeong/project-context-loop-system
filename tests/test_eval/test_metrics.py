@@ -6,13 +6,13 @@ import math
 
 from context_loop.eval.metrics import (
     aggregate,
+    aggregate_with_variance,
     hit_at_k,
     mrr,
     ndcg_at_k,
     precision_at_k,
     recall_at_k,
 )
-
 
 # --- recall_at_k ---
 
@@ -168,3 +168,64 @@ def test_aggregate_exclude_drops_id_columns() -> None:
     summary = aggregate(rows, exclude={"source_document_id"})
     assert "source_document_id" not in summary
     assert summary["recall@5"] == 0.5
+
+
+# --- aggregate_with_variance ---
+
+
+def test_aggregate_with_variance_empty() -> None:
+    assert aggregate_with_variance([]) == {}
+
+
+def test_aggregate_with_variance_single_run() -> None:
+    """n=1 이면 std 는 0, min=max=mean."""
+    out = aggregate_with_variance([{"recall@5": 0.6, "mrr": 0.4}])
+    assert out["recall@5"] == {
+        "mean": 0.6, "std": 0.0, "min": 0.6, "max": 0.6, "n": 1,
+    }
+    assert out["mrr"]["std"] == 0.0
+
+
+def test_aggregate_with_variance_basic_stats() -> None:
+    """mean/std/min/max 가 알려진 케이스에 맞는다.
+
+    [0.6, 0.5, 0.7] → mean=0.6, 표본 분산=(0.01+0+0.01)/2=0.01, std=0.1.
+    """
+    runs = [
+        {"recall@5": 0.6, "mrr": 0.5},
+        {"recall@5": 0.5, "mrr": 0.4},
+        {"recall@5": 0.7, "mrr": 0.6},
+    ]
+    out = aggregate_with_variance(runs)
+    r = out["recall@5"]
+    assert abs(r["mean"] - 0.6) < 1e-9
+    assert abs(r["std"] - 0.1) < 1e-9
+    assert r["min"] == 0.5
+    assert r["max"] == 0.7
+    assert r["n"] == 3
+    # mrr 도 동일 패턴
+    m = out["mrr"]
+    assert abs(m["mean"] - 0.5) < 1e-9
+    assert abs(m["std"] - 0.1) < 1e-9
+
+
+def test_aggregate_with_variance_handles_missing_keys() -> None:
+    """일부 잡에만 있는 메트릭(예: judge_score) 도 가진 잡만 모아 통계."""
+    runs = [
+        {"recall@5": 0.6, "judge_score": 4.0},
+        {"recall@5": 0.4},
+        {"recall@5": 0.5, "judge_score": 5.0},
+    ]
+    out = aggregate_with_variance(runs)
+    assert out["recall@5"]["n"] == 3
+    # judge_score 는 잡 2개만 있음
+    assert out["judge_score"]["n"] == 2
+    assert abs(out["judge_score"]["mean"] - 4.5) < 1e-9
+
+
+def test_aggregate_with_variance_zero_variance() -> None:
+    """모든 잡 값이 같으면 std=0."""
+    runs = [{"x": 0.5}, {"x": 0.5}, {"x": 0.5}]
+    out = aggregate_with_variance(runs)
+    assert out["x"]["std"] == 0.0
+    assert out["x"]["mean"] == 0.5

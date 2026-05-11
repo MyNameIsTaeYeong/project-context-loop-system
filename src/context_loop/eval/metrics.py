@@ -121,3 +121,52 @@ def aggregate(
         if values:
             out[k] = sum(values) / len(values)
     return out
+
+
+def aggregate_with_variance(
+    per_run_summaries: list[dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    """여러 골드셋의 ``aggregate`` 결과를 모아 평균/편차를 낸다.
+
+    같은 검색 시스템을 N개의 골드셋에 돌렸을 때 메트릭 변동성을 측정하기 위한
+    상위 집계 함수. 입력은 각 골드셋의 ``aggregate`` 출력 dict 리스트, 출력은
+    ::
+
+        {
+            "recall@5": {"mean": .., "std": .., "min": .., "max": .., "n": ..},
+            "mrr":      {"mean": .., ...},
+            ...
+        }
+
+    어떤 골드셋엔 있고 다른 데엔 없는 키는 가진 골드셋만 모아 통계를 낸다
+    (judge 비활성 잡 등). 표준편차는 ``n>=2`` 일 때만 계산하며, n=1 이면 0.0.
+    표본 표준편차 (n-1 분모, ddof=1) 를 사용해 작은 N 의 편차 과소추정을 방지.
+    """
+    if not per_run_summaries:
+        return {}
+
+    keys: set[str] = set()
+    for s in per_run_summaries:
+        keys.update(s.keys())
+
+    out: dict[str, dict[str, float]] = {}
+    for k in sorted(keys):
+        values = [float(s[k]) for s in per_run_summaries if k in s]
+        if not values:
+            continue
+        n = len(values)
+        mean = sum(values) / n
+        if n >= 2:
+            # ddof=1 표본 분산
+            var = sum((v - mean) ** 2 for v in values) / (n - 1)
+            std = math.sqrt(var)
+        else:
+            std = 0.0
+        out[k] = {
+            "mean": mean,
+            "std": std,
+            "min": min(values),
+            "max": max(values),
+            "n": n,
+        }
+    return out
