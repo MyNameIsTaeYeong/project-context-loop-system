@@ -270,7 +270,7 @@ def write_summary(
     config_summary: dict[str, Any],
 ) -> dict[str, Any]:
     """집계 요약을 JSON 으로 저장하고 반환."""
-    summary = aggregate(rows)
+    summary = aggregate(rows, exclude={"source_document_id"})
     out = {
         "label": label,
         "n_queries": len(rows),
