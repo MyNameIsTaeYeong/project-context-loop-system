@@ -17,6 +17,15 @@
 4. ``eval/runs/baseline.summary.json`` ↔ ``multiview.summary.json`` 비교 →
    효과 정량화. 자세한 per-question 결과는 ``*.csv`` 로 저장된다.
 
+변동성 측정 (다중 골드셋):
+``--gold-set-glob`` 으로 같은 source_type 의 N개 골드셋을 일괄 채점하면 잡별
+요약 외에 ``{label}.aggregate.summary.json`` 으로 메트릭 mean/std/min/max 가
+함께 저장된다. mean Δ 가 std 보다 크면 통계적으로 유의미한 개선::
+
+    python scripts/eval_search.py \\
+        --gold-set-glob "eval/gold_sets/git_code_*.yaml" \\
+        --label baseline
+
 옵션:
 - ``--judge`` 활성화 시 별도 LLM 으로 응답 품질을 0~5 점으로 채점.
   Generator/시스템과 다른 family 의 모델 권장 (자기 평가 편향 회피).
@@ -27,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import glob
 import json
 import logging
 import sys
@@ -43,6 +53,7 @@ from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
 from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.metrics import (  # noqa: E402
     aggregate,
+    aggregate_with_variance,
     hit_at_k,
     mrr,
     ndcg_at_k,
@@ -334,16 +345,120 @@ def _build_clients(config: Config) -> tuple[Any, Any, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_gold_paths(args: argparse.Namespace) -> list[Path]:
+    """``--gold-set`` (단일) 또는 ``--gold-set-glob`` (다중) 을 정규화한다.
+
+    글롭 매칭 결과는 사전순으로 정렬해 결정론적 처리. 매칭 0건이면 빈 리스트.
+    """
+    if args.gold_set_glob:
+        matches = sorted(glob.glob(args.gold_set_glob))
+        return [Path(m) for m in matches]
+    return [Path(args.gold_set)]
+
+
+def _label_for_run(base_label: str, gold_path: Path, multi: bool) -> str:
+    """다중 잡일 때만 파일명 stem 을 라벨에 합쳐 결과 파일 충돌을 막는다."""
+    if not multi:
+        return base_label
+    return f"{base_label}_{gold_path.stem}"
+
+
+async def _evaluate_gold_set(
+    gold_path: Path,
+    *,
+    label: str,
+    config_summary: dict[str, Any],
+    out_dir: Path,
+    args: argparse.Namespace,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Any,
+    llm_client: LLMClient,
+    reranker_client: Any,
+    judge: LLMClient | None,
+    similarity_threshold: float,
+    rerank_enabled: bool,
+    rerank_top_k: int | None,
+    rerank_score_threshold: float,
+    hyde_enabled: bool,
+) -> dict[str, Any] | None:
+    """골드셋 1개를 채점하고 CSV/요약 JSON 을 저장. 실패 시 None.
+
+    공유 자원(stores, clients) 은 호출자가 한 번만 초기화해 모든 잡에 재사용.
+    """
+    gold = load_gold_set(gold_path)
+    if not gold.items:
+        logger.warning("골드셋 %s 에 항목이 없습니다 — 건너뜀.", gold_path)
+        return None
+    if args.limit:
+        gold.items = gold.items[: args.limit]
+
+    logger.info("골드셋 채점 시작 — file=%s, n=%d, label=%s",
+                gold_path, len(gold.items), label)
+
+    rows: list[dict[str, Any]] = []
+    for i, item in enumerate(gold.items):
+        logger.info(
+            "[%s | %d/%d] q=%s | gold_doc=%s",
+            label, i + 1, len(gold.items), item.id, item.relevant_doc_ids,
+        )
+        try:
+            row = await evaluate_one(
+                item,
+                meta_store=meta_store,
+                vector_store=vector_store,
+                graph_store=graph_store,
+                embedding_client=embedding_client,
+                llm_client=llm_client if args.include_graph else None,
+                reranker_client=reranker_client,
+                top_k=args.top_k,
+                max_chunks=args.max_chunks,
+                similarity_threshold=similarity_threshold,
+                rerank_enabled=rerank_enabled,
+                rerank_top_k=rerank_top_k,
+                rerank_score_threshold=rerank_score_threshold,
+                hyde_enabled=hyde_enabled,
+                include_graph=args.include_graph,
+                judge=judge,
+                reasoning_mode=args.reasoning_mode,
+            )
+            rows.append(row)
+        except Exception as exc:
+            logger.exception("질의 %s 실패: %s", item.id, exc)
+            rows.append({
+                "id": item.id,
+                "query": item.query,
+                "error": str(exc),
+            })
+
+    csv_path = out_dir / f"{label}.csv"
+    summary_path = out_dir / f"{label}.summary.json"
+    write_csv(rows, csv_path)
+    # gold_set 출처를 요약에 기록 — aggregate 결과 추적용
+    enriched_config = dict(config_summary)
+    enriched_config["gold_set"] = str(gold_path)
+    summary = write_summary(
+        rows, summary_path, label=label, config_summary=enriched_config,
+    )
+    print_summary(summary)
+    print(f"  details : {csv_path}")
+    print(f"  summary : {summary_path}\n")
+    return summary
+
+
 async def run(args: argparse.Namespace) -> int:
     config = Config(config_path=Path(args.config) if args.config else None)
     data_dir = config.data_dir
 
-    gold = load_gold_set(Path(args.gold_set))
-    if not gold.items:
-        print("골드셋에 항목이 없습니다.", file=sys.stderr)
+    gold_paths = _resolve_gold_paths(args)
+    if not gold_paths:
+        print(
+            f"--gold-set-glob 패턴 '{args.gold_set_glob}' 매칭 없음.",
+            file=sys.stderr,
+        )
         return 1
-    if args.limit:
-        gold.items = gold.items[: args.limit]
+    multi = len(gold_paths) > 1
 
     meta_store = MetadataStore(data_dir / "metadata.db")
     await meta_store.initialize()
@@ -409,58 +524,115 @@ async def run(args: argparse.Namespace) -> int:
         "judge_model": args.judge_model or (config.get("llm.model") if args.judge else None),
     }
 
-    rows: list[dict[str, Any]] = []
+    out_dir = Path(args.output_dir)
+    per_run_summaries: list[dict[str, Any]] = []
     try:
-        for i, item in enumerate(gold.items):
-            logger.info(
-                "[%d/%d] q=%s | gold_doc=%s",
-                i + 1, len(gold.items), item.id, item.relevant_doc_ids,
-            )
+        for gold_path in gold_paths:
+            run_label = _label_for_run(args.label, gold_path, multi)
             try:
-                row = await evaluate_one(
-                    item,
+                summary = await _evaluate_gold_set(
+                    gold_path,
+                    label=run_label,
+                    config_summary=config_summary,
+                    out_dir=out_dir,
+                    args=args,
                     meta_store=meta_store,
                     vector_store=vector_store,
                     graph_store=graph_store,
                     embedding_client=embedding_client,
-                    llm_client=llm_client if args.include_graph else None,
+                    llm_client=llm_client,
                     reranker_client=reranker_client,
-                    top_k=args.top_k,
-                    max_chunks=args.max_chunks,
+                    judge=judge,
                     similarity_threshold=similarity_threshold,
                     rerank_enabled=rerank_enabled,
                     rerank_top_k=rerank_top_k,
                     rerank_score_threshold=rerank_score_threshold,
                     hyde_enabled=hyde_enabled,
-                    include_graph=args.include_graph,
-                    judge=judge,
-                    reasoning_mode=args.reasoning_mode,
                 )
-                rows.append(row)
             except Exception as exc:
-                logger.exception("질의 %s 실패: %s", item.id, exc)
-                rows.append({
-                    "id": item.id,
-                    "query": item.query,
-                    "error": str(exc),
-                })
+                logger.exception("골드셋 %s 채점 중 실패: %s — 다음으로 진행.",
+                                 gold_path, exc)
+                continue
+            if summary is not None:
+                per_run_summaries.append(summary)
 
-        out_dir = Path(args.output_dir)
-        csv_path = out_dir / f"{args.label}.csv"
-        summary_path = out_dir / f"{args.label}.summary.json"
-
-        write_csv(rows, csv_path)
-        summary = write_summary(
-            rows, summary_path, label=args.label, config_summary=config_summary,
-        )
-        print_summary(summary)
-        print(f"  details : {csv_path}")
-        print(f"  summary : {summary_path}\n")
+        if multi:
+            _write_aggregate(
+                per_run_summaries,
+                out_dir=out_dir,
+                label=args.label,
+                gold_paths=gold_paths,
+                config_summary=config_summary,
+            )
 
     finally:
         await meta_store.close()
 
     return 0
+
+
+def _write_aggregate(
+    per_run_summaries: list[dict[str, Any]],
+    *,
+    out_dir: Path,
+    label: str,
+    gold_paths: list[Path],
+    config_summary: dict[str, Any],
+) -> None:
+    """다중 잡 결과를 mean ± std 로 묶어 aggregate.summary.json 저장."""
+    if not per_run_summaries:
+        logger.warning("aggregate 대상 잡이 0개 — 모든 골드셋이 실패했거나 비어 있습니다.")
+        return
+    per_metric = [s.get("metrics") or {} for s in per_run_summaries]
+    variance = aggregate_with_variance(per_metric)
+
+    out = {
+        "label": label,
+        "n_gold_sets_requested": len(gold_paths),
+        "n_gold_sets_evaluated": len(per_run_summaries),
+        "gold_sets": [str(p) for p in gold_paths],
+        "config": config_summary,
+        "metrics": variance,
+        "per_gold_set": [
+            {
+                "label": s.get("label"),
+                "gold_set": (s.get("config") or {}).get("gold_set"),
+                "n_queries": s.get("n_queries"),
+                "metrics": s.get("metrics"),
+            }
+            for s in per_run_summaries
+        ],
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    agg_path = out_dir / f"{label}.aggregate.summary.json"
+    agg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(agg_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+
+    print("\n" + "=" * 60)
+    print(f"  Aggregate: {label}  |  N gold-sets = {len(per_run_summaries)}")
+    print("=" * 60)
+    preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+                 "judge_score", "elapsed_ms"]
+    keys = sorted(
+        variance.keys(),
+        key=lambda k: next(
+            (i for i, p in enumerate(preferred) if k.startswith(p)),
+            len(preferred),
+        ),
+    )
+    for k in keys:
+        stats = variance[k]
+        mean = stats["mean"]
+        std = stats["std"]
+        if "ms" in k:
+            print(f"  {k:24s} mean={mean:>10.1f}  std={std:>8.1f}  "
+                  f"min={stats['min']:>8.1f}  max={stats['max']:>8.1f}")
+        else:
+            print(f"  {k:24s} mean={mean:>10.4f}  std={std:>8.4f}  "
+                  f"min={stats['min']:>8.4f}  max={stats['max']:>8.4f}")
+    print("=" * 60)
+    print(f"  aggregate : {agg_path}\n")
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -481,9 +653,15 @@ def main() -> None:
         description="골드셋으로 검색 시스템 정량 채점",
     )
     parser.add_argument("--config", "-c", default="")
-    parser.add_argument(
-        "--gold-set", "-g", required=True,
-        help="골드셋 YAML 경로",
+    gold_group = parser.add_mutually_exclusive_group(required=True)
+    gold_group.add_argument(
+        "--gold-set", "-g", default=None,
+        help="골드셋 YAML 단일 경로",
+    )
+    gold_group.add_argument(
+        "--gold-set-glob", default=None,
+        help="골드셋 YAML 글롭 패턴 (예: 'eval/gold_sets/git_code_*.yaml'). "
+             "매칭된 N개 골드셋을 순차 채점하고 mean/std aggregate 를 저장.",
     )
     parser.add_argument(
         "--label", default="run",

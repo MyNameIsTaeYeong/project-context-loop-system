@@ -15,6 +15,7 @@ from context_loop.eval.synth import (
     extract_unique_tokens,
     filter_question,
     generate_questions,
+    has_demonstrative_reference,
     has_identifier_leakage,
     parse_generated_questions,
     parse_yes_no,
@@ -196,6 +197,111 @@ def test_has_identifier_leakage_case_sensitive() -> None:
     question2 = "fooHandler 가 어떻게 동작?"  # 다른 케이스 → 누출 아님
     assert has_identifier_leakage(question1, chunk) is True
     assert has_identifier_leakage(question2, chunk) is False
+
+
+# ---------------------------------------------------------------------------
+# has_demonstrative_reference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "이 클래스의 역할은 무엇인가요?",
+        "이 메서드는 무엇을 반환하나요?",
+        "이 메소드의 부작용은?",
+        "이 함수가 호출하는 다른 함수는?",
+        "이 코드의 동작 원리는?",
+        "이 모듈에서 외부에 노출하는 것은?",
+        "이 타입은 어떤 용도로 쓰이나요?",
+        "이 구조체의 필드는?",
+        "이 인터페이스를 구현하는 것은?",
+        "이 객체의 라이프사이클은?",
+        "이 스니펫의 핵심은?",
+        "이 예제의 의도는?",
+        "이 예시는 무엇을 보여주나요?",
+        "이 구현의 트레이드오프는?",
+        "이 로직의 엣지 케이스는?",
+        # 공백 0 허용 — 한글 합성 변형
+        "이클래스의 역할은?",
+        # 위/아래/다음/해당/본
+        "위 코드의 동작은?",
+        "아래 함수가 반환하는 값은?",
+        "다음 메서드의 책임은?",
+        "해당 모듈의 의존성은?",
+        "본 함수가 호출되는 시점은?",
+        "위에 있는 코드 블록의 효과는?",
+        "아래에 있는 예제는 어떻게 동작?",
+    ],
+)
+def test_has_demonstrative_reference_korean_patterns(question: str) -> None:
+    """한글 지시어 + 코드 단위 분류어 조합은 모두 차단된다."""
+    assert has_demonstrative_reference(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What does this class do?",
+        "What does this method return?",
+        "How does this function work?",
+        "What is the purpose of this code?",
+        "Which module does this snippet belong to?",
+        "The above code does what?",
+        "What does the below function compute?",
+        "The following method handles what?",
+        "What does the preceding example illustrate?",
+        # 대소문자 무시 — IGNORECASE
+        "THIS CLASS has what role?",
+        "The Above Code returns what?",
+    ],
+)
+def test_has_demonstrative_reference_english_patterns(question: str) -> None:
+    """영어 this/the above/below + 코드 단위 분류어 조합은 모두 차단된다."""
+    assert has_demonstrative_reference(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # 한글 false positive — 합성어 / 일반 문장
+        "이메일 발송 실패 시 동작은?",
+        "이벤트 발행 순서는?",
+        "이미지 업로드 한도는?",
+        "이용자 권한은 어떻게 결정되나요?",
+        "위치 정보 저장 방식은?",
+        "위반 사항 발생 시 처리 흐름은?",
+        "본문에서 결제 흐름은 어떻게 설명되나요?",
+        "다음과 같은 상황에서 무엇이 발생?",
+        "아래쪽 정렬은 어떻게?",
+        # 영어 false positive — 일반어 / 다른 명사
+        "Is this year's pricing changed?",
+        "the above all matters",
+        "thisclass is not in code",  # 공백 없는 영어는 word-boundary 로 제외
+        # 의문대명사는 정상 (지시 아님)
+        "어떤 클래스가 인증을 담당하나요?",
+        "무슨 함수가 호출되나요?",
+    ],
+)
+def test_has_demonstrative_reference_false_positives_pass(question: str) -> None:
+    """합성어·일반 문장·의문대명사는 차단되지 않는다."""
+    assert has_demonstrative_reference(question) is False
+
+
+@pytest.mark.asyncio
+async def test_filter_question_fails_demonstrative() -> None:
+    """식별자 누출 게이트 통과 후 지시대명사 게이트에서 탈락 — LLM 호출 1회만."""
+    # answerable "yes" 만 응답 — demonstrative 는 결정론적이므로 distractor
+    # 까지 안 감.
+    judge = StubLLM(["yes"])
+    report = await filter_question(
+        question="이 클래스의 역할은 무엇인가요?",
+        source_chunk="class PaymentHandler: pass",  # 식별자 누출 없음 (PaymentHandler 미언급)
+        distractors=["distractor body"],
+        judge=judge,  # type: ignore[arg-type]
+    )
+    assert report.passed is False
+    assert report.reason == "demonstrative"
 
 
 # ---------------------------------------------------------------------------

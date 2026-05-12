@@ -140,14 +140,15 @@ async def tab_chunks(
 ):
     """청크 탭 HTML 파셜.
 
-    소스 타입에 따라 청크의 임베딩 표현이 다르므로 가시성도 분기한다:
+    모든 소스 타입이 멀티뷰(body + meta) 임베딩을 사용하지만, meta 뷰의
+    입력 텍스트 정의가 소스 타입에 따라 다르므로 합성 경로가 다르다:
 
-      - ``git_code``: D-036에 따라 임베딩 입력은 ``embed_text``
-        (이름+시그니처+docstring), 저장 본문은 ``content`` (전체 코드).
-        ChromaDB 엔트리는 청크당 1개 — meta 뷰 없음.
-      - 그 외(Confluence/upload/manual): D-042 멀티뷰. 임베딩 입력은
-        ``content`` 자체(body 뷰) + ``build_meta_view_text(title,
-        section_path)`` (meta 뷰). ChromaDB 엔트리는 청크당 최대 2개.
+      - ``git_code``: meta 뷰 입력은 ``embed_text`` 컬럼에 영속화된
+        식별자 요약(이름+시그니처+docstring). body 뷰는 ``content``
+        (전체 코드)이며 둘 다 ChromaDB 엔트리로 저장된다 (I-046).
+        레거시 청크(멀티뷰 적용 이전 처리)는 ``embed_text`` 가 비어 있다.
+      - 그 외(Confluence/upload/manual): D-042 멀티뷰. body=``content``,
+        meta=``build_meta_view_text(title, section_path)``.
 
     템플릿이 ``source_type`` 으로 분기하여 운영자가 실제 임베딩된 텍스트를
     오인하지 않도록 표시한다.
@@ -160,8 +161,9 @@ async def tab_chunks(
     enriched = []
     for chunk in chunks:
         if source_type == "git_code":
-            # body는 임베딩 대상이 아님 — meta_text 합성 금지
-            enriched.append({**chunk, "meta_text": ""})
+            # git_code 의 meta 뷰 입력은 파이프라인이 SQLite ``embed_text`` 에
+            # 영속화한다 (D-042 후속). 재구성 없이 그대로 노출.
+            enriched.append({**chunk, "meta_text": chunk.get("embed_text", "")})
         else:
             meta_text = build_meta_view_text(
                 title, chunk.get("section_path", ""),

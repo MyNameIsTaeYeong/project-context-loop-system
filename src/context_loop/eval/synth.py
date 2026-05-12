@@ -2,10 +2,12 @@
 
 원리:
 1. 청크를 보여주고 Generator LLM 에 N개 질문 생성 요청 (역방향 생성).
-2. Judge LLM 으로 3 단계 품질 게이트 적용:
-   (a) 답변 가능성 — 출처 청크만 보고 답할 수 있는가?
-   (b) 식별자 누출 — 청크 고유 식별자가 질문에 그대로 들어갔는가?
-   (c) 일반성 — 무관한 다른 청크로도 답할 수 있는가?
+2. 4 단계 품질 게이트 적용:
+   (a) 답변 가능성 — 출처 청크만 보고 답할 수 있는가? (Judge LLM)
+   (b) 식별자 누출 — 청크 고유 식별자가 질문에 그대로 들어갔는가? (결정론)
+   (c) 지시대명사·포인터 — "이 클래스/위 코드/this method" 처럼 청크 포인터를
+       가정하는가? (결정론)
+   (d) 일반성 — 무관한 다른 청크로도 답할 수 있는가? (Judge LLM)
 3. 통과한 (질문, 청크) 페어만 골드셋에 등재.
 
 자동 채점 시 BM25 만으로 100% 맞히는 사기성 골드셋을 막기 위해
@@ -45,7 +47,12 @@ class FilterReport:
     """품질 게이트 통과/탈락 사유 리포트."""
 
     passed: bool
-    reason: str = ""  # 탈락 시 원인 (answerable | leakage | generic | parse_error)
+    reason: str = ""
+    """탈락 시 원인.
+
+    가능 값: ``not_answerable`` | ``leakage`` | ``demonstrative`` | ``generic`` |
+    ``parse_error``.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +69,23 @@ GENERATE_PROMPT_TEMPLATE = """\
 
 이 청크가 정답이 되도록, 사람이 자연스럽게 물어볼 만한 한국어 질문을 {n}개 생성해라.
 
+원칙: 질문은 **검색창에 단독으로 입력해도 의미가 통해야** 한다. 사용자는
+청크를 보지 않고 질문만 입력하기 때문이다.
+
 조건:
 - 한국어 자연어 질문 (의문문)
 - 식별자(함수명/클래스명/변수명/페이지명)를 그대로 베끼지 말고 의미 단위로 풀어쓸 것
   ✗ 나쁜 예: "_clamp_max_per_tenant 함수가 뭔가요?"
   ○ 좋은 예: "테넌트별 최대치 제한 로직은 어떻게 동작하나요?"
+- **지시대명사·포인터 표현 금지** — "이/위/아래/다음/해당/본 + 클래스/메서드/
+  함수/코드/모듈/예제" 처럼 청크를 가리키는 표현은 검색 질의로 의미가
+  성립하지 않으므로 사용 금지
+  ✗ 나쁜 예: "이 클래스의 역할은 무엇인가요?"
+  ✗ 나쁜 예: "위 코드의 동작 원리는?"
+  ✗ 나쁜 예: "다음 메서드는 무엇을 반환하나요?"
+  ○ 좋은 예: "결제 한도 검증 시 어떤 예외가 발생하나요?"
 - 청크 안의 정보로 답할 수 있는 질문일 것 (외부 지식 요구 금지)
-- 난이도를 골고루 분포: easy(직접 사실 조회) / medium(개념 이해) / hard(원인·관계·왜)
+- 난이도를 골고루 분포: easy(도메인 사실 직접 조회) / medium(개념 이해) / hard(원인·관계·왜)
 
 JSON 배열로만 출력해라. 다른 설명 금지:
 [
@@ -155,6 +172,43 @@ def has_identifier_leakage(question: str, source_text: str) -> bool:
         if re.search(rf"\b{re.escape(tok)}\b", question):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Demonstrative reference detection (지시대명사·포인터 표현 탐지)
+# ---------------------------------------------------------------------------
+
+
+_DEMONSTRATIVE_RE = re.compile(
+    # 한글: 지시어(이/위/아래/다음/해당/본) + (선택 공백) + 코드 단위 분류어.
+    # 분류어 화이트리스트로 "이메일/이벤트/위치/위반/본문/다음과" 같은 합성어
+    # false positive 를 자연스럽게 회피한다.
+    r"(?:이|위|아래|다음|해당|본)\s*"
+    r"(?:클래스|메서드|메소드|함수|코드|모듈|타입|구조체|인터페이스|"
+    r"객체|스니펫|예제|예시|구현|로직)"
+    # 한글: "위/아래에 있는"
+    r"|(?:위|아래)에\s*있는"
+    # 영어: this + 코드 단위
+    r"|\bthis\s+(?:class|method|function|code|module|type|struct|"
+    r"interface|object|snippet|example|implementation)\b"
+    # 영어: the above/below/following/preceding + 코드 단위
+    r"|\bthe\s+(?:above|below|following|preceding)\s+"
+    r"(?:class|method|function|code|module|snippet|example)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def has_demonstrative_reference(question: str) -> bool:
+    """질문이 청크를 가리키는 지시대명사·포인터 표현을 포함하는지 검사.
+
+    True 면 "이 클래스/위 코드/this method" 처럼 단독 검색어로 의미가
+    성립하지 않는 질문 — 골드셋에서 탈락시킨다. 검색 시스템은 청크 포인터
+    없이 질의만 받으므로 이런 표현은 측정 노이즈일 뿐이다.
+
+    LLM 호출 없는 결정론적 검사. 프롬프트 (``GENERATE_PROMPT_TEMPLATE``) 의
+    명시 금지 조항을 슬립스루하는 케이스를 마지막에 차단한다.
+    """
+    return bool(_DEMONSTRATIVE_RE.search(question))
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +339,13 @@ async def filter_question(
     if has_identifier_leakage(question, source_chunk):
         return FilterReport(passed=False, reason="leakage")
 
-    # (c) 일반성 — 무관 청크로도 답할 수 있으면 정답 청크 유일성이 깨짐
+    # (c) 지시대명사·포인터 표현 — 결정론적 (LLM 호출 없음).
+    # "이 클래스/위 코드/this method" 처럼 청크 포인터를 가정하는 질문은
+    # 검색 시스템에는 의미가 없으므로 탈락.
+    if has_demonstrative_reference(question):
+        return FilterReport(passed=False, reason="demonstrative")
+
+    # (d) 일반성 — 무관 청크로도 답할 수 있으면 정답 청크 유일성이 깨짐
     for distractor in distractors:
         ans = await is_answerable(question, distractor, judge=judge, reasoning_mode=reasoning_mode)
         if ans is True:

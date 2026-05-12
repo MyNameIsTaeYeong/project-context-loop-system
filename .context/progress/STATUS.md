@@ -1,9 +1,24 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 7.18 — 검색 품질 측정 인프라 (I-040 도구 완성) + git_code 멀티뷰 비대칭 진단 (I-046)
-- **Step**: 사용자 보고 "git sync 기반 검색이 잘 안된다" → git_code 인덱싱 파이프라인 정밀 검토. P0 진단 — `pipeline.py` 의 git_code 분기는 식별자 요약만 임베딩하고 본문 코드는 임베딩 벡터에 들어가지 않음 (Confluence 의 멀티뷰와 비대칭). 적용 PR 은 별도. 같은 세션에 I-040 측정 도구 (합성 골드셋 + 정량 평가) 도입.
-- **최신(2026-05-06)**: 브랜치 `claude/improve-context-search-DOoJw`. 5개 커밋 (+1 revert).
+- **Phase**: Phase 7.19 — 변동성 측정 인프라 + I-046 효과 측정 워크플로 확정
+- **Step**: 같은 source_type 으로 N개 골드셋을 빌드/평가해서 변동성을 잡는 인프라 추가 + 이미 머지된 I-046 (git_code 멀티뷰) 의 효과를 baseline/after 로 측정할 수 있게 SQL hash 우회 방식의 평가 워크플로 확정. 코드 추적으로 doc_id 보존(UPDATE 만, DELETE+INSERT 경로 없음) 과 7단계 재인덱싱 파이프라인 검증 완료.
+- **최신(2026-05-12)**: 브랜치 `claude/fix-multiview-asymmetry-kUoHn`. 커밋 1개 (`54f9d49`).
+  1. **변동성 측정 인프라**: `scripts/build_synthetic_gold_set.py --n-gold-sets N` (시드 `seed..seed+N-1`, 파일명 `_NNN` 접미사 자동). `scripts/eval_search.py --gold-set-glob "...*.yaml"` (mutually exclusive with `--gold-set`). stores/clients 1회 초기화 후 N개 골드셋 순차 채점. 잡 1개 실패해도 다음 진행. `{label}.aggregate.summary.json` 신규 — mean/std/min/max/n + per-gold-set 세부.
+  2. **`aggregate_with_variance()`** (`src/context_loop/eval/metrics.py`): 잡 요약 dict 리스트를 받아 메트릭별 mean/std/min/max/n 산출. 표본 표준편차 (ddof=1) 사용 — 작은 N 에서 편차 과소추정 방지. 결측 키는 가진 잡만 모아 통계.
+  3. **I-046 평가 워크플로 확정 (분석 only, 코드 변경 없음)**:
+     - 옵션 A (SQL hash 우회) 채택. `UPDATE documents SET content_hash='_force_' WHERE source_type=<type>` → 웹/CLI sync trigger → `update_document_content()` (UPDATE, id 보존) → `process_document()` 호출 → chunks/vector/graph 멀티뷰 재구성.
+     - 검증된 보존: `documents.id` 100% — `git_repository.py:386` hash 비교 → `metadata_store.py:286-293` 의 `UPDATE … WHERE id=?` 만. DELETE+INSERT 경로 없음.
+     - confluence_mcp 도 동일 패턴 (`mcp_confluence.py:1010`) — 같은 force-reindex 방식 적용 가능 (MCP 서버 가용성 필수).
+- 테스트 누적 +5 건 (`aggregate_with_variance` 단위 테스트). eval 28 passed, 전체 비-웹 830 passed, 회귀 없음.
+- **미해결 후속**:
+  1. **I-046 측정 실행** (다음 세션 1순위) — 위 SOP 로 baseline/multiview aggregate 비교. mean Δ vs std 비교로 통계적 유의성 판정.
+  2. **(선택)** `--force-reindex` 코드 옵션 영구화 — 1회성이라 보류. 측정이 정례화될 시 `coordinator`/`git_repository`/`web/api/git_sync` 3곳 + 템플릿 1곳 수정.
+  3. **(선택)** `sorted(rglob(...))` 패치 + 골드셋 `source_id` 기반 라벨링 — 미래 시나리오용, 이번 측정엔 무관.
+
+## 이전 단계
+- **Phase 7.18(2026-05-06)**: 검색 품질 측정 인프라 (I-040 도구 완성) + git_code 멀티뷰 비대칭 진단 (I-046).
+  사용자 보고 "git sync 기반 검색이 잘 안된다" → git_code 인덱싱 파이프라인 정밀 검토. P0 진단 — `pipeline.py` 의 git_code 분기는 식별자 요약만 임베딩하고 본문 코드는 임베딩 벡터에 들어가지 않음 (Confluence 의 멀티뷰와 비대칭). 같은 세션에 I-040 측정 도구 (합성 골드셋 + 정량 평가) 도입. 브랜치 `claude/improve-context-search-DOoJw`, 5개 커밋 (+1 revert).
   1. **합성 골드셋 + 정량 평가 인프라**: `src/context_loop/eval/` 신규 패키지 (metrics / gold_set / synth / llm). `scripts/build_synthetic_gold_set.py` + `scripts/eval_search.py`. LLM 역방향 생성 + 3단계 품질 게이트 (답변 가능성·식별자 누출·일반성). Recall@k / Precision@k / MRR / nDCG@k / hit@k + 옵션 LLM-as-judge.
   2. **`web/app._build_llm_client` 재사용 패턴**: 기존 스크립트가 `EndpointLLMClient` 직접 빌드하던 것을 `mcp/server.py` 와 동일하게 `_build_llm_client(config)` 재사용으로 정리 → `llm.provider` 분기 + `llm.headers` + `llm.reasoning_profiles` 자동 주입. CLI override 는 `try/finally` 로 임시 config 변경 후 복원 — Generator/Judge 두 번 호출해도 격리 보장.
   3. **`config.eval.{role}.*` 운영 디폴트화**: 기존 멀티에이전트(worker/synthesizer/orchestrator) 와 동일 패턴. role 별 endpoint/model/api_key/headers/reasoning_profiles. 우선순위 CLI > `eval.{role}.*` > `llm.*` 폴백. `build_eval_llm_client(config, role)` + `role_is_configured()` 헬퍼.

@@ -4,10 +4,10 @@
 Confluence outbound_links)까지 저장한다. LLM 호출은 없다.
 
 소스 타입별 처리
-    - ``git_code``           : AST 기반 청크 + import 그래프
-    - ``confluence``         : 구조화 추출 + plain_text 청크 + 링크 그래프
+    - ``git_code``           : AST 기반 청크 + 멀티뷰 임베딩(body+meta) + import 그래프
+    - ``confluence``         : 구조화 추출 + plain_text 청크(멀티뷰) + 링크 그래프
     - ``confluence_mcp``     : 위와 동일
-    - 그 외 (``upload`` 등)   : 청크만
+    - 그 외 (``upload`` 등)   : 청크(멀티뷰)만
 
 ``storage_method``
     과거에는 LLM classifier가 결정했으나 현재는 처리 결과에서 파생한다:
@@ -126,7 +126,7 @@ async def process_document(
         extracted: ExtractedDocument | None = None  # Confluence 경로에서만 채워짐
 
         if source_type == "git_code":
-            # --- git_code: AST 기반 정적 추출 ---
+            # --- git_code: AST 기반 정적 추출 + 멀티뷰 임베딩 ---
             logger.info(
                 "AST 코드 추출 시작 — document_id=%d, title=%s",
                 document_id, title,
@@ -135,38 +135,63 @@ async def process_document(
             extraction = extract_code_symbols(content, title)
 
             # 심볼 → 청크 → 벡터DB
-            chunks, embed_texts = to_chunks(extraction, title)
+            chunks, meta_texts = to_chunks(extraction, title)
             if chunks:
-                # 임베딩: 이름+시그니처+docstring (검색 정확도)
-                # 저장: 전체 코드 (반환 내용)
-                embeddings = await embedding_client.aembed_documents(embed_texts)
-                documents = [c.content for c in chunks]
+                # 멀티뷰 임베딩 (D-042 git_code 일반화 / I-046):
+                #   body 뷰: 코드 본문(chunk.content) — 자연어 도메인 용어·주석·구현
+                #   meta 뷰: 식별자 요약(file+parent+name+signature+docstring)
+                #             — 시그니처/타입 친화 질의
+                # 두 뷰는 같은 본문(documents=chunk.content)을 가리키고
+                # logical_chunk_id 를 공유하므로 _search_chunks dedup 으로 흡수된다.
+                # meta 텍스트는 항상 비어있지 않다 (file_title + name + signature
+                # 가 최소 보장). embed_text SQLite 컬럼은 meta 뷰 입력을 그대로
+                # 영속화한다.
+                body_texts = [c.content for c in chunks]
+                to_embed = body_texts + meta_texts
+                embeddings = await embedding_client.aembed_documents(to_embed)
+                body_embeddings = embeddings[: len(chunks)]
+                meta_embeddings = embeddings[len(chunks):]
 
-                chunk_ids = [c.id for c in chunks]
-                metadatas = [
-                    {
+                vec_ids: list[str] = []
+                vec_embeddings: list[list[float]] = []
+                vec_documents: list[str] = []
+                vec_metadatas: list[dict[str, Any]] = []
+
+                for i, chunk in enumerate(chunks):
+                    base_meta = {
                         "document_id": document_id,
-                        "chunk_index": c.index,
+                        "chunk_index": chunk.index,
                         "title": title,
-                        "section_path": c.section_path,
-                        "section_anchor": c.section_anchor,
+                        "section_path": chunk.section_path,
+                        "section_anchor": chunk.section_anchor,
+                        "logical_chunk_id": chunk.id,
                     }
-                    for c in chunks
-                ]
+                    vec_ids.append(f"{chunk.id}#body")
+                    vec_embeddings.append(body_embeddings[i])
+                    vec_documents.append(chunk.content)
+                    vec_metadatas.append({**base_meta, "view": "body"})
+
+                    vec_ids.append(f"{chunk.id}#meta")
+                    vec_embeddings.append(meta_embeddings[i])
+                    vec_documents.append(chunk.content)
+                    vec_metadatas.append({**base_meta, "view": "meta"})
+
                 vector_store.delete_by_document(document_id)
-                vector_store.add_chunks(chunk_ids, embeddings, documents, metadatas)
+                vector_store.add_chunks(
+                    vec_ids, vec_embeddings, vec_documents, vec_metadatas,
+                )
 
                 await meta_store.delete_chunks_by_document(document_id)
-                for chunk, cid, embed_text in zip(chunks, chunk_ids, embed_texts):
+                for chunk, meta_text in zip(chunks, meta_texts):
                     await meta_store.create_chunk(
-                        chunk_id=cid,
+                        chunk_id=chunk.id,
                         document_id=document_id,
                         chunk_index=chunk.index,
                         content=chunk.content,
                         token_count=chunk.token_count,
                         section_path=chunk.section_path,
                         section_anchor=chunk.section_anchor,
-                        embed_text=embed_text,
+                        embed_text=meta_text,
                         section_index=chunk.section_index,
                     )
                 chunk_count = len(chunks)

@@ -4,34 +4,72 @@
 
 ## 미해결
 
-### I-046: git_code 멀티뷰 임베딩 부재 (P0) — **다음 세션 1순위**
-- 진단 완료 (2026-05-06). `pipeline.py:128-179` (git_code) 가 `181-273`
+### I-046: git_code 멀티뷰 임베딩 부재 (P0) — **코드 적용 완료, 효과 측정 대기**
+- 진단 (2026-05-06): `pipeline.py:128-179` (git_code) 가 `181-273`
   (Confluence/upload) 와 비대칭. Confluence 는 멀티뷰(`#body` + `#meta`)
   를 ChromaDB 에 별도 엔트리로 저장하는데 git_code 는 `name + signature
   + docstring` 만 임베딩 — 본문 코드는 임베딩 벡터에 들어가지 않음.
 - 결과: 한국어 자연어 질의가 코드 본문의 도메인 용어와 매칭되지 않음
   (`_clamp_max_per_tenant` 안의 "rate limit" 등이 실종).
-- 해결 방향: git_code 분기에도 동일한 멀티뷰 적용. body 뷰는 헤더 +
-  코드 본문, meta 뷰는 식별자 요약 (현재의 `embed_texts`).
-  `_search_chunks` 의 `logical_chunk_id` dedup 이미 양쪽 흡수하므로
-  검색 단계 변경 불필요.
-- I-040 골드셋으로 baseline/after 정량 비교 가능 (도구 준비됨).
+- **코드 적용 완료**: 커밋 `ce75681` (pipeline 멀티뷰 적용) + `0a8a364`
+  (web 청크 탭 UI). `_search_chunks` 의 `logical_chunk_id` dedup
+  (`context_assembler.py:193`) 이 단일뷰/멀티뷰 데이터를 graceful 하게
+  흡수 — 검색 단계 변경 불필요.
+- **효과 측정 워크플로 확정 (2026-05-12)** — SQL hash 우회 방식. 코드 추적
+  검증: `documents.id` 100% 보존 (UPDATE 만, DELETE+INSERT 경로 없음),
+  chunks/vector/graph 는 완전 재구성, retrieval 메트릭(`relevant_doc_ids`)
+  영향 없음.
+  ```bash
+  # 1) baseline 측정 — 현재 단일뷰 인덱싱 상태에서
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "SELECT id, source_id FROM documents WHERE source_type='git_code' ORDER BY id" \
+      > /tmp/ids_baseline.txt
+  python scripts/build_synthetic_gold_set.py --source-types git_code \
+      --seed 42 --n-gold-sets 5 --output eval/gold_sets/git_code.yaml
+  python scripts/eval_search.py \
+      --gold-set-glob "eval/gold_sets/git_code_*.yaml" --label baseline
+  # 2) hash 깨기 — short-circuit 우회
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "UPDATE documents SET content_hash='_force_' WHERE source_type='git_code'"
+  # 3) 웹 sync 버튼 (또는 CLI) → update_document_content() (id 보존)
+  #    → process_document() → 멀티뷰 재구성
+  # 4) sanity check
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "SELECT id, source_id FROM documents WHERE source_type='git_code' ORDER BY id" \
+      > /tmp/ids_after.txt
+  diff /tmp/ids_baseline.txt /tmp/ids_after.txt   # 차이 0줄
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "SELECT COUNT(*) FROM documents WHERE source_type='git_code' AND content_hash='_force_'"  # 0
+  # 5) multiview 평가
+  python scripts/eval_search.py \
+      --gold-set-glob "eval/gold_sets/git_code_*.yaml" --label multiview
+  ```
+- **다음 작업** (다음 세션 1순위): 위 SOP 실행 후
+  `baseline.aggregate.summary.json` vs `multiview.aggregate.summary.json`
+  비교. `|mean Δ| > max(std_baseline, std_multiview)` 이면 통계적 유의 개선.
+- confluence_mcp 도 동일 패턴 (`mcp_confluence.py:1010`) — 같은 force-reindex
+  방식 적용 가능. 단 MCP 서버 가용성 필수 (`/api/confluence-mcp/health`).
 
-### I-040: 검색 품질 측정 인프라 → **도구 완성 (2026-05-06)**, 운영 검증 단계
+### I-040: 검색 품질 측정 인프라 → **도구 완성 (2026-05-06)** + 변동성 집계 (2026-05-12), 운영 검증 단계
 - 합성 골드셋 + 정량 평가 도구 도입 완료. `src/context_loop/eval/`
   (metrics, gold_set, synth, llm) + `scripts/build_synthetic_gold_set.py`
   + `scripts/eval_search.py`.
 - LLM 으로 (질문, 정답 청크) 페어 자동 생성 + 3단계 품질 게이트
   (답변 가능성 / 식별자 누출 / 일반성). 라벨링 비용 0.
 - Recall@k / Precision@k / MRR / nDCG@k / hit@k + 옵션 LLM-as-judge
-  채점. 99개 단위 테스트 통과.
+  채점. 단위 테스트 +99 + 변동성 +5 = 누적 104건 통과.
 - Generator/Judge 는 `config.eval.{role}.*` 에서 (endpoint/model/headers/
   reasoning_profiles) 별도 정의 가능 — 자기 평가 편향 회피.
+- **변동성 집계 추가 (2026-05-12, `54f9d49`)**: `--n-gold-sets N` (build)
+  + `--gold-set-glob` (eval) + `aggregate_with_variance()` (metrics).
+  같은 source_type 으로 시드만 다른 N개 골드셋을 만들어 mean/std/min/max
+  를 잡음으로써 샘플링 변동 + LLM 확률성을 노이즈 floor 로 분리. 변경
+  효과는 `|mean Δ| > std` 일 때만 유의로 판정.
 - **남은 일** (운영 검증):
   - 사내 환경에서 30~50건 합성 → baseline 측정
   - 골드셋 품질 사람 검수 (10% 샘플)
   - I-046 (P0 git_code 멀티뷰) 적용 후 after 측정으로 도구 자체 신뢰도
-    검증
+    검증 ← 위 워크플로로 실행 대기
 
 ### I-041: 그래프 검색 결과 렌더링 빈약
 - `execute_graph_search` 의 출력이 `A --[rel]--> B` 단순 불릿. PR-4 가 추출한 의미 관계가 사용자에게 가치 있게 전달되지 않음.

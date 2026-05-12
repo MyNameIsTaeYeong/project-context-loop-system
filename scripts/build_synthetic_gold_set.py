@@ -36,6 +36,18 @@ source_type 제한, 시드 고정 (재현성)::
         --seed 42 \\
         --output eval/gold_set.yaml
 
+변동성 측정용 다중 골드셋 (같은 source_type 으로 N개 빌드)::
+
+    python scripts/build_synthetic_gold_set.py \\
+        --source-types git_code \\
+        --seed 42 --n-gold-sets 5 \\
+        --output eval/gold_sets/git_code.yaml
+
+    # → eval/gold_sets/git_code_001.yaml  (seed=42)
+    #    eval/gold_sets/git_code_002.yaml  (seed=43)
+    #    ... git_code_005.yaml             (seed=46)
+    # 평가 시 --gold-set-glob "eval/gold_sets/git_code_*.yaml" 로 일괄 채점.
+
 빠른 실험 (게이트 OFF — 디버그/탐색 전용)::
 
     python scripts/build_synthetic_gold_set.py --no-filter --n-chunks 5
@@ -282,6 +294,20 @@ async def build(
         await store.close()
 
 
+def _numbered_output_path(base: Path, index: int, total: int) -> Path:
+    """N>1 일 때 base 경로에 ``_NNN`` 접미사를 추가한다.
+
+    ``eval/gold_sets/git_code.yaml`` + index=2 → ``eval/gold_sets/git_code_002.yaml``.
+    N=1 이면 base 그대로 반환 (기존 단일-파일 동작 유지).
+    width 는 total 자릿수와 최소 3 의 max — N=5 든 N=500 든 사전적 정렬이 안정적.
+    """
+    if total <= 1:
+        return base
+    width = max(3, len(str(total)))
+    suffix = f"_{index:0{width}d}"
+    return base.with_name(f"{base.stem}{suffix}{base.suffix}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -320,7 +346,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--seed", type=int, default=None,
-        help="랜덤 시드 (재현성). 미지정 시 결정론적 정렬 순서로 샘플링.",
+        help="랜덤 시드 (재현성). 미지정 시 결정론적 정렬 순서로 샘플링. "
+             "--n-gold-sets>1 일 때 i번째 골드셋은 seed+i-1 시드를 사용.",
+    )
+    parser.add_argument(
+        "--n-gold-sets", type=int, default=1,
+        help="생성할 골드셋 수 (기본 1). N>1 일 때 동일 파라미터로 시드만 바꿔 "
+             "여러 골드셋을 빌드 — 평가 변동성/안정성 측정용. 출력 경로에는 "
+             "'_NNN' 접미사가 자동 추가된다.",
     )
     parser.add_argument(
         "--no-filter", action="store_true",
@@ -403,21 +436,38 @@ def main() -> None:
 
     source_types = [s.strip() for s in args.source_types.split(",") if s.strip()] or None
 
-    asyncio.run(build(
-        config=config,
-        n_chunks=args.n_chunks,
-        questions_per_chunk=args.questions_per_chunk,
-        output_path=Path(args.output),
-        source_types=source_types,
-        seed=args.seed,
-        apply_filter=not args.no_filter,
-        n_distractors=args.n_distractors,
-        generator=generator,
-        judge=judge,
-        reasoning_mode=args.reasoning_mode,
-        min_chars=args.min_chars,
-        max_chars=args.max_chars,
-    ))
+    if args.n_gold_sets < 1:
+        parser.error("--n-gold-sets 는 1 이상이어야 합니다.")
+
+    base_output = Path(args.output)
+    base_seed = args.seed
+
+    async def _run_all() -> None:
+        for i in range(1, args.n_gold_sets + 1):
+            seed_i = (base_seed + i - 1) if base_seed is not None else None
+            out_i = _numbered_output_path(base_output, i, args.n_gold_sets)
+            if args.n_gold_sets > 1:
+                logger.info(
+                    "=== 골드셋 %d/%d — seed=%s, output=%s ===",
+                    i, args.n_gold_sets, seed_i, out_i,
+                )
+            await build(
+                config=config,
+                n_chunks=args.n_chunks,
+                questions_per_chunk=args.questions_per_chunk,
+                output_path=out_i,
+                source_types=source_types,
+                seed=seed_i,
+                apply_filter=not args.no_filter,
+                n_distractors=args.n_distractors,
+                generator=generator,
+                judge=judge,
+                reasoning_mode=args.reasoning_mode,
+                min_chars=args.min_chars,
+                max_chars=args.max_chars,
+            )
+
+    asyncio.run(_run_all())
 
 
 if __name__ == "__main__":

@@ -561,14 +561,15 @@ def test_build_meta_view_text_combinations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_git_code_pipeline_persists_embed_text(
+async def test_git_code_pipeline_writes_body_and_meta_views(
     store: MetadataStore,
 ) -> None:
-    """git_code 분기에서 embed_text(이름+시그니처+docstring)가 SQLite에 저장된다.
+    """git_code 분기도 멀티뷰(body + meta)로 임베딩한다 (I-046).
 
-    임베딩 입력은 ``embed_texts``(생성된 단축 텍스트), 저장 본문은
-    ``chunk.content``(전체 코드). 두 값이 다르므로 대시보드가 실제 임베딩
-    대상을 보여주려면 embed_text가 영속화되어야 한다.
+    body 뷰는 코드 본문(chunk.content)을, meta 뷰는 식별자 요약
+    (file+parent+name+signature+docstring)을 임베딩한다. 두 뷰는 같은 본문을
+    document 로 저장하고 ``logical_chunk_id`` 를 공유한다. SQLite ``embed_text``
+    컬럼은 meta 뷰 입력을 영속화한다.
     """
     code = '''def hello(name: str) -> str:
     """Greet a person."""
@@ -592,22 +593,30 @@ async def test_git_code_pipeline_persists_embed_text(
         config=PipelineConfig(),
     )
 
-    # ChromaDB add_chunks: 청크당 1엔트리(멀티뷰 아님). 임베딩 입력은 본문이 아닌
-    # 짧은 시그니처 텍스트 — 본문(전체 코드)보다 토큰이 적어야 한다.
+    # ChromaDB add_chunks: 청크당 2엔트리 — #body + #meta.
     vector_store.add_chunks.assert_called_once()
-    ids, _embs, docs, _metas = vector_store.add_chunks.call_args.args
-    # #body/#meta 접미사가 붙지 않아야 함
-    assert all("#" not in cid for cid in ids)
-    # document(반환 본문)에는 함수 본문이 들어 있어야 함
-    assert any("Hello {name}" in d for d in docs)
+    ids, _embs, docs, metas = vector_store.add_chunks.call_args.args
+    assert len(ids) == 2
+    body_idx = next(i for i, cid in enumerate(ids) if cid.endswith("#body"))
+    meta_idx = next(i for i, cid in enumerate(ids) if cid.endswith("#meta"))
+    # 두 엔트리는 같은 logical_chunk_id 를 공유해 _search_chunks dedup 에 흡수됨
+    assert metas[body_idx]["view"] == "body"
+    assert metas[meta_idx]["view"] == "meta"
+    assert (
+        metas[body_idx]["logical_chunk_id"]
+        == metas[meta_idx]["logical_chunk_id"]
+    )
+    # documents(반환 본문)는 두 엔트리 모두 전체 코드 본문 — 검색 결과는 동일
+    assert docs[body_idx] == docs[meta_idx]
+    assert "Hello {name}" in docs[body_idx]
 
-    # SQLite에 embed_text가 채워져 있어야 함
+    # SQLite 에는 논리 청크당 1행. embed_text 는 meta 뷰 입력을 영속화.
     stored = await store.get_chunks_by_document(doc_id)
     assert len(stored) == 1
     chunk = stored[0]
     assert chunk["embed_text"] != ""
     assert "hello" in chunk["embed_text"]  # 심볼 이름
-    # 본문(전체 코드)와 다른 값이어야 함 — 임베딩과 저장의 분리(D-036)
+    # 본문(전체 코드)과 다른 값 — 임베딩 분리 원칙 유지(D-036, D-042 일반화)
     assert chunk["embed_text"] != chunk["content"]
 
 
