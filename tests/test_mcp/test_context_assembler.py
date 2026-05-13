@@ -261,6 +261,96 @@ async def test_assemble_context_with_sources_llm_graph(stores) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sources_labeled_chunk_when_no_graph(stores) -> None:
+    """그래프 미포함 시 모든 출처가 source_type='chunk' 로 라벨된다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="OnlyChunk", original_content="c", content_hash="hsc",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["청크 본문"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    assembled = await assemble_context_with_sources(
+        query="질의",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=False,
+    )
+    assert len(assembled.sources) == 1
+    assert assembled.sources[0].source_type == "chunk"
+    assert assembled.sources[0].similarity > 0
+
+
+@pytest.mark.asyncio
+async def test_sources_labeled_graph_for_graph_only_docs(stores) -> None:
+    """그래프 탐색이 추가로 끌어오는 문서는 source_type='graph' 로 라벨된다.
+
+    chunk 와 graph 가 같은 문서를 가리키면 chunk 가 먼저 등록되어 graph
+    중복은 스킵된다. 따라서 graph-only 문서를 별도로 두어 라벨 검증.
+    """
+    meta_store, vector_store, graph_store = stores
+
+    # chunk 만 가진 문서
+    chunk_doc_id = await meta_store.create_document(
+        source_type="manual", title="ChunkDoc", original_content="c", content_hash="hsg1",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{chunk_doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["청크 본문"],
+        metadatas=[{"document_id": chunk_doc_id, "chunk_index": 0}],
+    )
+    # 그래프 노드만 가진 별도 문서 (벡터엔 없음)
+    graph_doc_id = await meta_store.create_document(
+        source_type="manual", title="GraphDoc", original_content="g", content_hash="hsg2",
+    )
+    await graph_store.save_graph_data(graph_doc_id, GraphData(
+        entities=[Entity(name="API", entity_type="component")],
+        relations=[],
+    ))
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = _make_llm_client({
+        "should_search": True,
+        "reasoning": "API 구조 확인",
+        "search_steps": [{"entity_name": "API", "depth": 1, "focus_relations": []}],
+    })
+
+    assembled = await assemble_context_with_sources(
+        query="API 관련",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=llm,
+        include_graph=True,
+    )
+
+    by_type: dict[str, list[int]] = {"chunk": [], "graph": []}
+    for s in assembled.sources:
+        by_type[s.source_type].append(s.document_id)
+
+    assert chunk_doc_id in by_type["chunk"]
+    assert graph_doc_id in by_type["graph"]
+    # 그래프 출처는 similarity=0.0 으로 정렬 뒤에 위치
+    chunk_indices = [i for i, s in enumerate(assembled.sources)
+                     if s.source_type == "chunk"]
+    graph_indices = [i for i, s in enumerate(assembled.sources)
+                     if s.source_type == "graph"]
+    if chunk_indices and graph_indices:
+        assert max(chunk_indices) < min(graph_indices)
+
+
+@pytest.mark.asyncio
 async def test_graph_search_llm_failure_graceful(stores) -> None:
     """LLM 호출 실패 시 그래프 탐색이 None을 반환한다."""
     meta_store, _, graph_store = stores

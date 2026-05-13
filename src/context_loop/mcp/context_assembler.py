@@ -31,11 +31,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Source:
-    """출처 정보."""
+    """출처 정보.
+
+    ``source_type`` 은 ``"chunk"`` (벡터 검색) 또는 ``"graph"`` (LLM 플래너
+    기반 그래프 탐색) 출처를 구분한다. 평가/관측 목적이며 검색 동작에는
+    영향을 주지 않는다. ``similarity`` 만으로 구분하면 chunk distance=1.0
+    케이스와 graph(=0.0) 가 모호해지므로 별도 라벨로 둔다.
+    """
 
     document_id: int
     title: str
     similarity: float = 0.0
+    source_type: str = "chunk"
 
 
 @dataclass
@@ -415,7 +422,10 @@ async def assemble_context_with_sources(
                     doc = await meta_store.get_document(doc_id)
                     doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
                 title = doc_cache[doc_id]["title"]
-                sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
+                sources.append(Source(
+                    document_id=doc_id, title=title, similarity=0.0,
+                    source_type="graph",
+                ))
 
     # Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:

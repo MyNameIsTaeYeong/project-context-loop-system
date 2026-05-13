@@ -187,6 +187,18 @@ async def evaluate_one(
     retrieved_doc_ids = [s.document_id for s in assembled.sources]
     relevant = set(item.relevant_doc_ids)
 
+    # 그래프 기여 분리 — chunk 와 graph 출처를 source_type 라벨로 구분.
+    # chunk 만으로 top-k 를 평가한 후, 그래프가 chunk miss 를 보충하는
+    # 비율(`graph_complement`) 을 별도 메트릭으로 노출한다. 그래프는
+    # similarity=0 으로 정렬 뒤에 위치하므로 top-k 결과에 거의 영향이 없는데,
+    # 그 "거의" 가 얼마인지 정량화하는 것이 이 메트릭들의 목적이다.
+    chunk_doc_ids = [s.document_id for s in assembled.sources
+                     if s.source_type == "chunk"]
+    graph_doc_ids = [s.document_id for s in assembled.sources
+                     if s.source_type == "graph"]
+    chunk_hit_top_k = hit_at_k(chunk_doc_ids, relevant, top_k)
+    graph_hit_any = any(d in relevant for d in graph_doc_ids)
+
     row: dict[str, Any] = {
         "id": item.id,
         "query": item.query,
@@ -200,6 +212,15 @@ async def evaluate_one(
         f"hit@{top_k}": int(hit_at_k(retrieved_doc_ids, relevant, top_k)),
         f"ndcg@{top_k}": ndcg_at_k(retrieved_doc_ids, relevant, top_k),
         "mrr": mrr(retrieved_doc_ids, relevant),
+        # 그래프 기여 진단용 메트릭
+        f"chunk_hit@{top_k}": int(chunk_hit_top_k),
+        f"chunk_recall@{top_k}": recall_at_k(chunk_doc_ids, relevant, top_k),
+        f"chunk_ndcg@{top_k}": ndcg_at_k(chunk_doc_ids, relevant, top_k),
+        "chunk_mrr": mrr(chunk_doc_ids, relevant),
+        "chunk_size": len(chunk_doc_ids),
+        "graph_hit": int(graph_hit_any),
+        "graph_complement": int((not chunk_hit_top_k) and graph_hit_any),
+        "graph_size": len(graph_doc_ids),
         "elapsed_ms": elapsed_ms,
     }
 
@@ -302,6 +323,8 @@ def print_summary(summary: dict[str, Any]) -> None:
     metrics = summary.get("metrics", {})
     # 보기 좋은 순서로 키 정렬
     preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+                 "chunk_recall@", "chunk_hit@", "chunk_ndcg@", "chunk_mrr",
+                 "chunk_size", "graph_hit", "graph_complement", "graph_size",
                  "judge_score", "elapsed_ms"]
     keys = sorted(
         metrics.keys(),
@@ -613,6 +636,8 @@ def _write_aggregate(
     print(f"  Aggregate: {label}  |  N gold-sets = {len(per_run_summaries)}")
     print("=" * 60)
     preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+                 "chunk_recall@", "chunk_hit@", "chunk_ndcg@", "chunk_mrr",
+                 "chunk_size", "graph_hit", "graph_complement", "graph_size",
                  "judge_score", "elapsed_ms"]
     keys = sorted(
         variance.keys(),
