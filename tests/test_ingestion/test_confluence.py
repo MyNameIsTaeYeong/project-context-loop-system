@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from context_loop.ingestion.confluence import _html_to_markdown
+from unittest.mock import AsyncMock
+
+import pytest
+
+from context_loop.ingestion.confluence import ConfluenceClient, _html_to_markdown
 
 
 def test_html_to_markdown_headings() -> None:
@@ -58,3 +62,20 @@ def test_html_to_markdown_empty() -> None:
     """빈 HTML은 빈 문자열을 반환한다."""
     assert _html_to_markdown("") == ""
     assert _html_to_markdown("   ") == ""
+
+
+@pytest.mark.asyncio
+async def test_get_page_content_with_html_returns_raw_html() -> None:
+    """``get_page_content_with_html``은 마크다운과 원본 HTML을 함께 반환한다."""
+    client = ConfluenceClient(base_url="https://x", email="e", token="t")
+    client.get_page = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "id": "p1",
+            "title": "Page",
+            "body": {"storage": {"value": "<h1>T</h1><p>B</p>"}},
+        }
+    )
+    markdown, html, meta = await client.get_page_content_with_html("p1")
+    assert html == "<h1>T</h1><p>B</p>"
+    assert "# T" in markdown
+    assert meta["id"] == "p1"

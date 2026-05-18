@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -32,6 +33,7 @@ class EndpointEmbeddingClient(Embeddings):
         model: 사용할 임베딩 모델 ID.
         api_key: 엔드포인트 인증 키. 불필요한 경우 빈 문자열.
         timeout: HTTP 요청 타임아웃(초). 기본 60초.
+        headers: 모든 요청에 추가할 커스텀 헤더. None 또는 빈 dict이면 미사용.
     """
 
     def __init__(
@@ -40,6 +42,7 @@ class EndpointEmbeddingClient(Embeddings):
         model: str,
         api_key: str = "",
         timeout: float = 60.0,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._url = endpoint
         self._model = model
@@ -47,6 +50,8 @@ class EndpointEmbeddingClient(Embeddings):
         self._headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             self._headers["Authorization"] = f"Bearer {api_key}"
+        if headers:
+            self._headers.update(headers)
 
     def _parse_response(self, data: dict) -> list[list[float]]:
         """응답 JSON에서 임베딩 벡터 목록을 인덱스 순으로 반환한다."""
@@ -78,17 +83,35 @@ class EndpointEmbeddingClient(Embeddings):
         if not texts:
             return []
         results: list[list[float]] = []
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            for i in range(0, len(texts), _BATCH_SIZE):
-                batch = texts[i : i + _BATCH_SIZE]
-                response = await client.post(
-                    self._url,
-                    json={"input": batch, "model": self._model},
-                    headers=self._headers,
-                )
-                response.raise_for_status()
-                results.extend(self._parse_response(response.json()))
-        return results
+        total_chars = sum(len(t) for t in texts)
+        batch_count = 0
+        for idx, text in enumerate(texts):
+            logger.info(
+                "Embedding text | provider=endpoint | model=%s | "
+                "idx=%d/%d | chars=%d | text=%s",
+                self._model, idx, len(texts), len(text), text,
+            )
+        start = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                for i in range(0, len(texts), _BATCH_SIZE):
+                    batch = texts[i : i + _BATCH_SIZE]
+                    response = await client.post(
+                        self._url,
+                        json={"input": batch, "model": self._model},
+                        headers=self._headers,
+                    )
+                    response.raise_for_status()
+                    results.extend(self._parse_response(response.json()))
+                    batch_count += 1
+            return results
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Embedding call | provider=endpoint | model=%s | "
+                "elapsed_ms=%.1f | num_texts=%d | batches=%d | total_chars=%d",
+                self._model, elapsed_ms, len(texts), batch_count, total_chars,
+            )
 
     async def aembed_query(self, text: str) -> list[float]:
         """단일 텍스트의 임베딩을 비동기 방식으로 생성한다."""
@@ -135,8 +158,24 @@ class LocalEmbeddingClient(Embeddings):
         """CPU 블로킹 작업을 executor로 실행한다."""
         if not texts:
             return []
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.embed_documents, texts)
+        total_chars = sum(len(t) for t in texts)
+        for idx, text in enumerate(texts):
+            logger.info(
+                "Embedding text | provider=local | model=%s | "
+                "idx=%d/%d | chars=%d | text=%s",
+                self._model_name, idx, len(texts), len(text), text,
+            )
+        start = time.perf_counter()
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.embed_documents, texts)
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Embedding call | provider=local | model=%s | "
+                "elapsed_ms=%.1f | num_texts=%d | total_chars=%d",
+                self._model_name, elapsed_ms, len(texts), total_chars,
+            )
 
     async def aembed_query(self, text: str) -> list[float]:
         results = await self.aembed_documents([text])

@@ -73,6 +73,179 @@ async def test_update_document_content(store: MetadataStore) -> None:
     assert doc["status"] == "pending"  # status는 호출자가 별도로 설정
 
 
+async def test_create_document_persists_raw_content(store: MetadataStore) -> None:
+    """``raw_content``를 지정해 생성하면 DB에 그대로 저장된다."""
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="페이지",
+        original_content="# 페이지",
+        content_hash="h",
+        raw_content="<h1>페이지</h1>",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] == "<h1>페이지</h1>"
+
+
+async def test_create_document_without_raw_content_is_null(store: MetadataStore) -> None:
+    """``raw_content``를 생략하면 NULL."""
+    doc_id = await store.create_document(
+        source_type="manual",
+        title="문서",
+        original_content="x",
+        content_hash="h",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] is None
+
+
+async def test_update_document_content_updates_raw_content(store: MetadataStore) -> None:
+    """``raw_content``를 넘기면 함께 갱신된다."""
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="old",
+        content_hash="h1",
+        raw_content="<p>old</p>",
+    )
+    await store.update_document_content(
+        doc_id,
+        "new content",
+        "h2",
+        raw_content="<p>new</p>",
+    )
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] == "<p>new</p>"
+    assert doc["original_content"] == "new content"
+
+
+async def test_update_document_content_preserves_raw_content_when_omitted(
+    store: MetadataStore,
+) -> None:
+    """``raw_content=None``이면 기존 값을 유지한다."""
+    doc_id = await store.create_document(
+        source_type="confluence",
+        source_id="p1",
+        title="문서",
+        original_content="old",
+        content_hash="h1",
+        raw_content="<p>original</p>",
+    )
+    await store.update_document_content(doc_id, "new content", "h2")
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["raw_content"] == "<p>original</p>"
+    assert doc["original_content"] == "new content"
+
+
+async def test_migration_adds_raw_content_to_legacy_db(tmp_path: Path) -> None:
+    """구버전 스키마 DB(raw_content 컬럼 없음)를 열면 ALTER TABLE로 컬럼이 추가된다."""
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.db"
+
+    # 구버전 스키마: raw_content 없는 documents 테이블
+    async with aiosqlite.connect(db_path) as legacy:
+        await legacy.execute(
+            """CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                title TEXT NOT NULL,
+                original_content TEXT,
+                content_hash TEXT,
+                storage_method TEXT,
+                status TEXT DEFAULT 'pending',
+                version INTEGER DEFAULT 1,
+                url TEXT,
+                author TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_type, source_id)
+            )"""
+        )
+        await legacy.execute(
+            "INSERT INTO documents (source_type, title, original_content, content_hash)"
+            " VALUES (?, ?, ?, ?)",
+            ("manual", "legacy", "legacy content", "h"),
+        )
+        await legacy.commit()
+
+    # 새 MetadataStore로 열면 마이그레이션이 실행되어야 함
+    store = MetadataStore(db_path)
+    await store.initialize()
+    try:
+        cursor = await store.db.execute("PRAGMA table_info(documents)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        assert "raw_content" in columns
+
+        # 기존 row는 raw_content가 NULL
+        cursor = await store.db.execute(
+            "SELECT raw_content FROM documents WHERE title = ?", ("legacy",)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["raw_content"] is None
+    finally:
+        await store.close()
+
+
+async def test_migration_adds_section_columns_to_legacy_chunks(
+    tmp_path: Path,
+) -> None:
+    """구버전 chunks 테이블(section_path/section_anchor/embed_text 없음)을 열면 ALTER로 컬럼이 추가된다."""
+    import aiosqlite
+
+    db_path = tmp_path / "legacy_chunks.db"
+
+    async with aiosqlite.connect(db_path) as legacy:
+        await legacy.execute(
+            """CREATE TABLE chunks (
+                id TEXT PRIMARY KEY,
+                document_id INTEGER,
+                chunk_index INTEGER,
+                content TEXT,
+                token_count INTEGER
+            )"""
+        )
+        await legacy.execute(
+            "INSERT INTO chunks (id, document_id, chunk_index, content, token_count)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("legacy-c1", 1, 0, "구버전 청크", 5),
+        )
+        await legacy.commit()
+
+    store = MetadataStore(db_path)
+    await store.initialize()
+    try:
+        cursor = await store.db.execute("PRAGMA table_info(chunks)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        assert "section_path" in columns
+        assert "section_anchor" in columns
+        assert "embed_text" in columns
+        assert "section_index" in columns
+
+        # 기존 row는 빈 문자열로 채워짐 (DEFAULT '')
+        cursor = await store.db.execute(
+            "SELECT section_path, section_anchor, embed_text, section_index "
+            "FROM chunks WHERE id = ?",
+            ("legacy-c1",),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["section_path"] == ""
+        assert row["section_anchor"] == ""
+        assert row["embed_text"] == ""
+        # section_index 는 ALTER 시 DEFAULT 가 없어 NULL
+        assert row["section_index"] is None
+    finally:
+        await store.close()
+
+
 async def test_delete_document_cascades(store: MetadataStore) -> None:
     doc_id = await store.create_document(
         source_type="manual", title="문서", original_content="x", content_hash="h"
@@ -96,16 +269,30 @@ async def test_chunks_crud(store: MetadataStore) -> None:
         source_type="manual", title="문서", original_content="x", content_hash="h"
     )
     await store.create_chunk(
-        chunk_id="c1", document_id=doc_id, chunk_index=0, content="첫 번째 청크", token_count=10
+        chunk_id="c1", document_id=doc_id, chunk_index=0,
+        content="첫 번째 청크", token_count=10,
+        section_path="문서 > 개요", section_anchor="개요",
+        embed_text="hello\nfoo()\nDocstring",
+        section_index=3,
     )
     await store.create_chunk(
-        chunk_id="c2", document_id=doc_id, chunk_index=1, content="두 번째 청크", token_count=8
+        chunk_id="c2", document_id=doc_id, chunk_index=1,
+        content="두 번째 청크", token_count=8,
     )
 
     chunks = await store.get_chunks_by_document(doc_id)
     assert len(chunks) == 2
     assert chunks[0]["chunk_index"] == 0
+    assert chunks[0]["section_path"] == "문서 > 개요"
+    assert chunks[0]["section_anchor"] == "개요"
+    assert chunks[0]["embed_text"] == "hello\nfoo()\nDocstring"
+    assert chunks[0]["section_index"] == 3
     assert chunks[1]["chunk_index"] == 1
+    # 선택 인자 생략 시 기본값 (section_index 는 NULL)
+    assert chunks[1]["section_path"] == ""
+    assert chunks[1]["section_anchor"] == ""
+    assert chunks[1]["embed_text"] == ""
+    assert chunks[1]["section_index"] is None
 
     await store.delete_chunks_by_document(doc_id)
     assert await store.get_chunks_by_document(doc_id) == []
@@ -118,9 +305,11 @@ async def test_graph_nodes_and_edges(store: MetadataStore) -> None:
     node1 = await store.create_graph_node(
         document_id=doc_id, entity_name="서비스A", entity_type="system"
     )
+    await store.add_node_document_link(node1, doc_id)
     node2 = await store.create_graph_node(
         document_id=doc_id, entity_name="서비스B", entity_type="system"
     )
+    await store.add_node_document_link(node2, doc_id)
     edge_id = await store.create_graph_edge(
         document_id=doc_id,
         source_node_id=node1,
@@ -154,6 +343,94 @@ async def test_processing_history(store: MetadataStore) -> None:
     assert history[0]["action"] == "created"
     assert history[0]["status"] == "completed"
     assert history[0]["completed_at"] is not None
+
+
+async def test_document_sources_crud(store: MetadataStore) -> None:
+    """document_sources 테이블 CRUD 테스트."""
+    # code_doc 문서 생성
+    code_doc_id = await store.create_document(
+        source_type="code_doc",
+        title="VPC 아키텍처 문서",
+        original_content="# VPC\nVPC 관련 설명",
+        content_hash="cd1",
+        source_id="vpc:architecture",
+    )
+    # git_code 원본 코드 문서 생성
+    git1_id = await store.create_document(
+        source_type="git_code",
+        title="vpc.tf",
+        original_content='resource "aws_vpc" ...',
+        content_hash="g1",
+        source_id="vpc.tf",
+    )
+    git2_id = await store.create_document(
+        source_type="git_code",
+        title="subnets.tf",
+        original_content='resource "aws_subnet" ...',
+        content_hash="g2",
+        source_id="subnets.tf",
+    )
+
+    # 소스 연결 추가 (code_doc → git_code N:M)
+    await store.add_document_source(code_doc_id, git1_id, file_path="infra/vpc.tf")
+    await store.add_document_source(code_doc_id, git2_id, file_path="infra/subnets.tf")
+
+    # code_doc → git_code 조회
+    sources = await store.get_document_sources(code_doc_id)
+    assert len(sources) == 2
+    source_paths = {s["file_path"] for s in sources}
+    assert source_paths == {"infra/vpc.tf", "infra/subnets.tf"}
+
+    # git_code → code_doc 역방향 조회
+    referencing = await store.get_documents_by_source(git1_id)
+    assert len(referencing) == 1
+    assert referencing[0]["doc_id"] == code_doc_id
+
+    # 중복 INSERT 무시 (INSERT OR IGNORE)
+    await store.add_document_source(code_doc_id, git1_id, file_path="infra/vpc.tf")
+    sources = await store.get_document_sources(code_doc_id)
+    assert len(sources) == 2  # 여전히 2개
+
+    # 소스 연결 삭제
+    await store.delete_document_sources(code_doc_id)
+    sources = await store.get_document_sources(code_doc_id)
+    assert len(sources) == 0
+
+
+async def test_document_sources_cascade_on_delete(store: MetadataStore) -> None:
+    """문서 삭제 시 document_sources도 CASCADE 삭제되는지 확인."""
+    doc_id = await store.create_document(
+        source_type="code_doc", title="doc", original_content="x", content_hash="h1",
+    )
+    src_id = await store.create_document(
+        source_type="git_code", title="src", original_content="y", content_hash="h2",
+    )
+    await store.add_document_source(doc_id, src_id, file_path="main.py")
+
+    # doc_id 삭제 → document_sources에서 doc_id 행 CASCADE 삭제
+    await store.delete_document(doc_id)
+    sources = await store.get_document_sources(doc_id)
+    assert len(sources) == 0
+
+    # src_id 측에서도 역방향 조회 시 결과 없음
+    referencing = await store.get_documents_by_source(src_id)
+    assert len(referencing) == 0
+
+
+async def test_document_sources_cascade_on_source_delete(store: MetadataStore) -> None:
+    """소스 문서(git_code) 삭제 시 document_sources도 CASCADE 삭제되는지 확인."""
+    doc_id = await store.create_document(
+        source_type="code_doc", title="doc", original_content="x", content_hash="h1",
+    )
+    src_id = await store.create_document(
+        source_type="git_code", title="src", original_content="y", content_hash="h2",
+    )
+    await store.add_document_source(doc_id, src_id, file_path="main.py")
+
+    # source_doc_id 삭제 → CASCADE로 연결 제거
+    await store.delete_document(src_id)
+    sources = await store.get_document_sources(doc_id)
+    assert len(sources) == 0
 
 
 async def test_get_stats(store: MetadataStore) -> None:

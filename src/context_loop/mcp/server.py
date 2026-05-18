@@ -27,12 +27,13 @@ _vector_store: VectorStore | None = None
 _graph_store: GraphStore | None = None
 _embedding_client: object | None = None
 _llm_client: object | None = None
+_reranker_client: object | None = None
 _config: Config | None = None
 
 
 async def _initialize() -> None:
     """저장소와 설정을 초기화한다."""
-    global _meta_store, _vector_store, _graph_store, _embedding_client, _llm_client, _config  # noqa: PLW0603
+    global _meta_store, _vector_store, _graph_store, _embedding_client, _llm_client, _reranker_client, _config  # noqa: PLW0603
 
     _config = Config()
     data_dir = Path(_config.get("app.data_dir", "~/.context-loop/data")).expanduser()
@@ -55,6 +56,7 @@ async def _initialize() -> None:
             endpoint=_config.get("processor.embedding_endpoint", ""),
             model=_config.get("processor.embedding_model", "text-embedding-3-small"),
             api_key=_config.get("processor.embedding_api_key", ""),
+            headers=_config.get("processor.embedding_headers") or None,
         )
     else:
         _embedding_client = LocalEmbeddingClient(
@@ -62,13 +64,20 @@ async def _initialize() -> None:
         )
 
     # LLM 클라이언트 초기화 (그래프 탐색 플래너용)
-    from context_loop.web.app import _build_llm_client
+    from context_loop.web.app import _build_llm_client, _build_reranker_client
 
     try:
         _llm_client = _build_llm_client(_config)
     except Exception:
         logger.warning("LLM 클라이언트 초기화 실패 (그래프 탐색 비활성화)", exc_info=True)
         _llm_client = None
+
+    # 전용 리랭커 클라이언트 초기화 (config 미설정 시 None — 리랭킹 스킵)
+    try:
+        _reranker_client = _build_reranker_client(_config)
+    except Exception:
+        logger.warning("리랭커 클라이언트 초기화 실패 (리랭킹 비활성화)", exc_info=True)
+        _reranker_client = None
 
     logger.info("MCP Server 저장소 초기화 완료")
 
@@ -91,7 +100,7 @@ def run_stdio() -> None:
 
     async def _run() -> None:
         await _initialize()
-        await mcp.run_async(transport="stdio")
+        await mcp.run_stdio_async()
 
     asyncio.run(_run())
 
@@ -101,6 +110,7 @@ def run_sse(port: int = 3001) -> None:
 
     async def _run() -> None:
         await _initialize()
-        await mcp.run_async(transport="sse", sse_params={"port": port})
+        mcp.settings.port = port
+        await mcp.run_sse_async()
 
     asyncio.run(_run())

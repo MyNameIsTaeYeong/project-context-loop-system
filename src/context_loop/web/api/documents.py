@@ -11,6 +11,8 @@ from langchain_core.embeddings import Embeddings
 from context_loop.config import Config
 from context_loop.ingestion.editor import save_document
 from context_loop.processor.llm_client import LLMClient
+from context_loop.processor.pipeline import build_meta_view_text
+from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -118,10 +120,15 @@ async def tab_original(
     doc = await meta_store.get_document(document_id)
     if not doc:
         raise HTTPException(404)
+    # git_code일 때 source_id에서 확장자 기반 언어 힌트 추출
+    lang_hint = ""
+    if doc.get("source_type") == "git_code" and doc.get("source_id"):
+        lang_hint = _guess_language(doc["source_id"])
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_original.html", {
         "request": request,
         "doc": doc,
+        "lang_hint": lang_hint,
     })
 
 
@@ -131,12 +138,43 @@ async def tab_chunks(
     document_id: int,
     meta_store: MetadataStore = Depends(get_meta_store),
 ):
-    """청크 탭 HTML 파셜."""
+    """청크 탭 HTML 파셜.
+
+    모든 소스 타입이 멀티뷰(body + meta) 임베딩을 사용하지만, meta 뷰의
+    입력 텍스트 정의가 소스 타입에 따라 다르므로 합성 경로가 다르다:
+
+      - ``git_code``: meta 뷰 입력은 ``embed_text`` 컬럼에 영속화된
+        식별자 요약(이름+시그니처+docstring). body 뷰는 ``content``
+        (전체 코드)이며 둘 다 ChromaDB 엔트리로 저장된다 (I-046).
+        레거시 청크(멀티뷰 적용 이전 처리)는 ``embed_text`` 가 비어 있다.
+      - 그 외(Confluence/upload/manual): D-042 멀티뷰. body=``content``,
+        meta=``build_meta_view_text(title, section_path)``.
+
+    템플릿이 ``source_type`` 으로 분기하여 운영자가 실제 임베딩된 텍스트를
+    오인하지 않도록 표시한다.
+    """
     chunks = await meta_store.get_chunks_by_document(document_id)
+    doc = await meta_store.get_document(document_id)
+    title = doc["title"] if doc else ""
+    source_type = doc["source_type"] if doc else ""
+
+    enriched = []
+    for chunk in chunks:
+        if source_type == "git_code":
+            # git_code 의 meta 뷰 입력은 파이프라인이 SQLite ``embed_text`` 에
+            # 영속화한다 (D-042 후속). 재구성 없이 그대로 노출.
+            enriched.append({**chunk, "meta_text": chunk.get("embed_text", "")})
+        else:
+            meta_text = build_meta_view_text(
+                title, chunk.get("section_path", ""),
+            )
+            enriched.append({**chunk, "meta_text": meta_text})
+
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_chunks.html", {
         "request": request,
-        "chunks": chunks,
+        "chunks": enriched,
+        "source_type": source_type,
     })
 
 
@@ -168,6 +206,27 @@ async def tab_graph(
         "request": request,
         "graph_data": json.dumps(graph_data, ensure_ascii=False),
         "has_graph": bool(nodes),
+    })
+
+
+@router.get("/partials/document/{document_id}/sources")
+async def tab_sources(
+    request: Request,
+    document_id: int,
+    meta_store: MetadataStore = Depends(get_meta_store),
+):
+    """소스 연결 탭 HTML 파셜."""
+    doc = await meta_store.get_document(document_id)
+    if not doc:
+        raise HTTPException(404)
+    sources = await meta_store.get_document_sources(document_id)
+    reverse_refs = await meta_store.get_documents_by_source(document_id)
+    templates = get_templates(request)
+    return templates.TemplateResponse("partials/tab_sources.html", {
+        "request": request,
+        "doc": doc,
+        "sources": sources,
+        "reverse_refs": reverse_refs,
     })
 
 
@@ -248,13 +307,14 @@ async def delete_document_api(
     graph_store: GraphStore = Depends(get_graph_store),
 ):
     """문서와 관련 데이터를 모두 삭제한다."""
-    doc = await meta_store.get_document(document_id)
-    if not doc:
+    deleted = await delete_document_cascade(
+        document_id,
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+    )
+    if not deleted:
         raise HTTPException(404)
-
-    vector_store.delete_by_document(document_id)
-    await graph_store.delete_document_graph(document_id)
-    await meta_store.delete_document(document_id)
 
     response = Response(status_code=204)
     response.headers["HX-Redirect"] = "/"
@@ -269,8 +329,8 @@ async def trigger_processing(
     vector_store: VectorStore = Depends(get_vector_store),
     graph_store: GraphStore = Depends(get_graph_store),
     config: Config = Depends(get_config),
-    llm_client: LLMClient = Depends(get_llm_client),
     embedding_client: Embeddings = Depends(get_embedding_client),
+    llm_client: LLMClient = Depends(get_llm_client),
 ):
     """문서 처리를 백그라운드로 실행한다."""
     doc = await meta_store.get_document(document_id)
@@ -281,7 +341,7 @@ async def trigger_processing(
     background_tasks.add_task(
         _run_pipeline,
         document_id, meta_store, vector_store, graph_store, config,
-        llm_client, embedding_client,
+        embedding_client, llm_client,
     )
     return {"status": "processing", "document_id": document_id}
 
@@ -292,8 +352,8 @@ async def _run_pipeline(
     vector_store: VectorStore,
     graph_store: GraphStore,
     config: Config,
-    llm_client: LLMClient,
     embedding_client: Embeddings,
+    llm_client: LLMClient | None = None,
 ) -> None:
     """백그라운드에서 파이프라인을 실행한다."""
     try:
@@ -310,10 +370,42 @@ async def _run_pipeline(
             meta_store=meta_store,
             vector_store=vector_store,
             graph_store=graph_store,
-            llm_client=llm_client,
             embedding_client=embedding_client,
             config=pipeline_config,
+            llm_client=llm_client,
         )
     except Exception:
         logger.exception("문서 %d 파이프라인 실행 실패", document_id)
         await meta_store.update_document_status(document_id, "failed")
+
+
+# --- Helpers ---
+
+_EXT_LANG_MAP: dict[str, str] = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".tsx": "tsx", ".jsx": "jsx",
+    ".java": "java", ".kt": "kotlin", ".scala": "scala",
+    ".go": "go", ".rs": "rust", ".c": "c", ".cpp": "cpp", ".h": "cpp",
+    ".cs": "csharp", ".rb": "ruby", ".php": "php", ".swift": "swift",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".sql": "sql", ".html": "html", ".css": "css", ".scss": "scss",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".xml": "xml", ".md": "markdown", ".txt": "plaintext",
+    ".dockerfile": "dockerfile", ".gradle": "gradle",
+}
+
+
+def _guess_language(source_id: str) -> str:
+    """source_id (repo_url:relative_path 형식)에서 파일 확장자 기반 언어를 추측한다."""
+    path = source_id.rsplit(":", 1)[-1] if ":" in source_id else source_id
+    # Dockerfile 등 확장자 없는 파일 처리
+    basename = path.rsplit("/", 1)[-1].lower()
+    if basename == "dockerfile":
+        return "dockerfile"
+    if basename == "makefile":
+        return "makefile"
+    dot_idx = path.rfind(".")
+    if dot_idx == -1:
+        return ""
+    ext = path[dot_idx:].lower()
+    return _EXT_LANG_MAP.get(ext, "")

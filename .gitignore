@@ -10,6 +10,7 @@ dist/
 build/
 .venv/
 venv/
+uv.lock
 
 # IDE
 .idea/
@@ -20,3 +21,6 @@ venv/
 # Environment
 .env
 .env.local
+
+# Scripts output
+scripts/output/

@@ -16,6 +16,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
+from context_loop.processor.graph_vocabulary import (
+    format_entity_types_for_prompt,
+    format_intent_mapping_for_prompt,
+    format_relation_types_for_prompt,
+)
 from context_loop.processor.llm_client import LLMClient, extract_json
 from context_loop.storage.graph_store import GraphStore
 
@@ -23,32 +29,47 @@ logger = logging.getLogger(__name__)
 
 _PLAN_SYSTEM_PROMPT = """\
 당신은 지식 그래프 탐색 전문가입니다.
-사용자의 질의와 그래프 구조 정보를 분석하여 어떤 엔티티를 중심으로 탐색할지 계획합니다.
+사용자의 질의와 그래프 구조 정보를 분석하여 어떤 엔티티를 중심으로 탐색할지
+계획합니다. 그래프에는 여러 추출기(링크 / 결정론 본문 / LLM 의미)가 만든
+다양한 의미 관계가 들어 있으며, ``focus_relations`` 로 의도에 맞는 관계를
+좁혀 탐색하면 더 정확한 컨텍스트를 얻을 수 있습니다.
 
-규칙:
-- 그래프에 실제 존재하는 엔티티 이름만 사용하세요.
+# Entity types (그래프에 등장 가능)
+{entity_types}
+
+# Relation types (그래프에 등장 가능)
+{relation_types}
+
+# 질의 의도 → 주목할 관계 (focus_relations 힌트)
+{intent_mapping}
+
+# 규칙
+- 그래프에 실제 존재하는 엔티티 이름만 사용하세요 (스키마 요약에 등장한 이름).
 - 질의와 관련 없는 엔티티는 포함하지 마세요.
-- 관련 엔티티가 없으면 빈 계획을 반환하세요.
-- 탐색 깊이(depth)는 1~2 사이로 설정하세요.
+- 관련 엔티티가 없으면 ``should_search=false`` 와 빈 ``search_steps`` 를 반환하세요.
+- 탐색 깊이(``depth``) 는 1~2 사이로 설정하세요 (단순 직접 관계는 1, 2-홉
+  추론이 필요하면 2).
+- ``focus_relations`` 는 위 매핑 가이드를 참고해 채우세요. 비어 있으면 모든
+  관계가 표시됩니다 — 의도가 명확하면 반드시 좁히세요.
+- ``focus_relations`` 에는 위 Relation types 목록의 정확한 이름만 사용하세요.
 
-반드시 아래 JSON 형식으로만 응답하세요:
+# 응답 형식 (JSON 만, 다른 텍스트 금지)
 ```json
-{
-  "should_search": true/false,
+{{
+  "should_search": true,
   "reasoning": "탐색 필요 여부에 대한 간단한 이유",
   "search_steps": [
-    {
+    {{
       "entity_name": "탐색 시작 엔티티 이름",
       "depth": 1,
-      "focus_relations": ["relation_type1"]
-    }
+      "focus_relations": ["depends_on"]
+    }}
   ]
-}
+}}
 ```
 
-- should_search: 그래프 탐색이 질의 답변에 도움이 되는지 여부
-- search_steps: 탐색할 엔티티 목록 (최대 3개)
-- focus_relations: 특히 주목할 관계 유형 (빈 배열이면 모든 관계)
+- ``search_steps`` 는 최대 3개.
+- ``should_search=false`` 인 경우 ``search_steps`` 는 빈 배열.
 """
 
 _PLAN_USER_TEMPLATE = """\
@@ -58,6 +79,19 @@ _PLAN_USER_TEMPLATE = """\
 ## 그래프 구조
 {schema}
 """
+
+
+def _render_system_prompt() -> str:
+    """어휘 가이드를 템플릿에 끼워 시스템 프롬프트를 만든다.
+
+    어휘는 ``graph_vocabulary`` 단일 출처에서 가져온다 — 추출기가 새 entity/
+    relation 타입을 도입하면 거기 추가만 하면 자동으로 플래너가 인식한다.
+    """
+    return _PLAN_SYSTEM_PROMPT.format(
+        entity_types=format_entity_types_for_prompt(),
+        relation_types=format_relation_types_for_prompt(),
+        intent_mapping=format_intent_mapping_for_prompt(),
+    )
 
 
 @dataclass
@@ -80,10 +114,20 @@ class GraphSearchPlan:
 
 @dataclass
 class GraphSearchResult:
-    """그래프 탐색 결과."""
+    """그래프 탐색 결과.
+
+    ``entities`` 의 각 ``GraphEntityRef`` 에는 노드 ``properties`` JSON 의
+    ``description`` 필드가 채워진다 (2차 — 평가 측 tiered matching 의 T4
+    embedding 단계가 자연어 evidence 를 비교할 수 있도록).
+
+    ``relations`` 는 ``--score-relations`` 평가용으로 노출되는 1-hop
+    엣지 정보 (2차 — 관계 채점 활성화 시).
+    """
 
     text: str
     document_ids: set[int] = field(default_factory=set)
+    entities: list[GraphEntityRef] = field(default_factory=list)
+    relations: list[GraphRelationRef] = field(default_factory=list)
 
 
 async def plan_graph_search(
@@ -120,9 +164,11 @@ async def plan_graph_search(
     try:
         response = await llm_client.complete(
             prompt,
-            system=_PLAN_SYSTEM_PROMPT,
+            system=_render_system_prompt(),
             max_tokens=512,
             temperature=0.0,
+            reasoning_mode="off",
+            purpose="graph_search_planner",
         )
         plan_data = extract_json(response)
     except Exception:
@@ -212,12 +258,17 @@ async def execute_graph_search(
         if filtered_edges:
             edges = filtered_edges
 
-    # 관련 document_id 수집
+    # 관련 document_id 수집 (정규 노드는 document_ids set을 가짐)
     document_ids: set[int] = set()
     for node in all_nodes:
-        doc_id = node.get("document_id")
-        if doc_id is not None:
-            document_ids.add(doc_id)
+        node_doc_ids = node.get("document_ids")
+        if isinstance(node_doc_ids, set):
+            document_ids.update(node_doc_ids)
+        else:
+            # 레거시 호환: 단일 document_id
+            doc_id = node.get("document_id")
+            if doc_id is not None:
+                document_ids.add(doc_id)
 
     # 포맷팅
     searched_set = {name.lower() for name in searched_entities}
@@ -245,4 +296,64 @@ async def execute_graph_search(
             label_text = f" ({label})" if label else ""
             lines.append(f"- {src} --[{rel}]--> {tgt}{label_text}")
 
-    return GraphSearchResult(text="\n".join(lines), document_ids=document_ids)
+    # 평가용 (entity_name, entity_type) 페어 노출 — `GoldItem.relevant_graph_entities`
+    # 와 동일 키로 비교 가능하도록 dataclass 외부에 채워준다.
+    # 2차: description 도 채워서 tiered matching T4 (embedding) 이 자연어
+    # evidence 를 비교할 수 있게 한다.
+    entities: list[GraphEntityRef] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for node in all_nodes:
+        name = str(node.get("entity_name", ""))
+        etype = str(node.get("entity_type", ""))
+        if not name:
+            continue
+        key = (name.lower(), etype)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        node_props = node.get("properties") or {}
+        description = ""
+        if isinstance(node_props, dict):
+            description = str(node_props.get("description") or "")
+        entities.append(GraphEntityRef(
+            name=name,
+            type=etype,
+            description=description,
+        ))
+
+    # 2차: 관계 채점 (`--score-relations`) 을 위해 검색된 edges 도 노출.
+    id_to_name_map = {n["id"]: n.get("entity_name", "") for n in all_nodes}
+    id_to_type_map = {n["id"]: n.get("entity_type", "") for n in all_nodes}
+    relations: list[GraphRelationRef] = []
+    seen_rel_keys: set[tuple[str, str, str]] = set()
+    for edge in edges:
+        src = str(id_to_name_map.get(edge.get("source"), ""))
+        tgt = str(id_to_name_map.get(edge.get("target"), ""))
+        rel = str(edge.get("relation_type", ""))
+        if not (src and tgt):
+            continue
+        rel_key = (src.lower(), tgt.lower(), rel)
+        if rel_key in seen_rel_keys:
+            continue
+        seen_rel_keys.add(rel_key)
+        # 관계의 description 은 edge properties 의 label 또는 빈 문자열.
+        edge_props = edge.get("properties") or {}
+        label = ""
+        if isinstance(edge_props, dict):
+            label = str(edge_props.get("label") or "")
+        # 자연어 evidence — type 명 변경 robust 매칭에 사용.
+        _ = id_to_type_map  # 사용 의도 유지 (현재는 타입 필요 없음)
+        rel_description = label or f"{src} {rel} {tgt}"
+        relations.append(GraphRelationRef(
+            source_name=src,
+            target_name=tgt,
+            relation_type=rel,
+            description=rel_description,
+        ))
+
+    return GraphSearchResult(
+        text="\n".join(lines),
+        document_ids=document_ids,
+        entities=entities,
+        relations=relations,
+    )
