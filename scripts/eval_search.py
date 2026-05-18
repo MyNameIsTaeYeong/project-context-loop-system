@@ -83,11 +83,25 @@ logger = logging.getLogger("eval_search")
 
 
 # ---------------------------------------------------------------------------
-# Judge prompt — 응답 품질 채점 (옵션)
+# Judge prompts — 응답 품질 채점 (옵션, 3 모드)
 # ---------------------------------------------------------------------------
+#
+# 모드별 설계:
+#
+# * **overlap** (legacy 기본) — Judge 에 source chunk + retrieved context 둘 다
+#   노출. 의미 평가가 아닌 lexical/semantic overlap 채점으로 회귀하는 위험.
+#   호환을 위해 유지하되 비추천 — 본 모드는 "이 검색 결과가 정답 청크의 핵심
+#   정보를 그대로 담는가" 라는 측정만 가능.
+#
+# * **reference-free** (★ 권장 기본) — source chunk 를 노출하지 않고 질문 +
+#   검색 컨텍스트만 보여줌. "이 컨텍스트로 질문에 답할 수 있는가" 만 평가하므로
+#   진짜 RAG 답변 품질에 가깝다. lexical overlap 편향 차단.
+#
+# * **entailment** — source chunk vs retrieved context 의 의미 entailment 만
+#   평가 (NLI 형식). overlap 보다 의미 추론에 무게.
 
 
-JUDGE_PROMPT_TEMPLATE = """\
+JUDGE_PROMPT_OVERLAP = """\
 질문: {query}
 
 정답 근거 (출처 청크):
@@ -111,6 +125,54 @@ JSON 으로만 출력::
 """
 
 
+JUDGE_PROMPT_REFERENCE_FREE = """\
+질문: {query}
+
+검색 시스템이 반환한 컨텍스트:
+---
+{retrieved_context}
+---
+
+위 컨텍스트만 보고 질문에 정확하고 충분히 답할 수 있는지 0~5점으로 평가하라.
+정답 출처를 보지 말고, 컨텍스트의 정보만으로 판단할 것.
+- 5: 컨텍스트 정보만으로 정확하고 완전한 답이 도출됨
+- 3: 부분 답 가능, 추가 정보 필요
+- 0: 답할 수 없음 (무관/공백)
+
+JSON 으로만 출력::
+
+  {{"score": 0~5 정수, "reason": "한 줄 설명"}}
+"""
+
+
+JUDGE_PROMPT_ENTAILMENT = """\
+질문: {query}
+
+전제(정답 근거 청크):
+---
+{source_chunk}
+---
+
+가설(검색 시스템 반환 컨텍스트):
+---
+{retrieved_context}
+---
+
+가설이 전제의 의미를 함의하는지 0~5점으로 평가하라 (NLI entailment).
+- 5: 가설이 전제의 모든 핵심 의미를 함의 (등가 또는 더 강함)
+- 3: 가설이 전제의 일부 핵심 의미만 함의
+- 0: 가설이 전제와 무관하거나 모순
+
+JSON 으로만 출력::
+
+  {{"score": 0~5 정수, "reason": "한 줄 설명"}}
+"""
+
+
+JUDGE_MODES = ("reference-free", "overlap", "entailment")
+"""Judge 모드 식별자. CLI ``--judge-mode`` 인자로 선택."""
+
+
 async def judge_answer(
     query: str,
     source_chunk: str,
@@ -118,12 +180,25 @@ async def judge_answer(
     *,
     judge: LLMClient,
     reasoning_mode: str | None = "off",
+    mode: str = "reference-free",
 ) -> tuple[int, str]:
-    """Judge LLM 으로 검색된 컨텍스트가 정답을 담는지 0~5 점 채점.
+    """Judge LLM 으로 검색된 컨텍스트의 응답 품질을 0~5 점 채점.
+
+    Args:
+        mode: ``"reference-free"`` (기본·권장) / ``"overlap"`` (legacy) /
+            ``"entailment"`` 중 하나.
 
     파싱 실패 시 (-1, "parse_error").
     """
-    prompt = JUDGE_PROMPT_TEMPLATE.format(
+    if mode == "overlap":
+        template = JUDGE_PROMPT_OVERLAP
+    elif mode == "entailment":
+        template = JUDGE_PROMPT_ENTAILMENT
+    else:
+        # reference-free 기본
+        template = JUDGE_PROMPT_REFERENCE_FREE
+
+    prompt = template.format(
         query=query,
         source_chunk=source_chunk[:4000],
         retrieved_context=retrieved_context[:6000],
@@ -133,7 +208,7 @@ async def judge_answer(
         max_tokens=256,
         temperature=0.0,
         reasoning_mode=reasoning_mode,
-        purpose="goldset_judge_answer",
+        purpose=f"goldset_judge_answer_{mode}",
     )
     try:
         data = extract_json(text)
@@ -177,6 +252,7 @@ async def evaluate_one(
     graph_match_threshold: float = DEFAULT_GRAPH_MATCH_THRESHOLD,
     graph_match_strict: bool = False,
     score_relations: bool = False,
+    judge_mode: str = "reference-free",
     embedding_model_id: str = "",
 ) -> dict[str, Any]:
     """단일 질의에 대한 검색 + 채점.
@@ -208,7 +284,17 @@ async def evaluate_one(
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    retrieved_doc_ids = [s.document_id for s in assembled.sources]
+    # P14 (S2) — tie-breaker 명시: vector store 의 동률(similarity tie) 시 결과
+    # 순서가 도착 순서·인덱스 빌드 순서에 의존하면 메트릭이 비결정적이 된다.
+    # `(similarity desc, document_id asc)` 의 명시적 stable sort 를 평가
+    # 레이어에서 한 번 더 적용하여 결정성을 보장한다.
+    # `assemble_context_with_sources` 자체의 sort 가 같은 키를 사용하면 no-op,
+    # 다르면 메트릭만 결정적으로 보정 (시스템 운영 동작에는 영향 없음).
+    sorted_sources = sorted(
+        assembled.sources,
+        key=lambda s: (-(s.similarity or 0.0), s.document_id),
+    )
+    retrieved_doc_ids = [s.document_id for s in sorted_sources]
     relevant = set(item.relevant_doc_ids)
 
     # graph-level 채점 — 4-tier cascade (exact → alias → normalize → embedding).
@@ -327,6 +413,7 @@ async def evaluate_one(
                 assembled.context_text,
                 judge=judge,
                 reasoning_mode=reasoning_mode,
+                mode=judge_mode,
             )
             if score < 0:
                 # parse_error — 평균에서 분리. aggregate 가 None 을 자동 스킵.
@@ -729,6 +816,7 @@ async def _evaluate_gold_set(
                     graph_match_strict=args.graph_match_strict,
                     score_relations=args.score_relations,
                     embedding_model_id=embedding_model_id,
+                    judge_mode=args.judge_mode,
                 )
                 row["_idx"] = idx
             except Exception as exc:
@@ -901,6 +989,7 @@ async def run(args: argparse.Namespace) -> int:
         "llm_model": config.get("llm.model"),
         "judge_enabled": args.judge,
         "judge_model": args.judge_model or (config.get("llm.model") if args.judge else None),
+        "judge_mode": args.judge_mode,
         # Self-evaluation 추적 — judge fall-through 시 메트릭이 편향됨을 명시.
         "judge_is_self": judge_is_self,
         "allow_self_judge": bool(args.allow_self_judge),
@@ -1112,6 +1201,16 @@ def main() -> None:
         "--judge-headers", default="",
         help="Judge 전용 헤더 JSON (예: '{\"X-Org-Id\":\"abc\"}'). "
              "미지정 시 config.llm.headers 사용.",
+    )
+    # S2 — Judge 프롬프트 모드 (lexical overlap 편향 차단).
+    parser.add_argument(
+        "--judge-mode", default="reference-free",
+        choices=list(JUDGE_MODES),
+        help="Judge 프롬프트 모드 (기본 'reference-free' — 권장). "
+             "'reference-free': source chunk 숨기고 retrieved 만 보여줘 "
+             "'질문에 답할 수 있는가' 평가 (lexical overlap 편향 차단). "
+             "'overlap': source + retrieved 노출 (legacy, 비추천). "
+             "'entailment': source vs retrieved 의미 entailment 평가.",
     )
     parser.add_argument(
         "--reasoning-mode", default="off",

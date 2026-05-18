@@ -335,6 +335,8 @@ async def build(
     judge_configured_separately: bool = False,
     self_evaluation_warning: bool = False,
     allow_self_eval: bool = False,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
 ) -> GoldSet:
     """전체 파이프라인 실행.
 
@@ -437,6 +439,8 @@ async def build(
             items=items,
             stats=stats,
             next_id=next_id,
+            generator_temperature=generator_temperature,
+            generator_seed_base=generator_seed_base,
         )
 
         # 그래프 모드 실행 — chunk 모드 이후에 머지
@@ -461,6 +465,8 @@ async def build(
                 embedding_client=embedding_client,
                 sem=sem,
                 next_id=next_id,
+                generator_temperature=generator_temperature,
+                generator_seed_base=generator_seed_base,
             )
 
         generation_modes = ["chunk"]
@@ -485,6 +491,8 @@ async def build(
             "judge_configured_separately": judge_configured_separately,
             "self_evaluation_warning": self_evaluation_warning,
             "allow_self_eval": allow_self_eval,
+            "generator_temperature": generator_temperature,
+            "generator_seed_base": generator_seed_base,
         }
         if enable_graph_mode:
             # 그래프 매칭 재현성을 위해 임베딩 모델 ID + 기본 τ 기록
@@ -519,6 +527,8 @@ async def _process_chunk_item(
     apply_filter: bool,
     sem: asyncio.Semaphore,
     total: int,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
 ) -> tuple[list[GoldItem], dict[str, int]]:
     """chunk 1개 처리 — LLM 생성·게이트를 수행하고 (items, local_stats) 반환.
 
@@ -534,11 +544,19 @@ async def _process_chunk_item(
         local_items: list[GoldItem] = []
         local_stats: dict[str, int] = {}
 
+        # 청크별 결정성: seed_base + chunk_index 로 청크 단위 deterministic seed.
+        item_seed = (
+            generator_seed_base + int(chunk.get("chunk_index") or 0)
+            if generator_seed_base is not None
+            else None
+        )
         generated = await generate_questions(
             chunk["content"],
             n=questions_per_chunk,
             generator=generator,
             reasoning_mode=reasoning_mode,
+            temperature=generator_temperature,
+            seed=item_seed,
         )
         local_stats["generated"] = local_stats.get("generated", 0) + len(generated)
 
@@ -625,6 +643,8 @@ async def _run_chunk_mode(
     items: list[GoldItem],
     stats: dict[str, int],
     next_id: int,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
 ) -> int:
     """sampled chunk 들을 동시 처리하고 결과를 items 에 합친다.
 
@@ -643,6 +663,8 @@ async def _run_chunk_mode(
             apply_filter=apply_filter,
             sem=sem,
             total=total,
+            generator_temperature=generator_temperature,
+            generator_seed_base=generator_seed_base,
         )
         for idx, chunk in enumerate(sampled, start=1)
     ]
@@ -686,6 +708,8 @@ async def _process_subgraph_item(
     score_relations: bool,
     sem: asyncio.Semaphore,
     total: int,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
 ) -> tuple[list[GoldItem], dict[str, int]]:
     """subgraph 1개 처리 — graph 질문 생성·게이트.
 
@@ -700,11 +724,17 @@ async def _process_subgraph_item(
         local_items: list[GoldItem] = []
         local_stats: dict[str, int] = {}
 
+        # subgraph 별 결정성: seed_base + idx (subgraph 정렬 위치) 로 결정적 seed.
+        sg_seed = (
+            generator_seed_base + idx if generator_seed_base is not None else None
+        )
         generated = await generate_graph_questions(
             sg,
             n=questions_per_chunk,
             generator=generator,
             reasoning_mode=reasoning_mode,
+            temperature=generator_temperature,
+            seed=sg_seed,
         )
         local_stats["graph_generated"] = local_stats.get("graph_generated", 0) + len(generated)
         local_stats["generated"] = local_stats.get("generated", 0) + len(generated)
@@ -788,6 +818,8 @@ async def _run_graph_mode(
     embedding_client: Any | None = None,
     sem: asyncio.Semaphore | None = None,
     next_id: int = 1,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
 ) -> int:
     """graph 모드 — subgraph 샘플링 후 질문 생성·게이트 적용.
 
@@ -851,6 +883,8 @@ async def _run_graph_mode(
             score_relations=score_relations,
             sem=sem,
             total=total,
+            generator_temperature=generator_temperature,
+            generator_seed_base=generator_seed_base,
         )
         for idx, sg in enumerate(sampled_sg, start=1)
     ]
@@ -1178,6 +1212,21 @@ def main() -> None:
         help="항목(chunk/subgraph) 단위 동시 처리 수 (기본 1, 직렬). "
              "LLM endpoint rate limit 에 맞춰 4~8 권장. metadata 에 기록.",
     )
+    # S2 P13 — 재현성: Generator temperature 와 seed.
+    parser.add_argument(
+        "--generator-temperature", type=float, default=0.0,
+        help="Generator LLM 의 sampling 온도 (기본 0.0 = 결정적). "
+             "다양성 확대 시 0.3~0.7 권장 — 단 재현성 트레이드오프. "
+             "metadata 에 기록되어 사후 재현 시 동일 값 사용 필수.",
+    )
+    parser.add_argument(
+        "--generator-seed-base", type=int, default=None,
+        help="Generator LLM 호출의 seed base. None 이면 seed 미전달 "
+             "(endpoint 가 결정성 보장 안 함). 정수 명시 시 청크별 "
+             "deterministic seed = seed_base + chunk_index 로 부여. "
+             "OpenAI 호환 endpoint (vLLM/gpt-4 이상) 만 실제 효과. "
+             "Anthropic 은 무시. metadata 에 기록.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -1321,6 +1370,8 @@ def main() -> None:
                 judge_configured_separately=bool(judge_configured),
                 self_evaluation_warning=self_evaluation_warning,
                 allow_self_eval=bool(args.allow_self_eval),
+                generator_temperature=float(args.generator_temperature),
+                generator_seed_base=args.generator_seed_base,
             )
 
     asyncio.run(_run_all())

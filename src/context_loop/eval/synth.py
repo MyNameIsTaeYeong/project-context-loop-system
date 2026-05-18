@@ -361,21 +361,32 @@ def has_identifier_leakage(question: str, source_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-_KOREAN_NOUN_RE = re.compile(r"[가-힣]{4,}")
-"""4자 이상의 연속 한글.
+_KOREAN_NOUN_RE = re.compile(r"[가-힣]{3,}")
+"""3자 이상의 연속 한글.
 
-일반 2~3자 명사(사용자, 데이터 등) 는 stopword 화이트리스트로 보강하지 않고 길이로 자연 필터한다.
+S2 보강 — 4자 이상만 보던 v2 대비 3자 한글 고유명사(예: "결제팀", "주문봇") 도
+포함. 일반 3자 명사 false positive 는 stem 길이 컷오프 + ``_KOREAN_COMMON_NOUNS``
+화이트리스트로 통제.
 """
 
 _KOREAN_COMMON_NOUNS = frozenset({
-    # 4자 이상이라도 너무 흔해 고유명사 후보가 아닌 일반 어휘
+    # 3자 일반 명사 (S2 보강) — 빈도 높고 고유명사가 아닌 어휘
+    "사용자", "관리자", "개발자", "시스템", "데이터", "서비스", "프로젝트",
+    "이용자", "고객사", "회사명", "팀원들", "구성원", "담당자", "참가자",
+    "사용법", "기능을", "기능이", "기능에", "기능의",
+    "정보를", "정보가", "정보의", "정보는",
+    "방법을", "방법이", "방법의",
+    "내용을", "내용이", "내용의",
+    "관련된", "다음은", "이전의", "현재의", "최근의",
+    # 4자+ 일반 어휘
     "사용자가", "사용자는", "사용자의", "사용자에게",
     "관리자가", "관리자는", "관리자의",
-    "프로젝트", "프로세스", "비즈니스", "데이터베이스", "데이터셋", "데이터를",
+    "프로세스", "비즈니스", "데이터베이스", "데이터셋", "데이터를",
     "애플리케이션", "인터페이스", "프레임워크", "라이브러리",
     "서비스가", "서비스는", "서비스의", "서비스를",
     "시스템이", "시스템은", "시스템의", "시스템을",
     "기능에서", "기능으로", "기능을",
+    "다음과같이", "예를들면", "예를들어",
 })
 
 
@@ -385,11 +396,13 @@ _KOREAN_JOSA_RE = re.compile(
 )
 
 
-def _strip_korean_josa(token: str, *, min_stem_len: int = 3) -> str:
+def _strip_korean_josa(token: str, *, min_stem_len: int = 2) -> str:
     """한국어 토큰에서 후행 조사를 1회 제거한 stem 을 반환.
 
     조사를 제거한 stem 의 길이가 ``min_stem_len`` 미만이 되면 원본 유지 — 너무
-    공격적인 stripping 으로 일반 단어가 잘못 매칭되는 것을 막는다.
+    공격적인 stripping 으로 일반 단어가 잘못 매칭되는 것을 막는다. S2 보강:
+    3자 토큰 "결제팀" 의 stem 도 후보로 살려야 하므로 2자까지 허용 (이후
+    extract 단계에서 길이 3 이상 컷오프로 통제).
     """
     m = _KOREAN_JOSA_RE.search(token)
     if not m:
@@ -407,11 +420,12 @@ def extract_korean_proper_noun_candidates(
 ) -> set[str]:
     """청크에서 한국어 고유명사 후보(stem) 를 추출한다.
 
-    - 4자 이상의 연속 한글 토큰을 정규식으로 후보화
+    - 3자 이상의 연속 한글 토큰을 정규식으로 후보화 (S2 보강 — 3자 고유명사
+      "결제팀", "주문봇" 등 포함)
     - 후행 조사를 1회 제거해 stem 으로 정규화 ("결제한도서비스는" → "결제한도서비스")
     - 청크 내 stem 빈도 ``max_freq`` 이하 (= 고유명사 가능성 높음)
     - stem 이 ``_KOREAN_COMMON_NOUNS`` 화이트리스트면 제외
-    - stem 길이 4자 이상만 유지
+    - stem 길이 3자 이상만 유지 (S2 — v2의 4자 컷오프 완화)
 
     누출 검사용 후보 — 한국어 토큰은 조사가 풍부해 단순 토큰 매칭이 실패하므로
     stem 매칭이 필수다.
@@ -420,7 +434,7 @@ def extract_korean_proper_noun_candidates(
     for m in _KOREAN_NOUN_RE.finditer(text):
         tok = m.group(0)
         stem = _strip_korean_josa(tok)
-        if len(stem) < 4:
+        if len(stem) < 3:
             continue
         if stem in _KOREAN_COMMON_NOUNS:
             continue
@@ -608,16 +622,28 @@ async def generate_questions(
     generator: LLMClient,
     reasoning_mode: str | None = "off",
     max_tokens: int = 1024,
+    temperature: float = 0.0,
+    seed: int | None = None,
 ) -> list[GeneratedQuestion]:
-    """Generator LLM 에 청크를 보여주고 질문 N개를 생성 요청한다."""
+    """Generator LLM 에 청크를 보여주고 질문 N개를 생성 요청한다.
+
+    Args:
+        temperature: 샘플링 온도. 기본 0.0 (결정적). 다양성 폭 확대가 필요하면
+            CLI 옵션으로 0.7 같은 값을 지정 — 단 재현성 손실 트레이드오프.
+        seed: 결정성용 seed. endpoint 가 지원하면 전달 (vLLM/OpenAI 호환). 같은
+            seed + temperature + 입력 → 같은 응답 (best-effort, model fingerprint
+            보장 아님).
+    """
     prompt = GENERATE_PROMPT_TEMPLATE.format(chunk_content=chunk_content, n=n)
-    text = await generator.complete(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=0.7,
-        reasoning_mode=reasoning_mode,
-        purpose="goldset_generate",
-    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_generate",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await generator.complete(prompt, **call_kwargs)
     return parse_generated_questions(text)
 
 
@@ -628,6 +654,8 @@ async def generate_graph_questions(
     generator: LLMClient,
     reasoning_mode: str | None = "off",
     max_tokens: int = 1024,
+    temperature: float = 0.0,
+    seed: int | None = None,
 ) -> list[GeneratedGraphQuestion]:
     """그래프 subgraph 에서 질문 N개 생성.
 
@@ -642,6 +670,8 @@ async def generate_graph_questions(
         generator: Generator LLM.
         reasoning_mode: 추론 프로파일 (chunk 모드와 동일).
         max_tokens: 응답 최대 토큰.
+        temperature: 샘플링 온도 (기본 0.0, 재현성 우선).
+        seed: 결정성용 seed (endpoint 지원 시 전달).
     """
     prompt = GRAPH_GENERATE_PROMPT_TEMPLATE.format(
         entity_name=subgraph.get("entity_name", ""),
@@ -650,13 +680,15 @@ async def generate_graph_questions(
         edges_text=format_edges_for_prompt(subgraph.get("edges") or []),
         n=n,
     )
-    text = await generator.complete(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=0.7,
-        reasoning_mode=reasoning_mode,
-        purpose="goldset_generate_graph",
-    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_generate_graph",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await generator.complete(prompt, **call_kwargs)
     return parse_generated_graph_questions(text)
 
 
