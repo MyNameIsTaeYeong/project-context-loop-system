@@ -153,7 +153,7 @@ items:
         relation_type: "depends_on"
         description: "결제 서비스는 주문 서비스에 의존한다"
         description_embedding: [0.034, 0.011, -0.087, ...]
-    source_type: "confluence"
+    source_type: "confluence_mcp"
     source_document_id: 42
     difficulty: "easy"
     synthesized: true

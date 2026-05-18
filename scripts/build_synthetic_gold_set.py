@@ -32,14 +32,14 @@ Generator/Judge 분리 (편향 회피, 권장)::
 source_type 제한, 시드 고정 (재현성)::
 
     python scripts/build_synthetic_gold_set.py \\
-        --source-types git_code,confluence \\
+        --source-types git_code,confluence_mcp \\
         --seed 42 \\
         --output eval/gold_set.yaml
 
 그래프 기반 질문 포함 (R1 — chunk + graph 평가)::
 
     python scripts/build_synthetic_gold_set.py \\
-        --source-types confluence,git_code \\
+        --source-types confluence_mcp,git_code \\
         --include-graph-questions \\
         --n-graph-nodes 20 \\
         --output eval/gold_set.yaml
@@ -804,7 +804,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--source-types", default="",
-        help="쉼표로 구분된 source_type 화이트리스트 (예: 'git_code,confluence'). 빈 값이면 전체.",
+        help="쉼표로 구분된 source_type 화이트리스트 (예: 'git_code,confluence_mcp'). 빈 값이면 전체.",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
