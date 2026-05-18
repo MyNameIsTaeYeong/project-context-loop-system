@@ -534,6 +534,7 @@ async def aembed_with_client(
 __all__ = [
     "DEFAULT_GRAPH_MATCH_THRESHOLD",
     "MATCH_TIERS",
+    "EmbedFn",
     "MatchReport",
     "MatchResult",
     "aembed_with_client",

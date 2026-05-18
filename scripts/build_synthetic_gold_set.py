@@ -326,6 +326,7 @@ async def build(
     graph_match_threshold: float = DEFAULT_GRAPH_MATCH_THRESHOLD,
     embedding_client: Any | None = None,
     embedding_model_id: str = "",
+    concurrency: int = 1,
 ) -> GoldSet:
     """전체 파이프라인 실행.
 
@@ -340,6 +341,10 @@ async def build(
         embedding_client: graph 임베딩 계산용 클라이언트. ``None`` 이면
             임베딩 미계산.
         embedding_model_id: 골드셋 metadata 에 기록할 임베딩 모델 ID.
+
+    3차 추가 파라미터:
+        concurrency: 항목(chunk/subgraph) 단위 동시 처리 수. 1 이면 직렬.
+            LLM endpoint 의 rate limit 에 맞춰 사용자가 명시 (보통 4~8).
     """
 
     rng = random.Random(seed)
@@ -384,93 +389,34 @@ async def build(
             "fail_leakage": 0,
             "fail_generic": 0,
             "fail_parse": 0,
+            "fail_runtime": 0,
             "graph_generated": 0,
             "graph_passed": 0,
         }
 
-        for i, chunk in enumerate(sampled):
-            logger.info(
-                "[%d/%d] 질문 생성 — doc=%d, chunk_index=%d, source_type=%s",
-                i + 1, len(sampled), chunk["document_id"],
-                chunk["chunk_index"], chunk["source_type"],
-            )
+        effective_concurrency = max(1, concurrency)
+        sem = asyncio.Semaphore(effective_concurrency)
 
-            generated = await generate_questions(
-                chunk["content"],
-                n=questions_per_chunk,
-                generator=generator,
-                reasoning_mode=reasoning_mode,
-            )
-            stats["generated"] += len(generated)
-
-            if not generated:
-                logger.warning("  → 생성 실패 (빈 응답)")
-                stats["fail_parse"] += 1
-                continue
-
-            # distractor 는 같은 source_type 내에서 우선 골라야 식별자 충돌이 적다
-            same_type_distractors = [
-                c for c in distractor_pool
-                if c["source_type"] == chunk["source_type"]
-            ][:n_distractors]
-            if len(same_type_distractors) < n_distractors:
-                # 부족하면 다른 type 으로 채움
-                fill = [c for c in distractor_pool if c not in same_type_distractors]
-                same_type_distractors += fill[: n_distractors - len(same_type_distractors)]
-
-            anchor = make_text_anchor(chunk["content"])
-
-            for j, gq in enumerate(generated):
-                if not apply_filter:
-                    items.append(GoldItem(
-                        id=f"q{len(items) + 1:04d}",
-                        query=gq.query,
-                        relevant_doc_ids=[chunk["document_id"]],
-                        source_type=chunk["source_type"],
-                        source_document_id=chunk["document_id"],
-                        source_text_anchor=anchor,
-                        source_section_path=chunk["section_path"],
-                        difficulty=gq.difficulty,
-                        synthesized=True,
-                    ))
-                    stats["passed"] += 1
-                    continue
-
-                report = await filter_question(
-                    gq.query,
-                    chunk["content"],
-                    [d["content"] for d in same_type_distractors],
-                    judge=judge,
-                    reasoning_mode=reasoning_mode,
-                )
-                if not report.passed:
-                    key = f"fail_{report.reason}" if report.reason else "fail_parse"
-                    stats[key] = stats.get(key, 0) + 1
-                    logger.info(
-                        "  q%d 탈락 — reason=%s, query=%s",
-                        j + 1, report.reason, gq.query[:80],
-                    )
-                    continue
-
-                items.append(GoldItem(
-                    id=f"q{len(items) + 1:04d}",
-                    query=gq.query,
-                    relevant_doc_ids=[chunk["document_id"]],
-                    source_type=chunk["source_type"],
-                    source_document_id=chunk["document_id"],
-                    source_text_anchor=anchor,
-                    source_section_path=chunk["section_path"],
-                    difficulty=gq.difficulty,
-                    synthesized=True,
-                ))
-                stats["passed"] += 1
-                logger.info(
-                    "  q%d 통과 — query=%s", j + 1, gq.query[:80],
-                )
+        # next_id 는 chunk 모드 → graph 모드로 연속 부여한다 (D-3).
+        next_id = 1
+        next_id = await _run_chunk_mode(
+            sampled=sampled,
+            distractor_pool=distractor_pool,
+            generator=generator,
+            judge=judge,
+            questions_per_chunk=questions_per_chunk,
+            n_distractors=n_distractors,
+            reasoning_mode=reasoning_mode,
+            apply_filter=apply_filter,
+            sem=sem,
+            items=items,
+            stats=stats,
+            next_id=next_id,
+        )
 
         # 그래프 모드 실행 — chunk 모드 이후에 머지
         if enable_graph_mode and graph_store is not None:
-            await _run_graph_mode(
+            next_id = await _run_graph_mode(
                 meta_store=store,
                 graph_store=graph_store,
                 source_types=source_types,
@@ -488,6 +434,8 @@ async def build(
                 score_relations=score_relations,
                 embed_evidence=embed_graph_evidence,
                 embedding_client=embedding_client,
+                sem=sem,
+                next_id=next_id,
             )
 
         generation_modes = ["chunk"]
@@ -502,6 +450,7 @@ async def build(
             "seed": seed,
             "source_types": source_types or [],
             "generation_modes": generation_modes,
+            "concurrency": effective_concurrency,
             "stats": stats,
         }
         if enable_graph_mode:
@@ -524,6 +473,267 @@ async def build(
         await store.close()
 
 
+async def _process_chunk_item(
+    idx: int,
+    chunk: dict[str, Any],
+    *,
+    distractor_pool: list[dict[str, Any]],
+    generator: LLMClient,
+    judge: LLMClient,
+    questions_per_chunk: int,
+    n_distractors: int,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    sem: asyncio.Semaphore,
+    total: int,
+) -> tuple[list[GoldItem], dict[str, int]]:
+    """chunk 1개 처리 — LLM 생성·게이트를 수행하고 (items, local_stats) 반환.
+
+    id 는 호출자가 gather 완료 후 idx 순서로 부여하므로 여기서는 ``id=""``.
+    distractor_pool 은 read-only 공유 (D-7) — 슬라이싱만 사용한다.
+    """
+    async with sem:
+        logger.info(
+            "[chunk start %d/%d] doc=%d, chunk_index=%d, source_type=%s",
+            idx, total, chunk["document_id"],
+            chunk["chunk_index"], chunk["source_type"],
+        )
+        local_items: list[GoldItem] = []
+        local_stats: dict[str, int] = {}
+
+        generated = await generate_questions(
+            chunk["content"],
+            n=questions_per_chunk,
+            generator=generator,
+            reasoning_mode=reasoning_mode,
+        )
+        local_stats["generated"] = local_stats.get("generated", 0) + len(generated)
+
+        if not generated:
+            logger.warning("  → 생성 실패 (빈 응답)")
+            local_stats["fail_parse"] = local_stats.get("fail_parse", 0) + 1
+            logger.info("[chunk done %d/%d]", idx, total)
+            return local_items, local_stats
+
+        # distractor 는 같은 source_type 내에서 우선 골라야 식별자 충돌이 적다.
+        same_type_distractors = [
+            c for c in distractor_pool
+            if c["source_type"] == chunk["source_type"]
+        ][:n_distractors]
+        if len(same_type_distractors) < n_distractors:
+            fill = [c for c in distractor_pool if c not in same_type_distractors]
+            same_type_distractors += fill[: n_distractors - len(same_type_distractors)]
+
+        anchor = make_text_anchor(chunk["content"])
+
+        for j, gq in enumerate(generated):
+            if not apply_filter:
+                local_items.append(GoldItem(
+                    id="",
+                    query=gq.query,
+                    relevant_doc_ids=[chunk["document_id"]],
+                    source_type=chunk["source_type"],
+                    source_document_id=chunk["document_id"],
+                    source_text_anchor=anchor,
+                    source_section_path=chunk["section_path"],
+                    difficulty=gq.difficulty,
+                    synthesized=True,
+                ))
+                local_stats["passed"] = local_stats.get("passed", 0) + 1
+                continue
+
+            report = await filter_question(
+                gq.query,
+                chunk["content"],
+                [d["content"] for d in same_type_distractors],
+                judge=judge,
+                reasoning_mode=reasoning_mode,
+            )
+            if not report.passed:
+                key = f"fail_{report.reason}" if report.reason else "fail_parse"
+                local_stats[key] = local_stats.get(key, 0) + 1
+                logger.info(
+                    "  q%d 탈락 — reason=%s, query=%s",
+                    j + 1, report.reason, gq.query[:80],
+                )
+                continue
+
+            local_items.append(GoldItem(
+                id="",
+                query=gq.query,
+                relevant_doc_ids=[chunk["document_id"]],
+                source_type=chunk["source_type"],
+                source_document_id=chunk["document_id"],
+                source_text_anchor=anchor,
+                source_section_path=chunk["section_path"],
+                difficulty=gq.difficulty,
+                synthesized=True,
+            ))
+            local_stats["passed"] = local_stats.get("passed", 0) + 1
+            logger.info(
+                "  q%d 통과 — query=%s", j + 1, gq.query[:80],
+            )
+
+        logger.info("[chunk done %d/%d]", idx, total)
+        return local_items, local_stats
+
+
+async def _run_chunk_mode(
+    *,
+    sampled: list[dict[str, Any]],
+    distractor_pool: list[dict[str, Any]],
+    generator: LLMClient,
+    judge: LLMClient,
+    questions_per_chunk: int,
+    n_distractors: int,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    sem: asyncio.Semaphore,
+    items: list[GoldItem],
+    stats: dict[str, int],
+    next_id: int,
+) -> int:
+    """sampled chunk 들을 동시 처리하고 결과를 items 에 합친다.
+
+    Returns: 다음 idx 에 사용될 ``next_id`` (graph 모드와 연속).
+    """
+    total = len(sampled)
+    tasks = [
+        _process_chunk_item(
+            idx, chunk,
+            distractor_pool=distractor_pool,
+            generator=generator,
+            judge=judge,
+            questions_per_chunk=questions_per_chunk,
+            n_distractors=n_distractors,
+            reasoning_mode=reasoning_mode,
+            apply_filter=apply_filter,
+            sem=sem,
+            total=total,
+        )
+        for idx, chunk in enumerate(sampled, start=1)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for idx, r in enumerate(results, start=1):
+        if isinstance(r, BaseException):
+            logger.exception(
+                "[chunk fail %d/%d] %s", idx, total, r,
+                exc_info=r if isinstance(r, Exception) else None,
+            )
+            stats["fail_runtime"] = stats.get("fail_runtime", 0) + 1
+            continue
+        local_items, local_stats = r
+        for item in local_items:
+            item.id = f"q{next_id:04d}"
+            items.append(item)
+            next_id += 1
+        _merge_stats(stats, local_stats)
+    return next_id
+
+
+def _merge_stats(target: dict[str, int], local: dict[str, int]) -> None:
+    """LocalStats dict 를 main stats 에 더한다 (동적 키 포함)."""
+    for k, v in local.items():
+        target[k] = target.get(k, 0) + v
+
+
+async def _process_subgraph_item(
+    idx: int,
+    sg: dict[str, Any],
+    *,
+    distractor_pool: list[dict[str, Any]],
+    skip_generic_gate: bool,
+    generator: LLMClient,
+    judge: LLMClient,
+    questions_per_chunk: int,
+    n_distractors: int,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    score_relations: bool,
+    sem: asyncio.Semaphore,
+    total: int,
+) -> tuple[list[GoldItem], dict[str, int]]:
+    """subgraph 1개 처리 — graph 질문 생성·게이트.
+
+    id 는 호출자가 후처리에서 부여 — placeholder ``id=""``.
+    """
+    async with sem:
+        logger.info(
+            "[graph start %d/%d] entity=%s (%s), source_type=%s",
+            idx, total, sg["entity_name"], sg["entity_type"],
+            sg["source_type"],
+        )
+        local_items: list[GoldItem] = []
+        local_stats: dict[str, int] = {}
+
+        generated = await generate_graph_questions(
+            sg,
+            n=questions_per_chunk,
+            generator=generator,
+            reasoning_mode=reasoning_mode,
+        )
+        local_stats["graph_generated"] = local_stats.get("graph_generated", 0) + len(generated)
+        local_stats["generated"] = local_stats.get("generated", 0) + len(generated)
+
+        if not generated:
+            logger.warning("  → 그래프 생성 실패 (빈 응답)")
+            local_stats["fail_parse"] = local_stats.get("fail_parse", 0) + 1
+            logger.info("[graph done %d/%d]", idx, total)
+            return local_items, local_stats
+
+        same_type_distractors = [
+            s for s in distractor_pool if s["source_type"] == sg["source_type"]
+        ][:n_distractors]
+        if len(same_type_distractors) < n_distractors:
+            fill = [s for s in distractor_pool if s not in same_type_distractors]
+            same_type_distractors += fill[
+                : n_distractors - len(same_type_distractors)
+            ]
+
+        distractor_snippets = (
+            [] if skip_generic_gate
+            else [d["subgraph_snippet"] for d in same_type_distractors]
+        )
+
+        for j, gq in enumerate(generated):
+            if not apply_filter:
+                local_items.append(_make_graph_gold_item(
+                    sg, gq, score_relations=score_relations,
+                ))
+                local_stats["passed"] = local_stats.get("passed", 0) + 1
+                local_stats["graph_passed"] = local_stats.get("graph_passed", 0) + 1
+                continue
+
+            report = await filter_question(
+                gq.query,
+                sg["subgraph_snippet"],
+                distractor_snippets,
+                judge=judge,
+                reasoning_mode=reasoning_mode,
+            )
+            if not report.passed:
+                key = f"fail_{report.reason}" if report.reason else "fail_parse"
+                local_stats[key] = local_stats.get(key, 0) + 1
+                logger.info(
+                    "  graph q%d 탈락 — reason=%s, query=%s",
+                    j + 1, report.reason, gq.query[:80],
+                )
+                continue
+
+            local_items.append(_make_graph_gold_item(
+                sg, gq, score_relations=score_relations,
+            ))
+            local_stats["passed"] = local_stats.get("passed", 0) + 1
+            local_stats["graph_passed"] = local_stats.get("graph_passed", 0) + 1
+            logger.info(
+                "  graph q%d 통과 — query=%s", j + 1, gq.query[:80],
+            )
+
+        logger.info("[graph done %d/%d]", idx, total)
+        return local_items, local_stats
+
+
 async def _run_graph_mode(
     *,
     meta_store: MetadataStore,
@@ -543,8 +753,13 @@ async def _run_graph_mode(
     score_relations: bool = False,
     embed_evidence: bool = True,
     embedding_client: Any | None = None,
-) -> None:
-    """graph 모드 — subgraph 샘플링 후 질문 생성·게이트 적용."""
+    sem: asyncio.Semaphore | None = None,
+    next_id: int = 1,
+) -> int:
+    """graph 모드 — subgraph 샘플링 후 질문 생성·게이트 적용.
+
+    Returns: 다음에 부여될 ``next_id`` (chunk + graph 연속 공간).
+    """
     subgraphs = await load_candidate_subgraphs(
         meta_store,
         graph_store,
@@ -557,7 +772,7 @@ async def _run_graph_mode(
             "그래프 후보가 0개 — 인덱싱된 graph_nodes 가 없거나 source_type 필터에 "
             "매칭되지 않습니다. graph 모드를 건너뜁니다.",
         )
-        return
+        return next_id
 
     sampled_sg = stratified_sample(
         subgraphs, n_total=n_graph_nodes, key="source_type", rng=rng,
@@ -584,84 +799,55 @@ async def _run_graph_mode(
             "graph distractor 풀이 5개 미만 — 일반성 게이트 신뢰도가 낮습니다.",
         )
 
-    for i, sg in enumerate(sampled_sg):
-        logger.info(
-            "[graph %d/%d] 질문 생성 — entity=%s (%s), source_type=%s",
-            i + 1, len(sampled_sg), sg["entity_name"], sg["entity_type"],
-            sg["source_type"],
-        )
+    # sem 미지정 시 직렬 동작 (보호 — 단독 호출자 호환).
+    if sem is None:
+        sem = asyncio.Semaphore(1)
 
-        generated = await generate_graph_questions(
-            sg,
-            n=questions_per_chunk,
+    total = len(sampled_sg)
+    tasks = [
+        _process_subgraph_item(
+            idx, sg,
+            distractor_pool=distractor_pool,
+            skip_generic_gate=skip_generic_gate,
             generator=generator,
+            judge=judge,
+            questions_per_chunk=questions_per_chunk,
+            n_distractors=n_distractors,
             reasoning_mode=reasoning_mode,
+            apply_filter=apply_filter,
+            score_relations=score_relations,
+            sem=sem,
+            total=total,
         )
-        stats["graph_generated"] += len(generated)
-        stats["generated"] += len(generated)
+        for idx, sg in enumerate(sampled_sg, start=1)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        if not generated:
-            logger.warning("  → 그래프 생성 실패 (빈 응답)")
-            stats["fail_parse"] += 1
+    for idx, r in enumerate(results, start=1):
+        if isinstance(r, BaseException):
+            logger.exception(
+                "[graph fail %d/%d] %s", idx, total, r,
+                exc_info=r if isinstance(r, Exception) else None,
+            )
+            stats["fail_runtime"] = stats.get("fail_runtime", 0) + 1
             continue
-
-        same_type_distractors = [
-            s for s in distractor_pool if s["source_type"] == sg["source_type"]
-        ][:n_distractors]
-        if len(same_type_distractors) < n_distractors:
-            fill = [s for s in distractor_pool if s not in same_type_distractors]
-            same_type_distractors += fill[
-                : n_distractors - len(same_type_distractors)
-            ]
-
-        distractor_snippets = (
-            [] if skip_generic_gate
-            else [d["subgraph_snippet"] for d in same_type_distractors]
-        )
-
-        for j, gq in enumerate(generated):
-            if not apply_filter:
-                items.append(_make_graph_gold_item(
-                    sg, gq, items, score_relations=score_relations,
-                ))
-                stats["passed"] += 1
-                stats["graph_passed"] += 1
-                continue
-
-            report = await filter_question(
-                gq.query,
-                sg["subgraph_snippet"],
-                distractor_snippets,
-                judge=judge,
-                reasoning_mode=reasoning_mode,
-            )
-            if not report.passed:
-                key = f"fail_{report.reason}" if report.reason else "fail_parse"
-                stats[key] = stats.get(key, 0) + 1
-                logger.info(
-                    "  graph q%d 탈락 — reason=%s, query=%s",
-                    j + 1, report.reason, gq.query[:80],
-                )
-                continue
-
-            items.append(_make_graph_gold_item(
-                sg, gq, items, score_relations=score_relations,
-            ))
-            stats["passed"] += 1
-            stats["graph_passed"] += 1
-            logger.info(
-                "  graph q%d 통과 — query=%s", j + 1, gq.query[:80],
-            )
+        local_items, local_stats = r
+        for item in local_items:
+            item.id = f"q{next_id:04d}"
+            items.append(item)
+            next_id += 1
+        _merge_stats(stats, local_stats)
 
     # 모든 graph 항목 생성 후 description 임베딩을 배치로 계산하여 채운다.
     if embed_evidence:
         await _embed_graph_item_descriptions(items, embedding_client)
 
+    return next_id
+
 
 def _make_graph_gold_item(
     sg: dict[str, Any],
     gq: GeneratedGraphQuestion,
-    existing_items: list[GoldItem],
     *,
     score_relations: bool = False,
 ) -> GoldItem:
@@ -672,6 +858,9 @@ def _make_graph_gold_item(
     ``evidence_description`` / ``entity_aliases`` 를 함께 저장하고,
     ``score_relations`` 가 True 면 ``relation`` 도 ``GraphRelationRef`` 로
     emit 한다. ``description_embedding`` 은 호출자가 배치 임베딩 후 채운다.
+
+    3차 변경: ``id`` 는 placeholder ``""`` 로 두고, ``_run_chunk_mode`` /
+    ``_run_graph_mode`` 가 gather 완료 후 idx 순으로 부여한다 (D-3).
     """
     # 그래프 노드 자체 description 을 fallback evidence 로 사용.
     description = gq.evidence_description or str(sg.get("entity_description") or "")
@@ -695,7 +884,7 @@ def _make_graph_gold_item(
         ))
 
     return GoldItem(
-        id=f"q{len(existing_items) + 1:04d}",
+        id="",
         query=gq.query,
         relevant_doc_ids=list(sg["document_ids"]),
         relevant_graph_entities=[entity_ref],
@@ -890,10 +1079,22 @@ def main() -> None:
              "그것도 비면 llm.headers.",
     )
 
+    # 3차 — 항목 단위 병렬 처리 (R1).
+    parser.add_argument(
+        "--concurrency", type=int, default=1,
+        help="항목(chunk/subgraph) 단위 동시 처리 수 (기본 1, 직렬). "
+             "LLM endpoint rate limit 에 맞춰 4~8 권장. metadata 에 기록.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
     _setup_logging(args.verbose)
+
+    if args.concurrency > 32:
+        logger.warning(
+            "--concurrency=%d 는 endpoint rate limit 초과 위험. 4~8 권장.",
+            args.concurrency,
+        )
 
     config = Config(config_path=Path(args.config) if args.config else None)
 
@@ -986,6 +1187,7 @@ def main() -> None:
                 graph_match_threshold=float(args.graph_match_threshold),
                 embedding_client=embedding_client,
                 embedding_model_id=embedding_model_id,
+                concurrency=int(args.concurrency),
             )
 
     asyncio.run(_run_all())

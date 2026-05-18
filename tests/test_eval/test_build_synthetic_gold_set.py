@@ -433,7 +433,7 @@ def test_make_graph_gold_item_emits_aliases_and_description() -> None:
     )
 
     item = builder._make_graph_gold_item(
-        subgraph, gq, existing_items=[], score_relations=True,
+        subgraph, gq, score_relations=True,
     )
     entity = item.relevant_graph_entities[0]
     assert entity.name == "결제 서비스"
@@ -471,7 +471,7 @@ def test_make_graph_gold_item_skips_relation_when_disabled() -> None:
         ),
     )
     item = builder._make_graph_gold_item(
-        subgraph, gq, existing_items=[], score_relations=False,
+        subgraph, gq, score_relations=False,
     )
     assert item.relevant_graph_relations == []
 
@@ -490,7 +490,7 @@ def test_make_graph_gold_item_falls_back_to_node_description() -> None:
     }
     gq = GeneratedGraphQuestion(query="?", evidence_description="")
     item = builder._make_graph_gold_item(
-        subgraph, gq, existing_items=[], score_relations=False,
+        subgraph, gq, score_relations=False,
     )
     assert item.relevant_graph_entities[0].description == "노드 자체 설명"
 
@@ -598,6 +598,8 @@ def test_cli_exposes_new_options() -> None:
     assert "--embed-graph-evidence" in source
     assert "--score-relations" in source
     assert "--graph-match-threshold" in source
+    # 3차 — 항목 단위 병렬 처리 CLI.
+    assert "--concurrency" in source
 
 
 def test_eval_search_cli_exposes_new_options() -> None:
@@ -610,3 +612,31 @@ def test_eval_search_cli_exposes_new_options() -> None:
     assert "--graph-match-threshold" in source
     assert "--graph-match-strict" in source
     assert "--score-relations" in source
+    # 3차 — 항목 단위 병렬 처리 CLI.
+    assert "--concurrency" in source
+
+
+# ---------------------------------------------------------------------------
+# 3차 — _merge_stats 단위 테스트
+# ---------------------------------------------------------------------------
+
+
+def test_merge_stats_adds_known_and_dynamic_keys() -> None:
+    """_merge_stats 가 알려진 키 + 동적 키 모두를 합산한다."""
+    target: dict[str, int] = {"generated": 1, "passed": 2}
+    local: dict[str, int] = {
+        "generated": 3, "passed": 1, "fail_demonstrative": 1, "fail_runtime": 0,
+    }
+    builder._merge_stats(target, local)
+    assert target["generated"] == 4
+    assert target["passed"] == 3
+    # 동적 키도 신규 생성.
+    assert target["fail_demonstrative"] == 1
+    assert target["fail_runtime"] == 0
+
+
+def test_merge_stats_empty_local_noop() -> None:
+    """빈 local 은 target 을 변경하지 않는다."""
+    target: dict[str, int] = {"generated": 5}
+    builder._merge_stats(target, {})
+    assert target == {"generated": 5}

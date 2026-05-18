@@ -52,6 +52,7 @@ from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
 from context_loop.eval.graph_match import (  # noqa: E402
     DEFAULT_GRAPH_MATCH_THRESHOLD,
+    EmbedFn,
     aggregate_tier_counts,
     build_embed_fn,
     run_entity_matching,
@@ -170,6 +171,7 @@ async def evaluate_one(
     include_graph: bool,
     judge: LLMClient | None,
     reasoning_mode: str | None,
+    embed_fn: EmbedFn,
     graph_match_threshold: float = DEFAULT_GRAPH_MATCH_THRESHOLD,
     graph_match_strict: bool = False,
     score_relations: bool = False,
@@ -180,6 +182,10 @@ async def evaluate_one(
     2차: graph entity 채점에 4-tier cascade 매칭을 사용하여 entity_type 명
     변경 / 표기 정규화 / 동의어 / 의미 매칭에 강건. 관계 채점은
     ``score_relations`` 옵션으로 활성화.
+
+    3차: ``embed_fn`` 을 외부에서 주입받는다. 항목 동시 평가 시 캐시 효과를
+    보존하기 위해 ``_evaluate_gold_set`` 가 1회만 빌드하여 모든 항목에
+    공유한다 (D-7).
     """
     start = time.perf_counter()
     assembled: AssembledContext = await assemble_context_with_sources(
@@ -204,10 +210,7 @@ async def evaluate_one(
     relevant = set(item.relevant_doc_ids)
 
     # graph-level 채점 — 4-tier cascade (exact → alias → normalize → embedding).
-    # 임베딩 단계의 비용 통제는 LRU 캐시 embed_fn 으로 흡수.
-    embed_fn = build_embed_fn(
-        embedding_client, model_id=embedding_model_id,
-    )
+    # 임베딩 단계의 비용 통제는 외부 주입된 LRU 캐시 embed_fn 으로 흡수.
     entity_report = run_entity_matching(
         item.relevant_graph_entities,
         list(assembled.retrieved_graph_entities),
@@ -601,44 +604,102 @@ async def _evaluate_gold_set(
     logger.info("골드셋 채점 시작 — file=%s, n=%d, label=%s",
                 gold_path, len(gold.items), label)
 
-    rows: list[dict[str, Any]] = []
-    for i, item in enumerate(gold.items):
-        logger.info(
-            "[%s | %d/%d] q=%s | gold_doc=%s",
-            label, i + 1, len(gold.items), item.id, item.relevant_doc_ids,
-        )
+    # 3차 (D-7): embed_fn 을 1회 빌드하여 모든 항목에 공유 — 동시 평가 시
+    # LRU 캐시 효과 보존.
+    embed_fn = build_embed_fn(embedding_client, model_id=embedding_model_id)
+
+    # 3차 (D-7): graph_store.build_entity_embeddings 를 항목 평가 시작 전에
+    # 1회 호출 — 동시 평가 시 중복 build race 회피.
+    if args.include_graph and graph_store.entity_embedding_count == 0:
+        logger.info("entity embedding 사전 빌드 시작")
         try:
-            row = await evaluate_one(
-                item,
-                meta_store=meta_store,
-                vector_store=vector_store,
-                graph_store=graph_store,
-                embedding_client=embedding_client,
-                llm_client=llm_client if args.include_graph else None,
-                reranker_client=reranker_client,
-                top_k=args.top_k,
-                max_chunks=args.max_chunks,
-                similarity_threshold=similarity_threshold,
-                rerank_enabled=rerank_enabled,
-                rerank_top_k=rerank_top_k,
-                rerank_score_threshold=rerank_score_threshold,
-                hyde_enabled=hyde_enabled,
-                include_graph=args.include_graph,
-                judge=judge,
-                reasoning_mode=args.reasoning_mode,
-                graph_match_threshold=args.graph_match_threshold,
-                graph_match_strict=args.graph_match_strict,
-                score_relations=args.score_relations,
-                embedding_model_id=embedding_model_id,
+            await graph_store.build_entity_embeddings(embedding_client)
+            logger.info(
+                "entity embedding 사전 빌드 완료 — count=%d",
+                graph_store.entity_embedding_count,
             )
-            rows.append(row)
-        except Exception as exc:
-            logger.exception("질의 %s 실패: %s", item.id, exc)
+        except Exception:
+            logger.warning(
+                "entity embedding 사전 빌드 실패 — 항목 평가 중 lazy 빌드 시도.",
+                exc_info=True,
+            )
+
+    effective_concurrency = max(1, int(getattr(args, "concurrency", 1) or 1))
+    sem = asyncio.Semaphore(effective_concurrency)
+    total = len(gold.items)
+    completed = 0
+
+    async def _process_item(idx: int, item: GoldItem) -> dict[str, Any]:
+        nonlocal completed
+        async with sem:
+            logger.info(
+                "[%s start %d/%d] q=%s | gold_doc=%s",
+                label, idx, total, item.id, item.relevant_doc_ids,
+            )
+            try:
+                row = await evaluate_one(
+                    item,
+                    meta_store=meta_store,
+                    vector_store=vector_store,
+                    graph_store=graph_store,
+                    embedding_client=embedding_client,
+                    llm_client=llm_client if args.include_graph else None,
+                    reranker_client=reranker_client,
+                    top_k=args.top_k,
+                    max_chunks=args.max_chunks,
+                    similarity_threshold=similarity_threshold,
+                    rerank_enabled=rerank_enabled,
+                    rerank_top_k=rerank_top_k,
+                    rerank_score_threshold=rerank_score_threshold,
+                    hyde_enabled=hyde_enabled,
+                    include_graph=args.include_graph,
+                    judge=judge,
+                    reasoning_mode=args.reasoning_mode,
+                    embed_fn=embed_fn,
+                    graph_match_threshold=args.graph_match_threshold,
+                    graph_match_strict=args.graph_match_strict,
+                    score_relations=args.score_relations,
+                    embedding_model_id=embedding_model_id,
+                )
+                row["_idx"] = idx
+            except Exception as exc:
+                logger.exception("질의 %s 실패: %s", item.id, exc)
+                row = {
+                    "id": item.id,
+                    "query": item.query,
+                    "error": str(exc),
+                    "_idx": idx,
+                }
+            completed += 1
+            logger.info(
+                "[%s done %d/%d] (completed=%d) q=%s",
+                label, idx, total, completed, item.id,
+            )
+            return row
+
+    raw_results = await asyncio.gather(
+        *(_process_item(i, it) for i, it in enumerate(gold.items, start=1)),
+        return_exceptions=True,
+    )
+
+    rows: list[dict[str, Any]] = []
+    for idx, r in enumerate(raw_results, start=1):
+        if isinstance(r, BaseException):
+            # _process_item 안에서 잡혔어야 함 — 여기 도달하면 방어적 처리.
+            logger.error(
+                "예외가 _process_item 밖으로 새어 나옴: idx=%d, exc=%s", idx, r,
+            )
             rows.append({
-                "id": item.id,
-                "query": item.query,
-                "error": str(exc),
+                "id": f"_idx{idx}",
+                "error": str(r),
+                "_idx": idx,
             })
+        else:
+            rows.append(r)
+    # 사전 idx 순으로 정렬해 동시성에 무관한 결정론적 결과 순서를 회복.
+    rows.sort(key=lambda r: r.get("_idx", 0))
+    for r in rows:
+        r.pop("_idx", None)
 
     csv_path = out_dir / f"{label}.csv"
     summary_path = out_dir / f"{label}.summary.json"
@@ -735,6 +796,8 @@ async def run(args: argparse.Namespace) -> int:
         "graph_match_threshold": args.graph_match_threshold,
         "graph_match_strict": args.graph_match_strict,
         "score_relations": args.score_relations,
+        # 3차 — 동시성 메타 (재현 디버그용).
+        "concurrency": max(1, int(getattr(args, "concurrency", 1) or 1)),
     }
 
     out_dir = Path(args.output_dir)
@@ -955,10 +1018,23 @@ def main() -> None:
         help="관계(엣지) 채점 메트릭 (graph_rel_*) 을 산출한다 (기본 False). "
              "골드셋의 relevant_graph_relations 가 비어 있으면 효과 없음.",
     )
+    # 3차 — 항목 단위 병렬 처리 (R1).
+    parser.add_argument(
+        "--concurrency", type=int, default=1,
+        help="골드셋 내 항목 동시 처리 수 (기본 1, 직렬). "
+             "LLM endpoint rate limit 에 맞춰 4~8 권장. summary 에 기록.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
     _setup_logging(args.verbose)
+
+    if args.concurrency > 32:
+        logger.warning(
+            "--concurrency=%d 는 endpoint rate limit 초과 위험. 4~8 권장.",
+            args.concurrency,
+        )
+
     sys.exit(asyncio.run(run(args)))
 
 
