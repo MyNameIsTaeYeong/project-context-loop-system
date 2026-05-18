@@ -680,3 +680,17 @@ python3 -m uvicorn "context_loop.web.app:create_app" --factory --host 127.0.0.1 
 - **결정**: 무엇을 선택했는지
 - **이유**: 왜 이 선택을 했는지
 ```
+
+---
+
+## 하네스: 골드셋·평가 시스템 개선
+
+**목표:** `scripts/build_synthetic_gold_set.py`, `src/context_loop/eval/*`, `scripts/eval_search.py` 영역의 개선/확장/디버그 작업을 분석→설계→구현 3단계 에이전트 팀으로 수행한다.
+
+**트리거:** 골드셋 합성·평가 시스템의 변경/확장/버그 수정 요청 시 `eval-gold-set-improvement` 스킬을 사용하라. 단순 질문(예: "골드셋이 뭐야?")은 직접 응답 가능.
+
+**변경 이력:**
+
+| 날짜 | 변경 내용 | 대상 | 사유 |
+|------|---------|------|------|
+| 2026-05-18 | 초기 구성 (analyst / designer / implementer 3인 팀 + `eval-domain-knowledge` 공유 스킬 + `eval-gold-set-improvement` 오케스트레이터) | 전체 | 골드셋 chunk-size 강건성 + git_code/graph 평가 도입 |

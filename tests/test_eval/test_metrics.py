@@ -229,3 +229,44 @@ def test_aggregate_with_variance_zero_variance() -> None:
     out = aggregate_with_variance(runs)
     assert out["x"]["std"] == 0.0
     assert out["x"]["mean"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Generic 메트릭이 (name, type) 튜플 키로도 동작 (R1 — graph 채점)
+# ---------------------------------------------------------------------------
+
+
+def test_recall_at_k_works_with_tuple_keys() -> None:
+    """그래프 채점에서 (name.lower(), type) 튜플 키로 호출 가능."""
+    retrieved: list[tuple[str, str]] = [
+        ("인증 서비스", "system"),
+        ("결제 팀", "team"),
+        ("vpc", "concept"),
+    ]
+    relevant = {("인증 서비스", "system"), ("결제 팀", "team")}
+    assert recall_at_k(retrieved, relevant, k=3) == 1.0
+    assert precision_at_k(retrieved, relevant, k=3) == 2 / 3
+
+
+def test_mrr_works_with_tuple_keys() -> None:
+    retrieved: list[tuple[str, str]] = [
+        ("x", "system"),
+        ("인증 서비스", "system"),
+    ]
+    relevant = {("인증 서비스", "system")}
+    assert mrr(retrieved, relevant) == 0.5
+
+
+def test_hit_at_k_works_with_tuple_keys() -> None:
+    retrieved: list[tuple[str, str]] = [("a", "t"), ("b", "t")]
+    relevant = {("c", "t")}
+    assert hit_at_k(retrieved, relevant, k=2) is False
+    assert hit_at_k([("a", "t")], {("a", "t")}, k=1) is True
+
+
+def test_ndcg_at_k_works_with_tuple_keys() -> None:
+    retrieved: list[tuple[str, str]] = [("a", "system"), ("b", "team")]
+    relevant = {("b", "team")}
+    val = ndcg_at_k(retrieved, relevant, k=2)
+    expected = (1.0 / math.log2(3)) / 1.0
+    assert abs(val - expected) < 1e-9

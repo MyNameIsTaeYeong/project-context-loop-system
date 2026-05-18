@@ -12,16 +12,21 @@ from typing import Any
 import pytest
 
 from context_loop.eval.synth import (
+    GRAPH_GENERATE_PROMPT_TEMPLATE,
+    build_subgraph_snippet,
     extract_unique_tokens,
     filter_question,
+    format_edges_for_prompt,
+    generate_graph_questions,
     generate_questions,
     has_demonstrative_reference,
     has_identifier_leakage,
+    make_text_anchor,
+    parse_generated_graph_questions,
     parse_generated_questions,
     parse_yes_no,
     stratified_sample,
 )
-
 
 # ---------------------------------------------------------------------------
 # parse_generated_questions
@@ -452,3 +457,311 @@ async def test_filter_question_parse_error() -> None:
     )
     assert report.passed is False
     assert report.reason == "parse_error"
+
+
+# ---------------------------------------------------------------------------
+# make_text_anchor (R2)
+# ---------------------------------------------------------------------------
+
+
+def test_make_text_anchor_short_content() -> None:
+    """200자 미만이면 전체 본문 (whitespace 정규화)."""
+    anchor = make_text_anchor("한 줄 본문")
+    assert anchor == "한 줄 본문"
+
+
+def test_make_text_anchor_truncates_to_200() -> None:
+    """200자 초과 시 prefix 절단."""
+    content = "x" * 500
+    anchor = make_text_anchor(content)
+    assert len(anchor) == 200
+
+
+def test_make_text_anchor_normalizes_whitespace() -> None:
+    """연속 공백·줄바꿈은 단일 공백으로 정규화."""
+    content = "첫 줄  \n\n  둘째 줄\t\t셋째"
+    anchor = make_text_anchor(content)
+    assert anchor == "첫 줄 둘째 줄 셋째"
+
+
+def test_make_text_anchor_custom_length() -> None:
+    """max_chars 인자로 길이 조절 가능."""
+    anchor = make_text_anchor("a" * 100, max_chars=50)
+    assert len(anchor) == 50
+
+
+# ---------------------------------------------------------------------------
+# build_subgraph_snippet + format_edges_for_prompt (R1)
+# ---------------------------------------------------------------------------
+
+
+def test_build_subgraph_snippet_contains_entity_and_edges() -> None:
+    snippet = build_subgraph_snippet(
+        entity_name="인증 서비스",
+        entity_type="system",
+        entity_description="사내 인증 게이트웨이",
+        edges=[
+            {
+                "source_name": "인증 서비스",
+                "target_name": "플랫폼 팀",
+                "relation_type": "owned_by",
+            },
+        ],
+    )
+    assert "인증 서비스 (system)" in snippet
+    assert "사내 인증 게이트웨이" in snippet
+    assert "인증 서비스 --[owned_by]--> 플랫폼 팀" in snippet
+
+
+def test_build_subgraph_snippet_truncates_long_text() -> None:
+    """max_chars 초과 시 prefix 절단."""
+    snippet = build_subgraph_snippet(
+        entity_name="X",
+        entity_type="t",
+        entity_description="d" * 9000,
+        edges=[],
+        max_chars=100,
+    )
+    assert len(snippet) == 100
+
+
+def test_build_subgraph_snippet_no_edges() -> None:
+    snippet = build_subgraph_snippet(
+        entity_name="X",
+        entity_type="system",
+        entity_description="",
+        edges=[],
+    )
+    assert "엔티티: X (system)" in snippet
+    assert "주변 관계" not in snippet
+
+
+def test_format_edges_for_prompt_empty() -> None:
+    assert format_edges_for_prompt([]) == "(관계 없음)"
+
+
+def test_format_edges_for_prompt_deterministic_order() -> None:
+    """엣지 순서는 (source, relation, target) 정렬 — 결정론적."""
+    out1 = format_edges_for_prompt([
+        {"source_name": "B", "target_name": "C", "relation_type": "uses"},
+        {"source_name": "A", "target_name": "X", "relation_type": "calls"},
+    ])
+    out2 = format_edges_for_prompt([
+        {"source_name": "A", "target_name": "X", "relation_type": "calls"},
+        {"source_name": "B", "target_name": "C", "relation_type": "uses"},
+    ])
+    assert out1 == out2
+    # A 가 먼저
+    lines = out1.split("\n")
+    assert lines[0].startswith("- A --[calls]")
+
+
+# ---------------------------------------------------------------------------
+# generate_graph_questions (LLM stub, R1+R3)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_generate_prompt_template_slots() -> None:
+    """프롬프트 템플릿이 entity_name/type/edges/n 슬롯을 모두 가진다."""
+    rendered = GRAPH_GENERATE_PROMPT_TEMPLATE.format(
+        entity_name="결제 서비스",
+        entity_type="system",
+        entity_description="결제 처리 컴포넌트",
+        edges_text="- 결제 서비스 --[depends_on]--> 결제 게이트웨이",
+        n=3,
+    )
+    assert "결제 서비스 (system)" in rendered
+    assert "결제 처리 컴포넌트" in rendered
+    assert "결제 게이트웨이" in rendered
+    assert "3개" in rendered
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_parses_response() -> None:
+    """LLM stub 응답을 파싱해 GeneratedQuestion 리스트로 반환."""
+    stub = StubLLM([
+        '[{"q": "결제 서비스는 누가 운영?", "difficulty": "easy"}]'
+    ])
+    subgraph = {
+        "entity_name": "결제 서비스",
+        "entity_type": "system",
+        "entity_description": "결제 처리",
+        "edges": [
+            {
+                "source_name": "결제 서비스",
+                "target_name": "결제 팀",
+                "relation_type": "owned_by",
+            },
+        ],
+    }
+    questions = await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    assert len(questions) == 1
+    assert questions[0].query == "결제 서비스는 누가 운영?"
+    # 프롬프트에 엔티티 이름과 관계가 모두 들어갔는지
+    prompt = stub.calls[0]["prompt"]
+    assert "결제 서비스" in prompt
+    assert "owned_by" in prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_handles_missing_description() -> None:
+    """description 누락 시에도 정상 동작."""
+    stub = StubLLM(['[{"q": "X", "difficulty": "easy"}]'])
+    subgraph = {
+        "entity_name": "X",
+        "entity_type": "t",
+        "edges": [],
+    }
+    questions = await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    assert len(questions) == 1
+    assert "(설명 없음)" in stub.calls[0]["prompt"]
+
+
+@pytest.mark.parametrize("question", [
+    "이 엔티티는 무엇인가요?",
+    "이 노드의 역할은?",
+    "이 관계는 어떤 의미인가요?",
+    "What does this entity represent?",
+    "What is the purpose of this node?",
+])
+def test_has_demonstrative_reference_graph_patterns(question: str) -> None:
+    """그래프 포인터 표현도 차단된다 (W-10 — 게이트 일관성)."""
+    assert has_demonstrative_reference(question) is True
+
+
+@pytest.mark.asyncio
+async def test_filter_question_graph_demonstrative_fails() -> None:
+    """그래프 질문의 지시대명사도 demonstrative 게이트에서 탈락."""
+    judge = StubLLM(["yes"])  # answerable 만 통과
+    report = await filter_question(
+        question="이 노드의 역할은?",
+        source_chunk="엔티티: 결제 서비스 (system)",
+        distractors=["entity X (system)"],
+        judge=judge,  # type: ignore[arg-type]
+    )
+    assert report.passed is False
+    assert report.reason == "demonstrative"
+
+
+# ---------------------------------------------------------------------------
+# 2차 — parse_generated_graph_questions (확장 LLM 출력 파싱)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_generated_graph_questions_full() -> None:
+    """evidence_description / entity_aliases / relation 모두 파싱."""
+    text = """[
+        {
+            "q": "결제 서비스는 누구에 의존?",
+            "difficulty": "easy",
+            "evidence_description": "결제 서비스: 주문에 의존하는 결제 시스템",
+            "entity_aliases": ["Payment Service", "결제서비스"],
+            "relation": {
+                "source_name": "결제 서비스",
+                "target_name": "주문 서비스",
+                "relation_type": "depends_on",
+                "relation_description": "결제는 주문에 의존"
+            }
+        }
+    ]"""
+    qs = parse_generated_graph_questions(text)
+    assert len(qs) == 1
+    q = qs[0]
+    assert q.query == "결제 서비스는 누구에 의존?"
+    assert q.difficulty == "easy"
+    assert q.evidence_description == "결제 서비스: 주문에 의존하는 결제 시스템"
+    assert q.entity_aliases == ["Payment Service", "결제서비스"]
+    assert q.relation is not None
+    assert q.relation.source_name == "결제 서비스"
+    assert q.relation.target_name == "주문 서비스"
+    assert q.relation.relation_type == "depends_on"
+    assert q.relation.description == "결제는 주문에 의존"
+
+
+def test_parse_generated_graph_questions_minimal_backward_compat() -> None:
+    """1차 호환 — LLM 이 q 만 반환해도 다른 필드는 기본값."""
+    text = '[{"q": "그냥 질문", "difficulty": "medium"}]'
+    qs = parse_generated_graph_questions(text)
+    assert len(qs) == 1
+    q = qs[0]
+    assert q.query == "그냥 질문"
+    assert q.difficulty == "medium"
+    assert q.evidence_description == ""
+    assert q.entity_aliases == []
+    assert q.relation is None
+
+
+def test_parse_generated_graph_questions_invalid_relation_dropped() -> None:
+    """relation 의 필수 필드가 비면 None 처리."""
+    text = """[
+        {
+            "q": "X",
+            "relation": {"source_name": "A"}
+        }
+    ]"""
+    qs = parse_generated_graph_questions(text)
+    assert qs[0].relation is None
+
+
+def test_parse_generated_graph_questions_filters_non_string_aliases() -> None:
+    text = '[{"q": "X", "entity_aliases": ["good", 123, "", " spaced "]}]'
+    qs = parse_generated_graph_questions(text)
+    assert qs[0].entity_aliases == ["good", "spaced"]
+
+
+def test_parse_generated_graph_questions_invalid_json_returns_empty() -> None:
+    qs = parse_generated_graph_questions("not json")
+    assert qs == []
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_emits_evidence_and_aliases() -> None:
+    """generate_graph_questions 가 확장 출력을 그대로 노출."""
+    stub = StubLLM(["""[
+        {
+            "q": "결제 서비스 운영 팀은?",
+            "difficulty": "easy",
+            "evidence_description": "결제 서비스 운영 팀은 결제 팀이다",
+            "entity_aliases": ["Payment Service"]
+        }
+    ]"""])
+    subgraph = {
+        "entity_name": "결제 서비스",
+        "entity_type": "system",
+        "entity_description": "결제 처리 컴포넌트",
+        "edges": [
+            {
+                "source_name": "결제 서비스",
+                "target_name": "결제 팀",
+                "relation_type": "owned_by",
+            },
+        ],
+    }
+    questions = await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    assert len(questions) == 1
+    q = questions[0]
+    assert q.query == "결제 서비스 운영 팀은?"
+    assert q.evidence_description == "결제 서비스 운영 팀은 결제 팀이다"
+    assert q.entity_aliases == ["Payment Service"]
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_graceful_on_minimal_output() -> None:
+    """LLM 이 q 만 반환해도 (1차 호환) 파싱이 깨지지 않는다."""
+    stub = StubLLM(['[{"q": "X", "difficulty": "easy"}]'])
+    subgraph = {
+        "entity_name": "X", "entity_type": "t", "edges": [],
+    }
+    questions = await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    assert len(questions) == 1
+    assert questions[0].evidence_description == ""
+    assert questions[0].entity_aliases == []
+    assert questions[0].relation is None

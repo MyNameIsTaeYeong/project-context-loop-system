@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
 from context_loop.processor.graph_vocabulary import (
     format_entity_types_for_prompt,
     format_intent_mapping_for_prompt,
@@ -113,10 +114,20 @@ class GraphSearchPlan:
 
 @dataclass
 class GraphSearchResult:
-    """그래프 탐색 결과."""
+    """그래프 탐색 결과.
+
+    ``entities`` 의 각 ``GraphEntityRef`` 에는 노드 ``properties`` JSON 의
+    ``description`` 필드가 채워진다 (2차 — 평가 측 tiered matching 의 T4
+    embedding 단계가 자연어 evidence 를 비교할 수 있도록).
+
+    ``relations`` 는 ``--score-relations`` 평가용으로 노출되는 1-hop
+    엣지 정보 (2차 — 관계 채점 활성화 시).
+    """
 
     text: str
     document_ids: set[int] = field(default_factory=set)
+    entities: list[GraphEntityRef] = field(default_factory=list)
+    relations: list[GraphRelationRef] = field(default_factory=list)
 
 
 async def plan_graph_search(
@@ -285,4 +296,64 @@ async def execute_graph_search(
             label_text = f" ({label})" if label else ""
             lines.append(f"- {src} --[{rel}]--> {tgt}{label_text}")
 
-    return GraphSearchResult(text="\n".join(lines), document_ids=document_ids)
+    # 평가용 (entity_name, entity_type) 페어 노출 — `GoldItem.relevant_graph_entities`
+    # 와 동일 키로 비교 가능하도록 dataclass 외부에 채워준다.
+    # 2차: description 도 채워서 tiered matching T4 (embedding) 이 자연어
+    # evidence 를 비교할 수 있게 한다.
+    entities: list[GraphEntityRef] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for node in all_nodes:
+        name = str(node.get("entity_name", ""))
+        etype = str(node.get("entity_type", ""))
+        if not name:
+            continue
+        key = (name.lower(), etype)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        node_props = node.get("properties") or {}
+        description = ""
+        if isinstance(node_props, dict):
+            description = str(node_props.get("description") or "")
+        entities.append(GraphEntityRef(
+            name=name,
+            type=etype,
+            description=description,
+        ))
+
+    # 2차: 관계 채점 (`--score-relations`) 을 위해 검색된 edges 도 노출.
+    id_to_name_map = {n["id"]: n.get("entity_name", "") for n in all_nodes}
+    id_to_type_map = {n["id"]: n.get("entity_type", "") for n in all_nodes}
+    relations: list[GraphRelationRef] = []
+    seen_rel_keys: set[tuple[str, str, str]] = set()
+    for edge in edges:
+        src = str(id_to_name_map.get(edge.get("source"), ""))
+        tgt = str(id_to_name_map.get(edge.get("target"), ""))
+        rel = str(edge.get("relation_type", ""))
+        if not (src and tgt):
+            continue
+        rel_key = (src.lower(), tgt.lower(), rel)
+        if rel_key in seen_rel_keys:
+            continue
+        seen_rel_keys.add(rel_key)
+        # 관계의 description 은 edge properties 의 label 또는 빈 문자열.
+        edge_props = edge.get("properties") or {}
+        label = ""
+        if isinstance(edge_props, dict):
+            label = str(edge_props.get("label") or "")
+        # 자연어 evidence — type 명 변경 robust 매칭에 사용.
+        _ = id_to_type_map  # 사용 의도 유지 (현재는 타입 필요 없음)
+        rel_description = label or f"{src} {rel} {tgt}"
+        relations.append(GraphRelationRef(
+            source_name=src,
+            target_name=tgt,
+            relation_type=rel,
+            description=rel_description,
+        ))
+
+    return GraphSearchResult(
+        text="\n".join(lines),
+        document_ids=document_ids,
+        entities=entities,
+        relations=relations,
+    )

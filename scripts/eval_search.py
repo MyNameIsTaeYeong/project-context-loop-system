@@ -50,6 +50,13 @@ sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
+from context_loop.eval.graph_match import (  # noqa: E402
+    DEFAULT_GRAPH_MATCH_THRESHOLD,
+    aggregate_tier_counts,
+    build_embed_fn,
+    run_entity_matching,
+    run_relation_matching,
+)
 from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.metrics import (  # noqa: E402
     aggregate,
@@ -163,8 +170,17 @@ async def evaluate_one(
     include_graph: bool,
     judge: LLMClient | None,
     reasoning_mode: str | None,
+    graph_match_threshold: float = DEFAULT_GRAPH_MATCH_THRESHOLD,
+    graph_match_strict: bool = False,
+    score_relations: bool = False,
+    embedding_model_id: str = "",
 ) -> dict[str, Any]:
-    """단일 질의에 대한 검색 + 채점."""
+    """단일 질의에 대한 검색 + 채점.
+
+    2차: graph entity 채점에 4-tier cascade 매칭을 사용하여 entity_type 명
+    변경 / 표기 정규화 / 동의어 / 의미 매칭에 강건. 관계 채점은
+    ``score_relations`` 옵션으로 활성화.
+    """
     start = time.perf_counter()
     assembled: AssembledContext = await assemble_context_with_sources(
         item.query,
@@ -187,21 +203,105 @@ async def evaluate_one(
     retrieved_doc_ids = [s.document_id for s in assembled.sources]
     relevant = set(item.relevant_doc_ids)
 
+    # graph-level 채점 — 4-tier cascade (exact → alias → normalize → embedding).
+    # 임베딩 단계의 비용 통제는 LRU 캐시 embed_fn 으로 흡수.
+    embed_fn = build_embed_fn(
+        embedding_client, model_id=embedding_model_id,
+    )
+    entity_report = run_entity_matching(
+        item.relevant_graph_entities,
+        list(assembled.retrieved_graph_entities),
+        embed_fn=embed_fn,
+        threshold=graph_match_threshold,
+        strict=graph_match_strict,
+    )
+
     row: dict[str, Any] = {
         "id": item.id,
         "query": item.query,
+        "mode": _classify_mode(item),
+        "source_type": item.source_type,
         "difficulty": item.difficulty,
         "source_document_id": item.source_document_id,
         "retrieved_doc_ids": retrieved_doc_ids[:top_k],
         "retrieved_count": len(retrieved_doc_ids),
         "relevant_doc_ids": sorted(relevant),
+        # chunk/doc-level (기존)
         f"recall@{top_k}": recall_at_k(retrieved_doc_ids, relevant, top_k),
         f"precision@{top_k}": precision_at_k(retrieved_doc_ids, relevant, top_k),
         f"hit@{top_k}": int(hit_at_k(retrieved_doc_ids, relevant, top_k)),
         f"ndcg@{top_k}": ndcg_at_k(retrieved_doc_ids, relevant, top_k),
         "mrr": mrr(retrieved_doc_ids, relevant),
+        # graph-level (D-5) — 매칭된 retrieved/relevant 키를 메트릭에 전달.
+        # all_relevant_keys 가 골든 전체이므로 recall 분모는 정상 유지된다.
+        f"graph_recall@{top_k}": recall_at_k(
+            entity_report.retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        f"graph_precision@{top_k}": precision_at_k(
+            entity_report.retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        f"graph_hit@{top_k}": int(hit_at_k(
+            entity_report.retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        )),
+        "graph_mrr": mrr(
+            entity_report.retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+        ),
+        f"graph_ndcg@{top_k}": ndcg_at_k(
+            entity_report.retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        # 2차 — tier 분포 / score 시그널.
+        "graph_match_tiers": dict(entity_report.tier_counts),
+        "graph_match_score_avg": entity_report.avg_score(),
+        "graph_match_score_min": entity_report.min_score(),
+        "graph_match_score_max": entity_report.max_score(),
         "elapsed_ms": elapsed_ms,
     }
+
+    if score_relations and item.relevant_graph_relations:
+        rel_retrieved_keys, rel_relevant_keys, rel_tier_counts, rel_scores = (
+            run_relation_matching(
+                item.relevant_graph_relations,
+                list(assembled.retrieved_graph_relations),
+                embed_fn=embed_fn,
+                threshold=graph_match_threshold,
+                strict=graph_match_strict,
+            )
+        )
+        # all_relevant 는 골든 관계 전체.
+        all_rel_keys: set[tuple[str, str, str]] = {
+            (
+                (g.source_name or "").strip().lower(),
+                (g.target_name or "").strip().lower(),
+                (g.relation_type or "").strip(),
+            )
+            for g in item.relevant_graph_relations
+        }
+        row[f"graph_rel_recall@{top_k}"] = recall_at_k(
+            rel_retrieved_keys, all_rel_keys, top_k,
+        )
+        row[f"graph_rel_precision@{top_k}"] = precision_at_k(
+            rel_retrieved_keys, all_rel_keys, top_k,
+        )
+        row[f"graph_rel_hit@{top_k}"] = int(hit_at_k(
+            rel_retrieved_keys, all_rel_keys, top_k,
+        ))
+        row["graph_rel_mrr"] = mrr(rel_retrieved_keys, all_rel_keys)
+        row["graph_rel_match_tiers"] = dict(rel_tier_counts)
+        if rel_scores:
+            row["graph_rel_match_score_avg"] = sum(rel_scores) / len(rel_scores)
+            row["graph_rel_match_score_min"] = min(rel_scores)
+            row["graph_rel_match_score_max"] = max(rel_scores)
+        # 사용 의도 유지 — relevant 키 변수 (디버그 후속용).
+        _ = rel_relevant_keys
 
     if judge is not None:
         # 정답 청크 본문 조회 (없으면 정답 문서의 첫 청크)
@@ -219,17 +319,50 @@ async def evaluate_one(
     return row
 
 
+def _classify_mode(item: GoldItem) -> str:
+    """GoldItem 을 chunk / graph / hybrid 로 분류한다.
+
+    - relevant_doc_ids 만 있으면 "chunk"
+    - relevant_graph_entities 만 있으면 "graph"
+    - 둘 다 있으면 "hybrid"
+    """
+    has_doc = bool(item.relevant_doc_ids)
+    has_graph = bool(item.relevant_graph_entities)
+    if has_doc and has_graph:
+        return "hybrid"
+    if has_graph:
+        return "graph"
+    return "chunk"
+
+
+def _normalize_for_anchor(text: str) -> str:
+    """source_text_anchor 비교용 정규화 — 연속 whitespace 단일 공백."""
+    return " ".join(text.split())
+
+
 async def _fetch_source_text(item: GoldItem, meta_store: MetadataStore) -> str:
     """골드 항목의 정답 청크 본문을 조회.
 
-    source_chunk_id 가 있으면 그 청크를, 없으면 첫 정답 문서의 첫 청크를 사용.
+    우선순위:
+    1. ``source_text_anchor`` prefix 매칭 (R2 — chunk_id 의존 제거).
+    2. (deprecated 호환) ``source_chunk_id`` 일치.
+    3. 첫 청크 fallback.
     """
     if item.source_document_id is not None:
         chunks = await meta_store.get_chunks_by_document(item.source_document_id)
+
+        if item.source_text_anchor:
+            normalized_anchor = _normalize_for_anchor(item.source_text_anchor)
+            for c in chunks:
+                content = c.get("content") or ""
+                if _normalize_for_anchor(content).startswith(normalized_anchor):
+                    return content
+
         if item.source_chunk_id:
             for c in chunks:
                 if c.get("id") == item.source_chunk_id:
                     return c.get("content") or ""
+
         if chunks:
             return chunks[0].get("content") or ""
     if item.relevant_doc_ids:
@@ -280,13 +413,57 @@ def write_summary(
     label: str,
     config_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    """집계 요약을 JSON 으로 저장하고 반환."""
-    summary = aggregate(rows, exclude={"source_document_id"})
+    """집계 요약을 JSON 으로 저장하고 반환.
+
+    전체 메트릭 평균 + mode 별 split (chunk / graph / hybrid) 도 함께 보고한다.
+    chunk-only 항목의 ``graph_*`` 메트릭은 자연 0.0 이라 전체 평균을 끌어내릴
+    수 있어 W-5 의 권장 대응으로 mode 별 분리 보고를 추가했다.
+
+    2차: ``graph_match_tiers`` (dict) 는 ``aggregate`` 가 숫자만 처리하므로
+    별도로 누적 합산하여 보고한다.
+    """
+    excluded = {"source_document_id"}
+    summary = aggregate(rows, exclude=excluded)
+
+    rows_by_mode: dict[str, list[dict[str, Any]]] = {
+        "chunk": [], "graph": [], "hybrid": [],
+    }
+    for r in rows:
+        mode = r.get("mode")
+        if mode in rows_by_mode:
+            rows_by_mode[mode].append(r)
+
+    metrics_by_mode: dict[str, dict[str, Any]] = {}
+    for mode, subset in rows_by_mode.items():
+        if not subset:
+            continue
+        block_metrics: dict[str, Any] = aggregate(subset, exclude=excluded)
+        # tier 카운트는 dict 라 aggregate 가 빠뜨림 — 누적 합산하여 추가.
+        tier_dicts = [r.get("graph_match_tiers") or {} for r in subset]
+        block_metrics["graph_match_tiers_total"] = aggregate_tier_counts(tier_dicts)
+        if any(r.get("graph_rel_match_tiers") for r in subset):
+            rel_tier_dicts = [r.get("graph_rel_match_tiers") or {} for r in subset]
+            block_metrics["graph_rel_match_tiers_total"] = aggregate_tier_counts(rel_tier_dicts)
+        metrics_by_mode[mode] = {
+            "n": len(subset),
+            "metrics": block_metrics,
+        }
+
+    # 전체 tier 누적도 보고.
+    summary["graph_match_tiers_total"] = aggregate_tier_counts(
+        [r.get("graph_match_tiers") or {} for r in rows],
+    )
+    if any(r.get("graph_rel_match_tiers") for r in rows):
+        summary["graph_rel_match_tiers_total"] = aggregate_tier_counts(
+            [r.get("graph_rel_match_tiers") or {} for r in rows],
+        )
+
     out = {
         "label": label,
         "n_queries": len(rows),
         "config": config_summary,
         "metrics": summary,
+        "metrics_by_mode": metrics_by_mode,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,8 +477,12 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"  Run: {summary['label']}  |  N={summary['n_queries']}")
     print("=" * 60)
     metrics = summary.get("metrics", {})
-    # 보기 좋은 순서로 키 정렬
+    # 보기 좋은 순서로 키 정렬 — graph_* 는 chunk 메트릭 다음에 배치
     preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+                 "graph_recall@", "graph_precision@", "graph_hit@",
+                 "graph_ndcg@", "graph_mrr",
+                 "graph_match_score_", "graph_rel_recall@",
+                 "graph_rel_precision@", "graph_rel_hit@", "graph_rel_mrr",
                  "judge_score", "elapsed_ms"]
     keys = sorted(
         metrics.keys(),
@@ -312,10 +493,32 @@ def print_summary(summary: dict[str, Any]) -> None:
     )
     for k in keys:
         v = metrics[k]
-        if "ms" in k:
+        if isinstance(v, dict):
+            # tier 카운트 dict 등은 한 줄로 압축 표시.
+            print(f"  {k:24s} {v}")
+        elif "ms" in k:
             print(f"  {k:24s} {v:>10.1f}")
         else:
             print(f"  {k:24s} {v:>10.4f}")
+
+    metrics_by_mode = summary.get("metrics_by_mode") or {}
+    for mode in ("chunk", "graph", "hybrid"):
+        block = metrics_by_mode.get(mode)
+        if not block:
+            continue
+        print(f"  [mode={mode}, n={block.get('n', 0)}]")
+        sub = block.get("metrics") or {}
+        for k in sorted(sub.keys(), key=lambda kk: next(
+            (i for i, p in enumerate(preferred) if kk.startswith(p)),
+            len(preferred),
+        )):
+            v = sub[k]
+            if isinstance(v, dict):
+                print(f"    {k:22s} {v}")
+            elif "ms" in k:
+                print(f"    {k:22s} {v:>10.1f}")
+            else:
+                print(f"    {k:22s} {v:>10.4f}")
     print("=" * 60 + "\n")
 
 
@@ -382,6 +585,7 @@ async def _evaluate_gold_set(
     rerank_top_k: int | None,
     rerank_score_threshold: float,
     hyde_enabled: bool,
+    embedding_model_id: str = "",
 ) -> dict[str, Any] | None:
     """골드셋 1개를 채점하고 CSV/요약 JSON 을 저장. 실패 시 None.
 
@@ -422,6 +626,10 @@ async def _evaluate_gold_set(
                 include_graph=args.include_graph,
                 judge=judge,
                 reasoning_mode=args.reasoning_mode,
+                graph_match_threshold=args.graph_match_threshold,
+                graph_match_strict=args.graph_match_strict,
+                score_relations=args.score_relations,
+                embedding_model_id=embedding_model_id,
             )
             rows.append(row)
         except Exception as exc:
@@ -511,6 +719,7 @@ async def run(args: argparse.Namespace) -> int:
     rerank_top_k = config.get("search.reranker_top_k") or None
     rerank_score_threshold = float(config.get("search.reranker_score_threshold", 0.0))
 
+    embedding_model_id = str(config.get("processor.embedding_model") or "")
     config_summary = {
         "top_k": args.top_k,
         "max_chunks": args.max_chunks,
@@ -518,10 +727,14 @@ async def run(args: argparse.Namespace) -> int:
         "rerank_enabled": rerank_enabled,
         "hyde_enabled": hyde_enabled,
         "include_graph": args.include_graph,
-        "embedding_model": config.get("processor.embedding_model"),
+        "embedding_model": embedding_model_id,
         "llm_model": config.get("llm.model"),
         "judge_enabled": args.judge,
         "judge_model": args.judge_model or (config.get("llm.model") if args.judge else None),
+        # 2차 — graph 매칭 정책 / 재현성용 메타.
+        "graph_match_threshold": args.graph_match_threshold,
+        "graph_match_strict": args.graph_match_strict,
+        "score_relations": args.score_relations,
     }
 
     out_dir = Path(args.output_dir)
@@ -548,6 +761,7 @@ async def run(args: argparse.Namespace) -> int:
                     rerank_top_k=rerank_top_k,
                     rerank_score_threshold=rerank_score_threshold,
                     hyde_enabled=hyde_enabled,
+                    embedding_model_id=embedding_model_id,
                 )
             except Exception as exc:
                 logger.exception("골드셋 %s 채점 중 실패: %s — 다음으로 진행.",
@@ -722,6 +936,24 @@ def main() -> None:
         "--reasoning-mode", default="off",
         help="LLM reasoning_mode (config.llm.reasoning_profiles 키, "
              "Judge 호출에 적용, 기본 'off')",
+    )
+    # 2차 — graph 채점 강건성 (R1/R2/R3).
+    parser.add_argument(
+        "--graph-match-threshold", type=float,
+        default=DEFAULT_GRAPH_MATCH_THRESHOLD,
+        help=f"4-tier 매칭의 T4 (embedding) 임계값 (기본 "
+             f"{DEFAULT_GRAPH_MATCH_THRESHOLD}). 골드셋 metadata 의 "
+             f"기본값을 무시한다.",
+    )
+    parser.add_argument(
+        "--graph-match-strict", action="store_true",
+        help="T2(alias)/T3(normalize)/T4(embedding) 단계를 모두 skip 하여 "
+             "1차 동작(정확 비교만) 을 재현한다 (기본 False).",
+    )
+    parser.add_argument(
+        "--score-relations", action="store_true",
+        help="관계(엣지) 채점 메트릭 (graph_rel_*) 을 산출한다 (기본 False). "
+             "골드셋의 relevant_graph_relations 가 비어 있으면 효과 없음.",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
