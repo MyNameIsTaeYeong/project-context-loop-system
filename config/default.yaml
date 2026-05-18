@@ -10,6 +10,106 @@ sources:
     token_storage: "keyring"
     sync_interval_minutes: 30
 
+  confluence_mcp:
+    enabled: false
+    server_url: ""                          # MCP 서버 엔드포인트 URL (예: "http://mcp-server:3001/mcp")
+    transport: "http"                       # 전송 방식: "http" (Streamable HTTP) 또는 "sse"
+    token_storage: "keyring"                # 인증 토큰은 OS keyring에 저장 (x-auth 헤더로 전달)
+    sync_interval_minutes: 30
+
+  git:
+    enabled: false
+    sync_interval_minutes: 60
+    file_size_limit_kb: 500                 # 이 크기 초과 파일 제외
+    supported_extensions:                   # 처리할 파일 확장자
+      - ".py"
+      - ".go"
+      - ".java"
+      - ".ts"
+      - ".js"
+      - ".tf"
+      - ".yaml"
+      - ".yml"
+      - ".proto"
+      - ".sql"
+
+    repositories: []
+    # repositories:                         # 수집 대상 레포지토리 목록
+    #   - url: ""                           # Git URL (예: "git@github.com:company/monorepo.git")
+    #     branch: "main"                    # 대상 브랜치
+    #     products:                         # 상품별 스코프 정의
+    #       product-name:
+    #         display_name: "상품 이름"
+    #         paths:                        # 포함할 경로 (glob 패턴)
+    #           - "services/product/**"
+    #         exclude:                      # 제외할 경로
+    #           - "**/*_test.go"
+    #           - "**/vendor/**"
+
+    categories:                             # 문서 카테고리 (상품별로 각 카테고리의 문서 생성)
+      architecture:
+        display_name: "아키텍처"
+        target_audience: "아키텍트, 시니어 개발자"
+        prompt: |
+          당신은 소프트웨어 아키텍트입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 아키텍처 문서를 작성하세요.
+          포함할 내용: 전체 구조, 핵심 컴포넌트, 데이터 흐름,
+          설계 패턴, 확장성 고려사항, 의존성 관계
+      development:
+        display_name: "개발 가이드"
+        target_audience: "개발자"
+        prompt: |
+          당신은 시니어 개발자입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 개발 가이드를 작성하세요.
+          포함할 내용: API 명세, 코드 구조, 핵심 함수/클래스 설명,
+          에러 처리 패턴, 로컬 개발 환경 설정, 테스트 방법
+      infrastructure:
+        display_name: "인프라 운영"
+        target_audience: "인프라 엔지니어, SRE"
+        prompt: |
+          당신은 DevOps/SRE 엔지니어입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 인프라 운영 문서를 작성하세요.
+          포함할 내용: 배포 구성, 리소스 명세, 모니터링 포인트,
+          스케일링 전략, 장애 대응 절차, 환경 변수/시크릿
+      pricing:
+        display_name: "과금 체계"
+        target_audience: "프라이싱팀, 사업팀"
+        prompt: |
+          당신은 프라이싱 전문가입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 과금 관련 정보를 정리하세요.
+          포함할 내용: 과금 단위, 비용 계산 로직, 리소스 사용량 측정,
+          할인/무료 구간, 빌링 주기
+      business:
+        display_name: "사업 요약"
+        target_audience: "사업팀, 영업팀, 경영진"
+        prompt: |
+          당신은 프로덕트 매니저입니다. 다음 코드 분석 결과를 바탕으로
+          이 상품의 비기술적 요약을 작성하세요.
+          포함할 내용: 핵심 기능, 고객 가치, 사용 시나리오,
+          제약 사항, 경쟁사 대비 차별점 (코드에서 유추 가능한 부분)
+
+    processing:                             # 멀티에이전트 처리 설정 (D-027, D-029)
+      max_concurrent_workers: 10            # 동시 Worker Agent 수
+      max_files_per_worker: 30              # Worker당 최대 파일 수 (초과 시 분할)
+      min_files_per_worker: 3               # Worker당 최소 파일 수 (미만 시 상위와 병합)
+      # 에이전트별 모델 설정 (엔드포인트 방식, D-010/D-029)
+      # 미지정 시 상위 llm.endpoint/llm.model로 폴백
+      worker:                               # Level 1 파일 요약 (경량 모델)
+        endpoint: ""                        # 예: "http://haiku-server:8080/v1"
+        model: ""
+        api_key: ""
+        headers: {}                         # 엔드포인트 호출 시 추가 헤더
+      synthesizer:                          # Level 2 디렉토리 문서 (중간 모델)
+        endpoint: ""                        # 예: "http://sonnet-server:8080/v1"
+        model: ""
+        api_key: ""
+        headers: {}                         # 엔드포인트 호출 시 추가 헤더
+      orchestrator:                         # Level 3 카테고리 문서 (고성능 모델)
+        endpoint: ""                        # 예: "http://opus-server:8080/v1"
+        model: ""
+        api_key: ""
+        headers: {}                         # 엔드포인트 호출 시 추가 헤더
+
 processor:
   chunk_size: 512
   chunk_overlap: 50
@@ -17,14 +117,89 @@ processor:
   embedding_provider: "endpoint"   # "openai" | "local" | "endpoint"
   embedding_endpoint: ""           # embedding_provider: "endpoint"일 때 사용 (예: "http://localhost:8080/v1")
   embedding_api_key: ""            # 엔드포인트 인증 키 (불필요한 경우 빈 문자열)
+  embedding_headers: {}            # 엔드포인트 호출 시 추가 헤더 (예: {X-Org-Id: "abc"})
+  # Confluence MCP 싱크의 Phase 2(인덱싱) 동시 처리 문서 수.
+  # 1 이면 완전 직렬(rate limit 안전, 느림), 5 는 직렬 대비 약 5배 단축.
+  # OpenAI text-embedding-3-small 기본 tier(5,000 RPM) 기준 10까지 여유.
+  phase2_concurrency: 5
 
 llm:
   provider: "endpoint"             # "openai" | "anthropic" | "endpoint"
   model: ""                        # 사용할 모델 ID
   endpoint: ""                     # provider: "endpoint"일 때 사용 (예: "http://localhost:11434/v1")
   api_key: ""                      # 엔드포인트 인증 키 (불필요한 경우 빈 문자열)
+  headers: {}                      # 엔드포인트 호출 시 추가 헤더 (예: {X-Org-Id: "abc"})
   api_key_storage: "keyring"       # provider: "openai" | "anthropic"일 때 keyring 사용
   classifier_prompt: "default"
+
+  # Reasoning(thinking) 프로파일.
+  # 호출부는 reasoning_mode="off" 같은 의도만 전달하고, 모델별 실제 페이로드는
+  # 여기서 매핑한다. 모델 교체 시 호출부 수정 없이 이 블록만 갈아끼우면 된다.
+  # 키는 자유롭게 정의 (예: "off", "low", "medium", "high"). 매칭되는 키가 없으면 무시.
+  reasoning_profiles:
+    # Qwen3 (기본): thinking 모드 비활성화로 JSON 추출 응답 안정화
+    off:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+    # Qwen3 thinking 모드 활성화 (Qwen은 on/off 만 지원하므로 모든 단계가 동일)
+    high:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+    # DeepSeek 예시 (모델 교체 시 위 'off'/'high'를 다음으로 갈아끼움):
+    # off:
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       thinking: false
+    #       reasoning_effort: "low"
+    # low:
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       thinking: true
+    #       reasoning_effort: "low"
+    # high:
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       thinking: true
+    #       reasoning_effort: "high"
+
+reranker:
+  endpoint: ""                     # 리랭커 API 엔드포인트 (예: "http://localhost:8080/rerank")
+  model: ""                        # 사용할 리랭커 모델 ID
+  api_key: ""                      # 엔드포인트 인증 키 (불필요한 경우 빈 문자열)
+  headers: {}                      # 엔드포인트 호출 시 추가 헤더 (예: {X-Org-Id: "abc"})
+
+search:
+  similarity_threshold: 0.3       # 코사인 유사도 최소값 (이 값 미만 청크 제외)
+  reranker_enabled: false          # 전용 리랭커 사용 여부 (reranker.endpoint/model 필요)
+  reranker_top_k: 5                # 리랭킹 후 반환할 최대 청크 수
+  reranker_score_threshold: 0.3    # 리랭크 점수 최소값 (모델 의존, 보통 0~1 — Cohere/Jina 호환)
+  hyde_enabled: false              # HyDE (Hypothetical Document Embedding) 사용 여부
+
+eval:
+  # 검색 품질 평가용 LLM 설정
+  # (scripts/build_synthetic_gold_set.py + scripts/eval_search.py 가 사용).
+  # 자기 평가 편향을 줄이려면 generator/judge 를 system 모델 (llm.*) 과
+  # 다른 family 의 모델로 분리하는 것을 권장한다.
+  # 각 키가 비어 있으면 상위 llm.* 값으로 폴백한다 (headers/reasoning_profiles 포함).
+  # reasoning_profiles 는 모델 family 별로 페이로드 형식이 다르므로 (Qwen3 의
+  # enable_thinking vs DeepSeek 의 thinking 등), generator/judge 가 system 과
+  # 다른 family 라면 여기서 별도 매핑을 정의하는 것이 안전하다.
+  generator:                       # 골드셋 질의 합성
+    endpoint: ""                   # 예: "http://strong-model:8080/v1"
+    model: ""                      # 예: "gpt-4o" 또는 "claude-sonnet-4"
+    api_key: ""
+    headers: {}                    # 예: {X-Org-Id: "abc"}
+    reasoning_profiles: {}         # 예: {off: {extra_body: {chat_template_kwargs: {thinking: false}}}}
+  judge:                           # 답변 가능성·품질 채점
+    endpoint: ""                   # 예: "http://other-family:8080/v1"
+    model: ""                      # generator 와 다른 family 권장
+    api_key: ""
+    headers: {}
+    reasoning_profiles: {}         # generator 와 다른 family 라면 별도 매핑
 
 storage:
   vector_db: "chromadb"

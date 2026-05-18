@@ -41,6 +41,12 @@
                 @click="tab = 'graph'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/graph', {target: '#tab-content', swap: 'innerHTML'})">
             Graph
         </button>
+        {% if doc.source_type in ('code_file_summary', 'code_doc', 'code_summary', 'git_code') %}
+        <button :class="tab === 'sources' ? '' : 'outline'"
+                @click="tab = 'sources'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/sources', {target: '#tab-content', swap: 'innerHTML'})">
+            Sources
+        </button>
+        {% endif %}
         <button :class="tab === 'metadata' ? '' : 'outline'"
                 @click="tab = 'metadata'; htmx.ajax('GET', '/partials/document/{{ doc.id }}/metadata', {target: '#tab-content', swap: 'innerHTML'})">
             Metadata

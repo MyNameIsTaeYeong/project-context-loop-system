@@ -5,8 +5,64 @@
         <header>
             <strong>Chunk #{{ chunk.chunk_index }}</strong>
             <small>{{ chunk.token_count }} tokens</small>
+            {% if chunk.section_path %}
+            <small>· 섹션: {{ chunk.section_path }}</small>
+            {% endif %}
+
+            {% if source_type == "git_code" %}
+                {% if chunk.meta_text %}
+                <small><mark>code · body + meta</mark></small>
+                {% else %}
+                <small><mark>code · body only</mark></small>
+                {% endif %}
+            {% elif chunk.meta_text %}
+            <small><mark>body + meta</mark></small>
+            {% else %}
+            <small><mark>body only</mark></small>
+            {% endif %}
         </header>
-        <pre><code>{{ chunk.content }}</code></pre>
+
+        {% if source_type == "git_code" %}
+        {# I-046 멀티뷰: body=코드 본문, meta=식별자 요약(embed_text). #}
+        <details open>
+            <summary><strong>Body</strong>
+                <small>(임베딩 대상 — 코드 본문)</small>
+            </summary>
+            <pre><code>{{ chunk.content }}</code></pre>
+        </details>
+
+        {% if chunk.meta_text %}
+        <details>
+            <summary><strong>Meta</strong>
+                <small>(추가 임베딩 대상 — 이름 + 시그니처 + docstring)</small>
+            </summary>
+            <pre><code>{{ chunk.meta_text }}</code></pre>
+        </details>
+        {% else %}
+        <details>
+            <summary><strong>Meta</strong>
+                <small>(미저장 — 재처리 시 채워집니다)</small>
+            </summary>
+            <p><em>이 청크는 git_code 멀티뷰 적용 이전에 처리되었습니다. 문서 재처리 시 meta 뷰 임베딩이 활성화됩니다.</em></p>
+        </details>
+        {% endif %}
+
+        {% else %}
+        {# D-042 멀티뷰: body 본문 + meta(title + section_path) #}
+        <details open>
+            <summary><strong>Body</strong> <small>(임베딩 대상 — 본문)</small></summary>
+            <pre><code>{{ chunk.content }}</code></pre>
+        </details>
+
+        {% if chunk.meta_text %}
+        <details>
+            <summary><strong>Meta</strong>
+                <small>(추가 임베딩 대상 — title + section_path)</small>
+            </summary>
+            <pre><code>{{ chunk.meta_text }}</code></pre>
+        </details>
+        {% endif %}
+        {% endif %}
     </article>
     {% endfor %}
 </div>

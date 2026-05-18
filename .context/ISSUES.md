@@ -4,9 +4,106 @@
 
 ## 미해결
 
-### I-003: 엔티티 병합 테이블 스키마 미정
-- 여러 문서에서 동일 엔티티가 등장할 때 병합 기준과 테이블 구조 상세 설계 필요
-- Phase 3.6 시작 전까지 결정 필요
+### I-046: git_code 멀티뷰 임베딩 부재 (P0) — **코드 적용 완료, 효과 측정 대기**
+- 진단 (2026-05-06): `pipeline.py:128-179` (git_code) 가 `181-273`
+  (Confluence/upload) 와 비대칭. Confluence 는 멀티뷰(`#body` + `#meta`)
+  를 ChromaDB 에 별도 엔트리로 저장하는데 git_code 는 `name + signature
+  + docstring` 만 임베딩 — 본문 코드는 임베딩 벡터에 들어가지 않음.
+- 결과: 한국어 자연어 질의가 코드 본문의 도메인 용어와 매칭되지 않음
+  (`_clamp_max_per_tenant` 안의 "rate limit" 등이 실종).
+- **코드 적용 완료**: 커밋 `ce75681` (pipeline 멀티뷰 적용) + `0a8a364`
+  (web 청크 탭 UI). `_search_chunks` 의 `logical_chunk_id` dedup
+  (`context_assembler.py:193`) 이 단일뷰/멀티뷰 데이터를 graceful 하게
+  흡수 — 검색 단계 변경 불필요.
+- **효과 측정 워크플로 확정 (2026-05-12)** — SQL hash 우회 방식. 코드 추적
+  검증: `documents.id` 100% 보존 (UPDATE 만, DELETE+INSERT 경로 없음),
+  chunks/vector/graph 는 완전 재구성, retrieval 메트릭(`relevant_doc_ids`)
+  영향 없음.
+  ```bash
+  # 1) baseline 측정 — 현재 단일뷰 인덱싱 상태에서
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "SELECT id, source_id FROM documents WHERE source_type='git_code' ORDER BY id" \
+      > /tmp/ids_baseline.txt
+  python scripts/build_synthetic_gold_set.py --source-types git_code \
+      --seed 42 --n-gold-sets 5 --output eval/gold_sets/git_code.yaml
+  python scripts/eval_search.py \
+      --gold-set-glob "eval/gold_sets/git_code_*.yaml" --label baseline
+  # 2) hash 깨기 — short-circuit 우회
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "UPDATE documents SET content_hash='_force_' WHERE source_type='git_code'"
+  # 3) 웹 sync 버튼 (또는 CLI) → update_document_content() (id 보존)
+  #    → process_document() → 멀티뷰 재구성
+  # 4) sanity check
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "SELECT id, source_id FROM documents WHERE source_type='git_code' ORDER BY id" \
+      > /tmp/ids_after.txt
+  diff /tmp/ids_baseline.txt /tmp/ids_after.txt   # 차이 0줄
+  sqlite3 ~/.context-loop/data/metadata.db \
+      "SELECT COUNT(*) FROM documents WHERE source_type='git_code' AND content_hash='_force_'"  # 0
+  # 5) multiview 평가
+  python scripts/eval_search.py \
+      --gold-set-glob "eval/gold_sets/git_code_*.yaml" --label multiview
+  ```
+- **다음 작업** (다음 세션 1순위): 위 SOP 실행 후
+  `baseline.aggregate.summary.json` vs `multiview.aggregate.summary.json`
+  비교. `|mean Δ| > max(std_baseline, std_multiview)` 이면 통계적 유의 개선.
+- confluence_mcp 도 동일 패턴 (`mcp_confluence.py:1010`) — 같은 force-reindex
+  방식 적용 가능. 단 MCP 서버 가용성 필수 (`/api/confluence-mcp/health`).
+
+### I-040: 검색 품질 측정 인프라 → **도구 완성 (2026-05-06)** + 변동성 집계 (2026-05-12), 운영 검증 단계
+- 합성 골드셋 + 정량 평가 도구 도입 완료. `src/context_loop/eval/`
+  (metrics, gold_set, synth, llm) + `scripts/build_synthetic_gold_set.py`
+  + `scripts/eval_search.py`.
+- LLM 으로 (질문, 정답 청크) 페어 자동 생성 + 3단계 품질 게이트
+  (답변 가능성 / 식별자 누출 / 일반성). 라벨링 비용 0.
+- Recall@k / Precision@k / MRR / nDCG@k / hit@k + 옵션 LLM-as-judge
+  채점. 단위 테스트 +99 + 변동성 +5 = 누적 104건 통과.
+- Generator/Judge 는 `config.eval.{role}.*` 에서 (endpoint/model/headers/
+  reasoning_profiles) 별도 정의 가능 — 자기 평가 편향 회피.
+- **변동성 집계 추가 (2026-05-12, `54f9d49`)**: `--n-gold-sets N` (build)
+  + `--gold-set-glob` (eval) + `aggregate_with_variance()` (metrics).
+  같은 source_type 으로 시드만 다른 N개 골드셋을 만들어 mean/std/min/max
+  를 잡음으로써 샘플링 변동 + LLM 확률성을 노이즈 floor 로 분리. 변경
+  효과는 `|mean Δ| > std` 일 때만 유의로 판정.
+- **남은 일** (운영 검증):
+  - 사내 환경에서 30~50건 합성 → baseline 측정
+  - 골드셋 품질 사람 검수 (10% 샘플)
+  - I-046 (P0 git_code 멀티뷰) 적용 후 after 측정으로 도구 자체 신뢰도
+    검증 ← 위 워크플로로 실행 대기
+
+### I-041: 그래프 검색 결과 렌더링 빈약
+- `execute_graph_search` 의 출력이 `A --[rel]--> B` 단순 불릿. PR-4 가 추출한 의미 관계가 사용자에게 가치 있게 전달되지 않음.
+- 사용자 처음 보고 "그래프가 유의미하지 않다" 의 6가지 원인 중 (5) 부분 — 추출 강화는 되었으나 렌더링은 그대로.
+- 개선안:
+  - 각 엣지에 본문 스니펫 (`section_index` ↔ chunks 조인 활용 — PR-2 키의 첫 사용처)
+  - 경로 서술 (`Auth Service ──(depends_on)→ Token Validator ──(owned_by)→ Platform Team`)
+  - 출처 섹션 anchor 링크 노출
+  - 노드별 연결 차수로 중요도 표시
+- 작업량: 중간 PR. I-040 (측정) 후 우선순위 결정.
+
+### I-042: 메타 축 부재 (author / space / label / time)
+- 현재 그래프엔 도메인 엔티티 + 의미 관계만 있음. 문서 메타데이터(`author`, `space`, `label`, `updated_at`)가 노드/엣지로 등재되지 않아 "팀 X 가 소유한 문서", "최근 업데이트된 결제 관련 문서" 같은 질의를 답할 구조가 없다.
+- 사용자 처음 보고 6가지 원인 중 (4).
+- 작업량: 작은 PR. metadata_store 의 `documents` 테이블 컬럼을 그대로 활용해 노드 승격.
+
+### I-043: 관계 cross-document 출처 보존 (NetworkX last-write-wins)
+- `nx.DiGraph` 가 같은 (src, tgt) 사이 엣지 1개만 허용. 두 문서가 같은 관계(`Auth Service --depends_on--> Token Validator`)를 추출하면 SQLite 엔 2 rows 지만 NetworkX 엔 1 edge 로 마지막 쓰기 메타데이터만 살아남음.
+- "여러 문서가 동의하는 관계" 신호와 출처 추적 손실.
+- 해결안 Option A (가성비 권장): 엣지에 `source_document_ids: set[int]` 누적 보존, DiGraph 유지로 검색 코드 호환.
+- 해결안 Option B: `nx.MultiDiGraph` 로 전환 (검색 코드 광범위 변경).
+- 작업량: Option A 는 작음.
+
+### I-044: HyDE 단계 임베딩-LLM 병렬화
+- D-045 에서 rerank ↔ graph plan 병렬화는 적용했지만 `expand_query_embedding` 내부의 "원본 쿼리 임베딩" 과 "HyDE 가상 문서 LLM 생성" 은 여전히 직렬.
+- 두 호출 모두 `query` 만 의존하므로 `asyncio.gather` 로 묶을 수 있음.
+- 단, HyDE (`search.hyde_enabled=true`) 활성화 시에만 효과 — 현재 기본 false 라 우선순위 낮음.
+- 작업량: 작음. `processor/query_expander.py:expand_query_embedding` 만 수정.
+
+### I-045: /api/chat 스트리밍 응답
+- 최종 답변 LLM 호출의 첫 토큰 지연(TTFB) 단축은 병렬화로 해결되지 않음 — 스트리밍 응답으로 전환 필요.
+- 현재 `LLMClient.complete` 자체는 내부적으로 `stream=True` 지만 응답을 전부 받은 뒤 한 번에 반환 (`/api/chat` 도 한 번에 JSON 응답).
+- SSE 기반 스트리밍 엔드포인트(`/api/chat/stream`) 신설 + 프론트엔드 `chat.js` 의 streaming 수신 처리 필요.
+- 작업량: 중간. 백엔드 SSE 라우트 + `LLMClient` 에 `stream_complete()` 추가 + 프론트엔드 EventSource 연동.
 
 ### I-004: LLM Classifier 프롬프트 설계
 - 문서를 chunk/graph/hybrid로 판정하는 프롬프트의 정확도와 비용 최적화 필요
@@ -34,7 +131,178 @@
 - 현재 채팅 대화는 브라우저 세션에서만 유지되며 서버에 저장하지 않음
 - 대화 이력 DB 저장 및 이전 대화 재개 기능은 향후 고도화 항목
 
+### I-010: Confluence MCP Client 연동 구현
+- Confluence REST API 접근이 차단되어 사내 Confluence MCP Server를 통한 문서 임포트 방식 채택 (D-016)
+- `ingestion/mcp_confluence.py` 신규 모듈 구현 필요
+- 사내 MCP 서버 전송 방식(SSE/stdio) 및 각 도구의 입출력 형식 확인 필요
+- 3가지 임포트 시나리오(검색, 트리 탐색, 내 문서) 구현
+- 웹 UI (탭 기반) 및 API 엔드포인트 추가
+- **진행 상태 (2026-04-23)**: 3-scope 싱크로 재설계되어 D-043 으로 백엔드 완성. 검색 기반 진입 + page/subtree/space 3범위 등록·싱크·해제의 REST API 와 동시성·안전 속성까지 완료. 수동 "검색 결과에서 페이지 선택 → 임포트" 와 "MCP `search_content` 기반 프리뷰" 는 기존 엔드포인트(`POST /api/confluence-mcp/search`, `POST /api/confluence-mcp/import`)가 유지된다.
+- **진행 상태 (2026-04-24)**: I-030 해결로 3-scope 싱크 UI 까지 완성. 남은 항목은 트리 탐색형 UI 와 내 문서 임포트 UI 정도.
+
+### I-011: Confluence REST API 접근 차단
+- 사내 보안 정책으로 Confluence REST API 직접 호출 불가
+- 기존 `ingestion/confluence.py` (ConfluenceClient) 사용 불가능
+- MCP Client 방식(I-010)으로 대체 예정
+
+### I-019: Git Repository 기반 코드 수집기 구현
+- Git repo를 clone/pull하여 소스 코드 파일을 수집하고, 변경 감지(commit hash 비교)로 증분 동기화하는 `ingestion/git_repository.py` 모듈 필요
+- GitPython 또는 subprocess 기반 구현 검토 필요
+- 파일 필터링 규칙 (`.gitignore` 존중, 바이너리 제외, 언어별 확장자 필터) 설계 필요
+- D-025 관련, Phase 9.2
+
+### I-020: 코드 → LLM 문서 자동 생성 파이프라인
+- ~~수집된 코드 파일을 LLM에 전달하여 자연어 문서(code_doc)를 자동 생성하는 파이프라인 필요~~
+- **방향 전환 (D-036)**: LLM 기반 문서 생성 대신 AST 기반 정적 추출로 전환. 코드에서 심볼(함수/클래스/메서드)과 import 관계를 직접 추출하여 벡터DB + GraphStore에 저장. LLM 호출 불필요.
+- D-025 관련, Phase 9.3
+
+### I-021: document_sources 테이블 및 검색 시 원본 코드 첨부
+- `document_sources` 테이블 추가하여 code_doc ↔ git_code N:M 관계 관리
+- context_assembler에서 code_doc chunk 반환 시 원본 코드를 함께 제공하는 옵션 구현
+- D-026, D-030 관련, Phase 9.7에서 git_code 저장 + document_sources 연결을 함께 구현
+
+### I-022: LLM 생성 문서의 환각 검증 메커니즘
+- ~~code_doc이 원본 코드와 불일치하는 경우를 감지하는 방법 검토 필요~~
+- **해결 (D-036)**: AST 기반 정적 추출로 전환하여 환각 문제 자체가 제거됨. LLM이 코드를 해석/요약하지 않고, 파서가 구문 구조를 그대로 추출하므로 정보 왜곡 불가.
+
+### I-023: 멀티에이전트 Coordinator/Product/Worker/Category 구현
+- D-027 아키텍처에 따른 4종 에이전트 구현 필요
+- `asyncio.gather` 기반 병렬 실행, 부분 실패 허용 (graceful degradation)
+- Worker 단위: 디렉토리 기반 + 크기 제한 (30개 초과 시 분할, 3개 미만 시 병합)
+- Phase 9.4, 9.5, 9.6
+- **진행 상태**: Coordinator(9.4) + Worker Agent(9.5) 구현 완료. Category Agent(9.6) 잔여.
+
+### I-024: 카테고리 프롬프트 시스템 설계
+- D-028에 따라 카테고리를 config 프롬프트로만 정의하여 코드 변경 없이 확장 가능하게
+- 기본 카테고리 5종 프롬프트 작성 필요: architecture, development, infrastructure, pricing, business
+- 팀별 추가 카테고리(보안, QA 등) 대응 구조 검증 필요
+- Phase 9.3, 9.6
+
+### I-025: 에이전트별 엔드포인트/모델 설정 구조
+- D-029에 따라 Worker(Haiku급), Synthesizer(Sonnet급), Category(Opus급) 각각 다른 엔드포인트 지정 가능해야 함
+- 기존 `llm_client.py`의 `EndpointLLMClient`를 에이전트별로 인스턴스화
+- 미지정 시 기존 `llm.endpoint` 폴백
+- Phase 9.3
+
+### I-026: 모노레포 상품 스코프 자동 제안 기능
+- ~~LLM이 레포 디렉토리 트리를 분석하여 상품별 스코프를 제안하는 기능~~
+- 방향 전환: config에 상품명만 정의하면 레포를 스캔하여 관련 파일 경로를 자동 탐지하는 방식으로 변경
+- **진행 상태**: `resolve_product_paths()` 구현 완료. LLM 기반 자동 제안(2-pass, 레이어 감지) 코드 제거.
+
+### I-027: scope_analyzer 상품 식별 정확도 개선
+- 방향 전환: LLM/레이어 감지 기반 → config 기반 상품명 + 파일명 토큰 매칭 방식으로 교체
+- **해결 완료**:
+  - `resolve_product_paths()`: config 상품명 기반으로 레포 전체에서 파일 경로 자동 탐지
+  - `_filename_matches_product()`: 경계 인식 토큰 매칭으로 오탐 방지
+  - `_plural_variants()`: 복수형 변형 지원 (vpcs, policies, addresses 등)
+  - `parse_product_scopes()`: paths 미정의 시 자동 탐지 연동 (기존 수동 paths와 하위 호환)
+
+### I-028: 오버로드 메서드 FQN 충돌
+- D-038의 파일 범위 FQN(`file::Class.method`)은 동일 이름·다른 시그니처 오버로드를 구분하지 못함 — Java/Kotlin 등에서 `foo(int)` / `foo(String)`이 단일 엔티티로 dedup됨
+- 해결 방향 후보: FQN에 시그니처 해시 접미사 추가, 또는 엔티티 properties에 overload index 저장
+- 현재는 상대적으로 드문 케이스라 우선순위 낮음
+
+### I-029: 그래프 스키마 프롬프트 FQN 노출 최적화
+- D-038 이후 LLM에게 제공되는 그래프 스키마 요약에 FQN(`file.py::Class.method`)이 그대로 노출되어 토큰 소모가 늘고, LLM이 FQN 그대로 응답하는 경향
+- `get_neighbors`의 짧은 이름 fallback이 동작을 보장하지만, 스키마 요약에서 짧은 이름만 노출하거나 FQN 표기 가이드를 프롬프트에 추가하면 품질/토큰 모두 개선 여지
+- 우선순위: 중간. 현재는 fallback으로 문제 없음.
+
 ## 해결됨
+
+### I-039: 그래프 컨텍스트 강화 — 본문 의미 관계 추출 → 해결 (2026-04-28, 브랜치 `claude/improve-graph-context-veDSQ`)
+- **증상**: Confluence 그래프가 `outbound_links` 만 사용해 의미 관계가 `references / mentions_user / mentions_ticket / has_attachment` 4종뿐. 사용자 보고 "그래프가 질의 시 유의미한 컨텍스트로 보이지 않음".
+- **6가지 원인 진단**: (1) 본문 의미 그래프 부재 (2) 관계 의미 소실 (3) 엔티티 병합 키 불안정 (4) 메타 축 부재 (5) 검색 결과 렌더링 빈약 (6) LLM 플래너 스키마 인식 얕음.
+- **이번 세션 해결: (1)(2)(6)**.
+- **PR-1 ExtractionUnit (`9be0a2d`)**: 추출 전용 입자도(target=1500/max=2400 토큰). 후위 순회 merged_tokens → top-down 응축/분할/흡수 4규칙. 안정적 `section_id = f"{document_id}:{section_index}"` + breadcrumb(`# 문서:`, `## 위치:`, 머리말). 기존 chunker 와 분리. 테스트 21건.
+- **PR-2 chunk ↔ unit 조인 키 (`b1ee655`)**: `chunks.section_index INTEGER` 컬럼 + idempotent 마이그레이션. 향후 검색 시 그래프 결과 → 본문 스니펫 인입의 인프라 (I-041 에서 사용).
+- **PR-3 결정론 본문 추출기 + Option A (`1516b33`, `5f15029`)**: `body_extractor.py` 4가지 시그널(API/Jira/bold/table). 회고 후 보수적 기본값 — API/Jira ON, bold/table OFF (작성 컨벤션 의존 + 추상 헤더 노이즈).
+- **PR-4 LLM 본문 추출기 (`2a54998`)**: `llm_body_extractor.py`. 9개 의미 관계(depends_on/implements/calls/owned_by/supersedes/has_part/uses/provides/documented_in) + 7개 엔티티 어휘 고정. 어휘 외 / 끝점 누락 / self-loop 검증 드롭. 단위 격리 + 비용 게이트. **opt-in** (`PipelineConfig.enable_llm_body_extraction=True` + `llm_client` 둘 다 전달 시).
+- **perf 7500배 (`266bc82`)**: cProfile 진단 결과 `tiktoken/load.py:read_file` 가 매 호출 vocab 재다운로드 시도(357 sections × 38ms = 13.6s). `chunker._get_tokenizer` 에 `lru_cache` 적용 + `_Node.own_body` 캐시 + `_render_subtree/_dfs` 단일 walk 통합. 13447ms → 1.8ms.
+- **호출 체인 통합 (`cbd7693`)**: `process_document(llm_client=...)` 4개 사이트 전파.
+- **fix 빈 응답 (`bd52f5a`)**: Qwen3 reasoning 모델이 `<think>` 사고에 max_tokens 소진 → `extract_json` 스트립 후 빈 응답. `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` 적용 + max_tokens 1024 → 2048. (`graph_search_planner` 와 동일 처방)
+- **PR-5 graph_vocabulary + 플래너 시스템 프롬프트 (`f0a7c6d`)**: `graph_vocabulary.py` 단일 출처(12 entity + 19 relation + 7 intent→relation 매핑). 추출기 어휘 ⊆ vocab 강제 테스트로 미래 누락 자동 검출. `_render_system_prompt()` 동적 렌더 → LLM 플래너가 어휘 의미 + 의도 매핑 가이드 인식. "Auth Service 의존?" → `focus_relations=["depends_on", "uses", "calls"]` 정확 선택.
+- **잔존 갭 (분리)**: I-040 (검색 품질 측정), I-041 (렌더링), I-042 (메타 축), I-043 (cross-doc 관계 출처).
+
+### I-035: Phase 2 인덱싱 자동화 + 동시성 + 실패 재시도 → 해결 (2026-04-24, D-044)
+- **증상**: 싱크 후 문서는 meta 에 저장되지만 벡터/그래프 인덱싱은 수동 "Process" 버튼 필요. Phase 2 가 직렬이라 대량 싱크 시 느림. 인덱싱 실패 문서는 `status='failed'` 로 stuck.
+- **해결 3단계** (`2178564` + `c5c9ca6`):
+  1. `execute_sync_target` 에 선택적 `embedding_client`/`pipeline_config` 주입 → Phase 2(process_document) 자동 실행. `SyncResult` 에 `processed`/`processing_errors` 버킷 + UI `◎N indexed · ⚠M indexing-failed` 노출
+  2. `asyncio.Semaphore(5)` + `asyncio.gather` 로 Phase 2 병렬화. `config.processor.phase2_concurrency` 운영자 튜닝 가능. 400 문서 기준 벽시계 ~5배 단축, OpenAI 기본 tier rate limit 의 ~5% 사용
+  3. `MetadataStore.list_failed_member_doc_ids(target_id)` 신설 — target 스코프 내 status='failed' 문서를 JOIN 쿼리로 식별. Phase 2 큐 = `created + updated + failed-in-membership`(중복 제거) → 재싱크마다 자동 재시도
+- 테스트 +11 (Phase 2 기본·unchanged skip·실패 격리·skip 조건·summary 확장·failed_member JOIN·concurrency bound·failed 재시도·clamp)
+
+### I-034: CQL 페이지네이션 서버 cap 대응 → 해결 (2026-04-24, `49add3c`)
+- **증상**: CQL `searchContent` 가 totalSize=356 을 돌려주는데 실제 임포트는 그보다 적음
+- **근본 원인 2가지 협력**:
+  1. `size < page_size` 에서 무조건 break — 일부 서버가 요청 `limit` 과 무관하게 응답당 개수를 cap (예: `limit=100` 요청에 `size=25` + `totalSize=500`) 하면 첫 응답 직후 종료되어 대량 누락
+  2. `start += page_size` (요청값 증분) — 서버 cap 으로 25개만 왔는데 start 를 100 증가 → items 25–99 구간 스킵
+- **해결**: `_paginate_cql` 공통 헬퍼 추출 + `total_size` 가 알려진 경우 short-page 휴리스틱 skip + `start += env.size` 로 실제 반환 개수만큼 전진. 관측성 보강: `_sync_subtree` 가 `estimate_subtree_page_count` 선행 호출해 totalSize vs 실제 열거 수 비교, 불일치 시 warning 로그
+- 테스트 +2 (`_make_capping_search_session` fake 로 server cap 재현 — space/subtree 각 1건)
+
+### I-033: 서브트리 BFS 누락 → CQL ancestor 평탄 열거로 전환 → 해결 (2026-04-24, `d507b15`, D-044)
+- **증상**: "하위 포함" 등록 시 최하위 depth 까지 가져오지 않음. walker 기반 BFS 가 몇 가지 경로로 누락 가능:
+  1. per-parent `getChild` 의 독립 페이지네이션 오판
+  2. 중간 노드 예외 격리가 그 아래 서브트리 전부 손실
+  3. `max_depth=20` 초과
+  4. `type` 필드가 `"page"` 아닌 값/누락으로 드롭
+  5. 권한 차이 per-node 호출
+- **해결**: 사용자 제안대로 CQL `ancestor = X AND type = "page"` 로 서버 측 평탄 열거. `_subtree_cql`/`estimate_subtree_page_count`/`enumerate_subtree_pages` 신설, `_sync_subtree` 가 descendants + 루트 수동 prepend (CQL ancestor 는 루트 자신 미포함)
+- **Trade-off**: membership 의 `parent_page_id`/`depth` 가 NULL 로 저장됨. 현재 코드베이스에서 이 컬럼을 읽는 곳이 없어 실영향 없음. hierarchy 가 필요해지면 별도 hydrate 단계 추가
+- `walk_subtree` 자체는 삭제하지 않고 유지 (다른 러너 호환)
+- 테스트 +9 (CQL helpers 3 + sync 재작성 6)
+
+### I-032: 서브트리 임포트 시 하위 페이지 누락 — structuredContent 누락 + envelope 키 변종 → 해결 (2026-04-24, `3bb7685`)
+- **증상**: 하위 포함 클릭 시 루트만 임포트되고 자식 전부 누락
+- **근본 원인 2가지 동시에**:
+  1. MCP 신규 스펙은 JSON 을 `CallToolResult.structuredContent` 에 직접 담기도 하는데, 기존 `_parse_json_result` 는 `content[].text` 만 읽어서 전체 페이로드가 소실됨. getChild 결과가 빈 리스트로 해석되어 walker 가 루트만 반환
+  2. 서버 구현체마다 envelope 키가 `results` / `children` / `page` / `pages` / `items` 또는 `{page: {results:[...]}}` 중첩 형태로 다양
+- **해결**: `_parse_json_result` 가 `structuredContent` 를 먼저 확인. `_unwrap_envelope(parsed) -> (items, envelope)` 공통 헬퍼 신설로 5가지 키 변종 + 1단계 중첩 흡수. `expand` 기본값 `""` → `"page"` (빈 문자열 거부하는 서버 방어)
+- 테스트 +4 (structuredContent 우선, children 키, 중첩 page.results, expand non-empty)
+
+### I-031: MCP tool 필수 파라미터 검증 에러 → 해결 (2026-04-24, `de0d7fb` + `9536c0c`)
+- **증상**: UI 에서 공간 검색 클릭 시 `CallToolResult validation` 에러. 사내 MCP 서버가 `getSpaceInfoAll` 에 `start`/`limit` 필수로 요구. 같은 날 `getChild` 도 `pageId`/`start`/`limit`/`expand` 필수로 확인
+- **해결**:
+  - `get_all_spaces` 가 `{"start": 0, "limit": 100}` 전달 + envelope 응답 페이지네이션 (`de0d7fb`)
+  - `get_child_pages` 가 `pageId`/`start`/`limit`/`expand` 함께 전달 + 동일 페이지네이션 로직 (`9536c0c`)
+  - 둘 다 envelope 없이 list 만 오는 서버 변종도 한 번에 처리 후 종료
+- 테스트 +5
+
+### I-030: Confluence MCP 3-scope 싱크 UI 구현 → 해결 (2026-04-24)
+- `web/templates/confluence_mcp.html` 단일 파일 확장으로 완료. `syncTargetsPanel()` Alpine 컴포넌트 신설.
+- 구현된 요소:
+  - 🔍 검색 박스: `GET /api/confluence-mcp/search?q=...` → Spaces / Pages 두 섹션으로 분리 렌더, 빈 쿼리 시 모든 공간 노출
+  - 결과 카드 3버튼: 📄 페이지만 / 🌿 하위 포함 / 🏢 공간 전체 (Space 카드는 🏢 단일 버튼)
+  - 확인 다이얼로그 3종: subtree(즉시), space(estimate 선행 후 "예상 N개" 표시), unregister(cascade 경고)
+  - 등록된 대상 카드 목록: scope 뱃지 색상(`scope-page`/`subtree`/`space`) + 상대시간 last_sync + 증분 요약 monospace 뱃지(+N new · ~N updated · -N removed) + [🔄 재싱크] [❌ 해제]
+  - 폴링: running/queued 가 하나라도 있을 때만 2초 간격 `GET /sync-targets/{id}` 자가 시작·정지
+- 구 단발성 임포트 UI(3탭)는 `<details>` 로 접어 "고급" 영역에 보존
+- 회귀 테스트: `tests/test_web/test_confluence_mcp_sync_api.py` 19건 모두 통과 (UI 자체는 E2E 없음, 백엔드 계약을 따름)
+
+### I-003: 엔티티 병합 테이블 스키마 미정 → 해결 (Phase 7.7, D-024)
+- `graph_node_documents` 조인 테이블로 노드-문서 다대다 관계 관리
+- `entity_name(대소문자 무시) + entity_type` 기준 정규 노드 병합
+
+### I-012: HTML→Markdown 변환 시 테이블·매크로 손실 → 해결 (Phase 7.1, D-018)
+- BeautifulSoup + markdownify 기반 변환으로 교체
+- Confluence 매크로 전처리 지원 (info/warning/note/code/expand 등)
+
+### I-013: 청킹 시 문서 구조(헤딩) 미활용 → 해결 (Phase 7.2, D-019)
+- 마크다운 헤딩 기반 계층적 청킹 + `section_path` 메타데이터 첨부
+
+### I-014: 그래프 추출 시 콘텐츠 절삭 → 해결 (Phase 7.4, D-021)
+- map-reduce 방식으로 전체 문서 처리, 엔티티/관계 중복 제거 병합
+
+### I-015: 컨텍스트 조립 시 재랭킹·필터링 부재 → 해결 (Phase 7.3, D-020)
+- cosine similarity threshold + LLM 리랭커 2단계 필터링
+
+### I-016: 쿼리 전처리 및 확장 부재 → 해결 (Phase 7.5, D-022)
+- HyDE 적용 — LLM 가상 문서 임베딩과 원본 쿼리 임베딩 평균
+
+### I-017: 문서 분류기가 처음 2000자만 사용 → 해결 (Phase 7.6, D-023)
+- 시작/중간/끝 구간 샘플링 (~4000자)
+
+### I-018: 크로스-문서 엔티티 병합 로직 미구현 → 해결 (Phase 7.7, D-024)
+- 정규 노드 방식 — entity_name + entity_type 기준 병합, graph_node_documents 조인 테이블
 
 ### I-001: 웹 프레임워크 최종 선택 → FastAPI + Jinja2 + HTMX
 - 2026-03-11 결정: FastAPI + Jinja2 + HTMX + Alpine.js + Pico CSS

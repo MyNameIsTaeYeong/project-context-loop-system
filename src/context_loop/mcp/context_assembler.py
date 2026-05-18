@@ -3,19 +3,26 @@
 벡터 유사도 검색과 그래프 탐색 결과를 병합하여
 LLM에 제공할 컨텍스트를 조립한다.
 LLM 기반 그래프 탐색 플래너로 질의 의도에 맞는 그래프 영역을 탐색한다.
+유사도 threshold로 무관한 청크를 제외하고,
+LLM 기반 리랭커로 검색 결과의 정밀도를 높인다.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
 from context_loop.processor.graph_search_planner import (
     GraphSearchResult,
     execute_graph_search,
     plan_graph_search,
 )
+from context_loop.processor.query_expander import expand_query_embedding
+from context_loop.processor.reranker import rerank
+from context_loop.processor.reranker_client import RerankerClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
@@ -34,10 +41,17 @@ class Source:
 
 @dataclass
 class AssembledContext:
-    """조립된 컨텍스트와 출처 정보."""
+    """조립된 컨텍스트와 출처 정보.
+
+    ``retrieved_graph_entities`` 는 검색된 그래프 노드의 ``GraphEntityRef``
+    리스트 (2차 — description 포함). ``retrieved_graph_relations`` 는
+    ``--score-relations`` 평가용으로 노출되는 1-hop 엣지 정보 (2차).
+    """
 
     context_text: str
     sources: list[Source] = field(default_factory=list)
+    retrieved_graph_entities: list[GraphEntityRef] = field(default_factory=list)
+    retrieved_graph_relations: list[GraphRelationRef] = field(default_factory=list)
 
 
 async def assemble_context(
@@ -48,8 +62,15 @@ async def assemble_context(
     graph_store: GraphStore,
     embedding_client: Any,
     llm_client: Any = None,
+    reranker_client: RerankerClient | None = None,
     max_chunks: int = 10,
     include_graph: bool = True,
+    similarity_threshold: float = 0.0,
+    rerank_enabled: bool = False,
+    rerank_top_k: int | None = None,
+    rerank_score_threshold: float = 0.0,
+    hyde_enabled: bool = False,
+    include_source_code: bool = False,
 ) -> str:
     """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
@@ -63,37 +84,75 @@ async def assemble_context(
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트 (Embeddings 인터페이스).
         llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        reranker_client: 전용 리랭커 모델 클라이언트. None이면 리랭킹 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
+        similarity_threshold: 최소 코사인 유사도 (이 값 미만 제외, 0이면 필터링 없음).
+        rerank_enabled: 전용 리랭커 사용 여부.
+        rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
+        rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
+        hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
+        include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
 
     Returns:
         조립된 컨텍스트 텍스트.
     """
     sections: list[str] = []
 
-    # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
-    query_embedding = await _embed_query(query, embedding_client)
+    # 쿼리 임베딩 생성 (HyDE 활성화 시 가상 문서 임베딩과 평균)
+    if hyde_enabled and llm_client:
+        query_embedding = await expand_query_embedding(query, llm_client, embedding_client)
+    else:
+        query_embedding = await _embed_query(query, embedding_client)
 
-    # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(query_embedding, vector_store, max_chunks)
+    # 1. 벡터 유사도 검색 + threshold 필터링
+    chunk_results = await _search_chunks(
+        query_embedding, vector_store, max_chunks,
+        similarity_threshold=similarity_threshold,
+    )
+
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (모델 호출 두 건을 동시에 처리).
+    chunk_results, graph_result = await _rerank_and_search_graph(
+        query, chunk_results,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        reranker_client=reranker_client,
+        embedding_client=embedding_client,
+        query_embedding=query_embedding,
+        rerank_enabled=rerank_enabled,
+        rerank_top_k=rerank_top_k,
+        rerank_score_threshold=rerank_score_threshold,
+        include_graph=include_graph,
+    )
+
     if chunk_results:
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
-    if include_graph and llm_client:
-        graph_result = await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-        if graph_result:
-            sections.append(graph_result.text)
+    # 3. 그래프 탐색 결과 처리
+    if graph_result:
+        sections.append(graph_result.text)
+
+    # 4. Phase 9.7: 원본 소스 코드 첨부
+    if include_source_code and chunk_results:
+        doc_ids = _extract_doc_ids(chunk_results)
+        source_section = await _fetch_and_format_source_code(doc_ids, meta_store)
+        if source_section:
+            sections.append(source_section)
 
     if not sections:
+        logger.info(
+            "Assembled context | query=%s | chars=0 | text=<empty>",
+            query,
+        )
         return "관련 컨텍스트를 찾을 수 없습니다."
 
-    return "\n\n---\n\n".join(sections)
+    context_text = "\n\n---\n\n".join(sections)
+    logger.info(
+        "Assembled context | query=%s | chars=%d | text=%s",
+        query, len(context_text), context_text,
+    )
+    return context_text
 
 
 async def _embed_query(
@@ -112,12 +171,46 @@ async def _search_chunks(
     query_embedding: list[float] | None,
     vector_store: VectorStore,
     max_chunks: int,
+    *,
+    similarity_threshold: float = 0.0,
 ) -> list[dict[str, Any]]:
-    """벡터 유사도 검색을 수행한다."""
+    """벡터 유사도 검색을 수행하고 threshold 이하 결과를 제외한다.
+
+    멀티뷰 임베딩(D-042)을 사용하므로 한 논리 청크가 ``body``/``meta`` 두
+    엔트리로 존재할 수 있다. 과잉 인출(over-fetch)한 뒤
+    ``logical_chunk_id`` 로 dedup하여 동일 본문이 중복 반환되지 않게 한다.
+    거리 오름차순으로 도착하므로 먼저 등장하는 항목이 해당 청크의 최소
+    distance이며, 그 값을 유지한다.
+
+    Args:
+        query_embedding: 쿼리 임베딩 벡터.
+        vector_store: 벡터 저장소.
+        max_chunks: 반환할 최대 청크 수.
+        similarity_threshold: 최소 코사인 유사도 (1 - distance).
+            이 값 미만인 청크는 제외된다. 0이면 필터링 없음.
+    """
     try:
         if vector_store.count() == 0 or query_embedding is None:
             return []
-        return vector_store.search(query_embedding, n_results=max_chunks)
+        # 뷰 수(최대 2)를 고려해 over-fetch 후 dedup.
+        raw = vector_store.search(query_embedding, n_results=max_chunks * 2)
+        seen: set[Any] = set()
+        deduped: list[dict[str, Any]] = []
+        for r in raw:
+            meta = r.get("metadata") or {}
+            key = meta.get("logical_chunk_id") or r.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+            if len(deduped) >= max_chunks:
+                break
+        if similarity_threshold > 0:
+            deduped = [
+                r for r in deduped
+                if (1 - r.get("distance", 1.0)) >= similarity_threshold
+            ]
+        return deduped
     except Exception:
         logger.warning("벡터 검색 실패", exc_info=True)
         return []
@@ -140,7 +233,11 @@ async def _format_chunk_results(
         title = doc_cache.get(doc_id, "알 수 없음") if doc_id else "알 수 없음"
         content = r.get("document", "")
         distance = r.get("distance", 0)
-        lines.append(f"\n### [{title}] (유사도: {1 - distance:.2f})")
+        section_path = r.get("metadata", {}).get("section_path", "")
+        header = f"\n### [{title}] (유사도: {1 - distance:.2f})"
+        if section_path:
+            header += f"\n_섹션: {section_path}_"
+        lines.append(header)
         lines.append(content)
 
     return "\n".join(lines)
@@ -179,6 +276,50 @@ async def _search_graph_with_llm(
         return None
 
 
+async def _rerank_and_search_graph(
+    query: str,
+    chunk_results: list[dict[str, Any]],
+    *,
+    graph_store: GraphStore,
+    llm_client: Any,
+    reranker_client: RerankerClient | None,
+    embedding_client: Any,
+    query_embedding: list[float] | None,
+    rerank_enabled: bool,
+    rerank_top_k: int | None,
+    rerank_score_threshold: float,
+    include_graph: bool,
+) -> tuple[list[dict[str, Any]], GraphSearchResult | None]:
+    """리랭킹과 그래프 탐색을 병렬 실행한다.
+
+    리랭킹은 chunk_results, 그래프 계획은 query_embedding 에만 의존하므로
+    서로 무관한 두 외부 호출을 동시에 보내 응답 지연을 줄인다.
+    """
+    async def _maybe_rerank() -> list[dict[str, Any]]:
+        if not (chunk_results and rerank_enabled and reranker_client):
+            return chunk_results
+        reranked = await rerank(
+            query, chunk_results, reranker_client, top_k=rerank_top_k,
+        )
+        if rerank_score_threshold > 0:
+            reranked = [
+                c for c in reranked
+                if c.get("rerank_score", 0) >= rerank_score_threshold
+            ]
+        return reranked
+
+    async def _maybe_graph() -> GraphSearchResult | None:
+        if not (include_graph and llm_client):
+            return None
+        return await _search_graph_with_llm(
+            query, graph_store, llm_client,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
+        )
+
+    return await asyncio.gather(_maybe_rerank(), _maybe_graph())
+
+
 async def assemble_context_with_sources(
     query: str,
     *,
@@ -187,8 +328,15 @@ async def assemble_context_with_sources(
     graph_store: GraphStore,
     embedding_client: Any,
     llm_client: Any = None,
+    reranker_client: RerankerClient | None = None,
     max_chunks: int = 10,
     include_graph: bool = True,
+    similarity_threshold: float = 0.0,
+    rerank_enabled: bool = False,
+    rerank_top_k: int | None = None,
+    rerank_score_threshold: float = 0.0,
+    hyde_enabled: bool = False,
+    include_source_code: bool = False,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -202,8 +350,15 @@ async def assemble_context_with_sources(
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트.
         llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        reranker_client: 전용 리랭커 모델 클라이언트. None이면 리랭킹 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
+        similarity_threshold: 최소 코사인 유사도 (이 값 미만 제외, 0이면 필터링 없음).
+        rerank_enabled: 전용 리랭커 사용 여부.
+        rerank_top_k: 리랭킹 후 반환할 최대 청크 수.
+        rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
+        hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
+        include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -212,11 +367,32 @@ async def assemble_context_with_sources(
     sources: list[Source] = []
     doc_cache: dict[int, dict[str, Any]] = {}
 
-    # 쿼리 임베딩 1회 생성 후 벡터 검색 + 그래프 탐색에 재사용
-    query_embedding = await _embed_query(query, embedding_client)
+    # 쿼리 임베딩 생성 (HyDE 활성화 시 가상 문서 임베딩과 평균)
+    if hyde_enabled and llm_client:
+        query_embedding = await expand_query_embedding(query, llm_client, embedding_client)
+    else:
+        query_embedding = await _embed_query(query, embedding_client)
 
-    # 1. 벡터 유사도 검색
-    chunk_results = await _search_chunks(query_embedding, vector_store, max_chunks)
+    # 1. 벡터 유사도 검색 + threshold 필터링
+    chunk_results = await _search_chunks(
+        query_embedding, vector_store, max_chunks,
+        similarity_threshold=similarity_threshold,
+    )
+
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (모델 호출 두 건을 동시에 처리).
+    chunk_results, graph_result = await _rerank_and_search_graph(
+        query, chunk_results,
+        graph_store=graph_store,
+        llm_client=llm_client,
+        reranker_client=reranker_client,
+        embedding_client=embedding_client,
+        query_embedding=query_embedding,
+        rerank_enabled=rerank_enabled,
+        rerank_top_k=rerank_top_k,
+        rerank_score_threshold=rerank_score_threshold,
+        include_graph=include_graph,
+    )
+
     if chunk_results:
         lines = []
         for r in chunk_results:
@@ -227,30 +403,114 @@ async def assemble_context_with_sources(
             title = doc_cache[doc_id]["title"] if doc_id and doc_id in doc_cache else "알 수 없음"
             distance = r.get("distance", 1.0)
             similarity = 1 - distance
-            lines.append(f"[출처: {title}]\n{r.get('document', '')}")
+            section_path = r.get("metadata", {}).get("section_path", "")
+            source_label = f"[출처: {title}]"
+            if section_path:
+                source_label += f" (섹션: {section_path})"
+            lines.append(f"{source_label}\n{r.get('document', '')}")
             if doc_id and doc_id not in {s.document_id for s in sources}:
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 2. LLM 기반 그래프 탐색 (쿼리 임베딩으로 관련 스키마 생성)
-    if include_graph and llm_client:
-        graph_result = await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
+    # 3. 그래프 탐색 결과 처리 (쿼리 임베딩으로 관련 스키마 생성)
+    if graph_result:
+        sections.append(graph_result.text)
+        # 그래프 탐색 결과에서 출처 추출
+        existing_doc_ids = {s.document_id for s in sources}
+        for doc_id in graph_result.document_ids:
+            if doc_id not in existing_doc_ids:
+                if doc_id not in doc_cache:
+                    doc = await meta_store.get_document(doc_id)
+                    doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
+                title = doc_cache[doc_id]["title"]
+                sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
+
+    # Phase 9.7: 원본 소스 코드 첨부
+    if include_source_code and chunk_results:
+        hit_doc_ids = _extract_doc_ids(chunk_results)
+        source_section = await _fetch_and_format_source_code(
+            hit_doc_ids, meta_store,
         )
-        if graph_result:
-            sections.append(graph_result.text)
-            # 그래프 탐색 결과에서 출처 추출
-            existing_doc_ids = {s.document_id for s in sources}
-            for doc_id in graph_result.document_ids:
-                if doc_id not in existing_doc_ids:
-                    if doc_id not in doc_cache:
-                        doc = await meta_store.get_document(doc_id)
-                        doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
-                    title = doc_cache[doc_id]["title"]
-                    sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
+        if source_section:
+            sections.append(source_section)
 
     context_text = "\n\n---\n\n".join(sections) if sections else ""
     sources.sort(key=lambda s: s.similarity, reverse=True)
-    return AssembledContext(context_text=context_text, sources=sources)
+    retrieved_entities = list(graph_result.entities) if graph_result else []
+    retrieved_relations = list(graph_result.relations) if graph_result else []
+    logger.info(
+        "Assembled context | query=%s | chars=%d | sources=%d | text=%s",
+        query, len(context_text), len(sources),
+        context_text if context_text else "<empty>",
+    )
+    return AssembledContext(
+        context_text=context_text,
+        sources=sources,
+        retrieved_graph_entities=retrieved_entities,
+        retrieved_graph_relations=retrieved_relations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.7: 원본 소스 코드 첨부 헬퍼
+# ---------------------------------------------------------------------------
+
+
+def _extract_doc_ids(chunk_results: list[dict[str, Any]]) -> set[int]:
+    """청크 검색 결과에서 고유 문서 ID를 추출한다."""
+    ids: set[int] = set()
+    for r in chunk_results:
+        doc_id = r.get("metadata", {}).get("document_id")
+        if doc_id is not None:
+            ids.add(doc_id)
+    return ids
+
+
+async def _fetch_and_format_source_code(
+    doc_ids: set[int],
+    meta_store: MetadataStore,
+) -> str | None:
+    """code_doc/code_summary 문서의 원본 git_code 소스를 조회하여 포맷팅한다.
+
+    document_sources 테이블을 통해 연결된 git_code 문서의 원본 코드를
+    검증용 섹션으로 조립한다.
+
+    Returns:
+        포맷팅된 소스 코드 섹션 문자열. 소스가 없으면 None.
+    """
+    source_parts: list[str] = []
+    seen_source_ids: set[int] = set()
+
+    for doc_id in doc_ids:
+        doc = await meta_store.get_document(doc_id)
+        if not doc or doc["source_type"] not in ("code_doc", "code_summary"):
+            continue
+
+        sources = await meta_store.get_document_sources(doc_id)
+        for src in sources:
+            src_id = src["source_doc_id"]
+            if src_id in seen_source_ids:
+                continue
+            seen_source_ids.add(src_id)
+
+            src_doc = await meta_store.get_document(src_id)
+            if not src_doc or not src_doc.get("original_content"):
+                continue
+
+            file_path = src.get("file_path") or src_doc.get("source_id", "")
+            title = src_doc.get("title", file_path)
+            content = src_doc["original_content"]
+
+            # 파일 확장자에서 언어 힌트 추출
+            ext = ""
+            if "." in file_path:
+                ext = file_path.rsplit(".", 1)[-1]
+
+            source_parts.append(
+                f"### {title} ({file_path})\n```{ext}\n{content}\n```"
+            )
+
+    if not source_parts:
+        return None
+
+    return "## 원본 소스 코드 (검증용)\n\n" + "\n\n".join(source_parts)

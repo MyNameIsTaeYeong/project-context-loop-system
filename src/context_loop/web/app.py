@@ -21,6 +21,27 @@ logger = logging.getLogger(__name__)
 _WEB_DIR = Path(__file__).resolve().parent
 
 
+def _configure_logging(config: Config) -> None:
+    """config의 app.log_level을 context_loop 로거에 적용한다.
+
+    uvicorn은 자체 로거만 INFO로 설정하므로 context_loop.* 로거들은
+    기본 WARNING을 상속한다. 이 함수가 호출되어야 INFO 로그가 출력된다.
+    """
+    level_name = str(config.get("app.log_level", "INFO")).upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+    pkg_logger = logging.getLogger("context_loop")
+    pkg_logger.setLevel(level)
+    if not pkg_logger.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"),
+        )
+        pkg_logger.addHandler(handler)
+        pkg_logger.propagate = False
+
+
 def _build_llm_client(config: Config):
     """설정에 따라 LLM 클라이언트를 생성한다."""
     from context_loop.auth import get_token
@@ -32,6 +53,8 @@ def _build_llm_client(config: Config):
             endpoint=config.get("llm.endpoint", ""),
             model=config.get("llm.model", ""),
             api_key=config.get("llm.api_key", ""),
+            headers=config.get("llm.headers") or None,
+            reasoning_profiles=config.get("llm.reasoning_profiles") or None,
         )
     if provider == "anthropic":
         api_key = get_token("anthropic", "api_key")
@@ -39,6 +62,25 @@ def _build_llm_client(config: Config):
     # openai
     api_key = get_token("openai", "api_key")
     return OpenAIClient(api_key=api_key or "")
+
+
+def _build_reranker_client(config: Config):
+    """설정에 따라 전용 리랭커 클라이언트를 생성한다.
+
+    ``reranker.endpoint`` 가 비어 있으면 None 을 반환해 리랭킹 단계를 스킵한다.
+    """
+    from context_loop.processor.reranker_client import EndpointRerankerClient
+
+    endpoint = config.get("reranker.endpoint", "") or ""
+    model = config.get("reranker.model", "") or ""
+    if not endpoint or not model:
+        return None
+    return EndpointRerankerClient(
+        endpoint=endpoint,
+        model=model,
+        api_key=config.get("reranker.api_key", "") or "",
+        headers=config.get("reranker.headers") or None,
+    )
 
 
 def _build_embedding_client(config: Config):
@@ -51,6 +93,7 @@ def _build_embedding_client(config: Config):
             endpoint=config.get("processor.embedding_endpoint", ""),
             model=config.get("processor.embedding_model", ""),
             api_key=config.get("processor.embedding_api_key", ""),
+            headers=config.get("processor.embedding_headers") or None,
         )
     if embed_provider == "local":
         return LocalEmbeddingClient(
@@ -72,6 +115,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     config = Config()
     data_dir = config.data_dir
 
+    _configure_logging(config)
+
     meta_store = MetadataStore(data_dir / "metadata.db")
     await meta_store.initialize()
 
@@ -83,6 +128,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     llm_client = _build_llm_client(config)
     embedding_client = _build_embedding_client(config)
+    reranker_client = _build_reranker_client(config)
 
     app.state.config = config
     app.state.meta_store = meta_store
@@ -90,6 +136,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.graph_store = graph_store
     app.state.llm_client = llm_client
     app.state.embedding_client = embedding_client
+    app.state.reranker_client = reranker_client
 
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
@@ -109,13 +156,17 @@ def create_app() -> FastAPI:
 
     from context_loop.web.api.chat import router as chat_router
     from context_loop.web.api.confluence import router as confluence_router
+    from context_loop.web.api.confluence_mcp import router as confluence_mcp_router
     from context_loop.web.api.documents import router as documents_router
+    from context_loop.web.api.git_sync import router as git_sync_router
     from context_loop.web.api.stats import router as stats_router
     from context_loop.web.api.upload import router as upload_router
 
     app.include_router(stats_router)
     app.include_router(upload_router)
     app.include_router(confluence_router)
+    app.include_router(confluence_mcp_router)
+    app.include_router(git_sync_router)
     app.include_router(chat_router)
     app.include_router(documents_router)
 

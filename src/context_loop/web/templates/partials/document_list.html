@@ -13,7 +13,7 @@
         {% for doc in documents %}
         <tr>
             <td><a href="/documents/{{ doc.id }}">{{ doc.title }}</a></td>
-            <td><span class="badge badge-source">{{ doc.source_type }}</span></td>
+            <td><span class="badge badge-source badge-source-{{ doc.source_type }}">{{ doc.source_type }}</span></td>
             <td><span class="badge badge-{{ doc.status }}">{{ doc.status }}</span></td>
             <td>
                 {% if doc.storage_method %}

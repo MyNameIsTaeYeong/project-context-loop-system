@@ -290,3 +290,42 @@ async def test_execute_search_focus_relations_filter(graph_store: GraphStore, me
     assert "calls" in result.text
     # uses는 필터링되어 표시되지 않아야 함
     assert "uses" not in result.text
+
+
+# ---------------------------------------------------------------------------
+# 시스템 프롬프트 어휘 노출 (PR-5)
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_exposes_full_vocabulary() -> None:
+    """LLM 시스템 프롬프트에 graph_vocabulary 의 모든 entity/relation 어휘가 노출된다.
+
+    이 회귀 방지가 없으면 추출기는 새 관계(예: depends_on)를 그래프에 쌓아도
+    탐색 플래너가 이를 모르고 활용 못한다.
+    """
+    from context_loop.processor.graph_search_planner import _render_system_prompt
+    from context_loop.processor.graph_vocabulary import (
+        ENTITY_TYPES,
+        RELATION_TYPES,
+    )
+
+    prompt = _render_system_prompt()
+    for entry in ENTITY_TYPES:
+        assert entry.name in prompt, f"entity_type '{entry.name}' 누락"
+    for entry in RELATION_TYPES:
+        assert entry.name in prompt, f"relation_type '{entry.name}' 누락"
+
+
+def test_system_prompt_includes_intent_mapping() -> None:
+    """질의 의도 → 관계 매핑 가이드가 시스템 프롬프트에 포함된다."""
+    from context_loop.processor.graph_search_planner import _render_system_prompt
+
+    prompt = _render_system_prompt()
+    # 핵심 의미 관계가 가이드에 포함되어 있어야 함
+    assert "depends_on" in prompt
+    assert "owned_by" in prompt
+    assert "implements" in prompt
+    # JSON 응답 스키마 가이드도 유지
+    assert "should_search" in prompt
+    assert "search_steps" in prompt
+    assert "focus_relations" in prompt

@@ -1,0 +1,47 @@
+{% if sources %}
+<article>
+    <header><strong>Source Code Files ({{ sources|length }})</strong></header>
+    <table>
+        <thead>
+            <tr>
+                <th>File Path</th>
+                <th>Source Document</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sources %}
+            <tr>
+                <td><code>{{ s.file_path or '-' }}</code></td>
+                <td><a href="/documents/{{ s.source_doc_id }}">{{ s.title }}</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</article>
+{% endif %}
+
+{% if reverse_refs %}
+<article>
+    <header><strong>Referenced By ({{ reverse_refs|length }})</strong></header>
+    <table>
+        <thead>
+            <tr>
+                <th>Document</th>
+                <th>Type</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in reverse_refs %}
+            <tr>
+                <td><a href="/documents/{{ r.doc_id }}">{{ r.title }}</a></td>
+                <td><span class="badge badge-source badge-source-{{ r.source_type }}">{{ r.source_type }}</span></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</article>
+{% endif %}
+
+{% if not sources and not reverse_refs %}
+<p>No source connections for this document.</p>
+{% endif %}
