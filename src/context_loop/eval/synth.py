@@ -75,8 +75,14 @@ class FilterReport:
     reason: str = ""
     """탈락 시 원인.
 
-    가능 값: ``not_answerable`` | ``leakage`` | ``demonstrative`` | ``generic`` |
-    ``parse_error``.
+    가능 값:
+        ``not_answerable`` — 정답 청크로 답할 수 없음 (LLM)
+        ``leakage`` — ASCII 식별자 누출 (결정론)
+        ``korean_leakage`` — 한국어 고유명사 누출 (결정론)
+        ``demonstrative`` — 지시대명사/포인터 표현 (결정론)
+        ``non_unique_source`` — 정답 청크가 유일한 출처가 아님 (LLM)
+        ``generic`` — Distractor 로도 답할 수 있음 (LLM)
+        ``parse_error`` — LLM 응답 파싱 실패
     """
 
 
@@ -141,7 +147,13 @@ GENERIC_PROMPT_TEMPLATE = """\
 {chunk_content}
 ---
 
-이 문맥만 보고 위 질문에 사실 기반으로 답할 수 있는가?
+이 문맥이 위 질문에 대한 **유일한 정답 출처**라고 단정할 수 있는지 평가하라.
+
+판단 기준:
+- 문맥에 명시되지 않은 정보로 답해야 한다면 'no'
+- 다른 일반적인 문서/매뉴얼/위키에서도 같은 답을 얻을 수 있다면 'no'
+- 이 문맥에만 있는 고유한 정보로 답해야만 한다면 'yes'
+
 yes/no 한 단어로만 답하라.
 """
 
@@ -340,6 +352,98 @@ def has_identifier_leakage(question: str, source_text: str) -> bool:
     for tok in tokens:
         # 대소문자 구분 (Foo 와 foo 는 다른 식별자로 취급)
         if re.search(rf"\b{re.escape(tok)}\b", question):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Korean proper noun leakage detection (한국어 고유명사 누출 탐지)
+# ---------------------------------------------------------------------------
+
+
+_KOREAN_NOUN_RE = re.compile(r"[가-힣]{4,}")
+"""4자 이상의 연속 한글.
+
+일반 2~3자 명사(사용자, 데이터 등) 는 stopword 화이트리스트로 보강하지 않고 길이로 자연 필터한다.
+"""
+
+_KOREAN_COMMON_NOUNS = frozenset({
+    # 4자 이상이라도 너무 흔해 고유명사 후보가 아닌 일반 어휘
+    "사용자가", "사용자는", "사용자의", "사용자에게",
+    "관리자가", "관리자는", "관리자의",
+    "프로젝트", "프로세스", "비즈니스", "데이터베이스", "데이터셋", "데이터를",
+    "애플리케이션", "인터페이스", "프레임워크", "라이브러리",
+    "서비스가", "서비스는", "서비스의", "서비스를",
+    "시스템이", "시스템은", "시스템의", "시스템을",
+    "기능에서", "기능으로", "기능을",
+})
+
+
+# 한국어 후행 조사 — 토큰 stem 추출에 사용.
+_KOREAN_JOSA_RE = re.compile(
+    r"(은|는|이|가|을|를|에|에서|에게|한테|으로|로|와|과|의|도|만|까지|부터|보다|마저|조차)$",
+)
+
+
+def _strip_korean_josa(token: str, *, min_stem_len: int = 3) -> str:
+    """한국어 토큰에서 후행 조사를 1회 제거한 stem 을 반환.
+
+    조사를 제거한 stem 의 길이가 ``min_stem_len`` 미만이 되면 원본 유지 — 너무
+    공격적인 stripping 으로 일반 단어가 잘못 매칭되는 것을 막는다.
+    """
+    m = _KOREAN_JOSA_RE.search(token)
+    if not m:
+        return token
+    stem = token[: m.start()]
+    if len(stem) < min_stem_len:
+        return token
+    return stem
+
+
+def extract_korean_proper_noun_candidates(
+    text: str,
+    *,
+    max_freq: int = 1,
+) -> set[str]:
+    """청크에서 한국어 고유명사 후보(stem) 를 추출한다.
+
+    - 4자 이상의 연속 한글 토큰을 정규식으로 후보화
+    - 후행 조사를 1회 제거해 stem 으로 정규화 ("결제한도서비스는" → "결제한도서비스")
+    - 청크 내 stem 빈도 ``max_freq`` 이하 (= 고유명사 가능성 높음)
+    - stem 이 ``_KOREAN_COMMON_NOUNS`` 화이트리스트면 제외
+    - stem 길이 4자 이상만 유지
+
+    누출 검사용 후보 — 한국어 토큰은 조사가 풍부해 단순 토큰 매칭이 실패하므로
+    stem 매칭이 필수다.
+    """
+    counts: dict[str, int] = {}
+    for m in _KOREAN_NOUN_RE.finditer(text):
+        tok = m.group(0)
+        stem = _strip_korean_josa(tok)
+        if len(stem) < 4:
+            continue
+        if stem in _KOREAN_COMMON_NOUNS:
+            continue
+        counts[stem] = counts.get(stem, 0) + 1
+    return {stem for stem, c in counts.items() if c <= max_freq}
+
+
+def has_korean_proper_noun_leakage(question: str, source_text: str) -> bool:
+    """질문이 출처 청크의 한국어 고유명사를 그대로 베꼈는지 검사.
+
+    한국어 사내 문서(팀명·시스템명·서비스명)는 ASCII 식별자 정규식으로 잡히지 않아
+    별도 게이트가 필요하다. 청크 내 빈도가 낮은(고유명사 가능성 높은) 4자 이상 한글
+    토큰의 stem 이 질문에 substring 으로 등장하면 누출로 판정한다.
+
+    True 면 골드셋에서 탈락 — 검색 시스템이 어휘 매칭만으로 1위를 차지해 검색 품질
+    측정이 부풀려지는 것을 막는다.
+    """
+    candidates = extract_korean_proper_noun_candidates(source_text)
+    if not candidates:
+        return False
+    for stem in candidates:
+        # stem 이 질문에 substring 으로 등장하면 누설 (조사가 달라도 잡기 위함)
+        if stem in question:
             return True
     return False
 
@@ -580,6 +684,35 @@ async def is_answerable(
     return parse_yes_no(text)
 
 
+async def is_unique_source(
+    question: str,
+    chunk_content: str,
+    *,
+    judge: LLMClient,
+    reasoning_mode: str | None = "off",
+) -> bool | None:
+    """Judge LLM 에 "이 청크가 이 질문의 유일한 정답 출처인가?" 를 물어 yes/no.
+
+    ``is_answerable`` 과 의미가 다른 별도 게이트 — 답변 가능성은 동일 프롬프트로
+    중복 검증되지 않는다. 일반적인 위키·매뉴얼·외부 지식으로 답할 수 있는 질문은
+    no 로 분류되어, 검색 시스템 평가에서 trivial recall 을 유발하는 generic 질문을
+    걸러낸다.
+
+    파싱 실패 시 None.
+    """
+    prompt = GENERIC_PROMPT_TEMPLATE.format(
+        question=question, chunk_content=chunk_content,
+    )
+    text = await judge.complete(
+        prompt,
+        max_tokens=64,
+        temperature=0.0,
+        reasoning_mode=reasoning_mode,
+        purpose="goldset_judge_unique_source",
+    )
+    return parse_yes_no(text)
+
+
 async def filter_question(
     question: str,
     source_chunk: str,
@@ -588,12 +721,25 @@ async def filter_question(
     judge: LLMClient,
     reasoning_mode: str | None = "off",
 ) -> FilterReport:
-    """3 단계 품질 게이트.
+    """다단계 품질 게이트.
+
+    적용 순서 (먼저 결정론적 게이트, 그다음 LLM 게이트):
+        (a) 답변 가능성 — 정답 청크로 답할 수 있는가? (LLM, ``is_answerable``)
+        (b1) ASCII 식별자 누출 — 결정론
+        (b2) 한국어 고유명사 누출 — 결정론
+        (c) 지시대명사·포인터 표현 — 결정론
+        (d1) 정답 청크 유일성 — 정답 청크가 유일한 출처인가? (LLM, ``is_unique_source``,
+             ``is_answerable`` 과 의미가 명확히 분리된 프롬프트)
+        (d2) Distractor 보조 검증 — 무관 청크로도 답할 수 있으면 generic
+
+    탈락 사유 (FilterReport.reason):
+        ``not_answerable`` | ``leakage`` | ``korean_leakage`` |
+        ``demonstrative`` | ``non_unique_source`` | ``generic`` | ``parse_error``
 
     Args:
         question: 후보 질문.
         source_chunk: 출처 청크 (정답 청크).
-        distractors: 무관 청크 N개 (일반성 검증용).
+        distractors: 무관 청크 N개 (일반성 보조 검증용).
         judge: Judge LLM.
     """
     # (a) 답변 가능성 — 출처 청크로 답해야 함
@@ -603,9 +749,14 @@ async def filter_question(
     if not ans:
         return FilterReport(passed=False, reason="not_answerable")
 
-    # (b) 식별자 누출 — 결정론적 (LLM 호출 없음)
+    # (b1) ASCII 식별자 누출 — 결정론적 (LLM 호출 없음)
     if has_identifier_leakage(question, source_chunk):
         return FilterReport(passed=False, reason="leakage")
+
+    # (b2) 한국어 고유명사 누출 — 결정론적. 사내 한국어 문서의 팀명·시스템명
+    # 같은 고유명사가 질문에 그대로 베껴진 케이스를 잡는다.
+    if has_korean_proper_noun_leakage(question, source_chunk):
+        return FilterReport(passed=False, reason="korean_leakage")
 
     # (c) 지시대명사·포인터 표현 — 결정론적 (LLM 호출 없음).
     # "이 클래스/위 코드/this method" 처럼 청크 포인터를 가정하는 질문은
@@ -613,7 +764,18 @@ async def filter_question(
     if has_demonstrative_reference(question):
         return FilterReport(passed=False, reason="demonstrative")
 
-    # (d) 일반성 — 무관 청크로도 답할 수 있으면 정답 청크 유일성이 깨짐
+    # (d1) 유일성 — 정답 청크가 유일한 출처인지 확인. ``is_answerable`` 과
+    # 의미가 명확히 분리된 프롬프트(GENERIC_PROMPT_TEMPLATE)로 호출하여,
+    # 동일 LLM 호출이 두 게이트를 동시에 통과시키는 self-bias 를 차단한다.
+    unique = await is_unique_source(
+        question, source_chunk, judge=judge, reasoning_mode=reasoning_mode,
+    )
+    if unique is None:
+        return FilterReport(passed=False, reason="parse_error")
+    if not unique:
+        return FilterReport(passed=False, reason="non_unique_source")
+
+    # (d2) Distractor 보조 검증 — 무관 청크로도 답할 수 있으면 정답 청크 유일성이 깨짐
     for distractor in distractors:
         ans = await is_answerable(question, distractor, judge=judge, reasoning_mode=reasoning_mode)
         if ans is True:

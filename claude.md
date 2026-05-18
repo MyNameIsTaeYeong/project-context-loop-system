@@ -699,11 +699,14 @@ python3 -m uvicorn "context_loop.web.app:create_app" --factory --host 127.0.0.1 
 
 ## 하네스: RAG 평가 신뢰성 감사
 
-**목표:** 합성 골드셋 생성기(`scripts/build_synthetic_gold_set.py`)와 평가 스크립트(`scripts/eval_search.py`)의 신뢰성을 정기적으로 감사하여, 측정된 메트릭을 운영 의사결정에 사용 가능한 수준인지 판정한다. `eval-gold-set-improvement` 하네스가 기능 확장에 초점이라면, 본 하네스는 신뢰성·메트릭 무결성 감사에 초점.
+**목표:** 합성 골드셋 생성기(`scripts/build_synthetic_gold_set.py`)와 평가 스크립트(`scripts/eval_search.py`)의 신뢰성을 정기적으로 감사하고, 감사 결과에 따른 코드 개선을 수행한다. `eval-gold-set-improvement` 하네스가 기능 확장에 초점이라면, 본 하네스는 신뢰성·메트릭 무결성 감사·패치에 초점.
 
-**트리거:** "골드셋·평가 신뢰성 검토", "RAG 평가 감사", "골드셋 편향 확인", "self-evaluation bias 검토", "build_synthetic_gold_set.py / eval_search.py 신뢰성 점검", 또는 평가 코드·모델·임베딩·골드셋이 변경된 직후 사전 검증이 필요한 경우 `rag-eval-audit` 스킬을 사용하라.
+**트리거:**
+- **감사**: "골드셋·평가 신뢰성 검토", "RAG 평가 감사", "골드셋 편향 확인", "self-evaluation bias 검토", "build_synthetic_gold_set.py / eval_search.py 신뢰성 점검" → `rag-eval-audit` 스킬
+- **개선**: "S0/S1 패치 적용", "감사 결과 기반 개선", "rag-eval-audit 결과 패치", "특정 P 항목만 패치", "감사 위험 해소 검증" → `rag-eval-fix` 스킬
 
 **변경 이력:**
 | 날짜 | 변경 내용 | 대상 | 사유 |
 |------|----------|------|------|
 | 2026-05-18 | 초기 구성 (gold-set-auditor + eval-script-auditor + rag-bias-cross-analyst 3-에이전트, rag-eval-audit 오케스트레이터) | 전체 | 합성 골드셋/평가 스크립트 신뢰성 일회성 검토 요청 — 재사용 가치로 자산화 |
+| 2026-05-18 | 패치 에이전트 3명 추가 + rag-eval-fix 오케스트레이터 신설 | gold-set-build-patcher, eval-script-patcher, rag-eval-change-verifier, skills/rag-eval-fix/ | 감사 결과(S0 6건 + S1 6건)를 코드 패치로 적용하는 워크플로우 자산화 — 감사와 패치를 별도 스킬로 분리해 트리거 명확화 |
