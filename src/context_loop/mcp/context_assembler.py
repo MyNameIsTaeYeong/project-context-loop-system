@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
 from context_loop.processor.graph_search_planner import (
     GraphSearchResult,
     execute_graph_search,
@@ -40,10 +41,17 @@ class Source:
 
 @dataclass
 class AssembledContext:
-    """조립된 컨텍스트와 출처 정보."""
+    """조립된 컨텍스트와 출처 정보.
+
+    ``retrieved_graph_entities`` 는 검색된 그래프 노드의 ``GraphEntityRef``
+    리스트 (2차 — description 포함). ``retrieved_graph_relations`` 는
+    ``--score-relations`` 평가용으로 노출되는 1-hop 엣지 정보 (2차).
+    """
 
     context_text: str
     sources: list[Source] = field(default_factory=list)
+    retrieved_graph_entities: list[GraphEntityRef] = field(default_factory=list)
+    retrieved_graph_relations: list[GraphRelationRef] = field(default_factory=list)
 
 
 async def assemble_context(
@@ -428,12 +436,19 @@ async def assemble_context_with_sources(
 
     context_text = "\n\n---\n\n".join(sections) if sections else ""
     sources.sort(key=lambda s: s.similarity, reverse=True)
+    retrieved_entities = list(graph_result.entities) if graph_result else []
+    retrieved_relations = list(graph_result.relations) if graph_result else []
     logger.info(
         "Assembled context | query=%s | chars=%d | sources=%d | text=%s",
         query, len(context_text), len(sources),
         context_text if context_text else "<empty>",
     )
-    return AssembledContext(context_text=context_text, sources=sources)
+    return AssembledContext(
+        context_text=context_text,
+        sources=sources,
+        retrieved_graph_entities=retrieved_entities,
+        retrieved_graph_relations=retrieved_relations,
+    )
 
 
 # ---------------------------------------------------------------------------
