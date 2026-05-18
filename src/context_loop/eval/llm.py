@@ -206,6 +206,32 @@ def build_eval_llm_client(
     )
 
 
+def _effective_role_target(
+    config: Config,
+    role: EvalRole,
+    *,
+    endpoint_override: str = "",
+    model_override: str = "",
+) -> tuple[str, str]:
+    """role 의 실제 적용될 (endpoint, model) 을 우선순위대로 계산.
+
+    우선순위: CLI override > ``config.eval.{role}.*`` > ``config.llm.*``.
+    role 별 설정과 override 가 모두 비면 system LLM 과 동일한 값이 반환된다.
+    """
+    role_path = f"eval.{role}"
+    endpoint = (
+        endpoint_override
+        or (config.get(f"{role_path}.endpoint") or "")
+        or (config.get("llm.endpoint") or "")
+    )
+    model = (
+        model_override
+        or (config.get(f"{role_path}.model") or "")
+        or (config.get("llm.model") or "")
+    )
+    return str(endpoint), str(model)
+
+
 def role_is_configured(
     config: Config,
     role: EvalRole,
@@ -213,14 +239,21 @@ def role_is_configured(
     endpoint_override: str = "",
     model_override: str = "",
 ) -> bool:
-    """``role`` 이 system LLM 과 별도 모델로 구성되었는지 판정.
+    """``role`` 이 system LLM 과 **실질적으로** 다른 모델로 구성되었는지 판정.
 
-    CLI override 또는 ``config.eval.{role}.endpoint``/``model`` 중 하나라도
-    채워져 있으면 True. 자기 평가 편향 경고 표시 여부 결정에 사용.
+    단순히 endpoint/model 키가 채워졌는지가 아니라, 최종 적용될 (endpoint, model)
+    페어가 ``config.llm.*`` 의 system 값과 다른지 비교한다. 같은 endpoint+model 을
+    role 양쪽에 명시한 경우(예: 사용자 실수로 generator/judge 에 동일 모델 지정)도
+    self-evaluation 위험이 있으므로 False 를 반환한다.
+
+    자기 평가 편향 차단(--allow-self-eval/--allow-self-judge) 의 판정 기준으로
+    사용된다.
     """
-    if endpoint_override or model_override:
-        return True
-    role_path = f"eval.{role}"
-    return bool(
-        config.get(f"{role_path}.endpoint") or config.get(f"{role_path}.model"),
+    role_endpoint, role_model = _effective_role_target(
+        config, role,
+        endpoint_override=endpoint_override,
+        model_override=model_override,
     )
+    system_endpoint = str(config.get("llm.endpoint") or "")
+    system_model = str(config.get("llm.model") or "")
+    return (role_endpoint, role_model) != (system_endpoint, system_model)

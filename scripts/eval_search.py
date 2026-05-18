@@ -37,10 +37,12 @@ import argparse
 import asyncio
 import csv
 import glob
+import hashlib
 import json
 import logging
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -306,18 +308,40 @@ async def evaluate_one(
         # 사용 의도 유지 — relevant 키 변수 (디버그 후속용).
         _ = rel_relevant_keys
 
+    # 정답 청크 본문 조회 방식은 judge 채점 여부와 무관하게 row 에 기록 —
+    # source 미해상도(fallback/empty) 의 빈도를 추적하기 위함.
+    source_text, source_method = await _fetch_source_text(item, meta_store)
+    row["source_fetch_method"] = source_method
+
     if judge is not None:
-        # 정답 청크 본문 조회 (없으면 정답 문서의 첫 청크)
-        source_text = await _fetch_source_text(item, meta_store)
-        score, reason = await judge_answer(
-            item.query,
-            source_text,
-            assembled.context_text,
-            judge=judge,
-            reasoning_mode=reasoning_mode,
-        )
-        row["judge_score"] = score
-        row["judge_reason"] = reason
+        if source_method.startswith("fallback_") or source_method == "empty":
+            # 잘못된 근거로 채점하면 평균을 오염시키므로 skip.
+            row["judge_score"] = None
+            row["judge_reason"] = ""
+            row["judge_skip_reason"] = "source_fallback"
+            row["judge_parse_failed"] = False
+        else:
+            score, reason = await judge_answer(
+                item.query,
+                source_text,
+                assembled.context_text,
+                judge=judge,
+                reasoning_mode=reasoning_mode,
+            )
+            if score < 0:
+                # parse_error — 평균에서 분리. aggregate 가 None 을 자동 스킵.
+                row["judge_score"] = None
+                row["judge_reason"] = reason
+                row["judge_parse_failed"] = True
+            else:
+                row["judge_score"] = score
+                row["judge_reason"] = reason
+                row["judge_parse_failed"] = False
+
+    # P12 — embed_fn 이 T4 단계 skip 을 한 번이라도 했는지 row 에 기록.
+    t4_disabled = bool(getattr(embed_fn, "t4_disabled", False))
+    if t4_disabled:
+        row["graph_t4_disabled"] = True
 
     return row
 
@@ -343,13 +367,23 @@ def _normalize_for_anchor(text: str) -> str:
     return " ".join(text.split())
 
 
-async def _fetch_source_text(item: GoldItem, meta_store: MetadataStore) -> str:
-    """골드 항목의 정답 청크 본문을 조회.
+async def _fetch_source_text(
+    item: GoldItem, meta_store: MetadataStore,
+) -> tuple[str, str]:
+    """골드 항목의 정답 청크 본문과 조회 방식을 반환.
 
-    우선순위:
-    1. ``source_text_anchor`` prefix 매칭 (R2 — chunk_id 의존 제거).
-    2. (deprecated 호환) ``source_chunk_id`` 일치.
-    3. 첫 청크 fallback.
+    Returns:
+        ``(content, method)`` — method 는 어느 경로로 본문을 잡았는지 식별:
+
+        * ``"anchor"`` — ``source_text_anchor`` prefix 매칭 성공
+        * ``"chunk_id"`` — ``source_chunk_id`` 일치 (deprecated 호환)
+        * ``"fallback_first_chunk"`` — source_document 의 첫 청크로 폴백
+        * ``"fallback_doc_first_chunk"`` — ``relevant_doc_ids[0]`` 의 첫 청크
+          로 폴백 (source_document_id 도 없는 경우)
+        * ``"empty"`` — 끝까지 조회 실패. content 는 빈 문자열.
+
+    호출부는 ``"fallback_*"`` / ``"empty"`` 메소드일 때 judge 채점에서 제외해
+    잘못된 근거로 매겨진 점수가 평균을 오염하지 않게 해야 한다.
     """
     if item.source_document_id is not None:
         chunks = await meta_store.get_chunks_by_document(item.source_document_id)
@@ -359,20 +393,20 @@ async def _fetch_source_text(item: GoldItem, meta_store: MetadataStore) -> str:
             for c in chunks:
                 content = c.get("content") or ""
                 if _normalize_for_anchor(content).startswith(normalized_anchor):
-                    return content
+                    return content, "anchor"
 
         if item.source_chunk_id:
             for c in chunks:
                 if c.get("id") == item.source_chunk_id:
-                    return c.get("content") or ""
+                    return c.get("content") or "", "chunk_id"
 
         if chunks:
-            return chunks[0].get("content") or ""
+            return chunks[0].get("content") or "", "fallback_first_chunk"
     if item.relevant_doc_ids:
         chunks = await meta_store.get_chunks_by_document(item.relevant_doc_ids[0])
         if chunks:
-            return chunks[0].get("content") or ""
-    return ""
+            return chunks[0].get("content") or "", "fallback_doc_first_chunk"
+    return "", "empty"
 
 
 # ---------------------------------------------------------------------------
@@ -461,9 +495,44 @@ def write_summary(
             [r.get("graph_rel_match_tiers") or {} for r in rows],
         )
 
+    # 실패 / 진단 통계 — 평균 메트릭과 별도로 분포·실패율을 명시 보고.
+    n_total = len(rows)
+    n_failed = sum(1 for r in rows if r.get("metric_failed"))
+    n_successful = n_total - n_failed
+    failure_rate = (n_failed / n_total) if n_total else 0.0
+
+    judge_parse_failures = sum(
+        1 for r in rows if r.get("judge_parse_failed")
+    )
+    judge_skipped = sum(
+        1 for r in rows if r.get("judge_skip_reason") == "source_fallback"
+    )
+    judge_success_count = sum(
+        1 for r in rows
+        if isinstance(r.get("judge_score"), (int, float))
+        and not isinstance(r.get("judge_score"), bool)
+    )
+
+    fetch_method_counts = Counter(
+        r.get("source_fetch_method") for r in rows
+        if r.get("source_fetch_method")
+    )
+
+    graph_t4_skip_count = sum(1 for r in rows if r.get("graph_t4_disabled"))
+    graph_t4_disabled_any = graph_t4_skip_count > 0
+
     out = {
         "label": label,
-        "n_queries": len(rows),
+        "n_queries": n_total,
+        "n_failed": n_failed,
+        "n_successful": n_successful,
+        "failure_rate": failure_rate,
+        "judge_score_parse_failures": judge_parse_failures,
+        "judge_score_success_count": judge_success_count,
+        "judge_skip_count": judge_skipped,
+        "source_fetch_method_counts": dict(fetch_method_counts),
+        "graph_t4_disabled": graph_t4_disabled_any,
+        "graph_t4_skip_count": graph_t4_skip_count,
         "config": config_summary,
         "metrics": summary,
         "metrics_by_mode": metrics_by_mode,
@@ -664,11 +733,19 @@ async def _evaluate_gold_set(
                 row["_idx"] = idx
             except Exception as exc:
                 logger.exception("질의 %s 실패: %s", item.id, exc)
+                top_k = args.top_k
                 row = {
                     "id": item.id,
                     "query": item.query,
                     "error": str(exc),
+                    "metric_failed": True,
                     "_idx": idx,
+                    # 표준 메트릭 키를 None 으로 명시 — aggregate 가 자동 스킵.
+                    f"recall@{top_k}": None,
+                    f"precision@{top_k}": None,
+                    f"hit@{top_k}": None,
+                    f"ndcg@{top_k}": None,
+                    "mrr": None,
                 }
             completed += 1
             logger.info(
@@ -689,10 +766,17 @@ async def _evaluate_gold_set(
             logger.error(
                 "예외가 _process_item 밖으로 새어 나옴: idx=%d, exc=%s", idx, r,
             )
+            top_k = args.top_k
             rows.append({
                 "id": f"_idx{idx}",
                 "error": str(r),
+                "metric_failed": True,
                 "_idx": idx,
+                f"recall@{top_k}": None,
+                f"precision@{top_k}": None,
+                f"hit@{top_k}": None,
+                f"ndcg@{top_k}": None,
+                "mrr": None,
             })
         else:
             rows.append(r)
@@ -704,9 +788,26 @@ async def _evaluate_gold_set(
     csv_path = out_dir / f"{label}.csv"
     summary_path = out_dir / f"{label}.summary.json"
     write_csv(rows, csv_path)
-    # gold_set 출처를 요약에 기록 — aggregate 결과 추적용
+    # gold_set 출처와 fingerprint 를 요약에 기록 — aggregate 결과 추적 +
+    # compare_runs.py 동치성 검증용.
     enriched_config = dict(config_summary)
     enriched_config["gold_set"] = str(gold_path)
+    try:
+        gold_bytes = gold_path.read_bytes()
+        enriched_config["gold_set_sha256"] = hashlib.sha256(gold_bytes).hexdigest()
+    except OSError:
+        enriched_config["gold_set_sha256"] = ""
+    enriched_config["gold_set_n_items"] = len(gold.items)
+    gold_meta = gold.metadata or {}
+    enriched_config["gold_set_generator_model"] = (
+        gold_meta.get("generator_model", "") or ""
+    )
+    enriched_config["gold_set_judge_model"] = (
+        gold_meta.get("judge_model", "") or ""
+    )
+    enriched_config["gold_set_self_evaluation_warning"] = gold_meta.get(
+        "self_evaluation_warning",
+    )
     summary = write_summary(
         rows, summary_path, label=label, config_summary=enriched_config,
     )
@@ -739,8 +840,9 @@ async def run(args: argparse.Namespace) -> int:
     llm_client, embedding_client, reranker_client = _build_clients(config)
 
     # Judge 는 옵션 — config.eval.judge.* + CLI override 에서 자동 합성.
-    # 둘 다 비면 system LLM 재사용 (편향 경고).
+    # 분리 구성이 없으면 --allow-self-judge 가 명시되어야 system LLM 재사용 허용.
     judge: LLMClient | None = None
+    judge_is_self = False
     if args.judge:
         judge_configured = role_is_configured(
             config, "judge",
@@ -755,12 +857,19 @@ async def run(args: argparse.Namespace) -> int:
                 api_key_override=args.judge_api_key,
                 headers_override_json=args.judge_headers,
             )
-        else:
+        elif args.allow_self_judge:
             logger.warning(
-                "--judge 가 켜져 있지만 config.eval.judge / --judge-* 가 비어 있어 "
-                "system llm_client 를 Judge 로 재사용합니다 (자기 평가 편향 가능).",
+                "--allow-self-judge 가 명시되어 system LLM 으로 Judge fallback. "
+                "메트릭에 self-evaluation 편향이 기록됩니다.",
             )
             judge = llm_client
+            judge_is_self = True
+        else:
+            raise SystemExit(
+                "--judge 가 설정되었으나 config.eval.judge / --judge-* 가 비어 있습니다. "
+                "system LLM 으로 Judge fallback 을 명시 허용하려면 "
+                "--allow-self-judge 를 추가하세요.",
+            )
 
     similarity_threshold = (
         args.similarity_threshold
@@ -792,6 +901,9 @@ async def run(args: argparse.Namespace) -> int:
         "llm_model": config.get("llm.model"),
         "judge_enabled": args.judge,
         "judge_model": args.judge_model or (config.get("llm.model") if args.judge else None),
+        # Self-evaluation 추적 — judge fall-through 시 메트릭이 편향됨을 명시.
+        "judge_is_self": judge_is_self,
+        "allow_self_judge": bool(args.allow_self_judge),
         # 2차 — graph 매칭 정책 / 재현성용 메타.
         "graph_match_threshold": args.graph_match_threshold,
         "graph_match_strict": args.graph_match_strict,
@@ -983,6 +1095,12 @@ def main() -> None:
     parser.add_argument(
         "--judge", action="store_true",
         help="Judge LLM 으로 응답 품질 0~5 점 채점 (느림, 비용 발생)",
+    )
+    parser.add_argument(
+        "--allow-self-judge", action="store_true",
+        help="config.eval.judge / --judge-* 가 비어 있을 때 system LLM 을 "
+             "Judge 로 재사용하도록 명시 허용. 자기 평가 편향이 발생하므로 "
+             "summary 의 judge_is_self=true 로 기록된다.",
     )
     # Judge override 가 모두 비면 시스템 LLM 재사용 (편향 경고 표시).
     # 별도 엔드포인트 지정 시 config.llm.headers / reasoning_profiles 자동 주입,

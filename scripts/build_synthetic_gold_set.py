@@ -327,6 +327,14 @@ async def build(
     embedding_client: Any | None = None,
     embedding_model_id: str = "",
     concurrency: int = 1,
+    generator_model: str = "",
+    generator_endpoint: str = "",
+    judge_model: str = "",
+    judge_endpoint: str = "",
+    generator_configured_separately: bool = False,
+    judge_configured_separately: bool = False,
+    self_evaluation_warning: bool = False,
+    allow_self_eval: bool = False,
 ) -> GoldSet:
     """전체 파이프라인 실행.
 
@@ -345,6 +353,20 @@ async def build(
     3차 추가 파라미터:
         concurrency: 항목(chunk/subgraph) 단위 동시 처리 수. 1 이면 직렬.
             LLM endpoint 의 rate limit 에 맞춰 사용자가 명시 (보통 4~8).
+
+    감사 보강 파라미터 (golden-set 추적성):
+        generator_model: 실제 사용된 Generator 모델 ID (CLI > eval.generator >
+            llm 우선순위로 호출자가 해석한 값). 골드셋 metadata 에 기록되어
+            사후에 어떤 모델로 빌드되었는지 추적 가능.
+        generator_endpoint: Generator endpoint URL (동일 우선순위).
+        judge_model: 실제 사용된 Judge 모델 ID.
+        judge_endpoint: Judge endpoint URL.
+        generator_configured_separately: Generator 가 system LLM 과 분리되어
+            구성됐는지 (CLI override 또는 ``config.eval.generator.*``).
+        judge_configured_separately: Judge 동일.
+        self_evaluation_warning: Generator/Judge 가 모두 system LLM 으로
+            fall-through 되어 자기 평가 편향 위험이 있는 빌드인지 표시.
+        allow_self_eval: 사용자가 ``--allow-self-eval`` 로 명시 허용했는지.
     """
 
     rng = random.Random(seed)
@@ -387,6 +409,9 @@ async def build(
             "passed": 0,
             "fail_not_answerable": 0,
             "fail_leakage": 0,
+            "fail_korean_leakage": 0,
+            "fail_non_unique_source": 0,
+            "fail_demonstrative": 0,
             "fail_generic": 0,
             "fail_parse": 0,
             "fail_runtime": 0,
@@ -452,6 +477,14 @@ async def build(
             "generation_modes": generation_modes,
             "concurrency": effective_concurrency,
             "stats": stats,
+            "generator_model": generator_model,
+            "generator_endpoint": generator_endpoint,
+            "judge_model": judge_model,
+            "judge_endpoint": judge_endpoint,
+            "generator_configured_separately": generator_configured_separately,
+            "judge_configured_separately": judge_configured_separately,
+            "self_evaluation_warning": self_evaluation_warning,
+            "allow_self_eval": allow_self_eval,
         }
         if enable_graph_mode:
             # 그래프 매칭 재현성을 위해 임베딩 모델 ID + 기본 τ 기록
@@ -861,9 +894,16 @@ def _make_graph_gold_item(
 
     3차 변경: ``id`` 는 placeholder ``""`` 로 두고, ``_run_chunk_mode`` /
     ``_run_graph_mode`` 가 gather 완료 후 idx 순으로 부여한다 (D-3).
+
+    감사 보강: LLM 이 ``evidence_description`` 을 비우면 description 도 빈
+    문자열로 둔다. graph_store 의 원본 ``entity_description`` 으로 폴백하지
+    않는다 — 인덱싱 시점의 description 을 그대로 정답으로 사용하면 T4
+    임베딩 cosine 이 trivially 1.0 으로 부풀려져 그래프 시스템의 표기 변형·
+    패러프레이즈 강건성 측정이 무력화된다. description 이 비면 임베딩 단계
+    (``_embed_graph_item_descriptions``) 가 자연 skip 한다.
     """
-    # 그래프 노드 자체 description 을 fallback evidence 로 사용.
-    description = gq.evidence_description or str(sg.get("entity_description") or "")
+    # LLM 이 자연어로 풀어쓴 evidence 만 사용. 빈 문자열이면 T4 skip (감사 H6).
+    description = gq.evidence_description
 
     entity_ref = GraphEntityRef(
         name=sg["entity_name"],
@@ -948,6 +988,24 @@ def _numbered_output_path(base: Path, index: int, total: int) -> Path:
     return base.with_name(f"{base.stem}{suffix}{base.suffix}")
 
 
+def _unfiltered_output_path(base: Path) -> Path:
+    """``--no-filter`` 빌드 경로에 ``.UNFILTERED`` 접미사를 강제 부여한다.
+
+    ``eval/gold_set.yaml`` → ``eval/gold_set.UNFILTERED.yaml``.
+    이미 ``.UNFILTERED`` 가 포함된 stem 이면 그대로 반환 (이중 접미사 방지).
+    ``_numbered_output_path`` 의 ``{stem}_NNN{suffix}`` 변환과 호환되며,
+    UNFILTERED 가 stem 마지막에 위치하므로 인덱스 접미사가 그 뒤에 오는
+    구조가 된다: ``gold_set.UNFILTERED_001.yaml``.
+
+    디버그/탐색 빌드를 운영 골드셋과 시각적으로 분리하기 위한 안전장치.
+    평가 스크립트는 파일명 또는 ``metadata.filter_applied`` 로 차단 가능.
+    """
+    stem = base.stem
+    if stem.endswith(".UNFILTERED"):
+        return base
+    return base.with_name(f"{stem}.UNFILTERED{base.suffix}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -958,6 +1016,33 @@ def _setup_logging(verbose: bool) -> None:
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+
+def _resolve_eval_role_identity(
+    config: Config,
+    role: str,
+    *,
+    endpoint_override: str,
+    model_override: str,
+) -> tuple[str, str]:
+    """``(effective_model, effective_endpoint)`` 를 우선순위대로 해석한다.
+
+    우선순위: CLI override > ``config.eval.{role}.{key}`` > ``config.llm.{key}``.
+    ``build_eval_llm_client`` 가 따르는 동일 폴백 체인을 메타데이터 기록용으로
+    재현한 헬퍼다. 어느 단계의 값도 비어 있을 수 있으므로 빈 문자열 가능.
+    """
+    role_path = f"eval.{role}"
+    effective_model = (
+        model_override
+        or str(config.get(f"{role_path}.model") or "")
+        or str(config.get("llm.model") or "")
+    )
+    effective_endpoint = (
+        endpoint_override
+        or str(config.get(f"{role_path}.endpoint") or "")
+        or str(config.get("llm.endpoint") or "")
+    )
+    return effective_model, effective_endpoint
 
 
 def _parse_optional_bool(v: str | None) -> bool:
@@ -1008,7 +1093,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-filter", action="store_true",
-        help="품질 게이트 비활성화 (디버그/탐색용 — 운영 골드셋에는 사용 금지).",
+        help="품질 게이트 비활성화 (디버그/탐색용 — 운영 골드셋에는 사용 금지). "
+             "출력 경로에는 ``.UNFILTERED`` 접미사가 강제 추가된다.",
+    )
+    parser.add_argument(
+        "--allow-self-eval", action="store_true",
+        help="Generator/Judge 가 모두 system LLM (``llm.*``) 으로 fall-through "
+             "되는 빌드를 허용한다. 명시 없으면 자기 평가 편향을 막기 위해 "
+             "실행이 차단된다. 골드셋 metadata 에 ``allow_self_eval=True`` 가 "
+             "기록되어 사후 추적된다.",
     )
     parser.add_argument(
         "--n-distractors", type=int, default=2,
@@ -1123,12 +1216,35 @@ def main() -> None:
         endpoint_override=args.judge_endpoint,
         model_override=args.judge_model,
     )
-    if not (gen_configured or judge_configured):
+    self_evaluation_warning = not (gen_configured or judge_configured)
+    if self_evaluation_warning and not args.allow_self_eval:
+        parser.error(
+            "Generator/Judge 모두 system LLM (llm.*) 과 동일 — 자기 평가 편향이 "
+            "차단되었습니다. config.yaml 의 eval.generator / eval.judge 에 별도 "
+            "모델을 지정하거나 --generator-* / --judge-* 인자를 사용하세요. "
+            "실험/디버그 용도로 의도적으로 진행하려면 --allow-self-eval 을 명시.",
+        )
+    if self_evaluation_warning:
         logger.warning(
             "Generator/Judge 모두 system LLM (llm.*) 과 동일 — 자기 평가 편향 가능. "
-            "config.yaml 의 eval.generator / eval.judge 에 별도 모델을 지정하거나 "
-            "--generator-* / --judge-* 인자를 사용하세요.",
+            "--allow-self-eval 이 명시되어 진행합니다. metadata 에 "
+            "self_evaluation_warning=True 가 기록됩니다.",
         )
+
+    effective_generator_model, effective_generator_endpoint = (
+        _resolve_eval_role_identity(
+            config, "generator",
+            endpoint_override=args.generator_endpoint,
+            model_override=args.generator_model,
+        )
+    )
+    effective_judge_model, effective_judge_endpoint = (
+        _resolve_eval_role_identity(
+            config, "judge",
+            endpoint_override=args.judge_endpoint,
+            model_override=args.judge_model,
+        )
+    )
 
     source_types = [s.strip() for s in args.source_types.split(",") if s.strip()] or None
 
@@ -1139,6 +1255,15 @@ def main() -> None:
     effective_n_graph_nodes = args.n_graph_nodes or args.n_chunks
 
     base_output = Path(args.output)
+    if args.no_filter:
+        original_output = base_output
+        base_output = _unfiltered_output_path(base_output)
+        if base_output != original_output:
+            logger.warning(
+                "--no-filter 빌드 — 출력 경로를 %s 에서 %s 로 변환했습니다. "
+                "운영 골드셋과 시각적으로 분리됩니다 (감사 H7).",
+                original_output, base_output,
+            )
     base_seed = args.seed
 
     # 2차 — graph evidence 임베딩 계산용 클라이언트.
@@ -1188,6 +1313,14 @@ def main() -> None:
                 embedding_client=embedding_client,
                 embedding_model_id=embedding_model_id,
                 concurrency=int(args.concurrency),
+                generator_model=effective_generator_model,
+                generator_endpoint=effective_generator_endpoint,
+                judge_model=effective_judge_model,
+                judge_endpoint=effective_judge_endpoint,
+                generator_configured_separately=bool(gen_configured),
+                judge_configured_separately=bool(judge_configured),
+                self_evaluation_warning=self_evaluation_warning,
+                allow_self_eval=bool(args.allow_self_eval),
             )
 
     asyncio.run(_run_all())

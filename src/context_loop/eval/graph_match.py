@@ -155,6 +155,13 @@ def build_embed_fn(
     캐시를 적용한다. ``embedding_client`` 가 ``None`` 이면 항상 ``None`` 을
     반환하는 함수를 돌려준다 (T4 skip).
 
+    반환된 callable 에는 두 가지 부가 속성이 부착된다 — 호출부가 T4 단계
+    skip 여부를 명시적으로 식별할 수 있게 한다:
+
+    * ``t4_disabled`` (bool): 임베딩 클라이언트가 없거나, 이벤트 루프
+      충돌로 async 경로를 쓸 수 없는 상황을 한 번이라도 만나면 ``True``.
+    * ``skip_count`` (int): T4 임베딩 시도가 ``None`` 으로 떨어진 횟수.
+
     Args:
         embedding_client: langchain ``Embeddings`` 인터페이스 — 동기
             ``embed_query`` 또는 비동기 ``aembed_query`` 를 가져야 한다.
@@ -163,12 +170,19 @@ def build_embed_fn(
             쓰일 수 있으므로 함수 외부에서 명시.
 
     Returns:
-        ``text -> list[float] | None`` 동기 함수. 실패 시 ``None``.
+        ``text -> list[float] | None`` 동기 함수 (속성 부착).
     """
     if embedding_client is None:
-        return lambda _t: None
+        def _disabled(_t: str) -> list[float] | None:
+            _disabled.skip_count += 1  # type: ignore[attr-defined]
+            return None
+        _disabled.t4_disabled = True  # type: ignore[attr-defined]
+        _disabled.skip_count = 0  # type: ignore[attr-defined]
+        return _disabled
 
     import asyncio
+
+    state = {"t4_disabled": False, "skip_count": 0}
 
     def _call(text: str) -> list[float] | None:
         if not text:
@@ -191,6 +205,7 @@ def build_embed_fn(
                         "이벤트 루프 내에서 비동기 임베딩을 동기로 호출할 수 없음. "
                         "임베딩 클라이언트의 embed_query 를 사용하세요.",
                     )
+                    state["t4_disabled"] = True
                     return None
                 except RuntimeError:
                     return list(asyncio.run(coro))
@@ -211,8 +226,14 @@ def build_embed_fn(
         if len(order) > cache_size:
             evict = order.pop(0)
             cache.pop(evict, None)
+        if emb is None and text:
+            _cached.skip_count += 1  # type: ignore[attr-defined]
+            if state["t4_disabled"]:
+                _cached.t4_disabled = True  # type: ignore[attr-defined]
         return emb
 
+    _cached.t4_disabled = False  # type: ignore[attr-defined]
+    _cached.skip_count = 0  # type: ignore[attr-defined]
     return _cached
 
 
