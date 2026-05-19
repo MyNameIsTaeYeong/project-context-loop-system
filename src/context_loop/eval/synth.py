@@ -417,6 +417,7 @@ def extract_korean_proper_noun_candidates(
     text: str,
     *,
     max_freq: int = 1,
+    extra_stopwords: frozenset[str] | None = None,
 ) -> set[str]:
     """청크에서 한국어 고유명사 후보(stem) 를 추출한다.
 
@@ -425,34 +426,48 @@ def extract_korean_proper_noun_candidates(
     - 후행 조사를 1회 제거해 stem 으로 정규화 ("결제한도서비스는" → "결제한도서비스")
     - 청크 내 stem 빈도 ``max_freq`` 이하 (= 고유명사 가능성 높음)
     - stem 이 ``_KOREAN_COMMON_NOUNS`` 화이트리스트면 제외
+    - S3 — ``extra_stopwords`` (코퍼스 빈도 학습 결과) 가 있으면 그것도 제외
     - stem 길이 3자 이상만 유지 (S2 — v2의 4자 컷오프 완화)
 
     누출 검사용 후보 — 한국어 토큰은 조사가 풍부해 단순 토큰 매칭이 실패하므로
     stem 매칭이 필수다.
     """
     counts: dict[str, int] = {}
+    extra = extra_stopwords or frozenset()
     for m in _KOREAN_NOUN_RE.finditer(text):
         tok = m.group(0)
         stem = _strip_korean_josa(tok)
         if len(stem) < 3:
             continue
-        if stem in _KOREAN_COMMON_NOUNS:
+        if stem in _KOREAN_COMMON_NOUNS or stem in extra:
             continue
         counts[stem] = counts.get(stem, 0) + 1
     return {stem for stem, c in counts.items() if c <= max_freq}
 
 
-def has_korean_proper_noun_leakage(question: str, source_text: str) -> bool:
+def has_korean_proper_noun_leakage(
+    question: str,
+    source_text: str,
+    *,
+    extra_stopwords: frozenset[str] | None = None,
+) -> bool:
     """질문이 출처 청크의 한국어 고유명사를 그대로 베꼈는지 검사.
 
     한국어 사내 문서(팀명·시스템명·서비스명)는 ASCII 식별자 정규식으로 잡히지 않아
-    별도 게이트가 필요하다. 청크 내 빈도가 낮은(고유명사 가능성 높은) 4자 이상 한글
+    별도 게이트가 필요하다. 청크 내 빈도가 낮은(고유명사 가능성 높은) 3자 이상 한글
     토큰의 stem 이 질문에 substring 으로 등장하면 누출로 판정한다.
+
+    Args:
+        extra_stopwords: 코퍼스 빈도 기반 자동 학습된 화이트리스트 (S3 — 정적
+            ``_KOREAN_COMMON_NOUNS`` 외에 도메인별 흔한 일반어를 추가로 제외).
+            ``build_korean_stopwords_from_corpus`` 로 빌드 가능.
 
     True 면 골드셋에서 탈락 — 검색 시스템이 어휘 매칭만으로 1위를 차지해 검색 품질
     측정이 부풀려지는 것을 막는다.
     """
-    candidates = extract_korean_proper_noun_candidates(source_text)
+    candidates = extract_korean_proper_noun_candidates(
+        source_text, extra_stopwords=extra_stopwords,
+    )
     if not candidates:
         return False
     for stem in candidates:
@@ -460,6 +475,44 @@ def has_korean_proper_noun_leakage(question: str, source_text: str) -> bool:
         if stem in question:
             return True
     return False
+
+
+def build_korean_stopwords_from_corpus(
+    corpus: list[str],
+    *,
+    min_corpus_freq: int = 5,
+    max_stopwords: int = 500,
+) -> frozenset[str]:
+    """코퍼스(빌드 대상 청크 전체)에서 흔한 한글 stem 을 자동 화이트리스트화.
+
+    S3 — 정적 `_KOREAN_COMMON_NOUNS` 의 도메인 한계를 보완. 같은 청크 풀 내에서
+    여러 번 등장하는 한글 토큰(stem)은 고유명사보다는 일반어일 가능성 높음 →
+    `extra_stopwords` 로 누설 검사에서 제외해 false positive 감소.
+
+    Args:
+        corpus: 청크 본문 리스트 (build_synthetic_gold_set 의 load_candidate_chunks
+            결과의 content 들).
+        min_corpus_freq: 이 빈도 이상 등장한 stem 을 stopword 후보로. 작으면
+            stopword 가 많아져 false negative 위험.
+        max_stopwords: 최종 화이트리스트 크기 상한 (메모리 보호).
+
+    Returns:
+        도메인 학습된 stopword stem 집합. `_KOREAN_COMMON_NOUNS` 와 union 해서
+        사용.
+    """
+    counts: dict[str, int] = {}
+    for text in corpus:
+        for m in _KOREAN_NOUN_RE.finditer(text):
+            stem = _strip_korean_josa(m.group(0))
+            if len(stem) < 3:
+                continue
+            counts[stem] = counts.get(stem, 0) + 1
+    # 빈도 ≥ threshold 인 stem 만, 그 중 상위 max_stopwords 개
+    frequent = sorted(
+        ((stem, c) for stem, c in counts.items() if c >= min_corpus_freq),
+        key=lambda x: (-x[1], x[0]),
+    )[:max_stopwords]
+    return frozenset(stem for stem, _ in frequent)
 
 
 # ---------------------------------------------------------------------------
@@ -698,21 +751,29 @@ async def is_answerable(
     *,
     judge: LLMClient,
     reasoning_mode: str | None = "off",
+    seed: int | None = None,
 ) -> bool | None:
     """Judge LLM 에 "이 청크로 이 질문 답할 수 있는가?" 를 물어 yes/no 로 받는다.
+
+    Args:
+        seed: 결정성용 seed. endpoint 가 지원하면 전달 (v3 서브 감사관이 발견한
+            N-H1 — P13 적용 시 Generator 만 처리했고 Judge 호출은 누락됐었다.
+            S3 에서 Judge 측 호출 3개 함수에도 seed 전파).
 
     파싱 실패 시 None.
     """
     prompt = ANSWERABLE_PROMPT_TEMPLATE.format(
         question=question, chunk_content=chunk_content,
     )
-    text = await judge.complete(
-        prompt,
-        max_tokens=64,
-        temperature=0.0,
-        reasoning_mode=reasoning_mode,
-        purpose="goldset_judge_answerable",
-    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_judge_answerable",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await judge.complete(prompt, **call_kwargs)
     return parse_yes_no(text)
 
 
@@ -722,6 +783,7 @@ async def is_unique_source(
     *,
     judge: LLMClient,
     reasoning_mode: str | None = "off",
+    seed: int | None = None,
 ) -> bool | None:
     """Judge LLM 에 "이 청크가 이 질문의 유일한 정답 출처인가?" 를 물어 yes/no.
 
@@ -730,18 +792,23 @@ async def is_unique_source(
     no 로 분류되어, 검색 시스템 평가에서 trivial recall 을 유발하는 generic 질문을
     걸러낸다.
 
+    Args:
+        seed: 결정성용 seed (S3 — Judge 호출 결정성 보장).
+
     파싱 실패 시 None.
     """
     prompt = GENERIC_PROMPT_TEMPLATE.format(
         question=question, chunk_content=chunk_content,
     )
-    text = await judge.complete(
-        prompt,
-        max_tokens=64,
-        temperature=0.0,
-        reasoning_mode=reasoning_mode,
-        purpose="goldset_judge_unique_source",
-    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_judge_unique_source",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await judge.complete(prompt, **call_kwargs)
     return parse_yes_no(text)
 
 
@@ -752,6 +819,8 @@ async def filter_question(
     *,
     judge: LLMClient,
     reasoning_mode: str | None = "off",
+    seed: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
 ) -> FilterReport:
     """다단계 품질 게이트.
 
@@ -774,8 +843,12 @@ async def filter_question(
         distractors: 무관 청크 N개 (일반성 보조 검증용).
         judge: Judge LLM.
     """
+    # S3 — seed 가 주어졌으면 모든 Judge 게이트에 전파해 결정성을 보장한다.
     # (a) 답변 가능성 — 출처 청크로 답해야 함
-    ans = await is_answerable(question, source_chunk, judge=judge, reasoning_mode=reasoning_mode)
+    ans = await is_answerable(
+        question, source_chunk, judge=judge,
+        reasoning_mode=reasoning_mode, seed=seed,
+    )
     if ans is None:
         return FilterReport(passed=False, reason="parse_error")
     if not ans:
@@ -786,8 +859,11 @@ async def filter_question(
         return FilterReport(passed=False, reason="leakage")
 
     # (b2) 한국어 고유명사 누출 — 결정론적. 사내 한국어 문서의 팀명·시스템명
-    # 같은 고유명사가 질문에 그대로 베껴진 케이스를 잡는다.
-    if has_korean_proper_noun_leakage(question, source_chunk):
+    # 같은 고유명사가 질문에 그대로 베껴진 케이스를 잡는다. S3 — 코퍼스 빈도
+    # 학습 결과를 extra_stopwords 로 받아 false positive 감소.
+    if has_korean_proper_noun_leakage(
+        question, source_chunk, extra_stopwords=extra_korean_stopwords,
+    ):
         return FilterReport(passed=False, reason="korean_leakage")
 
     # (c) 지시대명사·포인터 표현 — 결정론적 (LLM 호출 없음).
@@ -800,7 +876,8 @@ async def filter_question(
     # 의미가 명확히 분리된 프롬프트(GENERIC_PROMPT_TEMPLATE)로 호출하여,
     # 동일 LLM 호출이 두 게이트를 동시에 통과시키는 self-bias 를 차단한다.
     unique = await is_unique_source(
-        question, source_chunk, judge=judge, reasoning_mode=reasoning_mode,
+        question, source_chunk, judge=judge,
+        reasoning_mode=reasoning_mode, seed=seed,
     )
     if unique is None:
         return FilterReport(passed=False, reason="parse_error")
@@ -808,8 +885,13 @@ async def filter_question(
         return FilterReport(passed=False, reason="non_unique_source")
 
     # (d2) Distractor 보조 검증 — 무관 청크로도 답할 수 있으면 정답 청크 유일성이 깨짐
-    for distractor in distractors:
-        ans = await is_answerable(question, distractor, judge=judge, reasoning_mode=reasoning_mode)
+    for i, distractor in enumerate(distractors):
+        # 각 distractor 마다 다른 seed 를 주어 LLM caching/노이즈 영향 분리
+        d_seed = (seed + 100 + i) if seed is not None else None
+        ans = await is_answerable(
+            question, distractor, judge=judge,
+            reasoning_mode=reasoning_mode, seed=d_seed,
+        )
         if ans is True:
             return FilterReport(passed=False, reason="generic")
 

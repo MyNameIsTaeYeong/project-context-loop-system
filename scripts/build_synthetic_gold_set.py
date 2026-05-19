@@ -102,6 +102,7 @@ from context_loop.eval.graph_match import (  # noqa: E402
 from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.synth import (  # noqa: E402
     GeneratedGraphQuestion,
+    build_korean_stopwords_from_corpus,
     build_subgraph_snippet,
     filter_question,
     generate_graph_questions,
@@ -405,6 +406,18 @@ async def build(
         ]
         rng.shuffle(distractor_pool)
 
+        # S3 — 한글 화이트리스트 자동 학습. 전체 후보 청크 코퍼스에서 빈도 ≥
+        # 5 인 한글 stem 을 도메인 일반어로 간주, false positive 누설 검출 감소.
+        extra_korean_stopwords = build_korean_stopwords_from_corpus(
+            [c["content"] for c in candidates],
+            min_corpus_freq=5,
+            max_stopwords=500,
+        )
+        logger.info(
+            "한글 stopword 자동 학습 — %d 개 stem (도메인 일반어)",
+            len(extra_korean_stopwords),
+        )
+
         items: list[GoldItem] = []
         stats: dict[str, int] = {
             "generated": 0,
@@ -441,6 +454,7 @@ async def build(
             next_id=next_id,
             generator_temperature=generator_temperature,
             generator_seed_base=generator_seed_base,
+            extra_korean_stopwords=extra_korean_stopwords,
         )
 
         # 그래프 모드 실행 — chunk 모드 이후에 머지
@@ -467,6 +481,7 @@ async def build(
                 next_id=next_id,
                 generator_temperature=generator_temperature,
                 generator_seed_base=generator_seed_base,
+                extra_korean_stopwords=extra_korean_stopwords,
             )
 
         generation_modes = ["chunk"]
@@ -529,6 +544,7 @@ async def _process_chunk_item(
     total: int,
     generator_temperature: float = 0.0,
     generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
 ) -> tuple[list[GoldItem], dict[str, int]]:
     """chunk 1개 처리 — LLM 생성·게이트를 수행하고 (items, local_stats) 반환.
 
@@ -593,12 +609,19 @@ async def _process_chunk_item(
                 local_stats["passed"] = local_stats.get("passed", 0) + 1
                 continue
 
+            # S3 — Judge 게이트도 결정성을 위해 seed 전달.
+            # chunk 단위 base seed + 질문 인덱스 j 로 질문별 deterministic seed.
+            judge_seed = (
+                (item_seed + 10000 + j) if item_seed is not None else None
+            )
             report = await filter_question(
                 gq.query,
                 chunk["content"],
                 [d["content"] for d in same_type_distractors],
                 judge=judge,
                 reasoning_mode=reasoning_mode,
+                seed=judge_seed,
+                extra_korean_stopwords=extra_korean_stopwords,
             )
             if not report.passed:
                 key = f"fail_{report.reason}" if report.reason else "fail_parse"
@@ -645,6 +668,7 @@ async def _run_chunk_mode(
     next_id: int,
     generator_temperature: float = 0.0,
     generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
 ) -> int:
     """sampled chunk 들을 동시 처리하고 결과를 items 에 합친다.
 
@@ -665,6 +689,7 @@ async def _run_chunk_mode(
             total=total,
             generator_temperature=generator_temperature,
             generator_seed_base=generator_seed_base,
+            extra_korean_stopwords=extra_korean_stopwords,
         )
         for idx, chunk in enumerate(sampled, start=1)
     ]
@@ -710,6 +735,7 @@ async def _process_subgraph_item(
     total: int,
     generator_temperature: float = 0.0,
     generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
 ) -> tuple[list[GoldItem], dict[str, int]]:
     """subgraph 1개 처리 — graph 질문 생성·게이트.
 
@@ -768,12 +794,18 @@ async def _process_subgraph_item(
                 local_stats["graph_passed"] = local_stats.get("graph_passed", 0) + 1
                 continue
 
+            # S3 — graph 모드에도 Judge seed 전파 (subgraph_seed + j).
+            graph_judge_seed = (
+                (sg_seed + 10000 + j) if sg_seed is not None else None
+            )
             report = await filter_question(
                 gq.query,
                 sg["subgraph_snippet"],
                 distractor_snippets,
                 judge=judge,
                 reasoning_mode=reasoning_mode,
+                seed=graph_judge_seed,
+                extra_korean_stopwords=extra_korean_stopwords,
             )
             if not report.passed:
                 key = f"fail_{report.reason}" if report.reason else "fail_parse"
@@ -820,6 +852,7 @@ async def _run_graph_mode(
     next_id: int = 1,
     generator_temperature: float = 0.0,
     generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
 ) -> int:
     """graph 모드 — subgraph 샘플링 후 질문 생성·게이트 적용.
 
@@ -885,6 +918,7 @@ async def _run_graph_mode(
             total=total,
             generator_temperature=generator_temperature,
             generator_seed_base=generator_seed_base,
+            extra_korean_stopwords=extra_korean_stopwords,
         )
         for idx, sg in enumerate(sampled_sg, start=1)
     ]
