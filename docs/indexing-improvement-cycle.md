@@ -195,20 +195,267 @@ sqlite3 ~/.context-loop/data/metadata.db \
 # 같은 골드셋으로 진단 실행 (전체 평가 전 빠른 점검)
 python scripts/eval_search.py \
     --gold-set eval/gold_sets/run_001.yaml \
-    --label diag --concurrency 4 --limit 30
+    --label diag --concurrency 4 --limit 50
 ```
 
-**`eval/runs/diag.summary.json` 에서 점검:**
+`eval/runs/diag.summary.json` 의 4개 진단 키를 본다. 각 키의 정의·계산·임계 해석을 아래 자세히 설명한다.
 
-| 키 | 임계 | 의미 |
+#### 진단 키 1. `source_fetch_method_counts`
+
+**정의**: 평가 시 골드 항목의 "정답 청크 본문" 을 회복한 경로별 카운트. `eval_search.py` 의 `_fetch_source_text` 가 어느 방식으로 source text 를 찾았는지 추적 (S0 P6 에서 도입).
+
+**값 (dict)**:
+
+```json
+"source_fetch_method_counts": {
+  "anchor": 145,
+  "chunk_id": 0,
+  "fallback_first_chunk": 8,
+  "fallback_doc_first_chunk": 0,
+  "empty": 2
+}
+```
+
+| method | 의미 | 신뢰도 |
 |---|---|---|
-| `source_fetch_method_counts.fallback_first_chunk / total` | < 5% | 청크 분할 stable, anchor 그대로 유효 |
-| | 5~20% | 청크 분할 변경 있음 — Judge overlap/entailment 모드 신뢰 저하. reference-free 권장 |
-| | > 20% | anchor 대부분 stale — 그래프는 살려도 chunk 골드셋만으로 운영 |
-| `graph_t4_disabled` (bool) | false | 그래프 T4 임베딩 매칭 정상 |
-| | true | 임베딩 모델 호환 깨짐 — 그래프 메트릭만 재빌드 필요 |
-| `judge_score_parse_failures / n_queries` | < 5% | Judge 응답 형식 안정 |
-| `failure_rate` | < 5% | 평가 자체 안정 |
+| `anchor` | 골드셋의 `source_text_anchor` (앞 200자) 가 새 청크의 본문 prefix 와 매칭 성공 | ✅ **최선** — 정확히 같은 청크 |
+| `chunk_id` | (deprecated, 옛 골드셋 호환) `source_chunk_id` UUID 일치 | ✅ 정확 |
+| `fallback_first_chunk` | anchor·chunk_id 매칭 실패 → 정답 문서의 **첫 청크** 채택 | ⚠️ **잘못된 청크 가능성** |
+| `fallback_doc_first_chunk` | `source_document_id` 없음 → `relevant_doc_ids[0]` 의 첫 청크 | ⚠️ 더 약함 |
+| `empty` | 청크가 0개 또는 문서 미발견 | ❌ Judge 채점 불가능 |
+
+##### `fallback_first_chunk` 동작 예시
+
+```
+item (골드셋 한 항목)
+  ├── source_document_id: 42
+  ├── source_text_anchor: "신용카드 결제 시 일일 한도는 100만원..."  (앞 200자)
+  └── source_chunk_id: ""  (deprecated, 새 골드셋은 비어 있음)
+        │
+        ▼
+  store.get_chunks_by_document(42)  ── 문서 42 의 새 청크 목록
+        │
+        ▼
+  ┌─ 1차: anchor prefix 매칭 ────────────────────────┐
+  │   normalize(chunk.content).startswith(           │
+  │     normalize(anchor))  ?                        │
+  │   → 성공: method="anchor"                        │
+  └──────────────────────────────────────────────────┘
+        │ 매칭 실패
+        ▼
+  ┌─ 2차: source_chunk_id UUID 매칭 (옛 골드셋용) ──┐
+  │   → 성공: method="chunk_id"                     │
+  └──────────────────────────────────────────────────┘
+        │ 매칭 실패 또는 chunk_id 비어 있음
+        ▼
+  ┌─ 3차: FALLBACK — 문서의 첫 청크 ────────────────┐
+  │   return (chunks[0].content,                    │
+  │           "fallback_first_chunk")  ◄── ★ 발동 ★ │
+  └──────────────────────────────────────────────────┘
+```
+
+**가장 흔한 발동 시나리오 — chunk_size 변경:**
+
+Baseline 빌드 (`chunk_size=512`) — 문서 "결제 가이드" (doc_id=42) 가 5 청크로 분할:
+
+| chunk_index | 본문 prefix |
+|---|---|
+| 0 | `"결제 시스템 개요\n\n본 가이드는 결제 처리..."` |
+| **1** | **`"신용카드 결제 시 일일 한도는 100만원이고 월간 한도는 1000만원입니다..."`** ★ |
+| 2 | `"환불 정책은 결제 후 30일..."` |
+
+골드셋이 chunk[1] 선택, `source_text_anchor` = 위 본문 앞 200자.
+
+Treatment 시점 (`chunk_size=1024` 로 변경 + 재인덱싱) — 같은 문서가 3 청크로 새로 분할:
+
+| chunk_index | 본문 prefix |
+|---|---|
+| 0 | `"결제 시스템 개요\n\n본 가이드는...신용카드 결제 시 일일 한도는 100만원이고..."` (옛 0+1 통합) |
+| 1 | `"환불 정책..."` |
+| 2 | `"부정 거래..."` |
+
+평가 시 anchor `"신용카드 결제 시 일일 한도는..."` 로 시작하는 청크 찾기:
+- new_chunk[0] prefix `"결제 시스템 개요..."` → 미스
+- new_chunk[1] prefix `"환불 정책..."` → 미스
+- new_chunk[2] prefix `"부정 거래..."` → 미스
+- → **fallback: new_chunk[0]** 반환, `method="fallback_first_chunk"`
+
+진짜 정답 정보 ("일일 한도 100만원") 가 new_chunk[0] 의 중간에 묻혀 있지만 prefix 가 달라 anchor 매칭 실패. Judge 가 받는 source text 는 `"결제 시스템 개요..."` (잘못된 청크).
+
+**메트릭별 영향:**
+
+| 메트릭 | fallback 시 영향 |
+|---|---|
+| `recall@k`, `precision@k`, `hit@k`, `ndcg@k`, `mrr` | **영향 없음** — `retrieved_doc_ids` 와 `relevant_doc_ids` (doc_id 기반) 만 비교. `_fetch_source_text` 는 Judge 용 source 회복일 뿐 |
+| `graph_*` | **영향 없음** — entity_name/type 기반 |
+| `judge_score` (`overlap` / `entailment` 모드) | **표본 손실** — fallback 시 `judge_score = None` 으로 자동 skip + `judge_skip_reason = "source_fallback"` (S0 P6) |
+| `judge_score` (`reference-free` 모드) | **영향 없음** — source 안 봄 (S2 N-M2 로 fallback 무시) |
+
+**임계 해석** (`fallback_first_chunk + fallback_doc_first_chunk / total`):
+
+| 비율 | 발생 원인 추정 | 운영 결정 |
+|---|---|---|
+| **< 5%** | 청크 분할 stable. 일부 짧은 청크나 normalize edge case 만 fallback | 그대로 사용. `overlap`/`entailment` Judge 도 사용 가능 |
+| **5~20%** | chunk_size·overlap·청킹 알고리즘 변경 의심. 일부 anchor 가 새 청크 prefix 와 불일치 | `--judge-mode reference-free` 강제. chunk 메트릭은 그대로 유효 |
+| **> 20%** | 대규모 청크 재분할 또는 normalize 비대칭 | reference-free 만 사용. anchor 자체가 stale 이라 부분 재구성 고려 ([S4-P2](./eval-system-followup.md)) |
+
+#### 진단 키 2. `graph_t4_disabled` (+ `graph_t4_skip_count`)
+
+**정의**: 그래프 4-tier cascade matching 의 **T4 (embedding cosine)** 단계가 한 번이라도 skip 됐는지. `build_embed_fn` (`graph_match.py:182-199`) 의 async 호환 분기가 None 반환 시 발동.
+
+**값**:
+- `graph_t4_disabled: true | false` — 평가 실행 중 한 번이라도 T4 skip 발생
+- `graph_t4_skip_count: int` — 총 skip 횟수
+
+**의미**: T4 가 skip 되면 4-tier cascade 가 T1 (exact name+type) / T2 (alias) / T3 (normalize) 만 시도. **T4 가 흡수해야 할 case (description 만 비슷한 의미 매칭, type-drift 등) 를 못 잡음** → `graph_recall@k` 하락.
+
+**임계 해석:**
+
+| 상태 | 의미 | 원인 |
+|---|---|---|
+| `false` | T4 정상 작동 | 임베딩 클라이언트 정상 |
+| `true` + skip_count < 5% | 일부 항목만 skip — 비동기 contention 등 일시 이슈 | 재실행 또는 무시 가능 |
+| `true` + skip_count ≥ 5% | T4 사실상 미작동 | **임베딩 모델 변경**으로 골드셋 `description_embedding` (옛 vector) 과 호환 깨짐 |
+
+**진단 명령** — 골드셋의 임베딩 모델과 현재 config 비교:
+
+```bash
+python -c "
+import yaml
+gs = yaml.safe_load(open('eval/gold_set.yaml'))
+print('골드셋 embedding_model:', gs['metadata'].get('embedding_model'))
+"
+grep -E "^processor:" -A 5 ~/.context-loop/config.yaml
+# → 두 값이 다르면 임베딩 모델 변경, 그래프 description_embedding 재계산 또는 그래프 골드셋 재빌드
+```
+
+#### 진단 키 3. `judge_score_parse_failures` (+ `judge_score_success_count`)
+
+**정의**: Judge LLM 이 0~5 점수를 JSON 으로 응답해야 하는데 파싱 실패한 횟수 (S0 P5 에서 도입). `judge_answer` 가 `-1` 반환 시 `judge_score = None` 으로 분리.
+
+**값**:
+
+```json
+"judge_score_parse_failures": 3,
+"judge_score_success_count": 147
+```
+
+**임계 해석** (`judge_score_parse_failures / n_queries`):
+
+| 비율 | 의미 | 운영 결정 |
+|---|---|---|
+| **< 5%** | Judge 응답 형식 안정 | 평균 `judge_score` 신뢰 가능 |
+| **5~10%** | Judge 모델이 가끔 JSON 형식 깸 | `reasoning_mode` 점검 (reasoning 토큰이 응답 본문에 섞이는지). 다른 Judge 모델 시도 |
+| **> 10%** | Judge 응답이 빈번히 깨짐 | **Judge 모델 교체 또는 프롬프트 점검**. 평균 `judge_score` 가 손실된 표본으로 계산돼 편향 가능 |
+
+**흔한 원인:**
+- Judge 가 JSON 외에 자연어 prefix 출력 (예: "응답: {"score": 4}")
+- 추가 키 출력 또는 잘못된 형식
+- Reasoning 토큰을 응답 본문에 섞음 (vLLM Qwen3 등)
+
+#### 진단 키 4. `failure_rate` (+ `n_failed`, `n_successful`)
+
+**정의**: 평가 자체가 exception 으로 실패한 질의 비율 (S0 P9 에서 도입). 검색 시스템이 timeout·import error 등으로 응답 못한 경우.
+
+**값**:
+
+```json
+"n_queries": 150,
+"n_failed": 3,
+"n_successful": 147,
+"failure_rate": 0.02
+```
+
+**계산**: `n_failed / n_queries`. 평균 메트릭 분모는 `n_successful` 기준 (실패는 자동 제외 — S0 P9 의 핵심 안전장치).
+
+**임계 해석:**
+
+| 비율 | 의미 | 운영 결정 |
+|---|---|---|
+| **< 5%** | 평가 안정 — 메트릭 분모가 거의 전체 | 그대로 사용 |
+| **5~10%** | 가끔 timeout/error | per-question CSV 의 `error` 컬럼 확인. 재실행으로 우회 가능 |
+| **> 10%** | 평가 환경 깨짐 | **재실행 전 환경 점검**. 메트릭 비교 의미 없음 |
+
+**진단 명령** — 실패 질의 에러 메시지 확인:
+
+```bash
+python -c "
+import csv
+with open('eval/runs/diag.csv') as f:
+    for row in csv.DictReader(f):
+        if row.get('metric_failed') == 'True':
+            print(row['id'], row.get('error', '')[:100])
+"
+```
+
+흔한 원인:
+- `assemble_context_with_sources` timeout (대용량 그래프 탐색)
+- LLM endpoint 연결 끊김 (reranker / HyDE 호출)
+- ChromaDB 락 충돌 (높은 `--concurrency` 일 때)
+
+#### 진단 키 종합 표
+
+| 키 | 안전 | 주의 | 위험 |
+|---|---|---|---|
+| `source_fetch_method_counts.fallback_*  / total` | <5% | 5~20% | >20% |
+| `graph_t4_disabled` | `false` | `true` + skip <5% | `true` + skip ≥5% |
+| `judge_score_parse_failures / n_queries` | <5% | 5~10% | >10% |
+| `failure_rate` | <5% | 5~10% | >10% |
+
+**운영 결정 흐름:**
+
+```
+모두 "안전" → 그대로 사용
+─────────────────────────
+한 항목 "주의" + 나머지 안전 → 그대로 사용하되 해당 영역 주의
+─────────────────────────
+한 항목 "위험" + 나머지 안전 → 해당 영역 우회
+  - fallback 위험 → reference-free Judge 강제
+  - T4 위험 → 그래프 골드셋 재빌드
+  - parse 위험 → Judge 모델 교체
+  - failure 위험 → 환경 점검
+─────────────────────────
+두 항목 이상 "위험" → 환경 점검 후 재실행. 메트릭 비교 의미 없음
+```
+
+#### 진단 자동 추출 명령
+
+```bash
+python -c "
+import json, sys
+s = json.load(open(sys.argv[1]))
+n = s.get('n_queries', 0) or 1
+
+print('=== 진단 요약 ===')
+fmc = s.get('source_fetch_method_counts') or {}
+fb = fmc.get('fallback_first_chunk', 0) + fmc.get('fallback_doc_first_chunk', 0)
+fb_total = sum(fmc.values())
+print(f'source fallback : {fb}/{fb_total} = {fb/max(fb_total,1):.1%}')
+print(f'  method 분포   : {fmc}')
+
+print(f'graph_t4        : disabled={s.get(\"graph_t4_disabled\", False)}, '
+      f'skip_count={s.get(\"graph_t4_skip_count\", 0)}')
+
+jpf = s.get('judge_score_parse_failures', 0)
+print(f'judge parse fail: {jpf}/{n} = {jpf/n:.1%}')
+
+print(f'failure_rate    : {s.get(\"failure_rate\", 0):.1%} '
+      f'({s.get(\"n_failed\", 0)}/{n})')
+" eval/runs/diag.summary.json
+```
+
+출력 예시:
+
+```
+=== 진단 요약 ===
+source fallback : 8/50 = 16.0%
+  method 분포   : {'anchor': 42, 'fallback_first_chunk': 8}
+graph_t4        : disabled=False, skip_count=0
+judge parse fail: 0/50 = 0.0%
+failure_rate    : 0.0% (0/50)
+```
+
+→ 16% 면 5~20% 구간 (주의) — `--judge-mode reference-free` 권장, chunk 메트릭은 그대로 사용 가능.
 
 ### 5. 등급별 분기
 
