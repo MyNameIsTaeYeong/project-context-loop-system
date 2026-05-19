@@ -78,8 +78,11 @@ class LLMBodyExtractionConfig:
     max_units_per_doc: int | None = None
     max_concurrency: int = 3
     # 본문 1500 토큰 unit 에서 entities + relations JSON 응답이 1000+ 토큰
-    # 으로 늘어날 수 있어 1024 는 빠듯함. 2048 로 두면 일반적 응답 안정.
-    max_tokens: int = 2048
+    # 으로 늘어날 수 있고, reasoning 모델은 thinking 토큰까지 예산을 잡아먹는다.
+    # 모델별 한도 차이(8K~128K)가 있으나 32768 은 대부분 모델이 지원하는 큰
+    # 값으로, 응답 잘림(JSON 파싱 실패) 위험을 최소화한다. 모델이 그보다
+    # 작은 한도를 가지면 서버가 클램프하거나 401 에러로 보고하므로 운영상 안전.
+    max_tokens: int = 32768
     temperature: float = 0.0
 
 

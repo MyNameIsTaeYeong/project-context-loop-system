@@ -62,7 +62,10 @@ class PipelineConfig:
     chunk_size: int = 512
     chunk_overlap: int = 50
     embedding_model: str = "text-embedding-3-small"
-    enable_llm_body_extraction: bool = False  # opt-in (비용 발생)
+    # LLM 본문 추출은 그래프의 도메인 의미 관계(depends_on/implements/owned_by 등)를
+    # 보강하여 검색 추론 가치를 끌어올린다. 비용이 발생하지만 운영 기본을 ON 으로
+    # 두어 그래프 품질을 기본 보장. LLM 호출을 끄려면 호출자가 명시적으로 False.
+    enable_llm_body_extraction: bool = True
 
 
 async def process_document(

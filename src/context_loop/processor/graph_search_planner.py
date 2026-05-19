@@ -162,10 +162,13 @@ async def plan_graph_search(
     prompt = _PLAN_USER_TEMPLATE.format(query=query, schema=schema_text)
 
     try:
+        # 그래프 탐색 계획 JSON 은 일반적으로 짧지만, reasoning 모델은 thinking
+        # 예산을 응답 토큰으로 잡아먹어 max_tokens 가 작으면 JSON 이 잘려 파싱
+        # 실패한다. 모델 한도 범위 안에서 큰 값을 두어 잘림을 방지.
         response = await llm_client.complete(
             prompt,
             system=_render_system_prompt(),
-            max_tokens=512,
+            max_tokens=32768,
             temperature=0.0,
             reasoning_mode="off",
             purpose="graph_search_planner",
