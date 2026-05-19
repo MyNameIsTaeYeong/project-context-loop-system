@@ -157,6 +157,113 @@ class TestPythonExtraction:
         assert len(result.symbols) == 1
         assert result.symbols[0].symbol_type == "module"
 
+    def test_module_docstring_emitted_as_symbol(self) -> None:
+        """파일 상단의 모듈 docstring 이 ``__module__`` 심볼로 추출된다 — '이
+        모듈이 무엇인가' 검색 시그널을 살린다."""
+        code = textwrap.dedent('''\
+            """결제 게이트웨이 모듈.
+
+            결제 요청 검증과 외부 PG 호출을 담당한다.
+            """
+
+            def charge(amount: int) -> None: pass
+        ''')
+        result = extract_code_symbols(code, "pg.py")
+        module_syms = [s for s in result.symbols if s.name == "__module__"]
+        assert len(module_syms) == 1
+        sym = module_syms[0]
+        assert sym.symbol_type == "module"
+        assert "결제 게이트웨이" in sym.docstring
+        assert "결제 게이트웨이" in sym.body
+
+    def test_module_constants_grouped_into_single_symbol(self) -> None:
+        """모듈 레벨 상수들이 ``__constants__`` 심볼 하나로 묶여 추출된다."""
+        code = textwrap.dedent('''\
+            MAX_RETRIES = 3
+            DEFAULT_TIMEOUT: float = 5.0
+            ALLOWED_ROLES = ["admin", "viewer"]
+
+            def foo(): pass
+        ''')
+        result = extract_code_symbols(code, "config.py")
+        const_syms = [s for s in result.symbols if s.name == "__constants__"]
+        assert len(const_syms) == 1
+        sym = const_syms[0]
+        # signature 에 상수 이름들이 들어감 (검색용)
+        assert "MAX_RETRIES" in sym.signature
+        assert "DEFAULT_TIMEOUT" in sym.signature
+        assert "ALLOWED_ROLES" in sym.signature
+        # body 에 실제 코드 포함
+        assert "MAX_RETRIES = 3" in sym.body
+        assert "ALLOWED_ROLES" in sym.body
+
+    def test_decorator_included_in_function_body(self) -> None:
+        """``@app.route("/x")`` 같은 데코레이터가 함수 body 의 prefix 로 포함된다 —
+        '어떤 라우트가 어떤 함수에 매핑되는가' 검색에 결정적."""
+        code = textwrap.dedent('''\
+            @app.route("/users/<id>")
+            @login_required
+            def get_user(id: int) -> dict:
+                return {"id": id}
+        ''')
+        result = extract_code_symbols(code, "views.py")
+        sym = next(s for s in result.symbols if s.name == "get_user")
+        assert '@app.route("/users/<id>")' in sym.body
+        assert "@login_required" in sym.body
+        assert "def get_user" in sym.body
+        # line_start 가 첫 데코레이터 라인을 가리킴
+        assert sym.line_start == 1
+
+    def test_class_decorator_and_bases_in_signature(self) -> None:
+        """클래스 시그니처에 상속/제네릭/keywords 정보 포함."""
+        code = textwrap.dedent('''\
+            from typing import Generic, TypeVar
+            T = TypeVar("T")
+
+            class Repository(Generic[T], BaseRepo, metaclass=ABCMeta):
+                """저장소 추상."""
+                def get(self, id: int) -> T: ...
+        ''')
+        result = extract_code_symbols(code, "repo.py")
+        get_sym = next(s for s in result.symbols if s.name == "get")
+        # parent_signature 에 base + metaclass 정보 포함
+        sig = get_sym.parent_signature
+        assert "Repository" in sig
+        assert "Generic[T]" in sig or "Generic" in sig
+        assert "BaseRepo" in sig
+        assert "metaclass=ABCMeta" in sig
+
+    def test_import_symbols_preserved_for_from_import(self) -> None:
+        """``from x import a, b`` 에서 a, b 가 ``import_symbols`` 에 보존된다 —
+        '이 함수가 어디서 import 되는가' 추적의 원천."""
+        code = textwrap.dedent('''\
+            import os
+            from pathlib import Path
+            from typing import Any, Dict
+            from . import utils
+        ''')
+        result = extract_code_symbols(code, "x.py")
+        # whole-module import: (module, None)
+        assert ("os", None) in result.import_symbols
+        # from x import y: (x, y)
+        assert ("pathlib", "Path") in result.import_symbols
+        assert ("typing", "Any") in result.import_symbols
+        assert ("typing", "Dict") in result.import_symbols
+        # 상대 import 도 보존
+        assert (".", "utils") in result.import_symbols
+
+    def test_function_signature_handles_varargs_and_kwonly(self) -> None:
+        """``*args``, ``**kwargs``, keyword-only, defaults 가 시그니처에 보존된다."""
+        code = textwrap.dedent('''\
+            def configure(name: str, *args: int, mode: str = "prod", **opts: object) -> None:
+                pass
+        ''')
+        result = extract_code_symbols(code, "x.py")
+        sym = next(s for s in result.symbols if s.name == "configure")
+        # 모든 카테고리가 시그니처에 들어감
+        for needle in ("name: str", "*args", "mode", "**opts"):
+            assert needle in sym.signature, f"{needle!r} 가 시그니처에서 누락: {sym.signature}"
+
 
 # ---------------------------------------------------------------------------
 # Go extractor
@@ -251,6 +358,47 @@ class TestGoExtraction:
         handle = next(s for s in result.symbols if s.name == "HandleRequest")
         assert "func HandleRequest" in handle.body
         assert "svc.Process(req)" in handle.body
+
+    def test_imports_no_string_literal_false_positive(self) -> None:
+        """본문의 문자열 리터럴(예: fmt.Errorf 인자)이 import 모듈로 잘못 잡히지
+        않아야 한다 — 이전 구현은 단순 ``"([^"]+)"`` 정규식으로 모든 string 을
+        매치해서 false positive 가 대량 발생했다."""
+        code = textwrap.dedent("""\
+            package main
+
+            import (
+                "fmt"
+                "context"
+                "github.com/example/svc"
+            )
+
+            func Hello(ctx context.Context) error {
+                fmt.Println("hello world")
+                return fmt.Errorf("validation failed: %s", "name required")
+            }
+        """)
+        result = extract_code_symbols(code, "hello.go")
+        # 정상 import 만 잡힘
+        assert set(result.imports) == {
+            "fmt", "context", "github.com/example/svc",
+        }
+        # 함수 호출 인자의 문자열 리터럴은 절대 import 가 아님
+        for noise in ("hello world", "validation failed: %s", "name required"):
+            assert noise not in result.imports, f"문자열 리터럴 {noise!r} 가 import 로 잘못 잡힘"
+
+    def test_imports_single_line_and_aliased(self) -> None:
+        """단일 라인 import + alias 가 있는 import 모두 처리."""
+        code = textwrap.dedent("""\
+            package main
+
+            import "fmt"
+            import alias "github.com/x/y"
+
+            func main() {}
+        """)
+        result = extract_code_symbols(code, "x.go")
+        assert "fmt" in result.imports
+        assert "github.com/x/y" in result.imports
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +519,35 @@ class TestJavaExtraction:
         assert "VPCController" in names
         assert "java.util.List" in result.imports
         assert "com.example.service.VPCService" in result.imports
+
+    def test_reserved_keywords_not_extracted_as_function(self) -> None:
+        """top-level 제어흐름 키워드(``for``/``if``/``return``)나 ``throw``/``new``
+        같은 토큰이 함수 정의로 잘못 인식되지 않아야 한다 — 함수 정의 정규식의
+        modifier 그룹이 옵션이라 일부 식이 통과할 수 있으나 reserved name 필터로
+        막힌다."""
+        code = textwrap.dedent("""\
+            public class Service {
+                public void doWork() {
+                    int x = compute(1);
+                    return;
+                }
+
+                private int compute(int a) {
+                    if (a > 0) {
+                        throw new IllegalArgumentException("err");
+                    }
+                    return a * 2;
+                }
+            }
+        """)
+        result = extract_code_symbols(code, "Service.java")
+        names = {s.name for s in result.symbols}
+        # 진짜 메서드만 추출됨
+        assert "doWork" in names
+        assert "compute" in names
+        # 예약어가 심볼명으로 잘못 등록되지 않음
+        for reserved in ("if", "for", "while", "return", "throw", "new"):
+            assert reserved not in names, f"reserved 키워드 {reserved!r} 가 심볼로 잡힘"
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +734,24 @@ class TestToGraphData:
         for r in graph.relations:
             assert r.source == "handler.go"
             assert r.relation_type == "imports"
+
+    def test_import_relations_include_symbol_label_from_python(self) -> None:
+        """Python ``from x import a, b`` 의 a, b 가 ``imports`` relation label 에
+        포함된다 — '이 함수가 어디서 import 되는가' 검색 시그널."""
+        code = textwrap.dedent('''\
+            from typing import Any, Dict
+            from pathlib import Path
+        ''')
+        result = extract_code_symbols(code, "x.py")
+        graph = to_graph_data(result, "x.py")
+
+        # typing 관계의 label 에 'Any, Dict'
+        typing_rel = next(r for r in graph.relations if r.target == "typing")
+        assert "Any" in typing_rel.label
+        assert "Dict" in typing_rel.label
+        # pathlib 관계의 label 에 'Path'
+        pathlib_rel = next(r for r in graph.relations if r.target == "pathlib")
+        assert "Path" in pathlib_rel.label
 
     def test_creates_import_module_entities(self) -> None:
         """import된 모듈이 엔티티로 등록되어 save_graph_data가 관계를 resolve할 수 있다."""

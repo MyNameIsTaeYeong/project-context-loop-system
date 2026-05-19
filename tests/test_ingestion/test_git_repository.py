@@ -349,6 +349,57 @@ class TestCollectFiles:
         assert "services/vpc/handler_test.go" not in paths
         assert "services/vpc/handler.go" in paths
 
+    def test_excludes_vendored_directories(self, tmp_path: Path) -> None:
+        """node_modules, .venv, __pycache__, dist 등 표준 vendored/캐시 디렉토리는
+        product paths 가 광범위해도 인덱싱에서 제외되어야 한다 — third-party 코드가
+        검색 노이즈가 되는 것을 막는다."""
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "main.py").write_text("def main(): pass")
+
+        # 흔한 vendored / 캐시 디렉토리들
+        (repo / "node_modules" / "react").mkdir(parents=True)
+        (repo / "node_modules" / "react" / "index.js").write_text("module.exports = {}")
+        (repo / ".venv" / "lib").mkdir(parents=True)
+        (repo / ".venv" / "lib" / "thirdparty.py").write_text("# third party")
+        (repo / "__pycache__").mkdir(parents=True)
+        (repo / "__pycache__" / "x.cpython-311.pyc").write_text("bytes")  # 확장자도 다르지만 디렉토리 자체 차단
+        (repo / "dist").mkdir(parents=True)
+        (repo / "dist" / "bundle.js").write_text("/* compiled */")
+        (repo / "build").mkdir(parents=True)
+        (repo / "build" / "app.py").write_text("compiled python")
+
+        # 광범위 paths 로 자기 src 와 위 디렉토리를 모두 매칭하는 scope
+        wide_scope = [ProductScope(
+            name="all", display_name="All", paths=["**/*.py", "**/*.js"], exclude=[],
+        )]
+        files = collect_files(repo, wide_scope, [".py", ".js"], 500)
+        paths = {f.relative_path for f in files}
+        assert "src/main.py" in paths, "사용자 코드는 포함되어야 함"
+        assert "node_modules/react/index.js" not in paths
+        assert ".venv/lib/thirdparty.py" not in paths
+        assert "dist/bundle.js" not in paths
+        assert "build/app.py" not in paths
+
+    def test_excludes_vendored_in_incremental(self, tmp_path: Path) -> None:
+        """증분(changed_files) 경로에서도 vendored 디렉토리는 제외된다."""
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "main.py").write_text("def main(): pass")
+        (repo / "node_modules").mkdir(parents=True)
+        (repo / "node_modules" / "lib.js").write_text("module.exports = {}")
+
+        wide_scope = [ProductScope(
+            name="all", display_name="All", paths=["**/*"], exclude=[],
+        )]
+        files = collect_files(
+            repo, wide_scope, [".py", ".js"], 500,
+            changed_files=["src/main.py", "node_modules/lib.js"],
+        )
+        paths = {f.relative_path for f in files}
+        assert "src/main.py" in paths
+        assert "node_modules/lib.js" not in paths
+
 
 # --- Integration Tests: Store Operations ---
 
@@ -385,6 +436,44 @@ class TestStoreGitCode:
         assert result["created"] is False
         assert result["changed"] is True
         assert result["original_content"] == "v2"
+
+    async def test_cache_avoids_full_list_call(self, store: MetadataStore) -> None:
+        """``existing_by_source_id`` 캐시가 주어지면 ``list_documents`` 를 호출하지
+        않아야 한다 — 대용량 레포에서의 O(N²) 회피."""
+        fi = FileInfo("a.go", Path("a.go"), "vpc", "v1", compute_content_hash("v1"), 2)
+        # 캐시에 미리 등록된 문서 — 같은 hash → unchanged 로 인식되어야 함
+        existing = {
+            "a.go": {
+                "id": -1,
+                "source_id": "a.go",
+                "source_type": "git_code",
+                "content_hash": fi.content_hash,
+                "title": "a.go",
+                "original_content": "v1",
+                "url": "url",
+                "storage_method": None,
+            },
+        }
+        # list_documents 가 호출되면 캐시가 무효화되었음을 의미.
+        original_list = store.list_documents
+        call_count = {"n": 0}
+
+        async def counting_list(*args, **kwargs):  # type: ignore[no-untyped-def]
+            call_count["n"] += 1
+            return await original_list(*args, **kwargs)
+
+        store.list_documents = counting_list  # type: ignore[assignment]
+        try:
+            result = await store_git_code(
+                store, fi, "url", existing_by_source_id=existing,
+            )
+        finally:
+            store.list_documents = original_list  # type: ignore[assignment]
+
+        assert call_count["n"] == 0, "캐시 제공 시 list_documents 호출되면 안 됨"
+        # hash 같으므로 unchanged
+        assert result["created"] is False
+        assert result["changed"] is False
 
 
 class TestDeleteRemovedFiles:

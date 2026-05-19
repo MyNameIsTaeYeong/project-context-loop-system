@@ -48,13 +48,22 @@ ENTITY_TYPES: tuple[VocabEntry, ...] = (
                "body + llm_body"),
     # LLM 의미 어휘 (llm_body_extractor)
     VocabEntry("system", "외부에서 보이는 서비스 (예: Auth Service)", "llm_body"),
-    VocabEntry("module", "시스템 내부 컴포넌트 (예: Token Validator)",
-               "llm_body"),
+    VocabEntry(
+        "module",
+        "시스템 내부 컴포넌트 또는 코드 파일/패키지 (예: Token Validator, "
+        "user_service.py)",
+        "llm_body + ast_code",
+    ),
     VocabEntry("policy", "정책/규칙", "llm_body"),
     VocabEntry("team", "팀/조직", "llm_body"),
     # AST 코드 추출
     VocabEntry("function", "함수 심볼 (git_code 추출)", "ast_code"),
     VocabEntry("class", "클래스 심볼 (git_code 추출)", "ast_code"),
+    VocabEntry("method", "클래스/구조체에 속한 메서드 심볼 (git_code 추출)",
+               "ast_code"),
+    VocabEntry("struct", "Go 구조체 (git_code 추출)", "ast_code"),
+    VocabEntry("interface", "Go/TypeScript/Java 인터페이스 (git_code 추출)",
+               "ast_code"),
 )
 
 
@@ -85,7 +94,7 @@ RELATION_TYPES: tuple[VocabEntry, ...] = (
     VocabEntry("provides", "A 가 B 를 제공 (서비스/기능)", "llm_body"),
     VocabEntry("documented_in", "A 가 B 에 문서화", "llm_body"),
     # AST 코드 추출
-    VocabEntry("import", "모듈이 다른 모듈을 import", "ast_code"),
+    VocabEntry("imports", "모듈이 다른 모듈을 import", "ast_code"),
     VocabEntry("contains", "클래스가 메서드를 포함 등", "ast_code"),
 )
 

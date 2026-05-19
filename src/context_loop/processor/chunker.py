@@ -25,8 +25,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 토큰 추정을 위한 문자 비율 (폴백용)
-_CHARS_PER_TOKEN = 4
+# 폴백 토큰화 정책: tiktoken 이 없을 때 1 char = 1 token 으로 처리한다.
+# 이 정책을 ``count_tokens`` 와 ``_chunk_blocks`` 의 encode/decode 가 일관되게
+# 사용해야 한다 (이전에는 count_tokens 가 chars/4, _chunk_blocks 가
+# range(len) 으로 일관성이 깨져 폴백 환경에서 overlap_tokens 가 의도의 25%
+# 만 적용되고 decode 가 텍스트를 무시하는 버그가 있었다).
+#
+# 의미: 영문 텍스트에서 chunk_size=512 가 폴백 시 character 512 가 되어 청크가
+# 작아질 수 있으나, 동작이 결정적이고 round-trip 정확하여 운영 환경에서 안전한
+# fallback 으로 더 적절하다 (tiktoken 의존성을 가진 prod 환경에서는 영향 없음).
+_FALLBACK_CHARS_PER_TOKEN = 1
 
 # 마크다운 헤딩 패턴 (# ~ ######)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -91,12 +99,13 @@ def count_tokens(text: str, model: str = "cl100k_base") -> int:
         model: tiktoken 인코딩 이름 또는 모델 이름.
 
     Returns:
-        토큰 수.
+        토큰 수. tiktoken 이 없으면 1 char = 1 token 으로 폴백 (decode 와의
+        round-trip 정확성을 위해; ``_FALLBACK_CHARS_PER_TOKEN`` 참조).
     """
     enc = _get_tokenizer(model)
     if enc is not None:
         return len(enc.encode(text))  # type: ignore[union-attr]
-    return len(text) // _CHARS_PER_TOKEN
+    return len(text) // _FALLBACK_CHARS_PER_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -395,12 +404,15 @@ def _chunk_blocks(
     def encode(s: str) -> list[int]:
         if enc is not None:
             return list(enc.encode(s))  # type: ignore[union-attr]
-        return list(range(len(s)))
+        # 폴백: 1 char = 1 token. ord/chr round-trip 정확성으로 overlap 이
+        # 실제로 텍스트에 반영되도록 한다 (이전 구현은 range(len) 으로 토큰을
+        # 만들어 decode 단계에서 fallback 텍스트로 대체되어 overlap 이 사라졌다).
+        return [ord(c) for c in s]
 
     def decode(tokens: list[int], fallback: str) -> str:
         if enc is not None:
             return enc.decode(tokens)  # type: ignore[union-attr]
-        return fallback
+        return "".join(chr(t) for t in tokens)
 
     chunks: list[Chunk] = []
     current_tokens: list[int] = []
@@ -444,8 +456,11 @@ def _chunk_blocks(
                 while start < len(block_tokens):
                     end = min(start + chunk_size, len(block_tokens))
                     sub_tokens = block_tokens[start:end]
+                    # 폴백 시 1 char = 1 token 이므로 토큰 인덱스를 그대로
+                    # character 인덱스로 사용한다 (decode 와 일관).
                     sub_fallback = block.content[
-                        start * _CHARS_PER_TOKEN : end * _CHARS_PER_TOKEN
+                        start * _FALLBACK_CHARS_PER_TOKEN
+                        : end * _FALLBACK_CHARS_PER_TOKEN
                     ]
                     sub_text = decode(sub_tokens, sub_fallback)
                     chunks.append(
