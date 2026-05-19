@@ -115,36 +115,122 @@ def _build_pair_buckets(
     *,
     n_neg: int,
     rng: random.Random,
-) -> tuple[list[tuple[dict, dict]], list[tuple[dict, dict]]]:
-    """양성/음성 쌍 후보를 만든다.
+) -> tuple[list[tuple[dict, dict, str]], list[tuple[dict, dict, str]]]:
+    """양성/음성 쌍 후보를 만든다. S3 보강 — 자명 양성 비중을 줄이고 실제로
+    T4 임베딩 매칭이 필요한 어려운 케이스를 포함.
 
-    - 양성: 같은 name_normalized + 같은 type (alias/표기 변형 가능성).
-    - 음성: 다른 name_normalized + 다른 type 의 랜덤 쌍.
+    **양성**:
+        - ``trivial-normalize``: 같은 name_normalized + 같은 type (T3 가 이미
+          잡는 자명 양성 — 비교 baseline)
+        - ``alias-only``: 같은 type, 다른 name_normalized 이지만 (a) 한쪽 이름이
+          다른 쪽의 substring 이거나 (b) prefix 4글자 공유. 약한 alias 후보 —
+          T4 의 description 임베딩이 실제로 잡아내야 하는 케이스.
+        - 두 유형을 모두 포함해 τ 가 자명 양성에만 최적화되지 않게 한다.
+
+    **음성**:
+        - ``unrelated``: 다른 name_normalized + 다른 type (기본).
+        - ``type-drift``: 같은 name_normalized 인데 다른 type (system → service
+          시나리오의 반대 — T4 type-agnostic 흡수 의도가 false positive 를
+          만드는 케이스).
+
+    Returns:
+        (positives, negatives) — 각 쌍은 (node_a, node_b, kind) 의 3-tuple.
     """
-    by_key: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    by_normalized_and_type: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    by_normalized_only: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for n in nodes:
-        by_key[(n["name_normalized"], n["type"])].append(n)
+        by_normalized_and_type[(n["name_normalized"], n["type"])].append(n)
+        by_normalized_only[n["name_normalized"]].append(n)
+        by_type[n["type"]].append(n)
 
-    positives: list[tuple[dict, dict]] = []
-    for group in by_key.values():
+    positives: list[tuple[dict, dict, str]] = []
+
+    # 양성 1: trivial-normalize (같은 normalized + type)
+    for group in by_normalized_and_type.values():
         if len(group) < 2:
             continue
-        # 같은 그룹의 모든 쌍을 양성으로
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
-                positives.append((group[i], group[j]))
+                positives.append((group[i], group[j], "trivial-normalize"))
 
-    # 음성: 랜덤 샘플 (서로 다른 key)
-    negatives: list[tuple[dict, dict]] = []
+    # 양성 2: alias-only (S3 N-H2 보강) — 같은 type 내에서 이름이 다른 alias.
+    # substring/prefix 휴리스틱으로 약한 양성 후보 발굴.
+    for etype, group in by_type.items():
+        if len(group) < 2:
+            continue
+        # type 그룹 내에서 normalized 이름이 다른 쌍 중 substring/prefix 공유
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                ni = group[i]["name_normalized"]
+                nj = group[j]["name_normalized"]
+                if ni == nj:
+                    continue  # trivial 과 중복
+                # substring 또는 4글자 이상 prefix 공유 → 약한 alias 후보
+                shared_prefix = 0
+                for k in range(min(len(ni), len(nj))):
+                    if ni[k] == nj[k]:
+                        shared_prefix += 1
+                    else:
+                        break
+                if ni in nj or nj in ni or shared_prefix >= 4:
+                    positives.append((group[i], group[j], "alias-only"))
+
+    # 음성 1: unrelated (다른 normalized + 다른 type)
+    negatives: list[tuple[dict, dict, str]] = []
     candidate_count = 0
-    while len(negatives) < n_neg and candidate_count < n_neg * 10:
+    while (
+        sum(1 for _, _, k in negatives if k == "unrelated") < n_neg
+        and candidate_count < n_neg * 10
+    ):
         a, b = rng.sample(nodes, 2)
         candidate_count += 1
         if (a["name_normalized"], a["type"]) == (b["name_normalized"], b["type"]):
             continue
-        negatives.append((a, b))
+        if a["name_normalized"] == b["name_normalized"]:
+            continue  # type-drift 후보로 분리
+        if a["type"] == b["type"]:
+            continue  # 같은 type 다른 이름은 alias 가능성 있어 음성으로 부적합
+        negatives.append((a, b, "unrelated"))
+
+    # 음성 2: type-drift (S3 보강) — 같은 정규화 이름 + 다른 type. T4 type-
+    # agnostic 매칭이 의도된 흡수 vs false positive 의 경계 케이스.
+    for nname, group in by_normalized_only.items():
+        types_seen = {g["type"] for g in group}
+        if len(types_seen) < 2:
+            continue
+        # 그룹 내에서 다른 type 인 쌍
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                if group[i]["type"] != group[j]["type"]:
+                    negatives.append((group[i], group[j], "type-drift"))
 
     return positives, negatives
+
+
+def _apply_threshold_to_module(new_tau: float) -> None:
+    """``graph_match.py`` 의 ``DEFAULT_GRAPH_MATCH_THRESHOLD`` 상수를 직접 갱신.
+
+    S3 — auto-tune τ. 정규식으로 안전하게 라인 교체. 기존 주석은 보존.
+    여러 매칭이 있어도 첫 정의만 바꾼다 (정규식이 단순화).
+    """
+    import re as _re  # noqa: PLC0415
+    module_path = (
+        Path(__file__).resolve().parent.parent
+        / "src" / "context_loop" / "eval" / "graph_match.py"
+    )
+    text = module_path.read_text(encoding="utf-8")
+    pattern = _re.compile(
+        r"^DEFAULT_GRAPH_MATCH_THRESHOLD\s*=\s*[\d.]+",
+        flags=_re.MULTILINE,
+    )
+    new_line = f"DEFAULT_GRAPH_MATCH_THRESHOLD = {new_tau:.2f}"
+    new_text, n_sub = pattern.subn(new_line, text, count=1)
+    if n_sub != 1:
+        raise RuntimeError(
+            "graph_match.py 에서 DEFAULT_GRAPH_MATCH_THRESHOLD 정의를 찾지 못함",
+        )
+    module_path.write_text(new_text, encoding="utf-8")
 
 
 def _compute_metrics_at_threshold(
@@ -215,12 +301,20 @@ async def run(args: argparse.Namespace) -> int:
 
         pos_sims = [
             cosine_similarity(a["embedding"], b["embedding"])
-            for a, b in positives
+            for a, b, _kind in positives
         ]
         neg_sims = [
             cosine_similarity(a["embedding"], b["embedding"])
-            for a, b in negatives
+            for a, b, _kind in negatives
         ]
+
+        # 종류별 카운트 — S3 보강의 효과 가시화
+        pos_kind_counts: dict[str, int] = defaultdict(int)
+        for _a, _b, k in positives:
+            pos_kind_counts[k] += 1
+        neg_kind_counts: dict[str, int] = defaultdict(int)
+        for _a, _b, k in negatives:
+            neg_kind_counts[k] += 1
 
         # τ 후보 — 0.50 ~ 0.95, 0.01 간격
         thresholds = [round(0.50 + i * 0.01, 2) for i in range(46)]
@@ -233,6 +327,8 @@ async def run(args: argparse.Namespace) -> int:
         # stdout 표
         print("\n" + "=" * 76)
         print(f"  graph τ 캘리브레이션 — n_pos={len(pos_sims)}, n_neg={len(neg_sims)}")
+        print(f"    양성 종류: {dict(pos_kind_counts)}")
+        print(f"    음성 종류: {dict(neg_kind_counts)}")
         print("=" * 76)
         print(f"  {'τ':>6s}  {'precision':>10s}  {'recall':>10s}  {'F1':>10s}")
         for r in results:
@@ -252,6 +348,22 @@ async def run(args: argparse.Namespace) -> int:
                 f"  → graph_match.py:33 의 DEFAULT_GRAPH_MATCH_THRESHOLD 를 "
                 f"{best['threshold']:.2f} 로 갱신 권장",
             )
+
+        # S3 — auto-tune τ 옵션. --apply 명시 시 graph_match.py:33 의 default
+        # 를 자동 갱신 (사용자가 결과를 검토 후 명시 활성화).
+        if args.apply:
+            new_tau = best["threshold"]
+            if abs(new_tau - 0.78) >= 0.005:
+                _apply_threshold_to_module(new_tau)
+                print(
+                    f"  [APPLIED] graph_match.py 의 "
+                    f"DEFAULT_GRAPH_MATCH_THRESHOLD 를 {new_tau:.2f} 로 갱신",
+                )
+            else:
+                print(
+                    f"  [SKIP] 권장 τ({new_tau:.2f}) 가 default 0.78 과 "
+                    f"0.005 미만 차이 — 갱신 없음",
+                )
         print()
 
         if args.output:
@@ -312,6 +424,12 @@ def main() -> int:
     parser.add_argument(
         "--output", "-o", default="",
         help="결과 JSON 저장 경로. 미지정 시 stdout 만.",
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="S3 — 권장 τ 를 graph_match.py 의 DEFAULT_GRAPH_MATCH_THRESHOLD "
+             "에 자동 반영. 기본은 stdout 권장만 출력. default 와의 차이가 "
+             "0.005 미만이면 갱신 skip (의미 없는 변경 회피).",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()

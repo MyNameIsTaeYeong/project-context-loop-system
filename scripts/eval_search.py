@@ -133,11 +133,20 @@ JUDGE_PROMPT_REFERENCE_FREE = """\
 {retrieved_context}
 ---
 
-위 컨텍스트만 보고 질문에 정확하고 충분히 답할 수 있는지 0~5점으로 평가하라.
-정답 출처를 보지 말고, 컨텍스트의 정보만으로 판단할 것.
-- 5: 컨텍스트 정보만으로 정확하고 완전한 답이 도출됨
-- 3: 부분 답 가능, 추가 정보 필요
-- 0: 답할 수 없음 (무관/공백)
+위 컨텍스트에 **명시적으로 포함된 정보만** 사용해 질문에 정확하고 충분히
+답할 수 있는지 0~5점으로 평가하라.
+
+**중요 — self-knowledge 차단**:
+- 컨텍스트에 없는 사실은 답에 쓰지 말 것 (당신의 학습 지식 사용 금지)
+- 컨텍스트가 부분만 답할 수 있다면 부분 점수, 답이 완전히 학습 지식에 의존
+  하면 0점.
+- "이 컨텍스트에 답이 있는가" 가 평가 기준 — 일반 상식으로 답할 수 있다고
+  high score 주지 말 것.
+
+점수 기준:
+- 5: 컨텍스트의 명시 정보만으로 정확하고 완전한 답이 도출됨
+- 3: 컨텍스트가 답의 일부만 담음, 외부 지식 보완 시에만 완전
+- 0: 컨텍스트가 답을 전혀 포함하지 않음 (무관/공백)
 
 JSON 으로만 출력::
 
@@ -173,29 +182,22 @@ JUDGE_MODES = ("reference-free", "overlap", "entailment")
 """Judge 모드 식별자. CLI ``--judge-mode`` 인자로 선택."""
 
 
-async def judge_answer(
+async def _judge_answer_single(
     query: str,
     source_chunk: str,
     retrieved_context: str,
     *,
     judge: LLMClient,
-    reasoning_mode: str | None = "off",
-    mode: str = "reference-free",
+    reasoning_mode: str | None,
+    mode: str,
+    seed: int | None,
 ) -> tuple[int, str]:
-    """Judge LLM 으로 검색된 컨텍스트의 응답 품질을 0~5 점 채점.
-
-    Args:
-        mode: ``"reference-free"`` (기본·권장) / ``"overlap"`` (legacy) /
-            ``"entailment"`` 중 하나.
-
-    파싱 실패 시 (-1, "parse_error").
-    """
+    """단일 Judge 호출 — judge_answer 의 내부 헬퍼."""
     if mode == "overlap":
         template = JUDGE_PROMPT_OVERLAP
     elif mode == "entailment":
         template = JUDGE_PROMPT_ENTAILMENT
     else:
-        # reference-free 기본
         template = JUDGE_PROMPT_REFERENCE_FREE
 
     prompt = template.format(
@@ -203,13 +205,15 @@ async def judge_answer(
         source_chunk=source_chunk[:4000],
         retrieved_context=retrieved_context[:6000],
     )
-    text = await judge.complete(
-        prompt,
-        max_tokens=256,
-        temperature=0.0,
-        reasoning_mode=reasoning_mode,
-        purpose=f"goldset_judge_answer_{mode}",
-    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": 256,
+        "temperature": 0.0,
+        "reasoning_mode": reasoning_mode,
+        "purpose": f"goldset_judge_answer_{mode}",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await judge.complete(prompt, **call_kwargs)
     try:
         data = extract_json(text)
     except ValueError:
@@ -222,6 +226,88 @@ async def judge_answer(
     score = max(0, min(5, int(score_raw)))
     reason = str(data.get("reason") or "").strip()
     return score, reason
+
+
+async def judge_answer(
+    query: str,
+    source_chunk: str,
+    retrieved_context: str,
+    *,
+    judge: LLMClient,
+    reasoning_mode: str | None = "off",
+    mode: str = "reference-free",
+    seed: int | None = None,
+    n_samples: int = 1,
+) -> tuple[int, str, dict[str, float]]:
+    """Judge LLM 으로 검색된 컨텍스트의 응답 품질을 0~5 점 채점.
+
+    Args:
+        mode: ``"reference-free"`` (기본·권장) / ``"overlap"`` (legacy) /
+            ``"entailment"`` 중 하나.
+        seed: 결정성 seed. endpoint 지원 시 LLM 호출에 전달 (S3 N-H1 해소).
+        n_samples: Judge 호출 반복 횟수 (S3 — Judge 분산 측정). 1 이면 기존
+            동작, 2+ 면 동일 입력에 seed+i 로 N회 호출 후 median 을 최종
+            점수, std/min/max 를 stats 로 반환.
+
+    Returns:
+        (score, reason, stats) — 세 요소 튜플.
+
+        - ``score``: int (median if n_samples>1, parse 실패 시 -1)
+        - ``reason``: str (median 호출의 reason; parse_error 면 "parse_error")
+        - ``stats``: dict
+          - ``n_samples``: 실제 성공한 샘플 수
+          - ``n_parse_failed``: parse 실패한 샘플 수
+          - 추가 (n_samples>=2): ``std``, ``min``, ``max``, ``samples`` (list[int])
+
+    파싱 실패 (모든 샘플 실패) 시 (-1, "parse_error", {...}).
+    """
+    if n_samples < 1:
+        n_samples = 1
+    scores: list[int] = []
+    reasons: list[str] = []
+    parse_failed = 0
+    for i in range(n_samples):
+        # 각 샘플은 다른 seed (seed + i) — 같은 prompt 의 응답 분포 측정
+        sample_seed = (seed + i) if seed is not None else None
+        s, r = await _judge_answer_single(
+            query, source_chunk, retrieved_context,
+            judge=judge, reasoning_mode=reasoning_mode, mode=mode,
+            seed=sample_seed,
+        )
+        if s < 0:
+            parse_failed += 1
+            continue
+        scores.append(s)
+        reasons.append(r)
+
+    stats: dict[str, float] = {
+        "n_samples": float(len(scores)),
+        "n_parse_failed": float(parse_failed),
+    }
+    if not scores:
+        return -1, "parse_error", stats
+
+    # median 으로 최종 점수 — 단일 호출 outlier 영향 차단
+    sorted_scores = sorted(scores)
+    mid = len(sorted_scores) // 2
+    if len(sorted_scores) % 2 == 1:
+        median = sorted_scores[mid]
+    else:
+        median = int(round((sorted_scores[mid - 1] + sorted_scores[mid]) / 2))
+    median_idx = scores.index(median) if median in scores else 0
+    final_reason = reasons[median_idx]
+
+    if len(scores) >= 2:
+        import math as _math  # noqa: PLC0415
+        mean = sum(scores) / len(scores)
+        var = sum((x - mean) ** 2 for x in scores) / (len(scores) - 1)
+        stats["std"] = _math.sqrt(var)
+        stats["min"] = float(min(scores))
+        stats["max"] = float(max(scores))
+        stats["mean"] = mean
+        stats["samples"] = list(scores)  # type: ignore[assignment]
+
+    return median, final_reason, stats
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +339,8 @@ async def evaluate_one(
     graph_match_strict: bool = False,
     score_relations: bool = False,
     judge_mode: str = "reference-free",
+    judge_seed_base: int | None = None,
+    judge_n_samples: int = 1,
     embedding_model_id: str = "",
 ) -> dict[str, Any]:
     """단일 질의에 대한 검색 + 채점.
@@ -400,20 +488,35 @@ async def evaluate_one(
     row["source_fetch_method"] = source_method
 
     if judge is not None:
-        if source_method.startswith("fallback_") or source_method == "empty":
+        # S3 N-M2 — reference-free 모드는 source_chunk 를 보지 않으므로 fallback
+        # 여부와 무관. fallback 이 일어나도 retrieved_context 만 평가하면 됨.
+        # overlap/entailment 모드만 source 가 필요하므로 fallback 시 skip.
+        needs_source = judge_mode in ("overlap", "entailment")
+        source_unreliable = (
+            source_method.startswith("fallback_") or source_method == "empty"
+        )
+        if needs_source and source_unreliable:
             # 잘못된 근거로 채점하면 평균을 오염시키므로 skip.
             row["judge_score"] = None
             row["judge_reason"] = ""
             row["judge_skip_reason"] = "source_fallback"
             row["judge_parse_failed"] = False
         else:
-            score, reason = await judge_answer(
+            # S3 N-H1 — Judge 호출에도 seed 전파. item.id 기반 deterministic.
+            judge_seed = (
+                judge_seed_base + (hash(item.id) % 10_000_000)
+                if judge_seed_base is not None
+                else None
+            )
+            score, reason, judge_stats = await judge_answer(
                 item.query,
                 source_text,
                 assembled.context_text,
                 judge=judge,
                 reasoning_mode=reasoning_mode,
                 mode=judge_mode,
+                seed=judge_seed,
+                n_samples=judge_n_samples,
             )
             if score < 0:
                 # parse_error — 평균에서 분리. aggregate 가 None 을 자동 스킵.
@@ -424,6 +527,14 @@ async def evaluate_one(
                 row["judge_score"] = score
                 row["judge_reason"] = reason
                 row["judge_parse_failed"] = False
+            # Judge 분산 통계 (n_samples >= 2 일 때만 std/min/max 채워짐)
+            if judge_stats.get("std") is not None:
+                row["judge_score_std"] = judge_stats.get("std")
+                row["judge_score_min"] = judge_stats.get("min")
+                row["judge_score_max"] = judge_stats.get("max")
+                row["judge_score_mean"] = judge_stats.get("mean")
+            row["judge_n_samples"] = int(judge_stats.get("n_samples") or 0)
+            row["judge_n_parse_failed"] = int(judge_stats.get("n_parse_failed") or 0)
 
     # P12 — embed_fn 이 T4 단계 skip 을 한 번이라도 했는지 row 에 기록.
     t4_disabled = bool(getattr(embed_fn, "t4_disabled", False))
@@ -817,6 +928,8 @@ async def _evaluate_gold_set(
                     score_relations=args.score_relations,
                     embedding_model_id=embedding_model_id,
                     judge_mode=args.judge_mode,
+                    judge_seed_base=args.judge_seed_base,
+                    judge_n_samples=args.judge_n_samples,
                 )
                 row["_idx"] = idx
             except Exception as exc:
@@ -1211,6 +1324,19 @@ def main() -> None:
              "'질문에 답할 수 있는가' 평가 (lexical overlap 편향 차단). "
              "'overlap': source + retrieved 노출 (legacy, 비추천). "
              "'entailment': source vs retrieved 의미 entailment 평가.",
+    )
+    # S3 — Judge 결정성·분산 측정.
+    parser.add_argument(
+        "--judge-seed-base", type=int, default=None,
+        help="Judge LLM 호출 결정성 seed base (S3 N-H1). None 이면 미전달. "
+             "정수 명시 시 항목별 seed = base + hash(item.id) % 10M 으로 "
+             "endpoint 가 OpenAI 호환이면 결정적 응답.",
+    )
+    parser.add_argument(
+        "--judge-n-samples", type=int, default=1,
+        help="Judge 호출 반복 횟수 (S3 — 분산 측정). 1 이면 단일 호출, 2+ 면 "
+             "seed+i 로 N회 호출 후 median 을 최종 점수, std/min/max 를 row 에 "
+             "기록. 운영 안정성 진단용.",
     )
     parser.add_argument(
         "--reasoning-mode", default="off",

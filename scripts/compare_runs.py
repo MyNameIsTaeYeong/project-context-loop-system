@@ -48,6 +48,8 @@ EQUIVALENCE_KEYS: tuple[str, ...] = (
     "similarity_threshold",
     "rerank_enabled",
     "hyde_enabled",
+    # S3 N-M1 — Judge 모드가 다르면 다른 측정 지표로 비교하는 셈이라 동치 위반.
+    "judge_mode",
 )
 
 
@@ -203,23 +205,96 @@ def bootstrap_ci(
     alpha: float = 0.05,
     seed: int = 42,
 ) -> tuple[float, float, float]:
-    """차이의 평균에 대한 부트스트랩 신뢰구간.
+    """차이의 평균에 대한 부트스트랩 신뢰구간 (기존 시그니처 호환 유지).
+
+    내부적으로 ``paired_bootstrap`` 를 호출하여 mean·CI 만 반환. 추가 통계가
+    필요하면 ``paired_bootstrap`` 를 직접 사용한다.
 
     Returns:
         ``(mean, lower, upper)``. diffs 비어 있으면 ``(0.0, 0.0, 0.0)``.
     """
     if not diffs:
         return 0.0, 0.0, 0.0
+    stats = paired_bootstrap(
+        diffs, n_resample=n_resample, alpha=alpha, seed=seed,
+    )
+    return stats["mean"], stats["ci_lo"], stats["ci_hi"]
+
+
+def paired_bootstrap(
+    diffs: list[float],
+    *,
+    n_resample: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 42,
+    min_effect_size: float = 0.0,
+) -> dict[str, float]:
+    """S3 — paired bootstrap 강화: mean CI + improvement probability +
+    효과 크기 + paired Cohen's d.
+
+    ``diffs`` 는 이미 per-question paired difference (treatment − baseline) 다.
+    같은 diff 리스트를 N회 resample(with replacement) 하여 분포 통계를 계산.
+
+    추가 산출:
+        - ``p_improve``: bootstrap 샘플 중 mean diff > 0 비율 — "treatment 가
+          baseline 보다 평균적으로 좋을 확률" 의 빈도주의 해석. 0~1.
+        - ``p_min_effect``: bootstrap 샘플 중 mean diff > ``min_effect_size``
+          비율. 최소 효과 임계를 통과할 확률.
+        - ``cohen_d_paired``: paired Cohen's d = mean(diffs) / std(diffs).
+          작은 N 에서도 효과 크기 비교에 유용.
+
+    Args:
+        diffs: per-question paired differences (treatment − baseline).
+        n_resample: bootstrap resample 횟수.
+        alpha: CI 유의수준 (0.05 = 95% CI).
+        seed: 결정성용.
+        min_effect_size: ``p_min_effect`` 계산용 임계 (기본 0.0 = p_improve 와 동일).
+
+    Returns:
+        통계 dict — ``mean``, ``std``, ``ci_lo``, ``ci_hi``, ``p_improve``,
+        ``p_min_effect``, ``cohen_d_paired``, ``n``, ``min_effect_size``.
+    """
+    if not diffs:
+        return {
+            "mean": 0.0, "std": 0.0, "ci_lo": 0.0, "ci_hi": 0.0,
+            "p_improve": 0.0, "p_min_effect": 0.0,
+            "cohen_d_paired": 0.0, "n": 0.0,
+            "min_effect_size": float(min_effect_size),
+        }
+
     rng = random.Random(seed)
-    means: list[float] = []
     n = len(diffs)
+    means: list[float] = []
     for _ in range(n_resample):
         sample = [diffs[rng.randint(0, n - 1)] for _ in range(n)]
         means.append(sum(sample) / n)
     means.sort()
     lo_idx = max(0, int((alpha / 2.0) * n_resample))
     hi_idx = min(n_resample - 1, int((1.0 - alpha / 2.0) * n_resample))
-    return sum(diffs) / n, means[lo_idx], means[hi_idx]
+
+    # 점 통계: paired difference 의 mean·std·Cohen's d.
+    mean = sum(diffs) / n
+    if n >= 2:
+        var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+        std = math.sqrt(var)
+    else:
+        std = 0.0
+    cohen_d = (mean / std) if std > 0 else 0.0
+
+    # bootstrap 분포에서 개선 확률 — mean diff > 0 / > min_effect 비율.
+    n_improve = sum(1 for m in means if m > 0.0)
+    n_min_effect = sum(1 for m in means if m > min_effect_size)
+    return {
+        "mean": mean,
+        "std": std,
+        "ci_lo": means[lo_idx],
+        "ci_hi": means[hi_idx],
+        "p_improve": n_improve / n_resample,
+        "p_min_effect": n_min_effect / n_resample,
+        "cohen_d_paired": cohen_d,
+        "n": float(n),
+        "min_effect_size": float(min_effect_size),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -318,24 +393,29 @@ def _print_summary(
             f"빌드하거나, 절댓값 차이 (mean Δ) 로 보조 판단.",
         )
 
-    print("-" * 72)
+    print("-" * 88)
     header = (
-        f"  {'metric':<24s} {'mean Δ':>10s} {'CI95 lo':>10s} "
-        f"{'CI95 hi':>10s} {'p':>8s} {'n':>5s}"
+        f"  {'metric':<22s} {'mean Δ':>9s} {'CI95':>17s} "
+        f"{'p_imp':>7s} {'Cohen d':>8s} {'p Wilc':>8s} {'n':>5s}"
     )
     print(header)
     for metric, stats in diff_stats.items():
         # 개별 메트릭의 표본도 작으면 별표 마킹.
         n_metric = int(stats["n"])
         low_sample_mark = " *" if n_metric < _MIN_SAMPLE_RECOMMENDED else ""
+        ci_str = f"[{stats['ci_lo']:>6.3f},{stats['ci_hi']:>6.3f}]"
+        cohen = stats.get("cohen_d_paired", 0.0)
+        p_imp = stats.get("p_improve", 0.0)
         print(
-            f"  {metric:<24s} "
-            f"{stats['mean']:>10.4f} {stats['ci_lo']:>10.4f} {stats['ci_hi']:>10.4f} "
-            f"{stats['p_value']:>8.4f} {n_metric:>5d}{low_sample_mark}",
+            f"  {metric:<22s} "
+            f"{stats['mean']:>9.4f} {ci_str:>17s} "
+            f"{p_imp:>7.2%} {cohen:>8.3f} {stats['p_value']:>8.4f} "
+            f"{n_metric:>5d}{low_sample_mark}",
         )
     if any(int(s["n"]) < _MIN_SAMPLE_RECOMMENDED for s in diff_stats.values()):
         print(f"  (* = 해당 메트릭 표본 < {_MIN_SAMPLE_RECOMMENDED} — 통계 검정 신뢰성 낮음)")
-    print("=" * 72 + "\n")
+    print("  (p_imp = bootstrap P(treatment > baseline); Cohen d = paired effect size)")
+    print("=" * 88 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -388,16 +468,23 @@ def run(args: argparse.Namespace) -> int:
     for metric, diffs in diffs_by_metric.items():
         if not diffs:
             continue
-        mean, lo, hi = bootstrap_ci(
+        # S3 — paired_bootstrap 으로 mean/CI 외에 improvement probability·
+        # Cohen's d·최소효과 통과율까지 산출.
+        boot = paired_bootstrap(
             diffs,
             n_resample=args.bootstrap_resamples,
             seed=args.seed,
+            min_effect_size=args.min_effect_size,
         )
         p, z, n_nz = wilcoxon_p_value(diffs)
         diff_stats[metric] = {
-            "mean": mean,
-            "ci_lo": lo,
-            "ci_hi": hi,
+            "mean": boot["mean"],
+            "std": boot["std"],
+            "ci_lo": boot["ci_lo"],
+            "ci_hi": boot["ci_hi"],
+            "p_improve": boot["p_improve"],
+            "p_min_effect": boot["p_min_effect"],
+            "cohen_d_paired": boot["cohen_d_paired"],
             "p_value": p,
             "z": z,
             "n": float(len(diffs)),
@@ -475,6 +562,13 @@ def main() -> None:
     parser.add_argument(
         "--seed", type=int, default=42,
         help="bootstrap 결정론용 시드 (기본 42)",
+    )
+    parser.add_argument(
+        "--min-effect-size", type=float, default=0.0,
+        help="S3 — paired bootstrap 의 최소 효과 임계 (기본 0.0). "
+             "p_min_effect = bootstrap 샘플 중 mean diff > 이 값인 비율. "
+             "예: 0.02 → 'treatment 가 baseline 보다 2pp 이상 개선될 확률' "
+             "을 계산. 운영 의사결정용 임계.",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
