@@ -282,6 +282,13 @@ def paired_diff(
 # ---------------------------------------------------------------------------
 
 
+_MIN_SAMPLE_RECOMMENDED = 10
+"""권장 표본 크기. 직접 구현한 Wilcoxon 의 정규근사가 신뢰할 수 있는 하한.
+
+N < 이 값이면 p-value · CI 가 부정확할 수 있어 경고를 추가 표시한다.
+"""
+
+
 def _print_summary(
     *,
     baseline_label: str,
@@ -301,6 +308,16 @@ def _print_summary(
             print(f"    {k:>28s}  baseline={b!r}  treatment={t!r}")
     else:
         print("  config: equivalence keys 모두 일치")
+
+    # 표본 크기 경고 — N<10 이면 직접 구현 Wilcoxon 의 정규근사가 부정확.
+    if n_paired < _MIN_SAMPLE_RECOMMENDED:
+        print(
+            f"  [WARN] N={n_paired} < {_MIN_SAMPLE_RECOMMENDED} — "
+            f"Wilcoxon p-value 와 bootstrap CI 의 신뢰성이 낮습니다. "
+            f"권장: 같은 source_type 으로 N≥{_MIN_SAMPLE_RECOMMENDED} 골드셋을 "
+            f"빌드하거나, 절댓값 차이 (mean Δ) 로 보조 판단.",
+        )
+
     print("-" * 72)
     header = (
         f"  {'metric':<24s} {'mean Δ':>10s} {'CI95 lo':>10s} "
@@ -308,11 +325,16 @@ def _print_summary(
     )
     print(header)
     for metric, stats in diff_stats.items():
+        # 개별 메트릭의 표본도 작으면 별표 마킹.
+        n_metric = int(stats["n"])
+        low_sample_mark = " *" if n_metric < _MIN_SAMPLE_RECOMMENDED else ""
         print(
             f"  {metric:<24s} "
             f"{stats['mean']:>10.4f} {stats['ci_lo']:>10.4f} {stats['ci_hi']:>10.4f} "
-            f"{stats['p_value']:>8.4f} {int(stats['n']):>5d}",
+            f"{stats['p_value']:>8.4f} {n_metric:>5d}{low_sample_mark}",
         )
+    if any(int(s["n"]) < _MIN_SAMPLE_RECOMMENDED for s in diff_stats.values()):
+        print(f"  (* = 해당 메트릭 표본 < {_MIN_SAMPLE_RECOMMENDED} — 통계 검정 신뢰성 낮음)")
     print("=" * 72 + "\n")
 
 
@@ -393,6 +415,7 @@ def run(args: argparse.Namespace) -> int:
         allow_mismatch=args.allow_config_mismatch,
     )
 
+    low_sample_warning = n_paired < _MIN_SAMPLE_RECOMMENDED
     out = {
         "baseline_label": baseline_label,
         "treatment_label": treatment_label,
@@ -405,6 +428,8 @@ def run(args: argparse.Namespace) -> int:
         "metrics": diff_stats,
         "bootstrap_resamples": args.bootstrap_resamples,
         "seed": args.seed,
+        "low_sample_warning": low_sample_warning,
+        "min_sample_recommended": _MIN_SAMPLE_RECOMMENDED,
     }
     out_path = Path(args.out) if args.out else None
     if out_path:

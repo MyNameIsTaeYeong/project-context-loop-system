@@ -206,15 +206,21 @@ class OpenAIClient(LLMClient):
         messages.append({"role": "user", "content": prompt})
 
         prompt_chars = len(prompt) + (len(system) if system else 0)
+        # 재현성 — OpenAI gpt-4 이상은 seed 파라미터 지원. system_fingerprint 가
+        # 같을 때만 결정성 보장 (best-effort).
+        api_kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        seed = kwargs.get("seed")
+        if seed is not None:
+            api_kwargs["seed"] = int(seed)
         start = time.perf_counter()
         text = ""
         try:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,  # type: ignore[arg-type]
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+            response = await self._client.chat.completions.create(**api_kwargs)  # type: ignore[arg-type]
             text = response.choices[0].message.content or ""
             return text
         finally:
@@ -365,6 +371,12 @@ class EndpointLLMClient(LLMClient):
             "temperature": temperature,
             "stream": True,
         }
+        # 재현성 — OpenAI 호환 API 의 seed 파라미터. 호출자가 kwargs 로 seed 를
+        # 전달하면 API 호출에 그대로 전달된다. endpoint(vLLM, OpenAI 등) 지원 시
+        # 같은 seed + 같은 입력 → 같은 응답 (best-effort, fingerprint 보장은 아님).
+        seed = kwargs.get("seed")
+        if seed is not None:
+            api_kwargs["seed"] = int(seed)
         extra_body = self._resolve_extra_body(reasoning_mode, kwargs.get("extra_body"))
         if extra_body is not None:
             api_kwargs["extra_body"] = extra_body
