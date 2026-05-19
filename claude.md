@@ -710,3 +710,16 @@ python3 -m uvicorn "context_loop.web.app:create_app" --factory --host 127.0.0.1 
 |------|----------|------|------|
 | 2026-05-18 | 초기 구성 (gold-set-auditor + eval-script-auditor + rag-bias-cross-analyst 3-에이전트, rag-eval-audit 오케스트레이터) | 전체 | 합성 골드셋/평가 스크립트 신뢰성 일회성 검토 요청 — 재사용 가치로 자산화 |
 | 2026-05-18 | 패치 에이전트 3명 추가 + rag-eval-fix 오케스트레이터 신설 | gold-set-build-patcher, eval-script-patcher, rag-eval-change-verifier, skills/rag-eval-fix/ | 감사 결과(S0 6건 + S1 6건)를 코드 패치로 적용하는 워크플로우 자산화 — 감사와 패치를 별도 스킬로 분리해 트리거 명확화 |
+
+---
+
+## 하네스: 인덱싱 파이프라인 개선
+
+**목표:** `confluence_mcp` / `git_code` 소스의 청킹·그래프 추출 로직(`src/context_loop/processor/{chunker,extraction_unit,ast_code_extractor,body_extractor,llm_body_extractor,link_graph_builder,graph_vocabulary}.py` + 관련 ingestion 모듈)을 4-Phase(병렬 분석 → 설계 → 구현 → 검증) 워크플로우로 검토·개선한다. 평가 시스템(eval/, build_synthetic_gold_set.py, eval_search.py)은 영역 외.
+
+**트리거:** "인덱싱 로직 검토/개선", "청킹 개선", "그래프 추출 개선", "chunker/extraction_unit/ast_code_extractor/body_extractor/llm_body_extractor/link_graph_builder 검토", "인덱싱 회귀 확인", "다음 라운드/추가 개선/이전 결과 기반" 요청 시 `indexing-improvement` 스킬을 사용하라.
+
+**변경 이력:**
+| 날짜 | 변경 내용 | 대상 | 사유 |
+|------|----------|------|------|
+| 2026-05-19 | 초기 구성 (4 분석가 + designer + implementer + verifier 7-에이전트, indexing-improvement 오케스트레이터) | 전체 | 인덱싱 파이프라인 자체의 청킹/그래프 추출 품질을 평가와 분리하여 체계적으로 개선 |
