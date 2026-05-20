@@ -723,3 +723,16 @@ python3 -m uvicorn "context_loop.web.app:create_app" --factory --host 127.0.0.1 
 | 날짜 | 변경 내용 | 대상 | 사유 |
 |------|----------|------|------|
 | 2026-05-19 | 초기 구성 (4 분석가 + designer + implementer + verifier 7-에이전트, indexing-improvement 오케스트레이터) | 전체 | 인덱싱 파이프라인 자체의 청킹/그래프 추출 품질을 평가와 분리하여 체계적으로 개선 |
+
+---
+
+## 하네스: 그래프 검색 진단·개선
+
+**목표:** 그래프 검색 메트릭(graph_hit/precision/recall/MRR/NDCG)이 비정상적으로 낮을 때 인덱스 ↔ 검색 파이프라인 ↔ 메트릭 산출 3 단계의 funnel 손실을 진단하고 우선순위 기반으로 개선까지 수행. 인덱싱 추출 로직 자체는 `indexing-improvement`, 평가 신뢰성은 `rag-eval-audit`/`rag-eval-fix` 영역 — 본 하네스는 **검색측 funnel 진단**에 초점.
+
+**트리거:** "그래프 검색 평가 낮음", "graph_recall/precision/hit 0%", "그래프 매칭 실패", "엔티티 매칭 실패", "검색 funnel 분석", "그래프 검색 진단/개선/디버그", "이전 결과 기반 추가 라운드" 요청 시 `graph-search-diagnosis` 스킬을 사용하라.
+
+**변경 이력:**
+| 날짜 | 변경 내용 | 대상 | 사유 |
+|------|----------|------|------|
+| 2026-05-20 | 초기 구성 (3 진단가 + designer + implementer + verifier 6-에이전트, graph-search-diagnosis 오케스트레이터) | 전체 | graph_hit/precision/recall < 10%, MRR/NDCG=0.065 보고 — 인덱싱/평가와 분리하여 검색 funnel 진단 자산화 |
