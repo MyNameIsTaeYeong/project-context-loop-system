@@ -1,74 +1,68 @@
-# Verification Report — Round 2
+# R3 Verification Report
 
 ## 한 줄 결론
 
-**PASS** — R2 계획서의 3개 항목 모두 구현, 신규 테스트 4건 + 기존 테스트 749건 통과, 전체 회귀 0.
+**PASS** — R3 계획서의 3개 항목 모두 구현, 신규 테스트 5건 + 기존 762건 통과, 전체 회귀 0.
 
 ## 테스트 결과
 
 | 명령 | 결과 |
 |------|------|
-| `pytest tests/test_storage/test_graph_store.py` | 41 passed (기존 39 + 신규 2) |
-| `pytest tests/test_processor/test_graph_search_planner.py` | 21 passed (기존 19 + 신규 2) |
+| `pytest tests/test_processor/test_graph_search_planner.py` | 27 passed (21 기존 + 5 신규 + 1 갱신) |
+| `pytest tests/test_storage/test_graph_store.py` | 41 passed (변경 없음) |
 | `pytest tests/test_mcp/test_context_assembler.py` | 23 passed |
-| `pytest tests/ --ignore=tests/test_eval` | **756 passed** (전체 회귀 0) |
-| `pytest tests/test_eval/` | 270 passed, 5 failed (사전 실패 5건, baseline 동일, 본 변경 무관 — `git stash` 후 베이스라인에서도 동일 실패 5건 확인) |
+| `pytest tests/ --ignore=tests/test_eval` | **762 passed** (전체 회귀 0) |
+| `pytest tests/test_eval/` | 270 passed, 5 failed (사전 실패 5건, baseline 동일, 본 변경 무관) |
 
-ruff check (touched files): **11 errors (baseline 동일 11 errors)** — regression 0. 모두 E501 line-length 사전 위반.
+ruff check (touched files): **3 errors (baseline 동일 3 errors)** — regression 0. 모두 E501 line-length 사전 위반.
 
 ## 계획-구현 매트릭스
 
 | ID | 계획 | 실제 | 일치 |
 |----|------|------|------|
-| F-SRCH-R2-01 | get_neighbors 양방향 | ✓ + `_bidirectional_bfs` 공통 헬퍼 + `get_neighbors_from_node_id` 동일 변경 | ✓+ |
-| F-SRCH-R2-03 | execute_graph_search always-on 시드 보강 | ✓ (threshold 0.6, top_k 3) | ✓ |
-| F-METRIC-R2-01 | retrieved description 관계 요약 fallback | ✓ (양방향 관계 — out + in) | ✓+ |
+| F-LLM-R3-01 | target_entities + target_relations schema | ✓ + has_targets property | ✓+ |
+| F-LLM-R3-02 | retrieved priority ordering | ✓ + idempotent priority 승격 | ✓+ |
+| F-LLM-R3-03 | system prompt 정렬 (인덱싱 어휘 + 방향성) | ✓ | ✓ |
+| 후방 호환 | search_steps 경로 유지 | ✓ (LLM 구식 응답 / 직접 호출자 둘 다 지원) | ✓ |
 
 불일치/누락: 0건.
 
-## 회귀 위험 점검
+## 회귀 위험 점검 (사후)
 
-| 변경 | 회귀 위험 | 검증 |
+| 변경 | 위험 가설 | 실측 |
 |------|----------|------|
-| 양방향 traversal | retrieved 노드 수 ↑, precision 약간 ↓ 가능 | 모든 기존 test_get_neighbors 케이스 통과. 의미적으로 검색은 양방향이 자연스러움. |
-| always-on 시드 보강 | LLM 의도 무관 시드 유입 | threshold 0.6 + top_k 3 으로 보수 통제. R1 의 전체-실패 fallback (threshold 0.5, top_k 5) 보존. |
-| 관계 요약 description | T4 임베딩이 더 의미적이라 매칭 분포 변화 | description 빈 경우만 발동. score threshold (0.65) 가 false-positive 흡수. |
-| `get_neighbors` 시그니처 | 변경 없음 (kwargs 동일) | 모든 호출자 무영향 |
-| `execute_graph_search` 시그니처 | 변경 없음 | 동일 |
+| 새 schema 출력 요구 | LLM 이 못 답하면 빈 결과 | 후방 호환 search_steps 경로로 graceful fallback — 기존 27 테스트 모두 통과 |
+| priority ordering | rank 변화 → 다른 메트릭 변동 | 신규 테스트 `test_execute_search_with_target_entities_prioritizes_seed` 가 rank-1 검증 |
+| system prompt 1.5x 증가 | max_tokens 한도 영향 | 한도 32768 대비 안전 |
 
-## 다운스트림 영향 분석
+## R1 → R2 → R3 funnel 손실 변화
 
-- `_bidirectional_bfs` 는 internal helper — 외부 호출자 없음
-- `context_assembler._search_graph_with_llm` 가 `execute_graph_search` 호출 — query_embedding 전달은 R1 부터 이미 적용
-- 신규 description fallback 은 retrieved 측에서만 작동 — gold 측의 description 은 비변경
-
-## R1 → R2 funnel 손실 변화 (예상)
-
-| 단계 | R1 (정적분석 기반) | R2 (실측+양방향) |
-|------|------------------|----------------|
-| Stage 2 plan LLM seed | 30~50% 손실 | 동일 (R3 후보) |
-| **Stage 3 get_neighbors** | **88.9% miss (sink 시드)** | **~0% miss (양방향)** |
-| Stage 3 always-on 보강 | 발동 안 함 (일부 성공 시) | 추가 시드 union |
-| Stage 4 T4 (description) | 보일러플레이트 → 비특이 | 관계 요약 → 더 의미적 |
+| 단계 | R1 | R2 | R3 |
+|------|-----|-----|-----|
+| Stage 2 LLM seed 선택 | 70% sink 선택 위험 | 동일 (양방향이 회복) | **schema 변경 — LLM 이 정답을 직접 식별** |
+| Stage 3 get_neighbors | 88.9% miss (sink 시) | 0% miss (양방향) | 동일 |
+| Stage 4 retrieved 포함성 | 부분 회복 | 거의 회복 | 회복 + **rank-1 priority** |
+| Stage 5 T4 매칭 | 임계값만 완화 | 관계 요약 description | 동일 |
+| **MRR/NDCG** | 0.065 | 거의 변화 없음 (사용자 보고) | **target_* 가 rank-1 → 큰 폭 ↑ 예상** |
 
 ## 평가 메트릭 재측정 권고
 
 ```bash
-python -m scripts.eval_search --gold-set <path> --label r2-baseline
-# R1 vs R2 비교
-python -m scripts.compare_runs <r1-output> <r2-output>
+python -m scripts.eval_search --gold-set <path> --label r3-baseline --include-graph
+python -m scripts.compare_runs <r2-output.json> <r3-output.json>
 ```
 
-예상:
-- graph_hit@10: < 10% → 30~50%
-- graph_recall@10: < 10% → 30~50%
-- MRR/NDCG: 0.065 → 0.3~0.5
+특히 비교할 지표:
+- **MRR**: priority ordering 의 직접 효과 (예상 0.065 → 0.5+)
+- **NDCG@10**: rank 가중 (예상 큰 폭 ↑)
+- **graph_hit@10**: 포함성은 R2 가 잡았으나 R3 가 정합성 보강
+- **graph_recall@k**: 보강 효과 누적
+- **graph_rel_recall**: target_relations 의 끝점 priority → edge 추출 정확도
 
-본 R2 라운드는 검색 측 funnel 의 directional 손실 회복이 핵심. 평가 메트릭의 정확한 변화는 별도 평가 실행 필요.
+R3 의 정확한 효과 검증은 LLM 의 새 schema 응답 품질에 의존. LLM 이 인덱싱-시점 형태에 더 친숙하면 효과 큼 — 정량 측정은 운영 평가 필요.
 
-## 다음 라운드 (R3) 후보
+## 다음 라운드 (R4) 후보
 
-- F-SRCH-R2-02 LLM 시드 선택 프롬프트 강화 (system prompt 의 entity 선택 가이드)
-- F-GOLD-R2-01 gold 후보 양방향 (eval-gold-set-improvement 영역 — gold 분포 영향)
-- F-IDX-R2-03 entity_embeddings 영속화 + lock
-- F-IDX-R2-02 entity_name strip 정제 (indexing-improvement 영역)
+- LLM 의 target_relations 를 retrieved_graph_relations 에 직접 포함 (실제 edge 부재 시에도)
+- target_relations 의 fuzzy 매칭 (source 미상 → target 만으로 incoming 추적)
+- 인덱싱 LLM 의 결정성 강화

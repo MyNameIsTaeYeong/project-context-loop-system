@@ -1,120 +1,73 @@
-# Graph Eval Metric + Gold Set Diagnosis (R2)
+# Eval Metric 영향 분석 (R3 Phase A)
 
-> R1은 정적 분석으로 임계값 완화·name fallback 2건 머지. R2는 **gold ↔ index 정합성**과 **메트릭 정의의 funnel 손실 기여도**를 정량 분석.
+## R2 메트릭이 안 오른 원인 가설 (사용자 보고 기반)
 
-## 골드셋 생성 메커니즘 (코드 추적)
+> "성능 지표가 크게 변한 게 없습니다."
 
-흐름: `scripts/build_synthetic_gold_set.py:_run_graph_mode` → `load_candidate_subgraphs` → `generate_graph_questions` (synth.py) → `_make_graph_gold_item`.
+R2 의 양방향 traversal 은 retrieved 의 **포함성** (gold seed 가 retrieved 안에 들어가는가) 을 회복했지만, **순위** (rank) 는 다루지 않았다.
 
-### 핵심 코드 흐름
+```python
+# graph_match.py:380
+hits.sort(key=lambda t: t[0])  # t[0] = retrieved_index (rank)
+```
 
-1. **`load_candidate_subgraphs`** (build_synthetic_gold_set.py:183-303):
-   - `graph_store.get_neighbors(name, depth=1)` 호출
-   - `if len(neighbors) < min_neighbors + 1: continue` (min_neighbors=1 default)
-   - → **outgoing edge >= 1 인 노드만 gold subgraph 후보**
-   - 실측: 21 노드 중 **6개만 통과** (Auth/Order/Payment/Notification/Search Service + API Gateway)
+→ MRR / NDCG 가 retrieved 의 rank 에 민감.
 
-2. **`generate_graph_questions`** (synth.py:703-745):
-   - 프롬프트 (synth.py 의 `GRAPH_GENERATE_PROMPT_TEMPLATE`, 추정 위치):
-     ```
-     엔티티: {entity_name} ({entity_type})
-     설명: {entity_description}
-     주변 관계: {edges_text}
-     이 엔티티 또는 관계에서 답을 찾을 수 있는 한국어 질문을 N개 생성해라
-     ```
-   - LLM 자연어 질의 생성 + evidence_description / aliases / relation 보조.
+## retrieved 순서가 어떻게 결정되었나 (R2 까지)
 
-3. **`_make_graph_gold_item`** (build_synthetic_gold_set.py:949-1005):
-   ```python
-   entity_ref = GraphEntityRef(
-       name=sg["entity_name"],            # SEED 노드 entity_name 그대로
-       type=sg["entity_type"],
-       aliases=list(gq.entity_aliases),
-       description=gq.evidence_description,
-   )
-   relevant_graph_entities=[entity_ref]   # SEED 1개만
-   ```
-   - → gold 의 `relevant_graph_entities[0].name` == 인덱스 노드의 `entity_name` (글자 단위 동일).
+`execute_graph_search`:
+1. search_steps 순회 → 각 step 의 get_neighbors 결과를 dict 발견 순서로 all_nodes 에 push
+2. R2 always-on 보강 → 임베딩 top-k 의 1-hop 이웃을 뒤에 append
+3. 마지막 fallback → 같음
 
-### 결론: gold ↔ index 표면 키 정합성은 OK
+→ retrieved 순서 = BFS 발견 순서 + boost 순서. **LLM 이 식별한 정답 후보가 어디에 있는지** 가 보장되지 않음.
 
-- gold-side `(name.lower().strip(), type.strip())` 키 == index-side `(entity_name.lower().strip(), entity_type.strip())` 키
-- T1 exact 매칭이 retrieved 에 seed 가 들어가기만 하면 무조건 hit.
-- **그러나 retrieved 에 seed 가 들어가지 않는 게 funnel 의 결정적 손실** — `02_search_pipeline_diagnosis.md` 의 F-SRCH-R2-01 참조.
+## 시나리오
 
-## F-GOLD-R2-01 (MEDIUM): gold subgraph 후보가 outgoing 의존 → 인덱스 노드의 71% (15/21) 가 영원히 gold seed 안됨
+- 그래프: Order Service → KakaoPay, Toss PG사, Payment Service, MySQL DB, Kafka (5 outgoing)
+- 질의: "Order Service 의 결제 의존성?"
+- gold seed: Order Service
+- R2 search_steps: `[{entity_name: "Order Service", depth: 1}]`
+- get_neighbors("Order Service") → BFS 결과의 dict.values() 순서:
+  - DiGraph 내부 dict 순서는 add_edge 순서 / node insertion 순서에 의존
+  - Order Service 가 첫 번째일 보장 없음 (양방향이면 incoming 노드가 먼저 올 수도)
 
-- 인덱스의 sink 노드(예: KakaoPay, Elasticsearch, 결제 팀 등)는 gold question 의 정답으로 결코 등장하지 못함.
-- 결과: gold question 분포가 service 중심으로 편향.
-- 평가 신호의 한쪽 (subgraph 다양성) 제한.
-- **해결**: `load_candidate_subgraphs` 가 양방향 이웃(outgoing+incoming)을 보도록 변경 → 21 노드 중 17개가 후보. 단, 본 변경은 **gold 빌드 분포에 영향**이라 별도 라운드 고려 (rag-eval-audit / eval-gold-set-improvement 하네스 영역 — 본 라운드는 검색 funnel 회복이 우선).
+→ Order Service 가 rank-3 이면 MRR = 1/3 ≈ 0.33. rank-5 면 0.2. 골드셋 평균이 0.065 → 평균 rank ≈ 15 (top_k=10 이면 매번 거의 outside).
 
-## F-METRIC-R2-01 (MEDIUM): T4 의 description 자연어 fallback 매칭의 비특이성
+## R3 으로 어떻게 회복되는가
 
-### 코드 위치
+`execute_graph_search` 에 priority_node_ids 도입:
+- LLM 의 target_entities / target_relations 끝점 노드 → priority 등록
+- 결과 빌드 시 priority 노드를 retrieved 의 앞순위에 배치
+- gold = LLM 의 target_entity 중 하나 → rank-1 hit → MRR = 1.0
 
-- 검색 측 (graph_search_planner.py:386-393):
-  ```python
-  if not description:
-      description = (
-          f"이 entity 는 {etype} 유형의 '{name}' 이며 그래프 노드로 등록되어 있다."
-          ...
-      )
-  ```
-- 매칭 측 (graph_match.py:310-318):
-  ```python
-  g_text = golden.description or golden.name or ""
-  ...
-  g_emb = embed_fn(g_text)
-  ```
+**예상 효과**:
+- graph_hit@10: R2 와 동일 또는 약간 ↑ (포함성은 R2 가 이미 잡음)
+- graph_recall@10: 약간 ↑
+- **MRR/NDCG: 큰 폭 ↑** (R2 대비 priority ordering 의 직접 효과)
 
-### 문제
+## 메트릭 매칭 흐름 (참고)
 
-- gold 측 description 은 LLM 합성 `evidence_description` (자연 문장).
-- retrieved 측 description 은 R1 의 metadata-스타일 fallback ("이 entity 는 ... 등록되어 있다").
-- 두 description 의 임베딩 cosine 이 threshold 0.65 를 못 넘김 (둘이 의미적으로 무관 — 한쪽은 정답 evidence, 다른 쪽은 metadata 보일러플레이트).
-- T4 가 사실상 발동되지 않음 → T1 표면 매칭에 전적 의존.
+`graph_match.run_entity_matching`:
+1. T1 exact: `(name.lower, type)` 양쪽 strip+lower 비교
+2. T2 alias: golden.aliases vs retrieved.name
+3. T3 normalize: NFKC + 구두점 제거
+4. T4 embedding: cosine ≥ 0.65 (R2 에서 완화됨)
 
-### R1 fix 평가
+→ retrieved 가 gold 와 표면 키 동일하면 T1 즉시 hit. R3 의 priority ordering 은 이 hit 의 **rank** 를 앞당김.
 
-- R1 의 description fallback (F-SRCH-06) 은 **T4 가 작동하기 위한 텍스트 채우기** 였지만, 텍스트의 *의미*가 비특이라 T4 매칭 자체는 회복하지 못함.
-- threshold 0.78 → 0.65 (F-METRIC-01) 도 noise 영역까지 떨어뜨려 다른 페어 false-positive 위험 살짝 ↑.
+## 관계 채점 (relation_recall)
 
-### 개선 방향 (R2)
+`run_relation_matching`:
+- 검색 측의 retrieved_graph_relations 는 `execute_graph_search` 가 `edges = graph_store.get_edges_between(node_ids)` 로 추출한 실제 edge 들
+- gold 의 relevant_graph_relations = `{source, target, relation_type}` 형태
+- 매칭: `(source.lower, target.lower, type)` 키
 
-- retrieved description fallback 을 **인접 관계 정보로 채움** — entity_name 자체보다 "이 entity 는 X 에 의존하며 Y 에 사용된다" 같은 1-hop 관계 요약 → 임베딩이 더 의미적.
-- 또는 T4 score 를 entity_name 임베딩 매칭으로 보조 — name 자체 vs golden description 임베딩 비교 path 추가.
+R3 의 **target_relations 가 retrieved 의 priority 끝점 노드를 만들어** → edges 가 양 끝점을 모두 포함 → retrieved_graph_relations 에 해당 edge 가 노출 → relation_recall ↑.
 
-## MRR/NDCG = 0.065 의 정량 해석
+## 결론
 
-- MRR ≈ 1/E[rank]. 0.065 → E[rank] ≈ 15. top_k=10 이면 거의 outside.
-- recall@10 < 0.1 → top-10 안에 매칭된 gold 가 매우 적음.
-- **분포 추정**:
-  - ~5~10% 의 query 만 T1 hit (LLM 시드 정확 + retrieved 에 seed 들어감)
-  - 나머지 ~90~95% 는 retrieved 자체에 seed 누락 → 메트릭 0
-  - 평균이 ~0.065 라는 건 hit 케이스의 평균 score 가 ~0.65~0.7 정도 (1.0 hit @ 5~10% × score) → mostly hit-at-rank-1
-
-→ 메트릭은 **검색이 retrieved 에 seed 를 넣지 못한 게 90%+ 의 case 라는 의미**. F-SRCH-R2-01 가 정답.
-
-## R1 메트릭 fix 효과 평가
-
-| R1 fix | 실제 효과 추정 |
-|--------|--------------|
-| F-METRIC-01 threshold 0.78→0.65 | T4 임계값 완화이나 T4 자체가 R2 funnel 에서 활성화 안됨 (description fallback 의 비특이성) → **효과 ~0** |
-| F-METRIC-02 golden description name fallback | 골드 description 비어있을 때만 발동 — 합성 골드는 거의 항상 description 채움 → **효과 미미** |
-
-→ R1 메트릭 fix 는 funnel 의 **T4 단계 회복**을 시도했지만, 실제 funnel 손실은 **T1 전 단계(retrieve)** 에 있어서 효과 미미.
-
-## 권고 (메트릭/골드셋 측)
-
-| ID | 권고 | 우선 |
-|----|------|------|
-| F-METRIC-R2-01 | retrieved description fallback 을 관계 요약으로 강화 (T4 회복) | Medium |
-| F-GOLD-R2-01 | load_candidate_subgraphs 양방향 (인덱스의 71% sink 노드도 gold 가능) | Medium (별도 라운드) |
-| 골드셋 신뢰성 일반 | 자체 매칭 self-test (gold 생성 직후 retrieved 시뮬레이션해서 hit rate 측정) | High (rag-eval-audit 영역) |
-
-## 범위 외 (본 R2 하네스에서 다루지 않음)
-
-- gold 합성 로직 자체 (synth.py) — eval-gold-set-improvement / rag-eval-audit 영역
-- 메트릭 정의 자체 (metrics.py) — rag-eval-audit 영역
-- 본 R2 는 **검색 funnel 회복(F-SRCH-R2-01)** 이 핵심.
+R3 의 핵심 효과는 두 가지:
+1. retrieved 의 **포함성** 은 R2 가 잡음
+2. R3 는 retrieved 의 **순위** 를 잡음 — MRR/NDCG 회복의 직접 동인
+3. + 관계 채점에도 양 끝점 priority 가 효과

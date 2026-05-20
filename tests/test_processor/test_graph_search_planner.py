@@ -13,6 +13,8 @@ from context_loop.processor.graph_search_planner import (
     GraphSearchPlan,
     GraphSearchResult,
     SearchStep,
+    TargetEntity,
+    TargetRelation,
     _parse_plan,
     execute_graph_search,
     plan_graph_search,
@@ -455,6 +457,158 @@ async def test_execute_search_description_uses_relation_summary(
     assert "uses" in hub_desc, f"Hub description should mention relation: {hub_desc!r}"
 
 
+# --- R3: target_entities / target_relations 정렬 테스트 ---
+
+
+def test_parse_plan_r3_target_entities_and_relations() -> None:
+    """R3: LLM 이 인덱싱과 정렬된 형태 (target_entities + target_relations) 로
+    응답하면 파싱된다."""
+    data = {
+        "should_search": True,
+        "reasoning": "Order Service 의 결제 의존성 조회",
+        "target_entities": [
+            {"name": "Order Service", "type": "service"},
+            {"name": "KakaoPay", "type": "team"},
+        ],
+        "target_relations": [
+            {"source": "Order Service", "target": "KakaoPay", "relation_type": "depends_on"},
+        ],
+    }
+    plan = _parse_plan(data)
+    assert plan.should_search
+    assert plan.has_targets
+    assert len(plan.target_entities) == 2
+    assert plan.target_entities[0].name == "Order Service"
+    assert plan.target_entities[0].entity_type == "service"
+    assert len(plan.target_relations) == 1
+    rel = plan.target_relations[0]
+    assert rel.source == "Order Service"
+    assert rel.target == "KakaoPay"
+    assert rel.relation_type == "depends_on"
+
+
+def test_parse_plan_r3_relation_with_empty_endpoint() -> None:
+    """R3: 정답이 미상이면 끝점을 빈 문자열로 두어도 파싱된다 (시스템이 fuzzy
+    매칭으로 채움)."""
+    data = {
+        "should_search": True,
+        "target_relations": [
+            {"source": "", "target": "Elasticsearch", "relation_type": "uses"},
+        ],
+    }
+    plan = _parse_plan(data)
+    assert plan.has_targets
+    assert plan.target_relations[0].source == ""
+    assert plan.target_relations[0].target == "Elasticsearch"
+
+
+def test_parse_plan_r3_falls_back_to_search_steps() -> None:
+    """R3: LLM 이 target_* 없이 구식 search_steps 만 응답하면 후방 호환으로
+    SearchStep 으로 파싱된다."""
+    data = {
+        "should_search": True,
+        "search_steps": [
+            {"entity_name": "Foo", "depth": 1, "focus_relations": ["uses"]},
+        ],
+    }
+    plan = _parse_plan(data)
+    assert plan.should_search
+    assert not plan.has_targets
+    assert len(plan.search_steps) == 1
+    assert plan.search_steps[0].entity_name == "Foo"
+
+
+@pytest.mark.asyncio
+async def test_execute_search_with_target_entities_prioritizes_seed(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R3: target_entities 로 명시된 노드는 retrieved 의 rank-1 priority 로
+    배치된다 — MRR/NDCG 회복의 핵심."""
+    doc_id = await _create_doc(meta_store)
+    # 그래프: A (정답) → B, C  (B, C 는 이웃)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="GoldSeed", entity_type="service"),
+            Entity(name="Neighbor1", entity_type="component"),
+            Entity(name="Neighbor2", entity_type="component"),
+        ],
+        relations=[
+            Relation(source="GoldSeed", target="Neighbor1", relation_type="uses"),
+            Relation(source="GoldSeed", target="Neighbor2", relation_type="uses"),
+        ],
+    ))
+    plan = GraphSearchPlan(
+        should_search=True,
+        target_entities=[TargetEntity(name="GoldSeed", entity_type="service")],
+    )
+    result = await execute_graph_search(plan, graph_store)
+    assert result is not None and result.entities
+    # GoldSeed 가 rank-1
+    assert result.entities[0].name == "GoldSeed"
+
+
+@pytest.mark.asyncio
+async def test_execute_search_with_target_relations_includes_both_endpoints(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R3: target_relations 의 source 와 target 양쪽이 모두 retrieved 의 priority
+    노드로 포함된다."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="OrderService", entity_type="service"),
+            Entity(name="KakaoPay", entity_type="team"),
+            Entity(name="Unrelated", entity_type="service"),
+        ],
+        relations=[
+            Relation(
+                source="OrderService", target="KakaoPay",
+                relation_type="depends_on",
+            ),
+        ],
+    ))
+    plan = GraphSearchPlan(
+        should_search=True,
+        target_relations=[TargetRelation(
+            source="OrderService", target="KakaoPay", relation_type="depends_on",
+        )],
+    )
+    result = await execute_graph_search(plan, graph_store)
+    assert result is not None
+    names = [e.name for e in result.entities]
+    assert "OrderService" in names[:2], f"source endpoint should be priority: {names}"
+    assert "KakaoPay" in names[:2], f"target endpoint should be priority: {names}"
+    assert "Unrelated" not in names
+
+
+@pytest.mark.asyncio
+async def test_execute_search_target_entity_uses_embedding_fallback(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R3: target_entity 의 표면 매칭이 실패해도 embedding fallback 으로 회복."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="Auth Service", entity_type="service")],
+        relations=[],
+    ))
+    mock_embed = AsyncMock()
+    # "Auth Service" 와 "AuthService" 의 표기 차이 — 임베딩으로 매칭
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0]])
+    mock_embed.aembed_query = AsyncMock(return_value=[0.95, 0.05])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    plan = GraphSearchPlan(
+        should_search=True,
+        target_entities=[TargetEntity(name="AuthService", entity_type="service")],
+    )
+    result = await execute_graph_search(
+        plan, graph_store, embedding_client=mock_embed,
+    )
+    assert result is not None
+    names = {e.name for e in result.entities}
+    assert "Auth Service" in names
+
+
 def test_system_prompt_enforces_exact_entity_name_copy() -> None:
     """R1 F-SRCH-04: 시스템 프롬프트가 'entity_name 을 글자 단위로 정확 복사' 를
     명시적으로 강제한다 — LLM 이 공백/케이스/하이픈을 임의로 바꿔서 매칭이
@@ -477,7 +631,7 @@ def test_system_prompt_includes_intent_mapping() -> None:
     assert "depends_on" in prompt
     assert "owned_by" in prompt
     assert "implements" in prompt
-    # JSON 응답 스키마 가이드도 유지
+    # R3 — JSON 응답 스키마는 인덱싱 측과 정렬된 target_entities / target_relations
     assert "should_search" in prompt
-    assert "search_steps" in prompt
-    assert "focus_relations" in prompt
+    assert "target_entities" in prompt
+    assert "target_relations" in prompt

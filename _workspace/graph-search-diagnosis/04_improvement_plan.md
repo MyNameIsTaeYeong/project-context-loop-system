@@ -1,97 +1,94 @@
-# Graph Search Improvement Plan (R2)
+# R3 Improvement Plan — 검색-인덱싱 LLM Schema 정렬
 
-## funnel 손실 재진단
+## 핵심 가설
 
-| 단계 | R1 후 추정 손실률 | 주된 원인 |
-|------|----------------|----------|
-| Stage 1: 쿼리 임베딩 | 거의 0 | 안정 |
-| Stage 2: plan_graph_search (LLM seed 선택) | 60~70% | LLM이 질의의 명시 keyword (sink 이웃)를 선택 — F-SRCH-R2-02 |
-| **Stage 3: get_neighbors (directed-only)** | **88.9%** (sink 시드 시) | **F-SRCH-R2-01 (single_source_shortest_path_length=outgoing)** ← 메인 |
-| Stage 4: T1 매칭 | retrieved 가 seed 누락 시 자동 0 | 위 결과 |
-| Stage 5: T4 매칭 | 자연어 fallback의 비특이성 | F-METRIC-R2-01 (보조) |
+R2 까지의 fix (양방향 traversal + always-on 보강 + 관계 요약 description) 가
+적용됐는데도 메트릭 변화 미미 → funnel 손실의 가장 큰 잔여 지점은 **검색
+LLM 의 mental model 이 인덱싱과 다른 schema 로 동작** 한다는 것.
 
-핵심 가설: **directed traversal 이 sink 시드 케이스에서 88.9% 정보 손실** — 이게 < 10% 메트릭의 결정적 원인. R1 의 임베딩 fallback 은 surface 매칭 실패 시에만 발동되므로 sink 표면 매칭이 성공하면 skip 되어 누수.
+LLM 은 인덱싱 시점에 `{entities, relations:[{source, target, type}]}` 로
+훈련됐는데, 검색 시점에는 `{search_steps:[{entity_name, depth,
+focus_relations}]}` 라는 다른 schema 로 답을 요구받음 → mental model
+간섭, 정답이 될 entity/relation 을 직접 표현하지 못함, retrieved 의
+priority 도 LLM 의도가 반영되지 못함.
+
+## 라운드 3 변경
+
+### 변경 1 (Critical): 검색 LLM 출력 schema 를 인덱싱과 정렬
+
+**전**:
+```json
+{
+  "search_steps": [
+    {"entity_name": "Order Service", "depth": 1, "focus_relations": ["depends_on"]}
+  ]
+}
+```
+
+**후**:
+```json
+{
+  "target_entities": [
+    {"name": "Order Service", "type": "service"},
+    {"name": "KakaoPay", "type": "team"}
+  ],
+  "target_relations": [
+    {"source": "Order Service", "target": "KakaoPay", "relation_type": "depends_on"}
+  ]
+}
+```
+
+### 변경 2 (Critical): retrieved 의 rank-1 priority 보장
+
+`execute_graph_search` 가 LLM 의 `target_entities` / `target_relations` 끝점
+노드를 **priority 시드** 로 표시 → 결과 빌드 시 priority 노드가 retrieved 의
+앞순위에 배치 → gold 의 relevant_graph_entities 가 rank-1 hit → **MRR/NDCG 회복**.
+
+### 변경 3 (High): 후방 호환
+
+- `GraphSearchPlan.search_steps` 유지 — 기존 호출자가 직접 SearchStep 을 만들거나, LLM 이 구식 응답을 돌려주는 경우 graceful fallback
+- `_parse_plan` 이 target_* 와 search_steps 둘 다 파싱
+- `execute_graph_search` 가 R3 신호 우선, 없으면 R2 경로
+
+### 변경 4 (Medium): system prompt 가 인덱싱과 같은 어휘/규약 명시
+
+- 인덱싱 LLM 의 entity_types / relation_types / 의도 매핑 가이드를 **동일하게** 노출
+- 방향성 규약 (`source --[type]--> target`) 을 명시 — 인덱싱과 일치
 
 ## 우선순위 매트릭스
 
-| ID | 출처 | 영역 | 영향 | 공수 | ROI | 라운드 |
-|----|------|------|------|------|-----|--------|
-| **F-SRCH-R2-01** | 02 | get_neighbors 양방향 | **Critical** | S | ★★★★★ | **R2** |
-| **F-SRCH-R2-03** | 02 | execute_graph_search 시드 보강 always-on | High | S | ★★★★ | **R2** |
-| **F-METRIC-R2-01** | 03 | retrieved description fallback 관계 요약 강화 | Medium | S | ★★★ | **R2** |
-| F-SRCH-R2-02 | 02 | LLM 시드 선택 가이드 (질의 주체 선택) | Medium | S | ★★ | R3 |
-| F-GOLD-R2-01 | 03 | load_candidate_subgraphs 양방향 | Medium | S | ★★ | R3 (gold 분포 영향) |
-| F-IDX-R2-02 | 01 | entity_name strip 정제 | Low | S | ★ | indexing-improvement |
-| F-IDX-R2-03 | 01 | entity_embeddings 영속화 | Medium | M | ★★ | R3 |
+| ID | 영역 | 영향 | 공수 | 라운드 |
+|----|------|------|------|--------|
+| **F-LLM-R3-01** | schema 정렬 (target_entities + target_relations) | **Critical** | M | **R3** |
+| **F-LLM-R3-02** | retrieved priority ordering | **Critical** | S | **R3** |
+| **F-LLM-R3-03** | system prompt 정렬 (어휘 + 방향성 규약) | High | S | **R3** |
+| F-LLM-R3-04 | LLM 의 target_relations 자체를 retrieved_graph_relations 에 포함 | Medium | S | R4 후보 |
 
-## 라운드 2: 양방향 traversal + always-on 시드 보강 + 관계 요약 description
+## 변경 파일
 
-### 포함 항목 (R2)
+| 파일 | 변경 |
+|------|------|
+| `src/context_loop/processor/graph_search_planner.py` | TargetEntity/TargetRelation dataclass, GraphSearchPlan 확장, system prompt 재작성, _parse_plan 확장, execute_graph_search R3 경로 + priority ordering |
+| `tests/test_processor/test_graph_search_planner.py` | R3 신규 테스트 5건, 기존 test_system_prompt_includes_intent_mapping 갱신 |
 
-1. **F-SRCH-R2-01 (Critical)**: `get_neighbors` 가 양방향 1-hop 이웃을 따르도록 변경.
-   - `single_source_shortest_path_length(G, source, cutoff=depth)` 대신 (직접) outgoing + incoming 합집합 BFS.
-   - depth>1 이면 매 단계 양방향 — 폭증 위험은 depth ≤ 2 제한으로 통제.
-   - `get_neighbors_from_node_id` 도 동일 변경.
+## 회귀 위험
 
-2. **F-SRCH-R2-03 (High)**: `execute_graph_search` 가 search_steps 실행 후, 결과가 비지 않아도 `query_embedding` 기반 top-k 시드를 **추가** 합집합 (현재는 0개일 때만 fallback).
-   - 단, 임계값 0.6 로 약간 보수 — noise 컨트롤.
-   - 시드 노드 자체 + 1-hop 양방향 이웃 union.
-
-3. **F-METRIC-R2-01 (Medium)**: retrieved 의 description fallback 이 빈 경우, **1-hop 관계 요약** 으로 채움.
-   - 예: `"이 entity 는 X 에 depends_on, Y 를 uses 한다."` (실제 관계 기반)
-   - T4 임베딩이 더 의미적 — 자연어 evidence (gold) 와 cosine 비교 시 더 분별력.
-
-### 변경 파일
-
-| 파일 | 변경 사유 |
-|------|----------|
-| `src/context_loop/storage/graph_store.py` | F-SRCH-R2-01 (get_neighbors 양방향), get_neighbors_from_node_id 양방향 |
-| `src/context_loop/processor/graph_search_planner.py` | F-SRCH-R2-03 (always-on 시드 보강), F-METRIC-R2-01 (관계 요약 description) |
-
-### 구현 순서
-
-1. **F-SRCH-R2-01**: graph_store.py `get_neighbors` / `get_neighbors_from_node_id` — BFS 헬퍼 추가. 양방향 successors + predecessors 합집합 traversal.
-2. **F-METRIC-R2-01**: graph_search_planner.py `execute_graph_search` 의 description fallback 분기 — `graph_store.get_edges_between` 호출하여 노드의 1-hop 관계를 자연어로 풀어쓰기. 빈 경우 R1 fallback 유지.
-3. **F-SRCH-R2-03**: graph_search_planner.py `execute_graph_search` 끝부분 — search_steps 실행 후 query_embedding 있고 결과 ≥ 1 인 경우에도 top-k 보강. threshold=0.6, top_k=3.
-
-### 회귀 위험
-
-| 변경 | 잠재 회귀 |
-|------|----------|
-| 양방향 traversal | 노이즈 ↑ — retrieved 노드 수 ↑ → context_text 길이 증가 가능. depth=1 에서 평균 2~3 노드 → 양방향 시 3~5 노드 정도 (실측 17/21 노드). 운영 LLM context 한도(32k tokens) 대비 안전. |
-| always-on 시드 보강 | LLM 의도 무관 시드가 retrieved 에 섞일 수 있음 — 임계값 0.6 + top_k 3 으로 제어. recall ↑, precision 약간 ↓ 트레이드오프. |
-| 관계 요약 description | retrieved description 의 텍스트 길이 ↑ — T4 임베딩 비용 약간 ↑ (cache 흡수). 그러나 의미적 신호 더 강함. |
-
-### 필요한 신규 테스트
-
-- `tests/test_storage/test_graph_store.py::test_get_neighbors_follows_both_directions` — sink 노드에서 incoming 이웃도 반환되는지
-- `tests/test_storage/test_graph_store.py::test_get_neighbors_from_node_id_bidirectional` — node_id seed 도 양방향
-- `tests/test_processor/test_graph_search_planner.py::test_execute_seeds_augment_always_on` — search_steps 일부 성공해도 query_embedding 시드 추가
-- `tests/test_processor/test_graph_search_planner.py::test_retrieved_description_uses_relation_summary` — 관계 요약 description fallback
-
-### 기존 테스트 영향
-
-- `test_get_neighbors_short_name_fallback` 등은 양방향이 super-set 이므로 표면 매칭 케이스는 변경 없음 (그대로 통과).
-- `test_get_neighbors_falls_back_to_embedding_when_name_unknown` (R1 신규) — surface miss 시 임베딩 fallback 으로 center_nodes 찾고 그로부터 양방향 BFS. R1 의도 보존.
-- `test_get_neighbors_exact_match_wins_over_short_name` — exact 매칭 우선, 변경 없음.
+| 변경 | 잠재 위험 | 검증 |
+|------|----------|------|
+| 새 schema 출력 요구 | LLM 이 학습 분포에 더 가까운 형태 | 후방 호환 search_steps 경로 유지 |
+| priority ordering | retrieved 순서 변화 → precision 분포 변화 가능 | priority 는 LLM 식별 정답 후보만이라 의도와 정합 |
+| system prompt 길이 | 1.5x 증가 | max_tokens 32768 한도 안전 |
 
 ## 검증 체크리스트
 
-R2 구현 후:
-- [ ] `pytest tests/test_storage/test_graph_store.py -x -q`
-- [ ] `pytest tests/test_processor/test_graph_search_planner.py -x -q`
-- [ ] `pytest tests/test_mcp/test_context_assembler.py -x -q`
-- [ ] `pytest tests/ --ignore=tests/test_eval` (전체 회귀)
-- [ ] ruff check (touched files)
+- [x] `pytest tests/test_processor/test_graph_search_planner.py` (27 passed = 21 기존 + 5 신규 + 1 갱신)
+- [x] `pytest tests/test_storage/test_graph_store.py` (41 passed)
+- [x] `pytest tests/test_mcp/test_context_assembler.py` (23 passed)
+- [x] `pytest tests/ --ignore=tests/test_eval` (**762 passed**, 전체 회귀 0)
+- [x] ruff: 3 errors == baseline 3 errors (regression 0)
 
-## 범위 외
+## R4 후보 (다음 세션)
 
-- `eval_search.py` / `build_synthetic_gold_set.py` 변경 → rag-eval-audit 영역
-- gold 후보 양방향 (F-GOLD-R2-01) → eval-gold-set-improvement 영역 (gold 분포 영향)
-- 본 라운드는 **검색 funnel 의 directional 손실 회복**이 핵심
-
-## 라운드 3 (다음 세션)
-
-- F-SRCH-R2-02 LLM 시드 선택 프롬프트 강화
-- F-GOLD-R2-01 gold 후보 양방향
-- F-IDX-R2-03 entity_embeddings 영속화
+- LLM 의 target_relations 를 retrieved_graph_relations 에 직접 포함 (실제 edge 가 없어도)
+- gold 의 evidence_description ↔ LLM target_relation 매칭 (intent 매칭)
+- 인덱싱 LLM 의 결정성 강화 (재인덱싱 시 같은 입력 → 같은 출력 보장)
