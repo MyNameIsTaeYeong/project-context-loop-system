@@ -196,18 +196,18 @@ GRAPH_GENERATE_PROMPT_TEMPLATE = """\
   relation_type / relation_description) 으로 명시. 관계가 핵심이 아니면
   생략 가능.
 
-JSON 배열로만 출력해라. 다른 설명 금지:
+JSON 배열로만 출력해라. 다른 설명 금지 (예시는 형태만, 실제 엔티티 이름은 위 정보에서):
 [
   {{
     "q": "질문 본문",
     "difficulty": "easy",
-    "evidence_description": "결제 서비스: 주문 서비스에 의존하는 결제 처리 시스템",
-    "entity_aliases": ["Payment Service", "결제서비스"],
+    "evidence_description": "Auth Service: 사용자 인증을 담당하며 Token Validator 를 호출",
+    "entity_aliases": ["Auth Service", "인증 서비스"],
     "relation": {{
-      "source_name": "결제 서비스",
-      "target_name": "주문 서비스",
+      "source_name": "Auth Service",
+      "target_name": "Token Validator",
       "relation_type": "depends_on",
-      "relation_description": "결제 서비스는 주문 서비스에 의존한다"
+      "relation_description": "Auth Service 는 Token Validator 에 의존한다"
     }}
   }}
 ]

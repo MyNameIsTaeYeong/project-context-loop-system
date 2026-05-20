@@ -150,3 +150,49 @@ def all_entity_type_names() -> set[str]:
 
 def all_relation_type_names() -> set[str]:
     return {r.name for r in RELATION_TYPES}
+
+
+# ---------------------------------------------------------------------------
+# Subset filters by extractor source
+# ---------------------------------------------------------------------------
+# 인덱싱 측 추출기 (llm_body_extractor, link_graph_builder, ast_code 등) 마다
+# 어휘 범위가 다르다. 인덱싱-검색 LLM 정렬을 위해, 각 추출기는 자신의 subset
+# 만 LLM 프롬프트에 노출해야 한다 — 그렇지 않으면 인덱싱 LLM 이 추출 안 한
+# 타입을 답할 위험. 검색 LLM 은 모든 subset 의 union 을 본다 (그래프에는 모든
+# 추출기 결과가 합쳐져 있으므로).
+
+
+def _has_source(entry: VocabEntry, keyword: str) -> bool:
+    return keyword in entry.source
+
+
+def llm_body_entity_types_vocab() -> tuple[VocabEntry, ...]:
+    """LLM 본문 추출기 (``llm_body_extractor``) 가 사용하는 entity_type subset.
+
+    ``source`` 필드에 ``"llm_body"`` 가 포함된 entry 만 반환.
+    """
+    return tuple(e for e in ENTITY_TYPES if _has_source(e, "llm_body"))
+
+
+def llm_body_relation_types_vocab() -> tuple[VocabEntry, ...]:
+    """LLM 본문 추출기가 사용하는 relation_type subset."""
+    return tuple(r for r in RELATION_TYPES if _has_source(r, "llm_body"))
+
+
+def llm_body_entity_type_names() -> tuple[str, ...]:
+    """LLM 본문 추출기 entity_type 이름 목록 (config 호환용)."""
+    return tuple(e.name for e in llm_body_entity_types_vocab())
+
+
+def llm_body_relation_type_names() -> tuple[str, ...]:
+    """LLM 본문 추출기 relation_type 이름 목록 (config 호환용)."""
+    return tuple(r.name for r in llm_body_relation_types_vocab())
+
+
+def format_vocab_entries_for_prompt(entries: tuple[VocabEntry, ...]) -> str:
+    """임의의 ``VocabEntry`` 튜플을 LLM 프롬프트용 텍스트로 변환.
+
+    검색·인덱싱 LLM 모두 동일 포맷 (``- **name**: description``) 으로 어휘를
+    보도록 한다 — mental model 정합.
+    """
+    return "\n".join(f"- **{e.name}**: {e.description}" for e in entries)

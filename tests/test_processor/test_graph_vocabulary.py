@@ -107,3 +107,50 @@ def test_format_intent_mapping_renders_all_intents() -> None:
         assert intent in text
         for r in rels:
             assert r in text
+
+
+def test_llm_body_subset_helpers_are_consistent() -> None:
+    """graph_vocabulary 의 llm_body subset 헬퍼와 llm_body_extractor 가 사용하는
+    어휘가 정확히 일치한다 — 인덱싱-검색 LLM 어휘 정렬의 단일 출처 보증."""
+    from context_loop.processor.graph_vocabulary import (
+        llm_body_entity_type_names,
+        llm_body_entity_types_vocab,
+        llm_body_relation_type_names,
+        llm_body_relation_types_vocab,
+    )
+
+    # subset 헬퍼가 ENTITY_TYPES / RELATION_TYPES 의 진짜 subset
+    assert set(llm_body_entity_type_names()) <= all_entity_type_names()
+    assert set(llm_body_relation_type_names()) <= all_relation_type_names()
+
+    # llm_body_extractor 가 graph_vocabulary 의 subset 을 그대로 사용
+    assert set(_DEFAULT_ENTITY_TYPES) == set(llm_body_entity_type_names()), (
+        "llm_body_extractor _DEFAULT_ENTITY_TYPES 와 graph_vocabulary 의 "
+        "llm_body_entity_type_names() 가 다릅니다 — 어휘 정렬 깨짐"
+    )
+    assert set(_DEFAULT_RELATION_TYPES) == set(llm_body_relation_type_names()), (
+        "llm_body_extractor _DEFAULT_RELATION_TYPES 와 graph_vocabulary 의 "
+        "llm_body_relation_type_names() 가 다릅니다 — 어휘 정렬 깨짐"
+    )
+
+    # subset vocab 의 source 필드에 "llm_body" 가 모두 포함
+    for entry in llm_body_entity_types_vocab():
+        assert "llm_body" in entry.source
+    for entry in llm_body_relation_types_vocab():
+        assert "llm_body" in entry.source
+
+
+def test_format_vocab_entries_for_prompt_includes_descriptions() -> None:
+    """범용 포매터가 이름 + 설명을 모두 노출한다 — 인덱싱·검색 LLM 모두
+    같은 포맷으로 어휘 가이드를 받도록 한다."""
+    from context_loop.processor.graph_vocabulary import (
+        format_vocab_entries_for_prompt,
+        llm_body_entity_types_vocab,
+    )
+
+    vocab = llm_body_entity_types_vocab()
+    assert vocab, "llm_body entity subset 이 비어있으면 안 됨"
+    text = format_vocab_entries_for_prompt(vocab)
+    for entry in vocab:
+        assert f"**{entry.name}**" in text
+        assert entry.description in text

@@ -46,35 +46,33 @@ _PLAN_SYSTEM_PROMPT = """\
 # 규칙
 - 그래프 스키마 요약에 실제 존재하는 엔티티 이름만 사용. 표기를 **글자 단위로
   정확히 복사**합니다. 임의로 공백/케이스/하이픈/언더스코어를 바꾸지 마세요.
-  (예: 스키마에 ``"Auth Service"`` 가 있으면 ``"AuthService"`` 가 아닌
-  ``"Auth Service"`` 그대로; ``"인증 서비스"`` 면 ``"인증서비스"`` 가 아닌 그대로)
+  (스키마 표기 그대로: 공백·하이픈·언더스코어·케이스·한자/영문 혼합 모두 보존)
 - ``target_entities``: 질문의 **정답이 될 엔티티**들. 질문이 "X 는 무엇인가"
   / "X 의 속성" 류면 그 X 자체가 target. 질문이 "Y 와 관계가 있는 것은?" 류면
   Y 와 정답 후보 entity 모두 target 에 포함.
 - ``target_relations``: 질문이 **관계 자체를 묻거나 관계로 정답을 찾는** 경우
   ``(source, target, relation_type)`` 으로 방향성을 명시. 인덱싱 시 추출된
   관계와 같은 형태.
-  - "Order Service 가 의존하는 결제 게이트웨이?" → source=Order Service,
-    target=KakaoPay, relation_type=depends_on (또는 정답이 미상이면 target 을
-    빈 문자열로 두고 source/type 만 채움)
-  - "Elasticsearch 를 사용하는 서비스?" → source=Search Service,
-    target=Elasticsearch, relation_type=uses (정답이 미상이면 source 빈 문자열)
-- 관계의 방향: ``source --[type]--> target`` 이 인덱싱과 동일한 규약입니다.
+  - 질문이 "A 가 의존하는 것?" 류면 source=A, relation_type=depends_on,
+    target 은 빈 문자열 가능 (시스템이 그래프에서 보충).
+  - 질문이 "X 를 사용하는 서비스는?" 류면 target=X, relation_type=uses,
+    source 는 빈 문자열 가능 (incoming 방향 탐색).
+- 관계의 방향: ``source --[type]--> target`` 이 인덱싱 측 어휘와 동일한 규약.
   "A 가 B 에 depends_on" 이면 source=A, target=B.
 - 그래프와 무관한 질문이면 ``should_search=false`` + 빈 배열 반환.
 - ``relation_type`` 은 위 Relation types 목록의 이름만 사용 (어휘 외 금지).
 
-# 응답 형식 (JSON 만, 다른 텍스트 금지)
+# 응답 형식 (JSON 만, 다른 텍스트 금지) — 예시는 형태만, 실제 엔티티는 스키마에서
 ```json
 {{
   "should_search": true,
   "reasoning": "왜 그래프 검색이 필요한지 간단히",
   "target_entities": [
-    {{"name": "Order Service", "type": "service"}},
-    {{"name": "KakaoPay", "type": "team"}}
+    {{"name": "Auth Service", "type": "system"}},
+    {{"name": "Token Validator", "type": "module"}}
   ],
   "target_relations": [
-    {{"source": "Order Service", "target": "KakaoPay", "relation_type": "depends_on"}}
+    {{"source": "Auth Service", "target": "Token Validator", "relation_type": "depends_on"}}
   ]
 }}
 ```
