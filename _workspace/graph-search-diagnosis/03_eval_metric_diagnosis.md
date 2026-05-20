@@ -1,107 +1,73 @@
-# Graph Eval Metric Diagnosis
+# Eval Metric 영향 분석 (R3 Phase A)
 
-> 정적 코드 분석 기준. 메트릭 정의 자체는 대체로 정확하지만, **검색이 빈 결과를 반환하면 메트릭은 정의상 0**.
+## R2 메트릭이 안 오른 원인 가설 (사용자 보고 기반)
 
-## 메트릭 계산 흐름 (eval_search.py)
+> "성능 지표가 크게 변한 게 없습니다."
 
-```
-GoldItem.relevant_graph_entities   ─┐
-                                    ├─► run_entity_matching(threshold=0.78)
-AssembledContext.retrieved_graph_entities ─┘
-                                    │
-                                    ├─ T1 exact (name.lower, type)
-                                    ├─ T2 alias (golden.aliases × type)
-                                    ├─ T3 normalize (NFKC + 구두점 제거 × type)
-                                    └─ T4 embedding (description cosine ≥ 0.78, type-agnostic)
-                                    ▼
-                              MatchReport
-                                    │
-                                    ├─ retrieved_keys_in_rank_order (= 매칭된 gold의 key list)
-                                    └─ all_relevant_keys (= 모든 gold key set)
-                                    ▼
-       recall@k / precision@k / hit@k / mrr / ndcg@k (metrics.py)
+R2 의 양방향 traversal 은 retrieved 의 **포함성** (gold seed 가 retrieved 안에 들어가는가) 을 회복했지만, **순위** (rank) 는 다루지 않았다.
+
+```python
+# graph_match.py:380
+hits.sort(key=lambda t: t[0])  # t[0] = retrieved_index (rank)
 ```
 
-## 메트릭 측 핵심 발견
+→ MRR / NDCG 가 retrieved 의 rank 에 민감.
 
-### F-METRIC-01 (HIGH): `DEFAULT_GRAPH_MATCH_THRESHOLD = 0.78` 이 매우 보수적
+## retrieved 순서가 어떻게 결정되었나 (R2 까지)
 
-- **위치**: `src/context_loop/eval/graph_match.py:33`
-- **현재 동작**: T4 embedding 매칭의 cosine 임계값 0.78
-- **문제**:
-  - 설계 §2.2 결정값이라 명시되어 있으나, description이 짧거나 노이즈 있는 경우 0.78 통과 어려움
-  - 특히 retrieved entity의 description이 비어있어 name fallback인 경우 (F-SRCH-06), 짧은 이름끼리는 비특이적 임베딩 → cosine이 낮음
-  - 의미 매칭의 실제 기준: 0.65~0.70 정도가 합리적
-- **개선 방향**:
-  - `DEFAULT_GRAPH_MATCH_THRESHOLD = 0.65`
-  - 또는 tier 별로 임계값을 분리 — T4은 0.65, T1~T3은 binary
-- **심각도**: High (메트릭 측 손실의 한 축) | **공수**: S
+`execute_graph_search`:
+1. search_steps 순회 → 각 step 의 get_neighbors 결과를 dict 발견 순서로 all_nodes 에 push
+2. R2 always-on 보강 → 임베딩 top-k 의 1-hop 이웃을 뒤에 append
+3. 마지막 fallback → 같음
 
-### F-METRIC-02 (MEDIUM): T4 시 골든 `description` 부재면 즉시 None — fallback 없음
+→ retrieved 순서 = BFS 발견 순서 + boost 순서. **LLM 이 식별한 정답 후보가 어디에 있는지** 가 보장되지 않음.
 
-- **위치**: `src/context_loop/eval/graph_match.py:300-301`
-- **현재 동작**:
-  ```python
-  if not golden.description:
-      return None
-  ```
-- **문제**: 골드셋 합성기가 description을 안 채운 케이스가 있으면 T4 전체 skip → T1~T3에서 표면 매칭이 실패한 골든은 모두 미매칭
-- **개선 방향**:
-  - 골든 description 비어있을 때 `golden.name` 자체로 fallback (검색 측의 r_text fallback과 대칭)
-  - 또는 별도 가드 메시지로 골드셋 신뢰성 문제 노출
-- **심각도**: Medium | **공수**: S
+## 시나리오
 
-### F-METRIC-03 (HIGH): retrieved의 description fallback이 짧은 이름이라 의미 임베딩이 비특이적
+- 그래프: Order Service → KakaoPay, Toss PG사, Payment Service, MySQL DB, Kafka (5 outgoing)
+- 질의: "Order Service 의 결제 의존성?"
+- gold seed: Order Service
+- R2 search_steps: `[{entity_name: "Order Service", depth: 1}]`
+- get_neighbors("Order Service") → BFS 결과의 dict.values() 순서:
+  - DiGraph 내부 dict 순서는 add_edge 순서 / node insertion 순서에 의존
+  - Order Service 가 첫 번째일 보장 없음 (양방향이면 incoming 노드가 먼저 올 수도)
 
-- **위치**: `src/context_loop/eval/graph_match.py:311`
-- **현재 동작**:
-  ```python
-  r_text = (r.description or "").strip() or (r.name or "").strip()
-  ```
-- **문제**:
-  - retrieved.description이 빈 경우 (F-SRCH-06 와 연결) r.name으로 임베딩
-  - r.name이 짧은 이름(예: `"main"`, `"foo"`)이면 임베딩이 비특이적 → 무작위 cosine 분포 → 0.78 통과 못함
-- **개선 방향**: 검색 측에서 description 폴백 보강(F-SRCH-06)과 묶음
-- **심각도**: High | **공수**: S (검색 측과 함께)
+→ Order Service 가 rank-3 이면 MRR = 1/3 ≈ 0.33. rank-5 면 0.2. 골드셋 평균이 0.065 → 평균 rank ≈ 15 (top_k=10 이면 매번 거의 outside).
 
-### F-METRIC-04 (LOW): tier 별 score 차이 — embedding=cosine 점수, normalize=0.9 고정
+## R3 으로 어떻게 회복되는가
 
-- **위치**: `src/context_loop/eval/graph_match.py:297, 321`
-- **현재 동작**: T3 score=0.9 고정, T4 score=실제 cosine
-- **문제**: 메트릭 평균 score 비교 시 두 tier가 다른 분포 — `graph_match_score_avg`가 의미 해석하기 어려움
-- **개선 방향**: 운영 영향 없음. 보고만.
-- **심각도**: Low
+`execute_graph_search` 에 priority_node_ids 도입:
+- LLM 의 target_entities / target_relations 끝점 노드 → priority 등록
+- 결과 빌드 시 priority 노드를 retrieved 의 앞순위에 배치
+- gold = LLM 의 target_entity 중 하나 → rank-1 hit → MRR = 1.0
 
-## 골드셋-검색 결과 키 정합성
+**예상 효과**:
+- graph_hit@10: R2 와 동일 또는 약간 ↑ (포함성은 R2 가 이미 잡음)
+- graph_recall@10: 약간 ↑
+- **MRR/NDCG: 큰 폭 ↑** (R2 대비 priority ordering 의 직접 효과)
 
-- **gold side**: `GoldItem.relevant_graph_entities` = `list[GraphEntityRef(name, type, description, aliases)]`
-- **retrieved side**: `AssembledContext.retrieved_graph_entities` = `list[GraphEntityRef(name, type, description)]` (검색이 채움)
-- **키**: `(name.lower(), type)` — 양측 동일 공간
+## 메트릭 매칭 흐름 (참고)
 
-**키 형식 정합성**: 일치 (둘 다 `(lower name, type)`). 문제는 **값**이 안 맞는 케이스가 다수.
+`graph_match.run_entity_matching`:
+1. T1 exact: `(name.lower, type)` 양쪽 strip+lower 비교
+2. T2 alias: golden.aliases vs retrieved.name
+3. T3 normalize: NFKC + 구두점 제거
+4. T4 embedding: cosine ≥ 0.65 (R2 에서 완화됨)
 
-## funnel 손실 시뮬레이션
+→ retrieved 가 gold 와 표면 키 동일하면 T1 즉시 hit. R3 의 priority ordering 은 이 hit 의 **rank** 를 앞당김.
 
-10건의 골드 entity 중 검색이 정확히 5건만 표면 표기로 매칭한다고 가정:
-- T1 exact: 5건 hit (50%)
-- T2 alias: aliases가 있는 골드의 경우 추가 매칭 가능 (현실적으로 골드 항상 alias 보유는 아님)
-- T3 normalize: 표기 변형 정규화 — 한국어 공백/하이픈 차이 흡수 일부
-- T4 embedding: description이 양측 모두 살아있고 임계값 통과 시
-- 합계 60% 정도 매칭 가능 — recall ≈ 0.6
+## 관계 채점 (relation_recall)
 
-그러나 사용자 보고: `< 10%`. 즉 검색이 **거의 빈 결과**를 반환하고 있다는 강한 증거. 메트릭 측보다 검색 측이 funnel의 손실 큰 위치.
+`run_relation_matching`:
+- 검색 측의 retrieved_graph_relations 는 `execute_graph_search` 가 `edges = graph_store.get_edges_between(node_ids)` 로 추출한 실제 edge 들
+- gold 의 relevant_graph_relations = `{source, target, relation_type}` 형태
+- 매칭: `(source.lower, target.lower, type)` 키
 
-## 권고
+R3 의 **target_relations 가 retrieved 의 priority 끝점 노드를 만들어** → edges 가 양 끝점을 모두 포함 → retrieved_graph_relations 에 해당 edge 가 노출 → relation_recall ↑.
 
-| ID | 우선 | 권고 |
-|----|------|------|
-| F-METRIC-01 | High | 임계값 0.78 → 0.65 (운영 변경) |
-| F-METRIC-02 | Medium | 골드 description 부재 시 name fallback |
-| F-METRIC-03 | High | 검색 측 description fallback 보강과 동기 |
-| 골드셋 신뢰성 | (별도) | rag-eval-audit 하네스 영역 |
+## 결론
 
-## 범위 외
-
-- 메트릭 정의 자체의 정확성 검토 (rag-eval-audit 영역)
-- 골드셋 합성 정확성 (eval-gold-set-improvement 영역)
-- 본 진단은 "왜 이번 run의 메트릭이 0인가"에 한정
+R3 의 핵심 효과는 두 가지:
+1. retrieved 의 **포함성** 은 R2 가 잡음
+2. R3 는 retrieved 의 **순위** 를 잡음 — MRR/NDCG 회복의 직접 동인
+3. + 관계 채점에도 양 끝점 priority 가 효과

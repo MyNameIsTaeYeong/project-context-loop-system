@@ -443,6 +443,61 @@ async def test_get_neighbors_from_node_id_returns_subgraph(
 
 
 @pytest.mark.asyncio
+async def test_get_neighbors_follows_both_directions(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R2 (F-SRCH-R2-01): get_neighbors 가 양방향(successor + predecessor) 으로
+    1-hop 이웃을 모두 반환한다.
+
+    DiGraph 의 자연 동작인 successor-only 는 sink 노드(예: 데이터베이스, 외부
+    시스템)가 시드로 선택되면 retrieved 에 sink 자신만 담겨 gold seed 누락의
+    가장 큰 원인이 되었다. 양방향 BFS 로 이를 회복한다.
+    """
+    doc_id = await _create_doc(meta_store)
+    # A → B → C  (A: 소스, B: 중간, C: sink)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="A", entity_type="t"),
+            Entity(name="B", entity_type="t"),
+            Entity(name="C", entity_type="t"),
+        ],
+        relations=[
+            Relation(source="A", target="B", relation_type="uses"),
+            Relation(source="B", target="C", relation_type="uses"),
+        ],
+    ))
+    # sink 노드 C 에서 양방향 이웃 → C, B 가 포함되어야 한다.
+    result = graph_store.get_neighbors("C", depth=1)
+    names = {n["entity_name"] for n in result}
+    assert "C" in names, "자기 자신 포함"
+    assert "B" in names, "양방향이면 incoming neighbor B 도 포함"
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_from_node_id_bidirectional(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R2: get_neighbors_from_node_id 도 양방향."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="X", entity_type="t"),
+            Entity(name="Y", entity_type="t"),
+        ],
+        relations=[Relation(source="X", target="Y", relation_type="uses")],
+    ))
+    y_id = next(
+        n for n, d in graph_store.graph.nodes(data=True)
+        if d.get("entity_name") == "Y"
+    )
+    # sink 노드 Y 에서 — incoming 으로 X 가 와야 한다.
+    result = graph_store.get_neighbors_from_node_id(y_id, depth=1)
+    names = {n["entity_name"] for n in result}
+    assert "Y" in names
+    assert "X" in names
+
+
+@pytest.mark.asyncio
 async def test_delete_clears_embedding_cache(graph_store: GraphStore, meta_store: MetadataStore) -> None:
     """문서 삭제 시 임베딩 캐시도 삭제된다."""
     doc_id = await _create_doc(meta_store)

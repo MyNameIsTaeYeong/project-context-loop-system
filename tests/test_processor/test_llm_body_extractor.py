@@ -459,6 +459,22 @@ async def test_prompt_includes_doc_title_and_unit_body() -> None:
     # 시스템 프롬프트에 어휘가 들어가 있어야 함
     assert "depends_on" in system_prompt
     assert "system" in system_prompt
+    # R3+ — graph_vocabulary 의 description 도 노출 (검색 LLM 과 동일 포맷).
+    # entity_type "system" 의 description 키워드 일부가 시스템 프롬프트에 보여야 함
+    from context_loop.processor.graph_vocabulary import (
+        llm_body_entity_types_vocab,
+    )
+    system_entry = next(
+        (e for e in llm_body_entity_types_vocab() if e.name == "system"),
+        None,
+    )
+    assert system_entry is not None
+    # description 의 첫 단어가 프롬프트에 들어가야 함
+    first_word = system_entry.description.split(" ", 1)[0]
+    assert first_word in system_prompt, (
+        f"인덱싱 프롬프트에 graph_vocabulary description '{first_word}' 가 없음 "
+        f"— 검색 LLM 과 어휘 가이드 포맷 정렬이 깨짐"
+    )
 
 
 @pytest.mark.asyncio

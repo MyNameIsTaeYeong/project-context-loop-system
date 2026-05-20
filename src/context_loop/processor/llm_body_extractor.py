@@ -25,32 +25,24 @@ from typing import Any
 
 from context_loop.processor.extraction_unit import ExtractionUnit
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
+from context_loop.processor.graph_vocabulary import (
+    llm_body_entity_type_names,
+    llm_body_entity_types_vocab,
+    llm_body_relation_type_names,
+    llm_body_relation_types_vocab,
+)
 from context_loop.processor.llm_client import LLMClient, extract_json
 
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_ENTITY_TYPES: tuple[str, ...] = (
-    "system",      # 외부에서 보이는 서비스 (예: "Auth Service")
-    "module",      # 시스템 내부 컴포넌트 (예: "Token Validator")
-    "api",         # HTTP/RPC 엔드포인트 (예: "POST /v1/payments")
-    "concept",     # 추상 개념/표준 (예: "OAuth2")
-    "policy",      # 정책/규칙
-    "person",      # 사람
-    "team",        # 팀/조직
-)
-
-_DEFAULT_RELATION_TYPES: tuple[str, ...] = (
-    "depends_on",   # A 가 B 에 의존
-    "implements",   # A 가 B 표준/인터페이스 구현
-    "calls",        # A 가 B 를 호출
-    "owned_by",     # A 의 소유자가 B
-    "supersedes",   # A 가 B 를 대체
-    "has_part",     # A 가 B 를 포함
-    "uses",         # A 가 B 를 사용
-    "provides",     # A 가 B 를 제공
-    "documented_in",  # A 가 B 에 문서화
-)
+# 인덱싱 LLM 어휘 단일 출처 — ``graph_vocabulary.py`` 의 llm_body subset.
+# 검색 LLM (``graph_search_planner``) 도 같은 모듈의 어휘를 사용하여 mental
+# model 정합. 어휘 변경 시 graph_vocabulary 한 곳만 갱신하면 양쪽 LLM 에 자동
+# 반영된다 (이전에는 llm_body_extractor 가 자체 _DEFAULT_ 상수를 유지하여
+# graph_vocabulary 와 분기 위험 존재).
+_DEFAULT_ENTITY_TYPES: tuple[str, ...] = llm_body_entity_type_names()
+_DEFAULT_RELATION_TYPES: tuple[str, ...] = llm_body_relation_type_names()
 
 
 @dataclass(frozen=True)
@@ -313,9 +305,16 @@ async def _call_llm(
     페이로드는 ``llm.reasoning_profiles`` 설정에서 매핑하며, 미지원 클라이언트
     (Anthropic, OpenAI) 는 인자를 무시한다.
     """
+    # 인덱싱 LLM 도 검색 LLM 과 동일한 어휘 포맷 (이름 + 설명) 으로 가이드.
+    # cfg.allowed_*_types 가 graph_vocabulary 의 subset 이름이면 description 을
+    # 자동 부착, 외부 어휘 (테스트/임시 override) 면 이름만 노출.
     system = _SYSTEM_PROMPT_TEMPLATE.format(
-        entity_types=_format_vocab(cfg.allowed_entity_types),
-        relation_types=_format_vocab(cfg.allowed_relation_types),
+        entity_types=_format_vocab_with_descriptions(
+            cfg.allowed_entity_types, llm_body_entity_types_vocab(),
+        ),
+        relation_types=_format_vocab_with_descriptions(
+            cfg.allowed_relation_types, llm_body_relation_types_vocab(),
+        ),
     )
     user = _USER_PROMPT_TEMPLATE.format(doc_title=doc_title, body=unit.content)
     response = await llm_client.complete(
@@ -333,7 +332,34 @@ async def _call_llm(
 
 
 def _format_vocab(items: tuple[str, ...]) -> str:
+    """단순 이름 목록 포매터 (legacy — 테스트 호환).
+
+    인덱싱 LLM 프롬프트 본 경로는 ``_format_vocab_with_descriptions`` 를
+    사용하여 검색 LLM 과 동일한 ``- **name**: description`` 형태로 어휘를
+    노출한다 — mental model 정합.
+    """
     return "\n".join(f"- {item}" for item in items)
+
+
+def _format_vocab_with_descriptions(
+    allowed_names: tuple[str, ...],
+    reference_vocab: tuple[Any, ...],
+) -> str:
+    """``allowed_names`` 의 각 이름을 reference_vocab 의 description 과 조합해
+    프롬프트용 텍스트 생성.
+
+    ``reference_vocab`` 은 ``graph_vocabulary.VocabEntry`` 튜플. 이름이
+    reference 에 없으면 ``- name`` 형태로만 노출 (외부 어휘 override 호환).
+    """
+    desc_by_name = {entry.name: entry.description for entry in reference_vocab}
+    lines = []
+    for name in allowed_names:
+        desc = desc_by_name.get(name)
+        if desc:
+            lines.append(f"- **{name}**: {desc}")
+        else:
+            lines.append(f"- {name}")
+    return "\n".join(lines)
 
 
 def _canonical_name(

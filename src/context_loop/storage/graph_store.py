@@ -304,6 +304,38 @@ class GraphStore:
 
         logger.debug("그래프 삭제 완료: document_id=%d", document_id)
 
+    def _bidirectional_bfs(
+        self,
+        sources: list[int],
+        depth: int,
+    ) -> set[int]:
+        """sources 에서 양방향(successor + predecessor) 으로 depth-hop BFS.
+
+        DiGraph 의 ``single_source_shortest_path_length`` 는 successors(outgoing)
+        만 따라간다. 그러나 "X 를 누가 사용하나?" 류의 질의에서 LLM 이 sink
+        노드(예: KakaoPay) 를 search step entity_name 으로 답하면 outgoing 0
+        으로 retrieved 가 sink 자신만 담겨 gold seed 를 놓친다 — < 10% 메트릭의
+        결정적 funnel 손실. 검색은 의미적으로 양방향이 자연스럽기 때문에 BFS
+        에서 양방향을 모두 따라간다.
+        """
+        if depth < 1:
+            return set(sources)
+        visited: set[int] = set(sources)
+        frontier: set[int] = set(sources)
+        for _ in range(depth):
+            next_frontier: set[int] = set()
+            for n in frontier:
+                if not self._graph.has_node(n):
+                    continue
+                next_frontier.update(self._graph.successors(n))
+                next_frontier.update(self._graph.predecessors(n))
+            next_frontier -= visited
+            if not next_frontier:
+                break
+            visited.update(next_frontier)
+            frontier = next_frontier
+        return visited
+
     def get_neighbors(
         self,
         entity_name: str,
@@ -323,6 +355,11 @@ class GraphStore:
         "UserService.create_user")로 요청해도 매칭되도록 단계별로
         fallback 조회한다. 표면 매칭이 모두 실패하면 ``embedding_fallback`` 이
         제공된 경우 임베딩 cosine 기반으로 가장 가까운 노드를 시드로 사용한다.
+
+        탐색은 양방향(successor + predecessor). DiGraph 의 자연 동작인
+        successor-only 는 sink 노드(예: 데이터베이스, 외부 시스템) 가 시드로
+        선택되면 retrieved 가 자기 자신만 담겨 검색 funnel 의 가장 큰 손실
+        지점이 된다 — F-SRCH-R2-01.
 
         Args:
             entity_name: 탐색 중심 엔티티 이름.
@@ -373,18 +410,15 @@ class GraphStore:
         if not center_nodes:
             return []
 
-        result_nodes: dict[int, dict[str, Any]] = {}
-        for center in center_nodes:
-            reachable = nx.single_source_shortest_path_length(
-                self._graph, center, cutoff=depth
-            )
-            for node_id in reachable:
-                if node_id not in result_nodes:
-                    data = dict(self._graph.nodes[node_id])
-                    data["id"] = node_id
-                    result_nodes[node_id] = data
-
-        return list(result_nodes.values())
+        reachable_ids = self._bidirectional_bfs(center_nodes, depth)
+        result_nodes: list[dict[str, Any]] = []
+        for node_id in reachable_ids:
+            if not self._graph.has_node(node_id):
+                continue
+            data = dict(self._graph.nodes[node_id])
+            data["id"] = node_id
+            result_nodes.append(data)
+        return result_nodes
 
     def get_neighbors_from_node_id(
         self,
@@ -395,15 +429,16 @@ class GraphStore:
 
         ``get_neighbors`` 는 이름 기반 표면 매칭부터 시작하지만, query
         임베딩 fallback 처럼 이미 시드 ``node_id`` 가 결정된 경우 직접
-        탐색이 필요하다. 결과 모양은 ``get_neighbors`` 와 동일.
+        탐색이 필요하다. 양방향(successor + predecessor) traversal —
+        ``get_neighbors`` 와 동일한 정책. 결과 모양도 동일.
         """
         if not self._graph.has_node(node_id):
             return []
-        reachable = nx.single_source_shortest_path_length(
-            self._graph, node_id, cutoff=depth,
-        )
+        reachable_ids = self._bidirectional_bfs([node_id], depth)
         result_nodes: list[dict[str, Any]] = []
-        for nid in reachable:
+        for nid in reachable_ids:
+            if not self._graph.has_node(nid):
+                continue
             data = dict(self._graph.nodes[nid])
             data["id"] = nid
             result_nodes.append(data)

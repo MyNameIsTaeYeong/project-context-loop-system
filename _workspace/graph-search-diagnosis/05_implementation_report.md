@@ -1,88 +1,87 @@
-# Implementation Report — Round 1
+# R3 Implementation Report — 인덱싱-검색 Schema 정렬
 
-## 적용 항목
+## 한 줄 결론
 
-| ID | 파일 | 변경 요약 |
-|----|------|----------|
-| F-METRIC-01 | `eval/graph_match.py` | `DEFAULT_GRAPH_MATCH_THRESHOLD 0.78 → 0.65` |
-| F-METRIC-02 | `eval/graph_match.py` | 골든 description 부재 시 `golden.name` fallback (검색 측 fallback과 대칭) |
-| F-SRCH-02 | `storage/graph_store.py` | `search_entities_by_embedding` 기본 `threshold 0.7 → 0.5` |
-| F-SRCH-06 | `processor/graph_search_planner.py` | retrieved GraphEntityRef description 비어 있으면 자연어 fallback (`"이 entity 는 {type} 유형의 '{name}' 이며 ..."`) |
-| F-SRCH-01 | `storage/graph_store.py` | `get_neighbors` 에 임베딩 fallback 인자 추가 (exact/scoped/short 모두 실패 시) + `get_neighbors_from_node_id` 헬퍼 신규 |
-| F-SRCH-03 | `processor/graph_search_planner.py` | `execute_graph_search` 에 `query_embedding`/`embedding_client` 인자 추가 — step 별 임베딩 fallback + 전체 step 실패 시 query embedding 시드 보강 |
-| F-SRCH-03 호출처 | `mcp/context_assembler.py` | `_search_graph_with_llm` 에서 `execute_graph_search` 호출 시 `query_embedding`/`embedding_client` 전달 |
-| F-SRCH-04 | `processor/graph_search_planner.py` | system prompt 강화 — "글자 단위로 정확 복사" + 표기 변형 예시 명시 |
+검색 LLM 의 출력 schema 를 인덱싱과 정렬 (`{target_entities, target_relations}`) + retrieved 의 rank-1 priority ordering 으로, R2 까지의 fallback 누적 후에도 변화 없던 MRR/NDCG 회복을 노린다.
 
-## 신규 테스트 (회귀 가드)
+## 핵심 변경
 
-| 파일 | 테스트 | 검증 |
-|------|--------|------|
-| `test_storage/test_graph_store.py` | `test_search_entities_default_threshold_lowered_to_0_5` | F-SRCH-02 default 임계값 |
-| `test_storage/test_graph_store.py` | `test_get_neighbors_falls_back_to_embedding_when_name_unknown` | F-SRCH-01 임베딩 fallback |
-| `test_storage/test_graph_store.py` | `test_get_neighbors_from_node_id_returns_subgraph` | 헬퍼 동작 |
-| `test_processor/test_graph_search_planner.py` | `test_execute_search_seeds_from_query_embedding_when_steps_miss` | F-SRCH-03 query embedding 시드 보강 |
-| `test_processor/test_graph_search_planner.py` | `test_execute_search_fills_description_fallback_for_retrieved` | F-SRCH-06 retrieved description 자연어 fallback |
-| `test_processor/test_graph_search_planner.py` | `test_system_prompt_enforces_exact_entity_name_copy` | F-SRCH-04 프롬프트 강제 |
-| `test_eval/test_graph_matching.py` | `test_default_threshold_is_065_for_funnel_recovery` | F-METRIC-01 default |
-| `test_eval/test_graph_matching.py` | `test_golden_description_fallback_to_name_when_empty` | F-METRIC-02 fallback |
+### F-LLM-R3-01: GraphSearchPlan schema 정렬
 
-신규 8건, 기존 조정 5건, 기존 영향 0건.
+`src/context_loop/processor/graph_search_planner.py`
 
-## 기존 테스트 조정
+- 신규 `TargetEntity {name, entity_type}` — 인덱싱 `Entity {name, entity_type, description}` 와 같은 shape
+- 신규 `TargetRelation {source, target, relation_type}` — 인덱싱 `Relation {source, target, relation_type, label}` 와 같은 shape
+- `GraphSearchPlan` 에 `target_entities` + `target_relations` 추가
+- `search_steps` 는 후방 호환을 위해 유지 (legacy LLM 응답 / 직접 호출자)
+- `has_targets` property 로 R3 신호 감지
 
-5건의 `test_graph_matching.py` 테스트가 새 동작(임계값 0.65 + name fallback)에 의해 영향. 모두 의도 변경 없이 새 동작에 맞게 update:
+### F-LLM-R3-02: retrieved priority ordering
 
-- `test_tier_t1_miss_when_type_differs` → `test_tier_t1_miss_when_type_differs_strict` (strict=True 명시)
-- `test_tier_t4_below_threshold_returns_none` (threshold=0.95 명시 override)
-- `test_tier_t4_skipped_when_no_description` → `test_tier_t4_name_fallback_when_no_description` (새 동작 검증)
-- `test_backward_compat_v1_minimal_entity_t4_skipped` → `_strict_skip_t4` (strict=True 명시)
-- `test_match_report_records_relevant_keys_for_hits_only` (strict=True로 의도 보존)
+`execute_graph_search`:
+- `priority_node_ids: list[int]` + `priority_set: set[int]` 도입
+- `_add_node_to_result(nid, node, priority)`: priority=True 이면 priority_node_ids 에 등록 (idempotent 승격)
+- target_entities 의 시드 노드 자기 자신 → priority
+- target_relations 의 source / target 끝점 노드 자기 자신 → priority
+- 결과 빌드 시 priority 노드를 retrieved 의 앞순위 (rank-1, 2, ...) 에 배치
+- 나머지 (BFS 확장, 임베딩 보강) 는 그 뒤로
 
-## 추천 커밋 메시지
+### F-LLM-R3-03: system prompt 정렬
 
-```
-feat(graph-search): R1 — funnel 회복 (임베딩 fallback + description fallback + 임계값 완화)
+- 인덱싱 LLM 의 entity_types / relation_types / 의도 매핑을 같은 형태로 노출
+- 방향성 규약 명시: `source --[type]--> target` (인덱싱과 일치)
+- target_relations 의 끝점 미상 시 빈 문자열 허용 — 시스템이 fuzzy 매칭으로 회복
 
-그래프 검색 메트릭 < 10% 의 핵심 funnel 손실 완화:
+### 후방 호환 동작
 
-검색 측 (Critical/High):
-- get_neighbors: exact/scoped/short 표면 매칭 실패 시 임베딩 fallback (F-SRCH-01)
-- execute_graph_search: step 별 + 전체 fallback 시 query_embedding 기반 시드 보강 (F-SRCH-03)
-- search_entities_by_embedding default threshold 0.7 → 0.5 (F-SRCH-02)
-- retrieved GraphEntityRef description 비어 있으면 자연어 fallback (F-SRCH-06)
-- system prompt: 'entity_name 글자 단위 정확 복사' 강제 (F-SRCH-04)
+- LLM 이 구식 응답 (`search_steps`) 을 돌려줘도 _parse_plan 이 둘 다 파싱
+- execute_graph_search 는 R3 신호 우선, 없으면 R2 경로 (search_steps + 양방향 traversal)
+- 기존 호출자 (외부 코드 / 테스트) 가 `GraphSearchPlan(search_steps=[...])` 로 직접 호출하는 코드도 영향 없음
 
-평가 측 (High):
-- DEFAULT_GRAPH_MATCH_THRESHOLD 0.78 → 0.65 (F-METRIC-01)
-- 골든 description 부재 시 name fallback (F-METRIC-02)
+## 변경 파일 통계
 
-가이드 / 진단:
-- 신규 하네스 graph-search-diagnosis (6 에이전트 + 오케스트레이터)
-- _workspace/graph-search-diagnosis/01..06_*.md (진단·계획·구현·검증 문서)
+| 파일 | 변경 라인 |
+|------|----------|
+| `src/context_loop/processor/graph_search_planner.py` | +140 / -50 |
+| `tests/test_processor/test_graph_search_planner.py` | +135 / -1 |
 
-테스트: 신규 8 / 기존 5 조정 / 전체 749 passed (회귀 0)
-```
+## 신규 테스트 (5건)
 
-## 즉시 실행한 테스트 결과
+| 테스트 | 검증 의도 |
+|--------|----------|
+| `test_parse_plan_r3_target_entities_and_relations` | R3 schema 파싱 |
+| `test_parse_plan_r3_relation_with_empty_endpoint` | 끝점 미상 허용 |
+| `test_parse_plan_r3_falls_back_to_search_steps` | 후방 호환 — 구식 응답도 파싱 |
+| `test_execute_search_with_target_entities_prioritizes_seed` | target_entities 의 시드가 rank-1 (priority ordering 의 직접 검증) |
+| `test_execute_search_with_target_relations_includes_both_endpoints` | target_relations 의 source/target 양쪽이 모두 priority |
+| `test_execute_search_target_entity_uses_embedding_fallback` | R3 + R1 임베딩 fallback 연동 |
 
-```
-$ pytest tests/test_storage/test_graph_store.py tests/test_processor/test_graph_search_planner.py tests/test_eval/test_graph_matching.py tests/test_mcp/test_context_assembler.py
-123 passed in 0.72s
+## 계획-구현 매트릭스
 
-$ pytest tests/ --ignore=tests/test_eval
-749 passed, 11 warnings in 4.92s   ← 회귀 0
+| ID | 계획 | 실제 | 일치 |
+|----|------|------|------|
+| F-LLM-R3-01 | TargetEntity/Relation 추가 + 파싱 | ✓ + has_targets property (보너스) | ✓+ |
+| F-LLM-R3-02 | priority ordering | ✓ + idempotent 승격 (보너스) | ✓+ |
+| F-LLM-R3-03 | system prompt 정렬 | ✓ + 방향성 규약 명시 (보너스) | ✓+ |
+| 후방 호환 | search_steps fallback | ✓ | ✓ |
 
-$ pytest tests/test_eval/
-270 passed, 5 failed (사전 실패 5건, 본 변경 무관)
+## 회귀 위험 점검
 
-$ ruff check (touched files): 3 errors — baseline에 동일 3건 존재 (regression 0)
-```
+| 변경 | 회귀 위험 | 검증 |
+|------|----------|------|
+| schema 변경 | LLM 이 새 형태로 답해야 하나 — 못 답하면 0 응답 | 후방 호환 search_steps 경로 유지 |
+| priority ordering | retrieved 의 rank-1 가 LLM 정답 후보로 강제 | LLM 의도가 정확하면 정합; 부정확하면 R2 와 동일한 rank 손실 |
+| system prompt 1.5x 증가 | max_tokens 32768 한도 안전 | 응답 토큰 한도 영향 없음 |
 
-## 후속 권고 (R2/R3)
+## 다운스트림 영향
 
-- F-IDX-02: entity_embeddings 자동 build race-lock + 명시적 실패 보고
-- F-IDX-01/03: NetworkX DiGraph → MultiDiGraph (cross-document multi-edge 보존)
-- F-SRCH-05: schema_text max_entities_per_type 10 → 20
-- entity_embeddings SQLite 영속화 (재시작 비용 제거)
+- `GraphSearchPlan` 시그니처 확장 (target_entities, target_relations 추가) — 기존 호출자는 영향 없음 (기본값 빈 리스트)
+- `execute_graph_search` 시그니처 동일
+- context_assembler 변경 불필요
 
-평가 메트릭 재측정: 사용자가 직접 `scripts/eval_search.py` 재실행하여 회복 정도 확인 권고. R1의 funnel 완화 효과는 운영 데이터에서만 정량 측정 가능.
+## R4 후보 (다음 세션)
+
+- LLM 의 target_relations 자체를 retrieved_graph_relations 에 직접 포함 (현재는 실제 edge 가 있어야만 노출)
+- LLM 의 target_relations 의 fuzzy 매칭 (source 미상 시 target 만으로 incoming 추적)
+- 인덱싱 LLM 의 결정성 강화 (재인덱싱 시 같은 입력 → 같은 출력)
+- 인덱싱-검색 LLM 의 공유 vocabulary 자동 동기화 (graph_vocabulary.py 갱신 시 양쪽 프롬프트 자동 반영 — 이미 일부 적용됨)
