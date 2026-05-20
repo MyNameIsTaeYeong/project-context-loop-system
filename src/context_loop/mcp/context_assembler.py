@@ -270,7 +270,14 @@ async def _search_graph_with_llm(
         if not plan.should_search:
             logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
             return None
-        return await execute_graph_search(plan, graph_store)
+        # query_embedding + embedding_client 전달 — execute_graph_search 가
+        # LLM 추측 entity_name 의 표면 매칭 실패 시 임베딩 fallback 으로 시드
+        # 노드를 보강할 수 있게 한다 (그래프 메트릭 0% 의 핵심 funnel 손실 완화).
+        return await execute_graph_search(
+            plan, graph_store,
+            query_embedding=query_embedding,
+            embedding_client=embedding_client,
+        )
     except Exception:
         logger.warning("LLM 기반 그래프 탐색 실패", exc_info=True)
         return None

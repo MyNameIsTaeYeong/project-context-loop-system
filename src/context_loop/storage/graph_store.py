@@ -305,6 +305,10 @@ class GraphStore:
         self,
         entity_name: str,
         depth: int = 1,
+        *,
+        embedding_fallback: list[float] | None = None,
+        embedding_fallback_threshold: float = 0.5,
+        embedding_fallback_top_k: int = 3,
     ) -> list[dict[str, Any]]:
         """엔티티 이름을 중심으로 주변 관계를 탐색한다.
 
@@ -314,11 +318,17 @@ class GraphStore:
         코드 심볼은 `file.py::Class.method` 형태의 FQN으로 등록되므로,
         LLM이 짧은 이름(예: "create_user")이나 부분 경로(예:
         "UserService.create_user")로 요청해도 매칭되도록 단계별로
-        fallback 조회한다.
+        fallback 조회한다. 표면 매칭이 모두 실패하면 ``embedding_fallback`` 이
+        제공된 경우 임베딩 cosine 기반으로 가장 가까운 노드를 시드로 사용한다.
 
         Args:
             entity_name: 탐색 중심 엔티티 이름.
             depth: 탐색 깊이 (1 = 직접 연결만).
+            embedding_fallback: 표면 매칭 모두 실패 시 사용할 임베딩 벡터.
+                일반적으로 ``entity_name`` 자체의 임베딩. ``None`` 이면
+                fallback 없이 빈 결과 반환 (기존 동작 호환).
+            embedding_fallback_threshold: 임베딩 fallback 의 cosine 최소값.
+            embedding_fallback_top_k: 임베딩 fallback 으로 가져올 시드 노드 수.
 
         Returns:
             관련 노드 정보 목록.
@@ -345,6 +355,18 @@ class GraphStore:
                 if _extract_short_name(d.get("entity_name", "")).lower() == query_lower
             ]
 
+        # 4. 임베딩 fallback — 표면 매칭이 모두 실패한 경우. LLM 추측 이름이
+        # 인덱스에 표기 차이로 존재할 때 (예: "Auth Service" ↔ "AuthService",
+        # "인증 서비스" ↔ "인증서비스") 의미 임베딩으로 가장 가까운 노드를 시드로
+        # 사용하여 검색 funnel 손실을 줄인다.
+        if not center_nodes and embedding_fallback is not None:
+            similar = self.search_entities_by_embedding(
+                embedding_fallback,
+                threshold=embedding_fallback_threshold,
+                top_k=embedding_fallback_top_k,
+            )
+            center_nodes = [s["node_id"] for s in similar if s.get("node_id") is not None]
+
         if not center_nodes:
             return []
 
@@ -360,6 +382,29 @@ class GraphStore:
                     result_nodes[node_id] = data
 
         return list(result_nodes.values())
+
+    def get_neighbors_from_node_id(
+        self,
+        node_id: int,
+        depth: int = 1,
+    ) -> list[dict[str, Any]]:
+        """주어진 node_id 를 중심으로 주변 노드를 반환한다.
+
+        ``get_neighbors`` 는 이름 기반 표면 매칭부터 시작하지만, query
+        임베딩 fallback 처럼 이미 시드 ``node_id`` 가 결정된 경우 직접
+        탐색이 필요하다. 결과 모양은 ``get_neighbors`` 와 동일.
+        """
+        if not self._graph.has_node(node_id):
+            return []
+        reachable = nx.single_source_shortest_path_length(
+            self._graph, node_id, cutoff=depth,
+        )
+        result_nodes: list[dict[str, Any]] = []
+        for nid in reachable:
+            data = dict(self._graph.nodes[nid])
+            data["id"] = nid
+            result_nodes.append(data)
+        return result_nodes
 
     def get_edges_between(
         self,
@@ -616,7 +661,7 @@ class GraphStore:
     def search_entities_by_embedding(
         self,
         query_embedding: list[float],
-        threshold: float = 0.7,
+        threshold: float = 0.5,
         top_k: int = 5,
     ) -> list[dict[str, Any]]:
         """질의 임베딩과 유사한 엔티티를 검색한다."""

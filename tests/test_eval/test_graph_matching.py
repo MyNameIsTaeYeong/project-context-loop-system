@@ -145,11 +145,17 @@ def test_tier_t1_exact_case_insensitive() -> None:
     assert result.score == 1.0
 
 
-def test_tier_t1_miss_when_type_differs() -> None:
-    """T1 은 type 일치를 요구 — T2/T3 도 alias/description 없으면 miss."""
+def test_tier_t1_miss_when_type_differs_strict() -> None:
+    """strict=True 면 T1 만 시도 — type 일치 요구로 miss.
+
+    이전엔 strict 인자 없이 T4 도 description/name 부재로 자연 skip 되었으나,
+    R1 에서 골든 description 부재 시 name fallback 이 도입되어 같은 name 끼리는
+    T4(type-agnostic) 로 매칭될 수 있다 (F-METRIC-02). 따라서 'T1 만 발동되어
+    miss' 를 검증하려면 strict=True 를 명시한다.
+    """
     golden = _ge("결제 서비스", "system")
     retrieved = [_ge("결제 서비스", "service")]
-    result = match_entity_tiered(golden, retrieved, _embed)
+    result = match_entity_tiered(golden, retrieved, _embed, strict=True)
     assert result is None
 
 
@@ -246,7 +252,11 @@ def test_tier_t4_embedding_type_agnostic() -> None:
 
 
 def test_tier_t4_below_threshold_returns_none() -> None:
-    """description 이 의미적으로 멀면 T4 도 miss → None."""
+    """description 이 의미적으로 멀면 T4 도 miss → None.
+
+    R1 에서 기본 threshold 가 0.65 로 낮춰졌으므로 (이전 0.78), 명시적 임계값을
+    높여서 '임계 미달 시 None' 의미를 보존한다.
+    """
     golden = _ge(
         "결제 서비스", "service",
         description="무관한 텍스트 1",
@@ -255,7 +265,7 @@ def test_tier_t4_below_threshold_returns_none() -> None:
         "주문 서비스", "service",
         description="완전 다른 의미의 텍스트 2",
     )]
-    result = match_entity_tiered(golden, retrieved, _embed)
+    result = match_entity_tiered(golden, retrieved, _embed, threshold=0.95)
     assert result is None
 
 
@@ -281,12 +291,19 @@ def test_tier_t4_uses_stored_embedding() -> None:
         assert result.tier == "embedding"
 
 
-def test_tier_t4_skipped_when_no_description() -> None:
-    """description 이 없으면 T4 skip — type 미스면 None."""
+def test_tier_t4_name_fallback_when_no_description() -> None:
+    """R1: description 부재 시 골든·검색 모두 name 으로 fallback (F-METRIC-02).
+
+    type 이 달라도 T4 는 type-agnostic 이므로 같은 name 임베딩이면 매칭된다.
+    이전엔 description 부재 시 T4 즉시 skip 이었지만, 검색 측 fallback
+    (F-SRCH-06) 과 대칭으로 평가 측도 name 으로 fallback 한다 — 합성
+    골드셋이 description 을 항상 채우지 못해 발생한 funnel 손실 완화.
+    """
     golden = _ge("X", "type-a")
     retrieved = [_ge("X", "type-b")]
     result = match_entity_tiered(golden, retrieved, _embed)
-    assert result is None
+    assert result is not None
+    assert result.tier == "embedding"
 
 
 # ---------------------------------------------------------------------------
@@ -522,11 +539,15 @@ def test_backward_compat_v1_minimal_entity_uses_t1_only() -> None:
     assert report.tier_counts == {"exact": 1, "alias": 0, "normalize": 0, "embedding": 0}
 
 
-def test_backward_compat_v1_minimal_entity_t4_skipped() -> None:
-    """description 이 없으면 T4 자연 skip — type 변경 시 miss."""
+def test_backward_compat_v1_minimal_entity_strict_skip_t4() -> None:
+    """strict=True 면 T4 단계가 skip 되어 description/name fallback 없이 miss.
+
+    R1 에서 description 부재 시 name fallback 이 도입되었으므로 'T4 자연 skip'
+    의미를 검증하려면 strict=True 가 필요하다 (1차 동작 호환).
+    """
     golden = [_ge("결제 서비스", "system")]
     retrieved = [_ge("결제 서비스", "service")]
-    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed, strict=True)
     # 모든 tier miss
     assert all(c == 0 for c in report.tier_counts.values())
 
@@ -536,14 +557,40 @@ def test_backward_compat_v1_minimal_entity_t4_skipped() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_default_threshold_is_065_for_funnel_recovery() -> None:
+    """R1 F-METRIC-01: T4 임베딩 매칭의 기본 임계값이 0.65 로 낮춰졌다.
+
+    이전 0.78 은 description 이 짧거나 비특이적인 검색 결과에서 과도하게
+    엄격하여 그래프 메트릭 funnel 손실의 한 축이었다. 0.65 가 default 임을
+    회귀 가드로 확정.
+    """
+    assert DEFAULT_GRAPH_MATCH_THRESHOLD == 0.65
+
+
+def test_golden_description_fallback_to_name_when_empty() -> None:
+    """R1 F-METRIC-02: 골든 description 이 비어도 name 으로 fallback 하여
+    T4 가 진행된다. 같은 name 끼리 임베딩이 일치하면 type 차이가 있어도
+    매칭 (T4 type-agnostic)."""
+    golden = _ge("X", "type-a")  # description 없음
+    retrieved = [_ge("X", "type-b")]  # description 없음
+    result = match_entity_tiered(golden, retrieved, _embed)
+    assert result is not None
+    assert result.tier == "embedding"
+
+
 def test_match_report_records_relevant_keys_for_hits_only() -> None:
-    """미매칭 golden 은 relevant_keys 에 안 들어가지만 all_relevant_keys 에는 들어감."""
+    """미매칭 golden 은 relevant_keys 에 안 들어가지만 all_relevant_keys 에는 들어감.
+
+    strict=True 로 호출하여 R1 의 name-fallback T4 가 우연히 짧은 이름 mock
+    임베딩에서 통과해 'B' 가 매칭되는 케이스를 차단한다 — 이 테스트의 본
+    목적은 'all_relevant_keys 분모와 relevant_keys 분자' 의 분리 검증.
+    """
     golden = [
         _ge("A", "system"),  # hit
         _ge("B", "system"),  # miss
     ]
     retrieved = [_ge("A", "system")]
-    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed, strict=True)
     assert report.relevant_keys == {("a", "system")}
     assert report.all_relevant_keys == {("a", "system"), ("b", "system")}
 

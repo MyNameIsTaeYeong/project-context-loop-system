@@ -324,6 +324,86 @@ async def test_search_entities_by_embedding(graph_store: GraphStore, meta_store:
 
 
 @pytest.mark.asyncio
+async def test_search_entities_default_threshold_lowered_to_0_5(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R1: ``search_entities_by_embedding`` 기본 threshold 가 0.5 로 낮춰졌다.
+
+    이전 0.7 은 표기 변형(공백/케이스/하이픈)이 있는 검색에서 의미 임베딩 통과를
+    어렵게 만들었다 — 그래프 검색 funnel 손실의 한 축. 0.5 가 default 임을
+    회귀 가드로 확정.
+    """
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="X", entity_type="t")], relations=[],
+    ))
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # cosine 0.6 (sqrt(0.36+0.64)=1.0, 0.6 dot 1.0 = 0.6) → 0.5 통과, 0.7 미통과.
+    results = graph_store.search_entities_by_embedding([0.6, 0.8])  # default
+    assert len(results) == 1, "default threshold 가 0.5 미만으로 낮춰진 것에 의존"
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_falls_back_to_embedding_when_name_unknown(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R1 F-SRCH-01: 표면 매칭(exact/scoped/short)이 모두 실패해도 임베딩
+    fallback 으로 시드 노드를 찾는다.
+
+    LLM 추측 entity_name 이 인덱스 표기와 공백/케이스/하이픈으로 어긋날 때
+    검색이 빈 결과가 되어 그래프 메트릭이 0 이 되는 funnel 손실을 완화.
+    """
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="AuthService", entity_type="system")],
+        relations=[],
+    ))
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0, 0.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # 표면 매칭으로는 "Auth Service" (공백) ≠ "AuthService" → 빈 결과.
+    no_fallback = graph_store.get_neighbors("Auth Service")
+    assert no_fallback == []
+
+    # 같은 의미의 임베딩 fallback 을 주면 시드 노드가 잡혀 결과가 비어있지 않다.
+    with_fallback = graph_store.get_neighbors(
+        "Auth Service",
+        embedding_fallback=[0.95, 0.1, 0.0],  # cosine ~0.96 > 0.5
+    )
+    assert len(with_fallback) == 1
+    assert with_fallback[0]["entity_name"] == "AuthService"
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_from_node_id_returns_subgraph(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R1: ``get_neighbors_from_node_id`` 가 node_id 시드로 직접 서브그래프를
+    반환한다 — execute_graph_search 의 query-embedding fallback 경로에서 사용."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="A", entity_type="t"),
+            Entity(name="B", entity_type="t"),
+        ],
+        relations=[Relation(source="A", target="B", relation_type="related")],
+    ))
+    # NetworkX 그래프에서 A 의 node_id 찾기
+    a_id = next(
+        n for n, d in graph_store.graph.nodes(data=True)
+        if d.get("entity_name") == "A"
+    )
+    result = graph_store.get_neighbors_from_node_id(a_id, depth=1)
+    names = {n["entity_name"] for n in result}
+    assert "A" in names
+    assert "B" in names
+
+
+@pytest.mark.asyncio
 async def test_delete_clears_embedding_cache(graph_store: GraphStore, meta_store: MetadataStore) -> None:
     """문서 삭제 시 임베딩 캐시도 삭제된다."""
     doc_id = await _create_doc(meta_store)
