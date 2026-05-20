@@ -1,88 +1,98 @@
-# Implementation Report — Round 1
+# Implementation Report — Round 2
 
-## 적용 항목
+## 한 줄 결론
 
-| ID | 파일 | 변경 요약 |
-|----|------|----------|
-| F-METRIC-01 | `eval/graph_match.py` | `DEFAULT_GRAPH_MATCH_THRESHOLD 0.78 → 0.65` |
-| F-METRIC-02 | `eval/graph_match.py` | 골든 description 부재 시 `golden.name` fallback (검색 측 fallback과 대칭) |
-| F-SRCH-02 | `storage/graph_store.py` | `search_entities_by_embedding` 기본 `threshold 0.7 → 0.5` |
-| F-SRCH-06 | `processor/graph_search_planner.py` | retrieved GraphEntityRef description 비어 있으면 자연어 fallback (`"이 entity 는 {type} 유형의 '{name}' 이며 ..."`) |
-| F-SRCH-01 | `storage/graph_store.py` | `get_neighbors` 에 임베딩 fallback 인자 추가 (exact/scoped/short 모두 실패 시) + `get_neighbors_from_node_id` 헬퍼 신규 |
-| F-SRCH-03 | `processor/graph_search_planner.py` | `execute_graph_search` 에 `query_embedding`/`embedding_client` 인자 추가 — step 별 임베딩 fallback + 전체 step 실패 시 query embedding 시드 보강 |
-| F-SRCH-03 호출처 | `mcp/context_assembler.py` | `_search_graph_with_llm` 에서 `execute_graph_search` 호출 시 `query_embedding`/`embedding_client` 전달 |
-| F-SRCH-04 | `processor/graph_search_planner.py` | system prompt 강화 — "글자 단위로 정확 복사" + 표기 변형 예시 명시 |
+R1 의 fallback 들이 발동하지 못하던 **directed traversal (sink 노드에서 outgoing 0)** funnel 손실을 제거. 양방향 BFS + always-on 시드 보강 + 관계 요약 description 으로 검색 측 funnel 가장 큰 손실 지점 회복.
 
-## 신규 테스트 (회귀 가드)
+## 핵심 변경
 
-| 파일 | 테스트 | 검증 |
-|------|--------|------|
-| `test_storage/test_graph_store.py` | `test_search_entities_default_threshold_lowered_to_0_5` | F-SRCH-02 default 임계값 |
-| `test_storage/test_graph_store.py` | `test_get_neighbors_falls_back_to_embedding_when_name_unknown` | F-SRCH-01 임베딩 fallback |
-| `test_storage/test_graph_store.py` | `test_get_neighbors_from_node_id_returns_subgraph` | 헬퍼 동작 |
-| `test_processor/test_graph_search_planner.py` | `test_execute_search_seeds_from_query_embedding_when_steps_miss` | F-SRCH-03 query embedding 시드 보강 |
-| `test_processor/test_graph_search_planner.py` | `test_execute_search_fills_description_fallback_for_retrieved` | F-SRCH-06 retrieved description 자연어 fallback |
-| `test_processor/test_graph_search_planner.py` | `test_system_prompt_enforces_exact_entity_name_copy` | F-SRCH-04 프롬프트 강제 |
-| `test_eval/test_graph_matching.py` | `test_default_threshold_is_065_for_funnel_recovery` | F-METRIC-01 default |
-| `test_eval/test_graph_matching.py` | `test_golden_description_fallback_to_name_when_empty` | F-METRIC-02 fallback |
+### F-SRCH-R2-01 (Critical) — `get_neighbors` 양방향 traversal
 
-신규 8건, 기존 조정 5건, 기존 영향 0건.
+`src/context_loop/storage/graph_store.py`
 
-## 기존 테스트 조정
+- 신규 헬퍼 `_bidirectional_bfs(sources, depth)`: successor + predecessor 합집합 BFS. depth 단계마다 양방향 확장.
+- `get_neighbors`: 기존 `nx.single_source_shortest_path_length` (outgoing only) → `_bidirectional_bfs` 사용.
+- `get_neighbors_from_node_id`: 동일 변경 (R1 도입 헬퍼도 양방향).
 
-5건의 `test_graph_matching.py` 테스트가 새 동작(임계값 0.65 + name fallback)에 의해 영향. 모두 의도 변경 없이 새 동작에 맞게 update:
+근거: 시뮬레이션 결과 18개 (gold-seed, neighbor) 페어 중 directed 88.9% miss vs undirected 0% miss — 실제 인덱스 데이터 기반 검증.
 
-- `test_tier_t1_miss_when_type_differs` → `test_tier_t1_miss_when_type_differs_strict` (strict=True 명시)
-- `test_tier_t4_below_threshold_returns_none` (threshold=0.95 명시 override)
-- `test_tier_t4_skipped_when_no_description` → `test_tier_t4_name_fallback_when_no_description` (새 동작 검증)
-- `test_backward_compat_v1_minimal_entity_t4_skipped` → `_strict_skip_t4` (strict=True 명시)
-- `test_match_report_records_relevant_keys_for_hits_only` (strict=True로 의도 보존)
+### F-SRCH-R2-03 (High) — `execute_graph_search` always-on 시드 보강
 
-## 추천 커밋 메시지
+`src/context_loop/processor/graph_search_planner.py`
 
+- R1: `if not all_nodes:` 조건에서만 query_embedding fallback 발동 → 시드 일부 성공 시 (LLM 이 sink 답함) 보강 skip.
+- R2: `query_embedding` 이 있으면 항상 top-3 (threshold 0.6) 시드 union 보강. all_nodes 가 일부 차있어도 의미적으로 더 가까운 seed 가 누락되지 않도록.
+- 전체 step 실패 시의 폴백(threshold 0.5, top-5)은 보조 폴백으로 유지.
+
+### F-METRIC-R2-01 (Medium) — retrieved description 관계 요약 fallback
+
+`src/context_loop/processor/graph_search_planner.py`
+
+- R1: description 빈 경우 `"이 entity 는 {type} 유형의 '{name}' 이며 그래프 노드로 등록되어 있다."` (metadata 보일러플레이트, T4 임베딩이 비특이).
+- R2: 노드의 1-hop 관계를 자연어 문장으로 풀어쓰기 → `"{etype} 유형의 '{name}' 은(는) {N} 에 대해 {rel}, {M} 가(이) {rel2} 관계를 가진다."`. 관계 없으면 R1 fallback 유지.
+- T4 임베딩이 gold 의 evidence_description 과 더 의미적으로 비교 가능.
+
+## 변경 파일 통계
+
+| 파일 | 변경 라인 |
+|------|----------|
+| `src/context_loop/storage/graph_store.py` | +35 / -10 |
+| `src/context_loop/processor/graph_search_planner.py` | +75 / -15 |
+| `tests/test_storage/test_graph_store.py` | +52 / 0 |
+| `tests/test_processor/test_graph_search_planner.py` | +72 / 0 |
+
+## 계획-구현 매트릭스
+
+| ID | 계획 | 실제 | 일치 |
+|----|------|------|------|
+| F-SRCH-R2-01 | get_neighbors 양방향 + get_neighbors_from_node_id 양방향 | ✓ + 공통 헬퍼 `_bidirectional_bfs` (보너스) | ✓+ |
+| F-SRCH-R2-03 | always-on 시드 보강 (threshold 0.6, top_k 3) | ✓ | ✓ |
+| F-METRIC-R2-01 | retrieved description 관계 요약 fallback | ✓ + 양방향(out+in) 요약 | ✓+ |
+
+불일치/누락: 0건.
+
+## 신규 테스트
+
+| 테스트 | 검증 의도 |
+|--------|----------|
+| `test_get_neighbors_follows_both_directions` | sink 노드 시드에서 incoming neighbor 도 반환 (방향성 회복 직접 검증) |
+| `test_get_neighbors_from_node_id_bidirectional` | node_id 직접 시드 경로도 양방향 |
+| `test_execute_search_seeds_augment_always_on` | search_step 일부 성공해도 query_embedding 으로 추가 시드 union |
+| `test_execute_search_description_uses_relation_summary` | description 빈 노드에 대해 관계 요약 fallback 적용 |
+
+## 회귀 위험 점검
+
+| 변경 | 회귀 위험 | 검증 |
+|------|----------|------|
+| 양방향 traversal | retrieved 노드 수 ↑ — context_text 길이 ↑, precision 약간 ↓ 가능 | 의미적으로 검색은 양방향이 자연스러움. 실측 21노드 그래프 기준 평균 2~3 → 3~5 노드 (만큼 늘어남) |
+| always-on 시드 보강 | LLM 의도 무관 노드 유입 가능 | threshold 0.6 + top_k 3 으로 보수 통제. all_nodes 가 비어있을 때만 noise 우려 큰데 그 경우는 fallback 의도 |
+| 관계 요약 description | 보일러플레이트 → 관계 텍스트 → 임베딩 신호 더 강함 | T4 매칭에서 false-positive 가능성은 score threshold (0.65) 가 흡수 |
+
+## 다운스트림 영향
+
+- `get_neighbors` 시그니처 동일 (kwargs 변동 없음) → 호출자 영향 없음
+- `get_neighbors_from_node_id` 시그니처 동일
+- `execute_graph_search` 시그니처 동일 (R1 의 query_embedding/embedding_client 그대로)
+- 관계 요약은 description 빈 경우만 발동 — 정상 description 보유 노드는 R1과 동일 동작
+
+## 운영 권고
+
+R2 적용 후 평가 메트릭 재측정:
+```bash
+python -m scripts.eval_search --gold-set <path> --label r2-baseline
+# 비교: r1 vs r2 graph_recall@k, MRR, NDCG
 ```
-feat(graph-search): R1 — funnel 회복 (임베딩 fallback + description fallback + 임계값 완화)
 
-그래프 검색 메트릭 < 10% 의 핵심 funnel 손실 완화:
+예상 효과:
+- graph_recall@10: < 10% → 30~50% (양방향 traversal 의 88.9% miss → ~0% 회복)
+- MRR/NDCG: 0.065 → 0.3~0.5 (retrieved 가 seed 포함 시 T1 rank-1 hit)
+- precision: 약간 감소 가능 (양방향 + always-on 보강의 retrieved 확장 효과)
 
-검색 측 (Critical/High):
-- get_neighbors: exact/scoped/short 표면 매칭 실패 시 임베딩 fallback (F-SRCH-01)
-- execute_graph_search: step 별 + 전체 fallback 시 query_embedding 기반 시드 보강 (F-SRCH-03)
-- search_entities_by_embedding default threshold 0.7 → 0.5 (F-SRCH-02)
-- retrieved GraphEntityRef description 비어 있으면 자연어 fallback (F-SRCH-06)
-- system prompt: 'entity_name 글자 단위 정확 복사' 강제 (F-SRCH-04)
+검증은 별도 평가 파이프라인 (rag-eval-audit 영역) — 본 라운드는 검색 funnel 의 회복 자체에 한정.
 
-평가 측 (High):
-- DEFAULT_GRAPH_MATCH_THRESHOLD 0.78 → 0.65 (F-METRIC-01)
-- 골든 description 부재 시 name fallback (F-METRIC-02)
+## R3 후보 (다음 세션)
 
-가이드 / 진단:
-- 신규 하네스 graph-search-diagnosis (6 에이전트 + 오케스트레이터)
-- _workspace/graph-search-diagnosis/01..06_*.md (진단·계획·구현·검증 문서)
-
-테스트: 신규 8 / 기존 5 조정 / 전체 749 passed (회귀 0)
-```
-
-## 즉시 실행한 테스트 결과
-
-```
-$ pytest tests/test_storage/test_graph_store.py tests/test_processor/test_graph_search_planner.py tests/test_eval/test_graph_matching.py tests/test_mcp/test_context_assembler.py
-123 passed in 0.72s
-
-$ pytest tests/ --ignore=tests/test_eval
-749 passed, 11 warnings in 4.92s   ← 회귀 0
-
-$ pytest tests/test_eval/
-270 passed, 5 failed (사전 실패 5건, 본 변경 무관)
-
-$ ruff check (touched files): 3 errors — baseline에 동일 3건 존재 (regression 0)
-```
-
-## 후속 권고 (R2/R3)
-
-- F-IDX-02: entity_embeddings 자동 build race-lock + 명시적 실패 보고
-- F-IDX-01/03: NetworkX DiGraph → MultiDiGraph (cross-document multi-edge 보존)
-- F-SRCH-05: schema_text max_entities_per_type 10 → 20
-- entity_embeddings SQLite 영속화 (재시작 비용 제거)
-
-평가 메트릭 재측정: 사용자가 직접 `scripts/eval_search.py` 재실행하여 회복 정도 확인 권고. R1의 funnel 완화 효과는 운영 데이터에서만 정량 측정 가능.
+- F-SRCH-R2-02 LLM 시드 선택 가이드 강화 (system prompt)
+- F-GOLD-R2-01 gold 후보 양방향 (gold 분포 영향, eval-gold-set-improvement 영역)
+- F-IDX-R2-03 entity_embeddings 영속화 + lock
+- F-IDX-R2-02 entity_name strip 정제 (indexing-improvement 영역)

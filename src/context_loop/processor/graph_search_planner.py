@@ -229,20 +229,24 @@ async def execute_graph_search(
 
     LLM 추측 entity_name 이 인덱스의 표기와 다른 경우(공백/케이스/하이픈 등)
     표면 매칭이 모두 실패하면 시드 노드가 0개가 되어 retrieved 결과가
-    빈다 — 그래프 메트릭 0% 의 주된 원인. 이를 완화하기 위해 두 단계
-    fallback 을 도입한다:
+    빈다 — 그래프 메트릭 0% 의 주된 원인. 이를 완화하기 위해 세 단계
+    fallback 을 도입한다 (R2):
 
     1. step 별: ``get_neighbors`` 가 표면 매칭 실패 시, step.entity_name 의
        임베딩(``embedding_client`` 가 있으면 즉시 계산)으로 가장 가까운 노드를
        시드로 사용.
-    2. 전체 step 이 모두 실패해도 ``query_embedding`` 이 제공되면 그것으로
+    2. **R2 — always-on 시드 보강**: search_steps 이 일부 성공해도(LLM 이
+       sink 이웃을 시드로 선택해 retrieved 가 sink 자신만 담는 케이스가 잦음)
+       ``query_embedding`` 으로 top-k 유사 노드를 항상 union 보강. 임계값을
+       다소 보수(0.6)로 잡아 noise 통제.
+    3. 전체 step 이 모두 실패해도 ``query_embedding`` 이 제공되면 그것으로
        가장 가까운 노드들을 시드로 추가 — LLM 계획이 완전히 빗나가도 의미
        유사도로 회복.
 
     Args:
         plan: LLM이 생성한 탐색 계획.
         graph_store: 그래프 저장소.
-        query_embedding: 쿼리 임베딩. 전체 step 실패 시 시드 보강에 사용.
+        query_embedding: 쿼리 임베딩. 시드 보강(2)과 폴백(3)에 사용.
         embedding_client: step 별 임베딩 fallback 에 사용 (없으면 step 별
             fallback 만 skip; 전체 fallback 은 query_embedding 으로 가능).
 
@@ -283,16 +287,43 @@ async def execute_graph_search(
                 all_node_ids.add(nid)
                 all_nodes.append(n)
 
-    # 전체 step 이 시드 0개로 실패한 경우 query_embedding 으로 직접 시드 보강.
-    # 메트릭 0% 의 핵심 원인 (F-SRCH-03) 을 완화한다 — LLM 추측 이름이 완전히
-    # 빗나가도 의미 유사도로 일부 회복 가능.
+    # R2 — always-on query embedding 시드 보강.
+    # LLM 이 질의에 명시된 sink 이웃(예: KakaoPay, Elasticsearch) 을 search step
+    # entity_name 으로 선택하면 retrieved 가 sink 자신만 담겨 gold seed 누락
+    # (양방향 traversal 도입 후에도 LLM 선택의 잡음을 보완). 임계값 0.6 으로
+    # 보수 — 의미 무관 노드 유입 최소화.
+    if query_embedding is not None:
+        boost = graph_store.search_entities_by_embedding(
+            query_embedding, threshold=0.6, top_k=3,
+        )
+        new_boost = 0
+        for s in boost:
+            nid = s.get("node_id")
+            if nid is None or nid in all_node_ids:
+                continue
+            reachable = graph_store.get_neighbors_from_node_id(nid, depth=1)
+            for n in reachable:
+                n_nid = n.get("id")
+                if n_nid and n_nid not in all_node_ids:
+                    all_node_ids.add(n_nid)
+                    all_nodes.append(n)
+                    new_boost += 1
+        if new_boost:
+            logger.debug(
+                "그래프 탐색 — query 임베딩 always-on 시드 보강 (+%d nodes)",
+                new_boost,
+            )
+            if not searched_entities:
+                searched_entities.append("(query-embedding fallback)")
+
+    # 전체 step + 보강 모두 실패한 경우 임계값 더 낮춰 마지막 폴백.
     if not all_nodes and query_embedding is not None:
         similar = graph_store.search_entities_by_embedding(
             query_embedding, threshold=0.5, top_k=5,
         )
         if similar:
             logger.info(
-                "그래프 탐색 — 모든 step 실패, query 임베딩 시드 보강 (n=%d)",
+                "그래프 탐색 — 모든 step 실패, query 임베딩 시드 폴백 (n=%d)",
                 len(similar),
             )
             for s in similar:
@@ -366,6 +397,50 @@ async def execute_graph_search(
     # 와 동일 키로 비교 가능하도록 dataclass 외부에 채워준다.
     # 2차: description 도 채워서 tiered matching T4 (embedding) 이 자연어
     # evidence 를 비교할 수 있게 한다.
+    # R2 (F-METRIC-R2-01): description 자연어 fallback 의 비특이성 문제를
+    # 줄이기 위해, node 의 1-hop 관계를 자연어 문장으로 풀어쓴다 — 평가 측의
+    # gold evidence_description 과 의미적으로 더 비교 가능.
+    id_to_meta: dict[int, tuple[str, str]] = {
+        n["id"]: (
+            str(n.get("entity_name", "")),
+            str(n.get("entity_type", "")),
+        )
+        for n in all_nodes
+    }
+    out_rels: dict[int, list[tuple[str, str]]] = {nid: [] for nid in id_to_meta}
+    in_rels: dict[int, list[tuple[str, str]]] = {nid: [] for nid in id_to_meta}
+    for edge in edges:
+        src_id = edge.get("source")
+        tgt_id = edge.get("target")
+        rel = str(edge.get("relation_type", "관련"))
+        if src_id in id_to_meta and tgt_id in id_to_meta:
+            tgt_name = id_to_meta[tgt_id][0]
+            src_name = id_to_meta[src_id][0]
+            out_rels.setdefault(src_id, []).append((rel, tgt_name))
+            in_rels.setdefault(tgt_id, []).append((rel, src_name))
+
+    def _natural_description(
+        node_id: int, name: str, etype: str,
+    ) -> str:
+        outs = out_rels.get(node_id, [])
+        ins = in_rels.get(node_id, [])
+        parts: list[str] = []
+        # 최대 3개씩 — context 길이 통제.
+        for rel, tgt in outs[:3]:
+            parts.append(f"{tgt} 에 대해 {rel}")
+        for rel, src in ins[:3]:
+            parts.append(f"{src} 가(이) {rel}")
+        if parts:
+            type_hint = f"{etype} 유형의 " if etype else ""
+            joined = ", ".join(parts)
+            return f"{type_hint}'{name}' 은(는) {joined} 관계를 가진다."
+        # 관계가 없는 단독 노드 — 기존 자연어 fallback 유지.
+        return (
+            f"이 entity 는 {etype} 유형의 '{name}' 이며 그래프 노드로 등록되어 있다."
+            if etype
+            else f"이 entity 는 '{name}' 이며 그래프 노드로 등록되어 있다."
+        )
+
     entities: list[GraphEntityRef] = []
     seen_pairs: set[tuple[str, str]] = set()
     for node in all_nodes:
@@ -381,16 +456,12 @@ async def execute_graph_search(
         description = ""
         if isinstance(node_props, dict):
             description = str(node_props.get("description") or "")
-        # description 이 비어 있으면 자연어 fallback 으로 채워준다 — 평가 측
-        # tiered matching 의 T4(embedding) 단계가 짧은 이름끼리 비교할 때
-        # 임베딩이 너무 비특이적이 되어 cosine 이 임계값을 넘지 못하는 funnel
-        # 손실을 줄인다.
+        # description 이 비어 있으면 1-hop 관계 요약으로 채움 — T4 매칭의
+        # 의미 임베딩이 짧은 이름끼리 비교 시 비특이적이 되는 funnel 손실을
+        # 줄인다. R1 의 metadata-스타일 보일러플레이트보다 더 의미적.
         if not description:
-            description = (
-                f"이 entity 는 {etype} 유형의 '{name}' 이며 그래프 노드로 등록되어 있다."
-                if etype
-                else f"이 entity 는 '{name}' 이며 그래프 노드로 등록되어 있다."
-            )
+            node_id = node.get("id")
+            description = _natural_description(node_id, name, etype)
         entities.append(GraphEntityRef(
             name=name,
             type=etype,

@@ -380,6 +380,81 @@ async def test_execute_search_fills_description_fallback_for_retrieved(
     assert "system" in entity.description
 
 
+@pytest.mark.asyncio
+async def test_execute_search_seeds_augment_always_on(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R2 (F-SRCH-R2-03): search_steps 가 일부 성공해도 query_embedding 으로
+    top-k 시드를 always-on 합집합 보강한다.
+
+    LLM 이 질의에 명시된 sink 이웃을 search step 으로 답하면 retrieved 가
+    sink 자신만 담겨 gold seed 누락 — 양방향 traversal 보강 위에 의미
+    유사도 보강을 추가한다.
+    """
+    doc_id = await _create_doc(meta_store)
+    # 그래프: AuthService (gold) → KakaoPay (sink)
+    # 시나리오: LLM 이 KakaoPay 를 시드로 답해도 query embedding 으로
+    # AuthService 가 추가 시드로 보강되어 retrieved 에 포함되어야 한다.
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="AuthService", entity_type="service"),
+            Entity(name="KakaoPay", entity_type="team"),
+        ],
+        relations=[
+            Relation(source="AuthService", target="KakaoPay", relation_type="depends_on"),
+        ],
+    ))
+    mock_embed = AsyncMock()
+    # AuthService 가 query embedding 과 더 비슷하게 임베딩
+    mock_embed.aembed_documents = AsyncMock(return_value=[[0.95, 0.05], [0.1, 0.9]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    plan = GraphSearchPlan(
+        should_search=True,
+        search_steps=[SearchStep(entity_name="KakaoPay", depth=1)],
+    )
+    # query embedding 이 AuthService 와 cosine ~0.95 (threshold 0.6 통과)
+    result = await execute_graph_search(
+        plan, graph_store, query_embedding=[1.0, 0.0],
+    )
+    assert result is not None
+    names = {e.name for e in result.entities}
+    # KakaoPay 는 step 이 잡았고, 양방향 traversal 로 AuthService 도 잡아야 한다.
+    # 양방향이 작동 안 해도 always-on 보강이 AuthService 를 추가로 잡아야 한다.
+    assert "KakaoPay" in names
+    assert "AuthService" in names
+
+
+@pytest.mark.asyncio
+async def test_execute_search_description_uses_relation_summary(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R2 (F-METRIC-R2-01): description 이 비어있을 때 1-hop 관계 요약으로
+    채운다 — 평가 측 T4 임베딩 매칭의 의미적 분별력을 강화."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        # description 비어있음 — R1 fallback path 발동
+        entities=[
+            Entity(name="Hub", entity_type="service", description=""),
+            Entity(name="Down", entity_type="component", description=""),
+        ],
+        relations=[
+            Relation(source="Hub", target="Down", relation_type="uses"),
+        ],
+    ))
+    plan = GraphSearchPlan(
+        should_search=True,
+        search_steps=[SearchStep(entity_name="Hub", depth=1)],
+    )
+    result = await execute_graph_search(plan, graph_store)
+    assert result is not None
+    by_name = {e.name: e for e in result.entities}
+    # Hub 의 description 은 관계 요약 — "Down" 과 "uses" 가 포함
+    hub_desc = by_name["Hub"].description
+    assert "Down" in hub_desc, f"Hub description should mention neighbor: {hub_desc!r}"
+    assert "uses" in hub_desc, f"Hub description should mention relation: {hub_desc!r}"
+
+
 def test_system_prompt_enforces_exact_entity_name_copy() -> None:
     """R1 F-SRCH-04: 시스템 프롬프트가 'entity_name 을 글자 단위로 정확 복사' 를
     명시적으로 강제한다 — LLM 이 공백/케이스/하이픈을 임의로 바꿔서 매칭이

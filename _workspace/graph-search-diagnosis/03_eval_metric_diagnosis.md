@@ -1,107 +1,120 @@
-# Graph Eval Metric Diagnosis
+# Graph Eval Metric + Gold Set Diagnosis (R2)
 
-> 정적 코드 분석 기준. 메트릭 정의 자체는 대체로 정확하지만, **검색이 빈 결과를 반환하면 메트릭은 정의상 0**.
+> R1은 정적 분석으로 임계값 완화·name fallback 2건 머지. R2는 **gold ↔ index 정합성**과 **메트릭 정의의 funnel 손실 기여도**를 정량 분석.
 
-## 메트릭 계산 흐름 (eval_search.py)
+## 골드셋 생성 메커니즘 (코드 추적)
 
-```
-GoldItem.relevant_graph_entities   ─┐
-                                    ├─► run_entity_matching(threshold=0.78)
-AssembledContext.retrieved_graph_entities ─┘
-                                    │
-                                    ├─ T1 exact (name.lower, type)
-                                    ├─ T2 alias (golden.aliases × type)
-                                    ├─ T3 normalize (NFKC + 구두점 제거 × type)
-                                    └─ T4 embedding (description cosine ≥ 0.78, type-agnostic)
-                                    ▼
-                              MatchReport
-                                    │
-                                    ├─ retrieved_keys_in_rank_order (= 매칭된 gold의 key list)
-                                    └─ all_relevant_keys (= 모든 gold key set)
-                                    ▼
-       recall@k / precision@k / hit@k / mrr / ndcg@k (metrics.py)
-```
+흐름: `scripts/build_synthetic_gold_set.py:_run_graph_mode` → `load_candidate_subgraphs` → `generate_graph_questions` (synth.py) → `_make_graph_gold_item`.
 
-## 메트릭 측 핵심 발견
+### 핵심 코드 흐름
 
-### F-METRIC-01 (HIGH): `DEFAULT_GRAPH_MATCH_THRESHOLD = 0.78` 이 매우 보수적
+1. **`load_candidate_subgraphs`** (build_synthetic_gold_set.py:183-303):
+   - `graph_store.get_neighbors(name, depth=1)` 호출
+   - `if len(neighbors) < min_neighbors + 1: continue` (min_neighbors=1 default)
+   - → **outgoing edge >= 1 인 노드만 gold subgraph 후보**
+   - 실측: 21 노드 중 **6개만 통과** (Auth/Order/Payment/Notification/Search Service + API Gateway)
 
-- **위치**: `src/context_loop/eval/graph_match.py:33`
-- **현재 동작**: T4 embedding 매칭의 cosine 임계값 0.78
-- **문제**:
-  - 설계 §2.2 결정값이라 명시되어 있으나, description이 짧거나 노이즈 있는 경우 0.78 통과 어려움
-  - 특히 retrieved entity의 description이 비어있어 name fallback인 경우 (F-SRCH-06), 짧은 이름끼리는 비특이적 임베딩 → cosine이 낮음
-  - 의미 매칭의 실제 기준: 0.65~0.70 정도가 합리적
-- **개선 방향**:
-  - `DEFAULT_GRAPH_MATCH_THRESHOLD = 0.65`
-  - 또는 tier 별로 임계값을 분리 — T4은 0.65, T1~T3은 binary
-- **심각도**: High (메트릭 측 손실의 한 축) | **공수**: S
+2. **`generate_graph_questions`** (synth.py:703-745):
+   - 프롬프트 (synth.py 의 `GRAPH_GENERATE_PROMPT_TEMPLATE`, 추정 위치):
+     ```
+     엔티티: {entity_name} ({entity_type})
+     설명: {entity_description}
+     주변 관계: {edges_text}
+     이 엔티티 또는 관계에서 답을 찾을 수 있는 한국어 질문을 N개 생성해라
+     ```
+   - LLM 자연어 질의 생성 + evidence_description / aliases / relation 보조.
 
-### F-METRIC-02 (MEDIUM): T4 시 골든 `description` 부재면 즉시 None — fallback 없음
+3. **`_make_graph_gold_item`** (build_synthetic_gold_set.py:949-1005):
+   ```python
+   entity_ref = GraphEntityRef(
+       name=sg["entity_name"],            # SEED 노드 entity_name 그대로
+       type=sg["entity_type"],
+       aliases=list(gq.entity_aliases),
+       description=gq.evidence_description,
+   )
+   relevant_graph_entities=[entity_ref]   # SEED 1개만
+   ```
+   - → gold 의 `relevant_graph_entities[0].name` == 인덱스 노드의 `entity_name` (글자 단위 동일).
 
-- **위치**: `src/context_loop/eval/graph_match.py:300-301`
-- **현재 동작**:
+### 결론: gold ↔ index 표면 키 정합성은 OK
+
+- gold-side `(name.lower().strip(), type.strip())` 키 == index-side `(entity_name.lower().strip(), entity_type.strip())` 키
+- T1 exact 매칭이 retrieved 에 seed 가 들어가기만 하면 무조건 hit.
+- **그러나 retrieved 에 seed 가 들어가지 않는 게 funnel 의 결정적 손실** — `02_search_pipeline_diagnosis.md` 의 F-SRCH-R2-01 참조.
+
+## F-GOLD-R2-01 (MEDIUM): gold subgraph 후보가 outgoing 의존 → 인덱스 노드의 71% (15/21) 가 영원히 gold seed 안됨
+
+- 인덱스의 sink 노드(예: KakaoPay, Elasticsearch, 결제 팀 등)는 gold question 의 정답으로 결코 등장하지 못함.
+- 결과: gold question 분포가 service 중심으로 편향.
+- 평가 신호의 한쪽 (subgraph 다양성) 제한.
+- **해결**: `load_candidate_subgraphs` 가 양방향 이웃(outgoing+incoming)을 보도록 변경 → 21 노드 중 17개가 후보. 단, 본 변경은 **gold 빌드 분포에 영향**이라 별도 라운드 고려 (rag-eval-audit / eval-gold-set-improvement 하네스 영역 — 본 라운드는 검색 funnel 회복이 우선).
+
+## F-METRIC-R2-01 (MEDIUM): T4 의 description 자연어 fallback 매칭의 비특이성
+
+### 코드 위치
+
+- 검색 측 (graph_search_planner.py:386-393):
   ```python
-  if not golden.description:
-      return None
+  if not description:
+      description = (
+          f"이 entity 는 {etype} 유형의 '{name}' 이며 그래프 노드로 등록되어 있다."
+          ...
+      )
   ```
-- **문제**: 골드셋 합성기가 description을 안 채운 케이스가 있으면 T4 전체 skip → T1~T3에서 표면 매칭이 실패한 골든은 모두 미매칭
-- **개선 방향**:
-  - 골든 description 비어있을 때 `golden.name` 자체로 fallback (검색 측의 r_text fallback과 대칭)
-  - 또는 별도 가드 메시지로 골드셋 신뢰성 문제 노출
-- **심각도**: Medium | **공수**: S
-
-### F-METRIC-03 (HIGH): retrieved의 description fallback이 짧은 이름이라 의미 임베딩이 비특이적
-
-- **위치**: `src/context_loop/eval/graph_match.py:311`
-- **현재 동작**:
+- 매칭 측 (graph_match.py:310-318):
   ```python
-  r_text = (r.description or "").strip() or (r.name or "").strip()
+  g_text = golden.description or golden.name or ""
+  ...
+  g_emb = embed_fn(g_text)
   ```
-- **문제**:
-  - retrieved.description이 빈 경우 (F-SRCH-06 와 연결) r.name으로 임베딩
-  - r.name이 짧은 이름(예: `"main"`, `"foo"`)이면 임베딩이 비특이적 → 무작위 cosine 분포 → 0.78 통과 못함
-- **개선 방향**: 검색 측에서 description 폴백 보강(F-SRCH-06)과 묶음
-- **심각도**: High | **공수**: S (검색 측과 함께)
 
-### F-METRIC-04 (LOW): tier 별 score 차이 — embedding=cosine 점수, normalize=0.9 고정
+### 문제
 
-- **위치**: `src/context_loop/eval/graph_match.py:297, 321`
-- **현재 동작**: T3 score=0.9 고정, T4 score=실제 cosine
-- **문제**: 메트릭 평균 score 비교 시 두 tier가 다른 분포 — `graph_match_score_avg`가 의미 해석하기 어려움
-- **개선 방향**: 운영 영향 없음. 보고만.
-- **심각도**: Low
+- gold 측 description 은 LLM 합성 `evidence_description` (자연 문장).
+- retrieved 측 description 은 R1 의 metadata-스타일 fallback ("이 entity 는 ... 등록되어 있다").
+- 두 description 의 임베딩 cosine 이 threshold 0.65 를 못 넘김 (둘이 의미적으로 무관 — 한쪽은 정답 evidence, 다른 쪽은 metadata 보일러플레이트).
+- T4 가 사실상 발동되지 않음 → T1 표면 매칭에 전적 의존.
 
-## 골드셋-검색 결과 키 정합성
+### R1 fix 평가
 
-- **gold side**: `GoldItem.relevant_graph_entities` = `list[GraphEntityRef(name, type, description, aliases)]`
-- **retrieved side**: `AssembledContext.retrieved_graph_entities` = `list[GraphEntityRef(name, type, description)]` (검색이 채움)
-- **키**: `(name.lower(), type)` — 양측 동일 공간
+- R1 의 description fallback (F-SRCH-06) 은 **T4 가 작동하기 위한 텍스트 채우기** 였지만, 텍스트의 *의미*가 비특이라 T4 매칭 자체는 회복하지 못함.
+- threshold 0.78 → 0.65 (F-METRIC-01) 도 noise 영역까지 떨어뜨려 다른 페어 false-positive 위험 살짝 ↑.
 
-**키 형식 정합성**: 일치 (둘 다 `(lower name, type)`). 문제는 **값**이 안 맞는 케이스가 다수.
+### 개선 방향 (R2)
 
-## funnel 손실 시뮬레이션
+- retrieved description fallback 을 **인접 관계 정보로 채움** — entity_name 자체보다 "이 entity 는 X 에 의존하며 Y 에 사용된다" 같은 1-hop 관계 요약 → 임베딩이 더 의미적.
+- 또는 T4 score 를 entity_name 임베딩 매칭으로 보조 — name 자체 vs golden description 임베딩 비교 path 추가.
 
-10건의 골드 entity 중 검색이 정확히 5건만 표면 표기로 매칭한다고 가정:
-- T1 exact: 5건 hit (50%)
-- T2 alias: aliases가 있는 골드의 경우 추가 매칭 가능 (현실적으로 골드 항상 alias 보유는 아님)
-- T3 normalize: 표기 변형 정규화 — 한국어 공백/하이픈 차이 흡수 일부
-- T4 embedding: description이 양측 모두 살아있고 임계값 통과 시
-- 합계 60% 정도 매칭 가능 — recall ≈ 0.6
+## MRR/NDCG = 0.065 의 정량 해석
 
-그러나 사용자 보고: `< 10%`. 즉 검색이 **거의 빈 결과**를 반환하고 있다는 강한 증거. 메트릭 측보다 검색 측이 funnel의 손실 큰 위치.
+- MRR ≈ 1/E[rank]. 0.065 → E[rank] ≈ 15. top_k=10 이면 거의 outside.
+- recall@10 < 0.1 → top-10 안에 매칭된 gold 가 매우 적음.
+- **분포 추정**:
+  - ~5~10% 의 query 만 T1 hit (LLM 시드 정확 + retrieved 에 seed 들어감)
+  - 나머지 ~90~95% 는 retrieved 자체에 seed 누락 → 메트릭 0
+  - 평균이 ~0.065 라는 건 hit 케이스의 평균 score 가 ~0.65~0.7 정도 (1.0 hit @ 5~10% × score) → mostly hit-at-rank-1
 
-## 권고
+→ 메트릭은 **검색이 retrieved 에 seed 를 넣지 못한 게 90%+ 의 case 라는 의미**. F-SRCH-R2-01 가 정답.
 
-| ID | 우선 | 권고 |
+## R1 메트릭 fix 효과 평가
+
+| R1 fix | 실제 효과 추정 |
+|--------|--------------|
+| F-METRIC-01 threshold 0.78→0.65 | T4 임계값 완화이나 T4 자체가 R2 funnel 에서 활성화 안됨 (description fallback 의 비특이성) → **효과 ~0** |
+| F-METRIC-02 golden description name fallback | 골드 description 비어있을 때만 발동 — 합성 골드는 거의 항상 description 채움 → **효과 미미** |
+
+→ R1 메트릭 fix 는 funnel 의 **T4 단계 회복**을 시도했지만, 실제 funnel 손실은 **T1 전 단계(retrieve)** 에 있어서 효과 미미.
+
+## 권고 (메트릭/골드셋 측)
+
+| ID | 권고 | 우선 |
 |----|------|------|
-| F-METRIC-01 | High | 임계값 0.78 → 0.65 (운영 변경) |
-| F-METRIC-02 | Medium | 골드 description 부재 시 name fallback |
-| F-METRIC-03 | High | 검색 측 description fallback 보강과 동기 |
-| 골드셋 신뢰성 | (별도) | rag-eval-audit 하네스 영역 |
+| F-METRIC-R2-01 | retrieved description fallback 을 관계 요약으로 강화 (T4 회복) | Medium |
+| F-GOLD-R2-01 | load_candidate_subgraphs 양방향 (인덱스의 71% sink 노드도 gold 가능) | Medium (별도 라운드) |
+| 골드셋 신뢰성 일반 | 자체 매칭 self-test (gold 생성 직후 retrieved 시뮬레이션해서 hit rate 측정) | High (rag-eval-audit 영역) |
 
-## 범위 외
+## 범위 외 (본 R2 하네스에서 다루지 않음)
 
-- 메트릭 정의 자체의 정확성 검토 (rag-eval-audit 영역)
-- 골드셋 합성 정확성 (eval-gold-set-improvement 영역)
-- 본 진단은 "왜 이번 run의 메트릭이 0인가"에 한정
+- gold 합성 로직 자체 (synth.py) — eval-gold-set-improvement / rag-eval-audit 영역
+- 메트릭 정의 자체 (metrics.py) — rag-eval-audit 영역
+- 본 R2 는 **검색 funnel 회복(F-SRCH-R2-01)** 이 핵심.
