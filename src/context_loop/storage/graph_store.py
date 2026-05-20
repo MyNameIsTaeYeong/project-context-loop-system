@@ -191,14 +191,17 @@ class GraphStore:
                         properties=existing_props,
                     )
             else:
-                # 새 노드 생성
-                node_id = await self._store.create_graph_node(
+                # 새 노드 생성 — graph_nodes INSERT 와 graph_node_documents link
+                # INSERT 를 같은 트랜잭션 / 한 번의 commit 으로 묶어, 두 INSERT
+                # 사이의 await 양보 시점에 다른 코루틴의 고아 노드 정리 SQL 이
+                # 방금 만든 노드를 삭제하여 후속 add_node_document_link 가 FK
+                # 위반을 일으키던 race window 를 제거한다.
+                node_id = await self._store.create_graph_node_with_link(
                     document_id=document_id,
                     entity_name=entity.name,
                     entity_type=entity.entity_type,
                     properties=json.dumps(props, ensure_ascii=False),
                 )
-                await self._store.add_node_document_link(node_id, document_id)
                 new_count += 1
                 self._graph.add_node(
                     node_id,

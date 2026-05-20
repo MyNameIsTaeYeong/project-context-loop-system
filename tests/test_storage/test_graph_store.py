@@ -324,6 +324,45 @@ async def test_search_entities_by_embedding(graph_store: GraphStore, meta_store:
 
 
 @pytest.mark.asyncio
+async def test_save_graph_data_concurrent_orphan_cleanup_safe(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """save_graph_data 가 신규 노드 INSERT 와 link INSERT 를 한 트랜잭션으로
+    처리하여, 동시 진행 중인 다른 문서의 delete_graph_data_by_document 가
+    호출되어도 FK 위반이 발생하지 않는다 — 재인덱싱 산발 실패의 핵심 회귀 가드.
+
+    asyncio 동시 실행으로 두 코루틴을 함께 돌리는 시뮬레이션:
+    - A: save_graph_data 로 신규 노드 N 개 생성
+    - B: 비어있는 다른 문서의 delete_graph_data_by_document 호출 (orphan SQL 발동)
+    """
+    doc_a = await _create_doc(meta_store)
+    doc_b = await _create_doc(meta_store)
+
+    # B 의 사전 정리 호출은 B 가 link 한 노드만 정리하므로 안전 — 이 테스트는
+    # save 도중 다른 문서의 delete 가 발생하더라도 A 의 신규 노드가 살아남는지
+    # 검증한다.
+    import asyncio
+    async def run_save() -> None:
+        data = GraphData(
+            entities=[
+                Entity(name=f"Node{i}", entity_type="system") for i in range(5)
+            ],
+            relations=[],
+        )
+        await graph_store.save_graph_data(doc_a, data)
+
+    async def run_delete_other() -> None:
+        # B 의 정리 — A 와 무관한 작업
+        await meta_store.delete_graph_data_by_document(doc_b)
+
+    await asyncio.gather(run_save(), run_delete_other())
+
+    # A 의 모든 노드가 보존되어야 함 (FK 위반 / 누락 없음)
+    nodes_after = await meta_store.get_graph_nodes_by_document(doc_a)
+    assert len(nodes_after) == 5
+
+
+@pytest.mark.asyncio
 async def test_search_entities_default_threshold_lowered_to_0_5(
     graph_store: GraphStore, meta_store: MetadataStore,
 ) -> None:
