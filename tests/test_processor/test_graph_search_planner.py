@@ -316,6 +316,83 @@ def test_system_prompt_exposes_full_vocabulary() -> None:
         assert entry.name in prompt, f"relation_type '{entry.name}' 누락"
 
 
+@pytest.mark.asyncio
+async def test_execute_search_seeds_from_query_embedding_when_steps_miss(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R1 F-SRCH-03: LLM 추측 entity_name 이 모두 인덱스에 없을 때
+    ``query_embedding`` 으로 시드 노드를 보강한다 — 그래프 메트릭 0% 의
+    핵심 funnel 손실 완화."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="AuthService", entity_type="system"),
+            Entity(name="OrderService", entity_type="system"),
+        ],
+        relations=[
+            Relation(source="AuthService", target="OrderService", relation_type="depends_on"),
+        ],
+    ))
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # LLM 이 잘못된 entity_name 을 답함 — 표면 매칭 전혀 안 됨
+    plan = GraphSearchPlan(
+        should_search=True,
+        search_steps=[SearchStep(entity_name="DoesNotExistInIndex", depth=1)],
+    )
+    # query_embedding 으로 AuthService 와 가까운 의미 벡터 제공
+    result = await execute_graph_search(
+        plan, graph_store, query_embedding=[0.95, 0.05],
+    )
+    # 시드 fallback 으로 AuthService 가 잡혀 결과가 비어있지 않다.
+    assert result is not None
+    names = {e.name for e in result.entities}
+    assert "AuthService" in names
+
+
+@pytest.mark.asyncio
+async def test_execute_search_fills_description_fallback_for_retrieved(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R1 F-SRCH-06: retrieved GraphEntityRef 의 description 이 비어 있으면
+    자연어 fallback 으로 채워준다 — 평가 측 T4 임베딩 매칭에서 짧은 이름
+    임베딩의 비특이성을 완화."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        # description 을 비워둔 entity
+        entities=[Entity(name="ShortName", entity_type="system", description="")],
+        relations=[],
+    ))
+    plan = GraphSearchPlan(
+        should_search=True,
+        search_steps=[SearchStep(entity_name="ShortName", depth=1)],
+    )
+    result = await execute_graph_search(plan, graph_store)
+    assert result is not None and len(result.entities) == 1
+    entity = result.entities[0]
+    assert entity.name == "ShortName"
+    # 비어있지 않고 자연어 fallback 텍스트가 들어감
+    assert entity.description
+    assert "ShortName" in entity.description
+    assert "system" in entity.description
+
+
+def test_system_prompt_enforces_exact_entity_name_copy() -> None:
+    """R1 F-SRCH-04: 시스템 프롬프트가 'entity_name 을 글자 단위로 정확 복사' 를
+    명시적으로 강제한다 — LLM 이 공백/케이스/하이픈을 임의로 바꿔서 매칭이
+    실패하는 funnel 손실을 줄인다."""
+    from context_loop.processor.graph_search_planner import _render_system_prompt
+
+    prompt = _render_system_prompt()
+    # 핵심 키워드 — 표현이 약간 달라도 의도가 살아있는지 확인
+    assert "글자 단위" in prompt or "정확히" in prompt
+    # 표기 변형 예시가 안내되어 LLM 이 의도를 이해
+    assert "공백" in prompt
+
+
 def test_system_prompt_includes_intent_mapping() -> None:
     """질의 의도 → 관계 매핑 가이드가 시스템 프롬프트에 포함된다."""
     from context_loop.processor.graph_search_planner import _render_system_prompt

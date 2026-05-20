@@ -329,6 +329,64 @@ async def test_graph_nodes_and_edges(store: MetadataStore) -> None:
     assert await store.get_graph_edges_by_document(doc_id) == []
 
 
+async def test_create_graph_node_with_link_atomic(store: MetadataStore) -> None:
+    """``create_graph_node_with_link`` 는 graph_nodes 와 graph_node_documents
+    두 INSERT 를 같은 트랜잭션 한 번의 commit 으로 처리한다 — 두 INSERT 사이
+    await 양보 시점에 다른 코루틴의 고아 노드 정리가 신규 노드를 잡아 FK
+    위반을 일으키던 race window 를 제거한다.
+    """
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    node_id = await store.create_graph_node_with_link(
+        document_id=doc_id, entity_name="X", entity_type="system",
+    )
+    # 노드와 link 가 동시에 보인다 — 별도 add_node_document_link 호출 없이도
+    # get_graph_nodes_by_document 에서 조회 가능.
+    nodes = await store.get_graph_nodes_by_document(doc_id)
+    assert len(nodes) == 1
+    assert nodes[0]["id"] == node_id
+
+
+async def test_delete_graph_data_by_document_narrow_orphan_cleanup(
+    store: MetadataStore,
+) -> None:
+    """``delete_graph_data_by_document`` 의 고아 정리가 '이 문서가 unlink 한
+    노드' 만 범위로 좁혀져, 동시 처리 중인 다른 문서의 신규 노드(아직 link 등록
+    중인 노드)를 잘못 삭제하지 않는다 — FK 위반의 핵심 회귀 가드.
+
+    시나리오 재구성:
+    1. 문서 A 가 노드 X 를 생성 (link 까지 atomic) — 정상 등록 상태
+    2. 문서 B 가 노드 Y 를 INSERT 만 한 직후 (link 등록 직전) — 모사를 위해
+       create_graph_node 단독 호출로 'link 없는 신규 노드' 상태를 흉내냄
+    3. A 의 delete_graph_data_by_document 호출 — Y 가 link 없지만 본 문서의
+       unlink 범위가 아니므로 보존되어야 함
+    """
+    doc_a = await store.create_document(
+        source_type="manual", title="A", original_content="x", content_hash="ha",
+    )
+    doc_b = await store.create_document(
+        source_type="manual", title="B", original_content="y", content_hash="hb",
+    )
+    # A 의 노드 X (link 동반)
+    x_id = await store.create_graph_node_with_link(
+        document_id=doc_a, entity_name="X", entity_type="system",
+    )
+    # B 의 노드 Y — link 등록 직전 상태를 흉내내기 위해 단독 INSERT 만
+    y_id = await store.create_graph_node(
+        document_id=doc_b, entity_name="Y", entity_type="system",
+    )
+
+    # A 의 그래프 정리 — Y 가 보존되어야 함 (이전 구현은 전역 스캔으로 삭제했음)
+    await store.delete_graph_data_by_document(doc_a)
+
+    # 검증: Y 는 graph_nodes 에 남아있고, X 는 삭제됨.
+    all_nodes = await store.get_all_graph_nodes()
+    ids = {n["id"] for n in all_nodes}
+    assert y_id in ids, "다른 문서의 link 등록 중 신규 노드가 잘못 삭제됨"
+    assert x_id not in ids, "이번 문서가 unlink 한 노드는 정상 삭제되어야 함"
+
+
 async def test_processing_history(store: MetadataStore) -> None:
     doc_id = await store.create_document(
         source_type="manual", title="문서", original_content="x", content_hash="h"

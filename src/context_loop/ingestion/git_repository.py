@@ -25,6 +25,43 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 표준 vendored / 빌드 산출물 / 캐시 디렉토리. 이 디렉토리가 경로의 어느 segment
+# 에라도 나오면 ``collect_files`` 가 건너뛴다. ``supported_extensions`` 필터만으로는
+# 예컨대 ``node_modules/react/index.js`` 같은 third-party 코드를 막지 못한다.
+# 사용자 product_scopes 가 paths 로 명시적으로 좁히면 OK 이지만, ``scope_analyzer``
+# 자동 탐지나 광범위한 paths 설정에서는 노이즈가 크다.
+_DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "node_modules",
+    "bower_components",
+    "vendor",
+    "dist",
+    "build",
+    "target",
+    ".next",
+    ".nuxt",
+    "out",
+    ".idea",
+    ".vscode",
+    ".gradle",
+    ".terraform",
+})
+
+
+def _has_excluded_part(parts: tuple[str, ...]) -> bool:
+    """경로 components 중 하나라도 ``_DEFAULT_EXCLUDED_DIRS`` 에 해당하면 True."""
+    return any(p in _DEFAULT_EXCLUDED_DIRS for p in parts)
+
 
 @dataclass
 class ProductScope:
@@ -301,15 +338,24 @@ def collect_files(
         # 증분: 변경 파일만 처리
         candidates = changed_files
     else:
-        # 전체: 레포 전체 순회
+        # 전체: 레포 전체 순회. vendored/캐시 디렉토리는 일찍 제외하여 거대
+        # 트리(예: node_modules) 진입을 막는다.
         candidates = []
         for abs_path in clone_dir.rglob("*"):
-            if abs_path.is_file() and ".git" not in abs_path.parts:
-                candidates.append(str(abs_path.relative_to(clone_dir)))
+            if not abs_path.is_file():
+                continue
+            rel_parts = abs_path.relative_to(clone_dir).parts
+            if _has_excluded_part(rel_parts):
+                continue
+            candidates.append(str(abs_path.relative_to(clone_dir)))
 
     for rel_path in candidates:
         abs_path = clone_dir / rel_path
         if not abs_path.is_file():
+            continue
+        # 증분 경로(``changed_files``) 도 동일하게 제외 (git pull 시 vendored
+        # 디렉토리 안의 파일이 변경되었을 가능성).
+        if _has_excluded_part(Path(rel_path).parts):
             continue
 
         file_size = abs_path.stat().st_size
@@ -344,6 +390,8 @@ async def store_git_code(
     store: MetadataStore,
     file_info: FileInfo,
     repo_url: str,
+    *,
+    existing_by_source_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """코드 파일을 git_code 문서로 저장한다.
 
@@ -351,18 +399,25 @@ async def store_git_code(
         store: 초기화된 MetadataStore 인스턴스.
         file_info: 수집된 파일 정보.
         repo_url: 원본 레포지토리 URL.
+        existing_by_source_id: 호출자가 미리 빌드한 ``{source_id: doc}`` 캐시.
+            제공되면 매 호출마다 ``list_documents`` 를 다시 부르지 않아
+            O(N²) → O(N) 으로 성능이 좋아진다. None 이면 기존 동작 유지
+            (호환성).
 
     Returns:
         문서 dict에 created, changed 키가 추가된 결과.
     """
     source_id = file_info.relative_path
 
-    # 기존 문서 확인
-    existing_docs = await store.list_documents(source_type="git_code")
-    existing = next(
-        (d for d in existing_docs if d.get("source_id") == source_id),
-        None,
-    )
+    # 기존 문서 확인 — 캐시가 있으면 dict lookup, 없으면 fallback 으로 list_documents
+    if existing_by_source_id is not None:
+        existing = existing_by_source_id.get(source_id)
+    else:
+        existing_docs = await store.list_documents(source_type="git_code")
+        existing = next(
+            (d for d in existing_docs if d.get("source_id") == source_id),
+            None,
+        )
 
     if existing is None:
         doc_id = await store.create_document(
@@ -407,15 +462,24 @@ async def store_git_code(
 async def delete_removed_files(
     store: MetadataStore,
     deleted_paths: list[str],
+    *,
+    existing_by_source_id: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     """삭제된 파일의 git_code 문서를 제거한다.
+
+    Args:
+        store: MetadataStore.
+        deleted_paths: 삭제된 source_id 목록.
+        existing_by_source_id: 호출자가 미리 빌드한 캐시. 제공되면 추가
+            ``list_documents`` 호출을 생략한다.
 
     Returns:
         실제 삭제된 source_id 리스트.
     """
     removed: list[str] = []
-    existing_docs = await store.list_documents(source_type="git_code")
-    existing_by_source_id = {d["source_id"]: d for d in existing_docs}
+    if existing_by_source_id is None:
+        existing_docs = await store.list_documents(source_type="git_code")
+        existing_by_source_id = {d["source_id"]: d for d in existing_docs}
 
     for path in deleted_paths:
         doc = existing_by_source_id.get(path)
@@ -488,10 +552,23 @@ async def sync_repository(
         clone_dir, scopes, supported_extensions, file_size_limit_kb, changed_files
     )
 
+    # 기존 git_code 문서를 한 번만 로드하여 캐시로 사용 (O(N²) → O(N)).
+    # store_git_code / delete_removed_files 가 각각 list_documents 를 다시 호출하면
+    # N 개 파일 처리에 N+1 번 전체 스캔이 발생한다.
+    existing_docs_list = await store.list_documents(source_type="git_code")
+    existing_cache: dict[str, dict[str, Any]] = {
+        d["source_id"]: d for d in existing_docs_list if d.get("source_id")
+    }
+
     # git_code 문서 저장
     for file_info in files:
         try:
-            doc_result = await store_git_code(store, file_info, repo_url)
+            doc_result = await store_git_code(
+                store, file_info, repo_url,
+                existing_by_source_id=existing_cache,
+            )
+            # 캐시도 즉시 갱신해서 같은 sync 안에서의 후속 lookup 이 일관되게 한다
+            existing_cache[file_info.relative_path] = doc_result
             if doc_result["created"]:
                 result.created.append(file_info.relative_path)
             elif doc_result["changed"]:
@@ -507,7 +584,10 @@ async def sync_repository(
     # 삭제된 파일 처리
     if not is_new_clone and prev_commit:
         deleted_paths = await get_deleted_files(clone_dir, prev_commit)
-        result.deleted = await delete_removed_files(store, deleted_paths)
+        result.deleted = await delete_removed_files(
+            store, deleted_paths,
+            existing_by_source_id=existing_cache,
+        )
 
     logger.info(
         "레포 동기화 완료: %s (생성=%d, 갱신=%d, 삭제=%d, 무변경=%d, 오류=%d)",

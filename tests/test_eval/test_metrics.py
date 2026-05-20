@@ -231,6 +231,49 @@ def test_aggregate_with_variance_zero_variance() -> None:
     assert out["x"]["mean"] == 0.5
 
 
+def test_aggregate_with_variance_ignores_dict_values() -> None:
+    """``metrics`` dict 안에 ``graph_match_tiers_total`` 같은 nested dict 가
+    있어도 TypeError 없이 숫자 키만 집계한다. 호출자(eval_search.py)가
+    각 골드셋 metrics 에 dict 값을 섞어 넣어도 안전해야 한다 — 이전에는
+    ``float({...})`` 에서 ``TypeError: float() argument must be a string or
+    real number, not 'dict'`` 가 발생했다."""
+    runs = [
+        {
+            "recall@5": 0.7,
+            "mrr": 0.5,
+            "graph_match_tiers_total": {"T1": 10, "T2": 5},
+            "graph_rel_match_tiers_total": {"T1": 3, "T2": 2},
+        },
+        {
+            "recall@5": 0.8,
+            "mrr": 0.6,
+            "graph_match_tiers_total": {"T1": 12, "T2": 4},
+        },
+    ]
+    out = aggregate_with_variance(runs)
+    # 숫자 키는 정상 집계
+    assert "recall@5" in out
+    assert "mrr" in out
+    assert abs(out["recall@5"]["mean"] - 0.75) < 1e-9
+    # 비숫자 키(dict)는 결과에 들어가지 않음 — silent skip
+    assert "graph_match_tiers_total" not in out
+    assert "graph_rel_match_tiers_total" not in out
+
+
+def test_aggregate_with_variance_ignores_non_numeric_types() -> None:
+    """str, list, bool 같은 비숫자 값도 silently skip 한다 (aggregate 와 동일 정책)."""
+    runs = [
+        {"x": 1.0, "label": "run1", "flags": [True, False], "active": True},
+        {"x": 2.0, "label": "run2", "flags": [True], "active": False},
+    ]
+    out = aggregate_with_variance(runs)
+    assert out["x"]["mean"] == 1.5
+    # 비숫자 키 모두 skip
+    assert "label" not in out
+    assert "flags" not in out
+    assert "active" not in out  # bool 은 numeric 으로 취급 안 함 (aggregate 와 일관)
+
+
 # ---------------------------------------------------------------------------
 # Generic 메트릭이 (name, type) 튜플 키로도 동작 (R1 — graph 채점)
 # ---------------------------------------------------------------------------

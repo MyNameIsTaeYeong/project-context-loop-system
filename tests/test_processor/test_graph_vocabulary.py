@@ -46,6 +46,24 @@ def test_llm_body_vocab_subset_of_vocabulary() -> None:
     assert set(_DEFAULT_RELATION_TYPES) <= all_relation_type_names()
 
 
+def test_ast_code_vocab_subset_of_vocabulary() -> None:
+    """ast_code_extractor 가 emit 하는 entity/relation 타입도 vocab 에 정의돼야 한다.
+
+    실제 ast_code_extractor.to_graph_data 의 출력에 등장하는 타입과 graph_vocabulary
+    가 어긋나면 graph_search_planner 의 LLM 가이드에 빈 항목이 생겨 검색 활용도가
+    떨어진다. ast_code 가 사용하는 entity_type: module/function/class/method/
+    struct/interface, relation_type: imports/contains.
+    """
+    expected_etypes = {
+        "module", "function", "class", "method", "struct", "interface",
+    }
+    expected_rtypes = {"imports", "contains"}
+    missing_e = expected_etypes - all_entity_type_names()
+    missing_r = expected_rtypes - all_relation_type_names()
+    assert not missing_e, f"ast_code entity_type 누락: {missing_e}"
+    assert not missing_r, f"ast_code relation_type 누락: {missing_r}"
+
+
 def test_body_extractor_vocab_subset_of_vocabulary() -> None:
     """body_extractor 가 emit 하는 entity_type / relation_type 도 포함."""
     # body_extractor 는 mentions, documents, has_attribute, mentions_ticket 4종.

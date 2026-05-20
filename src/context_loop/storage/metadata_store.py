@@ -370,13 +370,58 @@ class MetadataStore:
         entity_type: str | None = None,
         properties: str | None = None,
     ) -> int:
-        """그래프 노드를 생성하고 ID를 반환한다."""
+        """그래프 노드를 생성하고 ID를 반환한다.
+
+        NOTE: 운영 경로(save_graph_data) 는 ``create_graph_node_with_link`` 를
+        사용한다 — 신규 노드 INSERT 직후 link INSERT 가 별도 commit 으로
+        분리되면, 두 commit 사이의 ``await`` 양보 시점에 다른 코루틴이 고아 노드
+        정리 SQL 을 실행하여 방금 만든 노드가 잘못 삭제될 수 있다 (FK violation
+        원인). 본 단독 메서드는 link 없는 노드 생성이 필요한 마이그레이션/
+        테스트 전용으로 보존.
+        """
         cursor = await self.db.execute(
             "INSERT INTO graph_nodes (document_id, entity_name, entity_type, properties) VALUES (?, ?, ?, ?)",
             (document_id, entity_name, entity_type, properties),
         )
         await self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
+
+    async def create_graph_node_with_link(
+        self,
+        *,
+        document_id: int,
+        entity_name: str,
+        entity_type: str | None = None,
+        properties: str | None = None,
+    ) -> int:
+        """그래프 노드 INSERT 와 graph_node_documents link INSERT 를 같은
+        트랜잭션에서 처리하고 한 번에 commit 한다.
+
+        ``create_graph_node`` 후 ``add_node_document_link`` 를 분리 호출하면
+        두 ``commit`` 사이의 ``await`` 양보 시점에 다른 코루틴의 고아 노드 정리
+        SQL 이 link 없는 신규 노드를 삭제하여 후속 link INSERT 가 FK 위반을
+        일으키는 race window 가 있었다 (재인덱싱 산발 실패의 근본 원인).
+        본 메서드는 두 INSERT 를 단일 commit 으로 묶어 race window 를 제거한다.
+
+        Returns:
+            새로 생성된 ``graph_nodes.id``.
+        """
+        cursor = await self.db.execute(
+            "INSERT INTO graph_nodes "
+            "(document_id, entity_name, entity_type, properties) VALUES (?, ?, ?, ?)",
+            (document_id, entity_name, entity_type, properties),
+        )
+        node_id = cursor.lastrowid
+        assert node_id is not None
+        # 같은 트랜잭션 안에서 link INSERT — 첫 INSERT 는 아직 commit 전이므로
+        # 외부에서는 두 INSERT 가 모두 보이거나 모두 안 보인다.
+        await self.db.execute(
+            "INSERT OR IGNORE INTO graph_node_documents "
+            "(node_id, document_id) VALUES (?, ?)",
+            (node_id, document_id),
+        )
+        await self.db.commit()
+        return node_id
 
     async def get_graph_nodes_by_document(self, document_id: int) -> list[dict[str, Any]]:
         """문서의 그래프 노드 목록을 조회한다.
@@ -494,22 +539,38 @@ class MetadataStore:
     async def delete_graph_data_by_document(self, document_id: int) -> None:
         """문서의 그래프 엣지를 삭제하고, 노드-문서 연결을 해제한다.
 
-        고아 노드(어떤 문서에도 연결되지 않은 노드)도 정리한다.
+        이 문서의 unlink 결과 link 가 0 이 된 노드만 정리한다 — 전역
+        ``WHERE id NOT IN (SELECT node_id FROM graph_node_documents)`` 스캔은
+        ``save_graph_data`` 가 아직 link 를 추가하기 전인 신규 노드까지
+        잘못 삭제하여 FK 위반을 일으켰다. 이번 문서가 실제로 unlink 한 노드만
+        범위로 좁히면 동시 처리 중인 다른 문서의 신규 노드를 건드리지 않는다.
         """
         # 1. 이 문서에서 생성된 엣지 삭제
         await self.db.execute(
             "DELETE FROM graph_edges WHERE document_id = ?", (document_id,)
         )
-        # 2. 노드-문서 연결 해제
+        # 2. 이번 문서가 link 한 노드 ID 집합을 미리 채취 (3 단계에서 그 노드들
+        #    만 고아 검사하기 위함).
+        cursor = await self.db.execute(
+            "SELECT DISTINCT node_id FROM graph_node_documents WHERE document_id = ?",
+            (document_id,),
+        )
+        rows = await cursor.fetchall()
+        candidate_node_ids: list[int] = [row[0] for row in rows]
+
+        # 3. 노드-문서 연결 해제
         await self.db.execute(
             "DELETE FROM graph_node_documents WHERE document_id = ?", (document_id,)
         )
-        # 3. 고아 노드 삭제 (어떤 문서에도 연결되지 않은 노드)
-        await self.db.execute(
-            """DELETE FROM graph_nodes WHERE id NOT IN (
-                SELECT DISTINCT node_id FROM graph_node_documents
-            )"""
-        )
+
+        # 4. 후보 노드들 중 link 가 0 인 것만 삭제 (좁힌 고아 정리).
+        if candidate_node_ids:
+            placeholders = ",".join("?" for _ in candidate_node_ids)
+            await self.db.execute(
+                f"DELETE FROM graph_nodes WHERE id IN ({placeholders}) "  # noqa: S608
+                f"AND id NOT IN (SELECT DISTINCT node_id FROM graph_node_documents)",
+                candidate_node_ids,
+            )
         await self.db.commit()
 
     # --- Graph Edges ---

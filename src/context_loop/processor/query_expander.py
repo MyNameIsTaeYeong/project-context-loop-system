@@ -46,10 +46,12 @@ async def generate_hypothetical_document(
     """
     try:
         prompt = _HYDE_USER_TEMPLATE.format(query=query)
+        # HyDE 가상 문서는 보통 짧지만 reasoning 모델은 thinking 예산을
+        # 포함해 응답이 길어진다. 모델 한도까지 여유를 두어 잘림을 방지.
         return await llm_client.complete(
             prompt,
             system=_HYDE_SYSTEM_PROMPT,
-            max_tokens=512,
+            max_tokens=32768,
             temperature=0.7,
             reasoning_mode="off",
             purpose="hyde_query_expansion",

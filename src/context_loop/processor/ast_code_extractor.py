@@ -63,13 +63,20 @@ class CodeExtraction:
         file_path: 파일 경로.
         language: 프로그래밍 언어.
         symbols: 추출된 심볼 목록.
-        imports: import된 모듈 이름 목록.
+        imports: import된 모듈 이름 목록 (legacy/호환 — 단순 모듈만).
+        import_symbols: ``from module import symbol`` 형태의 정밀한 import.
+            각 항목은 ``(module, symbol)`` 튜플. ``import x`` 의 whole-module
+            import 는 ``(x, None)`` 으로 표기. 같은 모듈에서 여러 심볼을 가져
+            오면 그 수만큼 튜플이 들어간다. ``to_graph_data`` 가 이 정보를
+            ``imports`` relation 의 ``label`` 로 노출하여 검색에서 "X 가
+            어디서 import 되는가" 질의를 살린다.
     """
 
     file_path: str
     language: str
     symbols: list[CodeSymbol] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    import_symbols: list[tuple[str, str | None]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +116,10 @@ def extract_code_symbols(content: str, file_path: str) -> CodeExtraction:
     if not content.strip():
         return CodeExtraction(file_path=file_path, language=language)
 
+    import_symbols: list[tuple[str, str | None]] = []
     try:
         if language == "python":
-            symbols, imports = _extract_python(content)
+            symbols, imports, import_symbols = _extract_python(content)
         elif language in _BRACE_LANGUAGES:
             symbols, imports = _extract_brace_language(content, language)
         else:
@@ -121,12 +129,14 @@ def extract_code_symbols(content: str, file_path: str) -> CodeExtraction:
             "코드 심볼 추출 실패: %s, 전체 파일로 대체", file_path, exc_info=True,
         )
         symbols, imports = _extract_fallback(content, file_path)
+        import_symbols = []
 
     return CodeExtraction(
         file_path=file_path,
         language=language,
         symbols=symbols,
         imports=imports,
+        import_symbols=import_symbols,
     )
 
 
@@ -262,14 +272,35 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
             description=sym.parent_signature or f"class {sym.parent_name}",
         ))
 
-    relations: list[Relation] = [
-        Relation(
+    # import 관계 — ``from x import a, b`` 에서 import 된 심볼 이름들을 ``label``
+    # 로 노출하여 "X 가 어디서 import 되는가" 검색을 살린다. 같은 모듈에서 여러
+    # 심볼을 가져오면 한 ``imports`` 관계의 label 에 join 한다 (관계 수 폭증 방지).
+    module_to_symbols: dict[str, list[str]] = {}
+    for module, symbol in extraction.import_symbols:
+        if module == file_title:
+            continue
+        if symbol is None:
+            module_to_symbols.setdefault(module, [])
+        else:
+            module_to_symbols.setdefault(module, []).append(symbol)
+    # extraction.import_symbols 가 비어있는 (Python 외 언어) 경우 imports 로 폴백
+    if not module_to_symbols:
+        module_to_symbols = {imp: [] for imp in extraction.imports if imp != file_title}
+
+    relations: list[Relation] = []
+    for module, symbols_list in module_to_symbols.items():
+        if symbols_list:
+            label = ", ".join(symbols_list[:20])
+            if len(symbols_list) > 20:
+                label += f", ... (+{len(symbols_list) - 20})"
+        else:
+            label = ""
+        relations.append(Relation(
             source=file_title,
-            target=imp,
+            target=module,
             relation_type="imports",
-        )
-        for imp in extraction.imports
-    ]
+            label=label,
+        ))
 
     # 메서드 → 클래스 contains 관계 (FQN 사용)
     for sym in extraction.symbols:
@@ -288,33 +319,103 @@ def to_graph_data(extraction: CodeExtraction, file_title: str) -> GraphData:
 # ---------------------------------------------------------------------------
 
 
-def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
+def _extract_python(
+    content: str,
+) -> tuple[list[CodeSymbol], list[str], list[tuple[str, str | None]]]:
     """Python AST를 사용한 심볼 추출.
 
     클래스는 메서드 단위로 분할하여 각 메서드를 개별 심볼로 추출한다.
     메서드가 없는 클래스는 클래스 전체를 단일 심볼로 추출한다.
+
+    추가로 다음을 인덱스에 포함한다 (이전 구현은 함수/클래스만 추출하여
+    인덱싱 사각지대가 컸음):
+
+    - **모듈 docstring**: 파일 상단의 ``\"\"\"...\"\"\"`` 를 ``module`` 심볼로 emit.
+      "이 모듈이 무엇인가" 질의의 핵심 시그널.
+    - **모듈 레벨 상수**: ``FOO = ...`` / ``BAR: int = 1`` top-level Assign /
+      AnnAssign 을 한 ``module_constants`` 심볼로 묶음. 개별 청크가 폭증하는
+      것을 막으면서 ``MAX_RETRIES`` 같은 검색을 살린다.
+    - **데코레이터 포함 body**: ``@app.route("/x")\\ndef foo()`` 의 데코레이터를
+      함수/클래스 body 의 prefix 로 포함 (이전 구현은 ``node.lineno`` 가 ``def``
+      라인이라 데코레이터가 누락되었음).
     """
     tree = ast.parse(content)
     lines = content.splitlines(keepends=True)
 
     symbols: list[CodeSymbol] = []
     imports: list[str] = []
+    import_symbols: list[tuple[str, str | None]] = []
+
+    # 1) 모듈 docstring 을 별도 심볼로 (있을 때만)
+    module_doc = ast.get_docstring(tree) or ""
+    if module_doc:
+        # docstring 노드의 line range 를 사용. 첫 표현이 Constant str 이면 그것.
+        doc_node = tree.body[0] if tree.body else None
+        doc_lineno = getattr(doc_node, "lineno", 1)
+        doc_end = getattr(doc_node, "end_lineno", doc_lineno) or doc_lineno
+        symbols.append(CodeSymbol(
+            name="__module__",
+            symbol_type="module",
+            signature="module docstring",
+            body="".join(lines[doc_lineno - 1: doc_end]),
+            line_start=doc_lineno,
+            line_end=doc_end,
+            docstring=module_doc,
+        ))
+
+    # 2) 모듈 레벨 상수 / 타입 alias 를 모아 단일 심볼로
+    constant_nodes: list[ast.Assign | ast.AnnAssign] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            # 단순 이름 = ... (튜플 packing / subscript 등은 제외)
+            if all(isinstance(t, ast.Name) for t in node.targets):
+                constant_nodes.append(node)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            constant_nodes.append(node)
+    if constant_nodes:
+        first = constant_nodes[0]
+        last = constant_nodes[-1]
+        start = first.lineno
+        end = last.end_lineno or last.lineno
+        const_body = "".join(lines[start - 1: end])
+        const_names: list[str] = []
+        for cn in constant_nodes:
+            if isinstance(cn, ast.AnnAssign) and isinstance(cn.target, ast.Name):
+                const_names.append(cn.target.id)
+            elif isinstance(cn, ast.Assign):
+                const_names.extend(
+                    t.id for t in cn.targets if isinstance(t, ast.Name)
+                )
+        signature = "module constants: " + ", ".join(const_names[:10])
+        if len(const_names) > 10:
+            signature += f", ... (+{len(const_names) - 10})"
+        symbols.append(CodeSymbol(
+            name="__constants__",
+            symbol_type="module",
+            signature=signature,
+            body=const_body,
+            line_start=start,
+            line_end=end,
+            docstring=", ".join(const_names),
+        ))
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = "".join(lines[node.lineno - 1 : node.end_lineno])
+            body_start = _body_start_line(node)
+            body = "".join(lines[body_start - 1 : node.end_lineno])
             sig = _python_func_sig(node)
             symbols.append(CodeSymbol(
                 name=node.name,
                 symbol_type="function",
                 signature=sig,
                 body=body,
-                line_start=node.lineno,
+                line_start=body_start,
                 line_end=node.end_lineno or node.lineno,
                 docstring=ast.get_docstring(node) or "",
             ))
         elif isinstance(node, ast.ClassDef):
-            class_sig = f"class {node.name}"
+            class_body_start = _body_start_line(node)
+            class_sig = _python_class_sig(node)
             class_doc = ast.get_docstring(node) or ""
 
             # 클래스 내부 메서드를 개별 심볼로 추출
@@ -325,8 +426,9 @@ def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
 
             if methods:
                 for method in methods:
+                    method_body_start = _body_start_line(method)
                     method_body = "".join(
-                        lines[method.lineno - 1 : method.end_lineno],
+                        lines[method_body_start - 1 : method.end_lineno],
                     )
                     method_sig = _python_func_sig(method)
                     symbols.append(CodeSymbol(
@@ -334,7 +436,7 @@ def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
                         symbol_type="method",
                         signature=method_sig,
                         body=method_body,
-                        line_start=method.lineno,
+                        line_start=method_body_start,
                         line_end=method.end_lineno or method.lineno,
                         docstring=ast.get_docstring(method) or "",
                         parent_name=node.name,
@@ -342,43 +444,104 @@ def _extract_python(content: str) -> tuple[list[CodeSymbol], list[str]]:
                     ))
             else:
                 # 메서드가 없는 클래스는 전체를 단일 심볼로
-                body = "".join(lines[node.lineno - 1 : node.end_lineno])
+                body = "".join(lines[class_body_start - 1 : node.end_lineno])
                 symbols.append(CodeSymbol(
                     name=node.name,
                     symbol_type="class",
                     signature=class_sig,
                     body=body,
-                    line_start=node.lineno,
+                    line_start=class_body_start,
                     line_end=node.end_lineno or node.lineno,
                     docstring=class_doc,
                 ))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 imports.append(alias.name)
+                # ``import x`` 는 whole-module — symbol 부분 None
+                import_symbols.append((alias.name, None))
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 imports.append(node.module)
+                # ``from x import a, b`` → (x, a), (x, b). 와일드카드 ``*`` 도
+                # 이름 그대로 보존하여 후속 분석이 식별 가능.
+                for alias in node.names:
+                    import_symbols.append((node.module, alias.name))
             elif node.level > 0:
                 # from . import x, from .. import y 같은 상대 import
                 prefix = "." * node.level
                 for alias in node.names:
                     imports.append(prefix + alias.name)
+                    import_symbols.append((prefix, alias.name))
 
-    return symbols, imports
+    return symbols, imports, import_symbols
+
+
+def _body_start_line(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> int:
+    """심볼 body 시작 라인을 반환 — 데코레이터가 있으면 첫 데코레이터 라인부터.
+
+    Python 3.8+ 에서 ``node.lineno`` 는 ``def``/``class`` 라인을 가리킨다.
+    ``@app.route("/x")`` 같이 의미적으로 중요한 데코레이터가 body 에서 빠지면
+    "어떤 엔드포인트인가" 같은 검색에 답할 수 없으므로 데코레이터의 첫 라인부터
+    body 를 시작한다.
+    """
+    if node.decorator_list:
+        first_decorator = node.decorator_list[0]
+        return first_decorator.lineno
+    return node.lineno
+
+
+def _python_class_sig(node: ast.ClassDef) -> str:
+    """Python 클래스 시그니처 — base/metaclass 포함.
+
+    예: ``class UserService(BaseService, Generic[T], metaclass=ABCMeta)``.
+    기존 ``f"class {node.name}"`` 은 상속 정보를 잃어 검색/그래프에서 의존성 누락.
+    """
+    parts: list[str] = []
+    for base in node.bases:
+        try:
+            parts.append(ast.unparse(base))
+        except Exception:
+            pass
+    for kw in node.keywords:
+        try:
+            value = ast.unparse(kw.value)
+        except Exception:
+            value = "..."
+        if kw.arg:
+            parts.append(f"{kw.arg}={value}")
+        else:
+            parts.append(f"**{value}")
+    if not parts:
+        return f"class {node.name}"
+    return f"class {node.name}({', '.join(parts)})"
 
 
 def _python_func_sig(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    """Python 함수 시그니처 문자열을 생성한다."""
+    """Python 함수 시그니처 문자열을 생성한다.
+
+    ``ast.unparse(node.args)`` 한 번으로 모든 args 카테고리를 처리하여
+    ``*args``, ``**kwargs``, keyword-only, positional-only, default value 가
+    모두 시그니처에 포함되도록 한다 (이전 구현은 ``node.args.args`` 만 사용해
+    가변 인자/키워드 전용 인자/기본값을 모두 잃었다).
+    """
     prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-    parts: list[str] = []
-    for arg in node.args.args:
-        name = arg.arg
-        if arg.annotation:
-            try:
-                name += f": {ast.unparse(arg.annotation)}"
-            except Exception:
-                pass
-        parts.append(name)
+
+    try:
+        args_str = ast.unparse(node.args)
+    except Exception:
+        # ast.unparse 실패 시 단순 위치 인자 fallback
+        names: list[str] = []
+        for arg in node.args.args:
+            n = arg.arg
+            if arg.annotation:
+                try:
+                    n += f": {ast.unparse(arg.annotation)}"
+                except Exception:
+                    pass
+            names.append(n)
+        args_str = ", ".join(names)
 
     ret = ""
     if node.returns:
@@ -387,7 +550,7 @@ def _python_func_sig(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
         except Exception:
             pass
 
-    return f"{prefix} {node.name}({', '.join(parts)}){ret}"
+    return f"{prefix} {node.name}({args_str}){ret}"
 
 
 # ---------------------------------------------------------------------------
@@ -423,14 +586,37 @@ _DEFINITION_PATTERNS: dict[str, list[tuple[re.Pattern[str], str]]] = {
 }
 
 # import 추출 패턴 (언어별)
+#
+# Go 는 별도 함수 ``_extract_go_imports`` 를 사용한다 — 단순 ``"([^"]+)"`` 패턴은
+# 코드 본문의 모든 문자열 리터럴(예: ``fmt.Println("hello")`` 안의 ``"hello"``)을
+# import 로 잘못 인식하므로, ``import`` 키워드를 anchor 로 잡아야 한다.
 _IMPORT_PATTERNS: dict[str, re.Pattern[str]] = {
-    "go": re.compile(r'"([^"]+)"'),
     "java": re.compile(r"^\s*import\s+([\w.]+)\s*;", re.MULTILINE),
     "typescript": re.compile(r"""from\s+['"]([^'"]+)['"]"""),
     "javascript": re.compile(
         r"""(?:from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))""",
     ),
 }
+
+# Go: ``import "x"`` 단일 + ``import ( "x" "y" )`` 블록. 본문의 임의 string
+# 리터럴이 import 로 잘못 잡히지 않도록 ``import`` 키워드를 명시적 anchor 로 사용.
+_GO_IMPORT_SINGLE_RE = re.compile(
+    r'^\s*import\s+(?:[\w.]+\s+)?"([^"]+)"', re.MULTILINE,
+)
+_GO_IMPORT_BLOCK_RE = re.compile(
+    r"^\s*import\s*\(([^)]*)\)", re.MULTILINE | re.DOTALL,
+)
+_GO_IMPORT_BLOCK_ENTRY_RE = re.compile(r'(?:[\w.]+\s+)?"([^"]+)"')
+
+# Brace-language 함수 패턴 매치 후 ``name`` 으로 잘못 잡힐 수 있는 예약어 / 제어
+# 흐름 키워드. 함수 호출이나 선언 일부가 패턴을 통과하더라도 이름이 이 목록에
+# 들어가면 심볼로 등록하지 않는다.
+_RESERVED_SYMBOL_NAMES: frozenset[str] = frozenset({
+    "if", "for", "while", "switch", "case", "default", "return", "throw",
+    "new", "try", "catch", "finally", "do", "synchronized",
+    "class", "interface", "enum", "extends", "implements", "package",
+    "import", "instanceof", "this", "super", "void",
+})
 
 
 def _extract_brace_language(
@@ -505,6 +691,11 @@ def _extract_brace_symbols(content: str, language: str) -> list[CodeSymbol]:
                 continue
 
             name = m.group(1)
+            # 예약어/제어흐름 키워드가 함수/타입 이름으로 잡힌 경우 false
+            # positive — 무시. ``class``/``interface``/``enum`` 같은 선언
+            # 키워드는 정의 패턴이 직접 다루므로 함수 패턴에서는 제외.
+            if name in _RESERVED_SYMBOL_NAMES:
+                continue
             # 해당 라인부터의 오프셋으로 블록 끝 찾기
             block_start = sum(len(l) for l in lines[:line_idx])
             brace_pos = content.find("{", block_start)
@@ -653,7 +844,15 @@ def _extract_class_methods(
 
 
 def _extract_brace_imports(content: str, language: str) -> list[str]:
-    """import 패턴으로 모듈 이름을 추출한다."""
+    """import 패턴으로 모듈 이름을 추출한다.
+
+    Go 는 ``"..."`` 문자열 리터럴 전체를 import 로 잘못 인식하지 않도록 별도
+    함수(``_extract_go_imports``)에서 처리한다 — 본문의 ``fmt.Println("hello")``
+    같은 호출 인자가 import 모듈로 잘못 등록되는 것을 방지.
+    """
+    if language == "go":
+        return _extract_go_imports(content)
+
     pattern = _IMPORT_PATTERNS.get(language)
     if pattern is None:
         return []
@@ -666,6 +865,22 @@ def _extract_brace_imports(content: str, language: str) -> list[str]:
                 imports.append(g)
                 break
     return list(dict.fromkeys(imports))  # 순서 유지 중복 제거
+
+
+def _extract_go_imports(content: str) -> list[str]:
+    """Go ``import`` 키워드 anchor 로 import 경로만 정확히 추출한다.
+
+    - 단일: ``import "fmt"`` 또는 ``import alias "fmt"``
+    - 블록: ``import ( "fmt"\\n  alias "x/y" )``
+    """
+    imports: list[str] = []
+    for m in _GO_IMPORT_SINGLE_RE.finditer(content):
+        imports.append(m.group(1))
+    for m in _GO_IMPORT_BLOCK_RE.finditer(content):
+        block_body = m.group(1)
+        for entry in _GO_IMPORT_BLOCK_ENTRY_RE.finditer(block_body):
+            imports.append(entry.group(1))
+    return list(dict.fromkeys(imports))
 
 
 def _find_matching_brace(content: str, open_pos: int) -> int:

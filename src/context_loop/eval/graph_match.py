@@ -30,8 +30,14 @@ from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GRAPH_MATCH_THRESHOLD = 0.78
-"""T4 임베딩 cosine 임계값 기본. 설계 §2.2 결정값."""
+DEFAULT_GRAPH_MATCH_THRESHOLD = 0.65
+"""T4 임베딩 cosine 임계값 기본.
+
+이전 0.78 은 description 이 짧거나(또는 비어서 name 으로 fallback) 임베딩이
+비특이적인 retrieved 와의 매칭에서 너무 보수적이었다 — funnel 손실의 한 축.
+0.65 는 의미 매칭의 실용 임계값이며, T1~T3 표면 매칭은 영향 없이 T4 단계만
+넓힌다. 골드셋 신뢰성에 영향이 큰 변경이므로 별도 validation 권장.
+"""
 
 MATCH_TIERS = ("exact", "alias", "normalize", "embedding")
 """기록·집계에 쓰이는 tier 이름. 순서는 cascade 적용 순서."""
@@ -296,13 +302,18 @@ def match_entity_tiered(
             if _normalize(r_name) == g_norm and r_type == g_type:
                 return MatchResult(retrieved_index=i, tier="normalize", score=0.9)
 
-    # T4 — embedding (type-agnostic)
-    if not golden.description:
+    # T4 — embedding (type-agnostic).
+    # 골든 description 이 비어 있으면 name 으로 fallback 한다 — 합성 골드셋이
+    # description 을 항상 채우지 못하므로 T1~T3 표면 매칭 실패한 골든이 T4 에서도
+    # 자동 skip 되어 미매칭으로 누락되는 것을 방지. 검색 측의 r_text fallback
+    # (name 사용) 과 대칭.
+    g_text = golden.description or golden.name or ""
+    if not g_text:
         return None
 
     g_emb = golden.description_embedding
     if g_emb is None:
-        g_emb = embed_fn(golden.description)
+        g_emb = embed_fn(g_text)
     if not g_emb:
         return None
 

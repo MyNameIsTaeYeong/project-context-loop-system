@@ -122,10 +122,13 @@ async def chat_api(
 
         prompt = f"## 컨텍스트\n\n{assembled.context_text}\n\n## 질문\n\n{body.query}"
         try:
+            # reasoning_mode="high" 는 thinking 토큰이 응답 예산을 크게 소비하므로
+            # max_tokens 가 작으면 답변 본문이 잘린다. 모델 한도 범위 안에서 큰
+            # 값을 두어 긴 답변/추론 잘림을 방지.
             async for event in llm_client.stream_events(
                 prompt,
                 system=_SYSTEM_PROMPT,
-                max_tokens=16384,
+                max_tokens=32768,
                 reasoning_mode="high",
                 purpose="answer_generation",
             ):

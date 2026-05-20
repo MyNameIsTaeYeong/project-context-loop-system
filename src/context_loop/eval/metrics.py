@@ -13,9 +13,12 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Iterable, Sequence
 from typing import TypeVar
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -141,6 +144,12 @@ def aggregate_with_variance(
     어떤 골드셋엔 있고 다른 데엔 없는 키는 가진 골드셋만 모아 통계를 낸다
     (judge 비활성 잡 등). 표준편차는 ``n>=2`` 일 때만 계산하며, n=1 이면 0.0.
     표본 표준편차 (n-1 분모, ddof=1) 를 사용해 작은 N 의 편차 과소추정을 방지.
+
+    호출자가 ``metrics`` dict 안에 ``graph_match_tiers_total`` 같은 nested
+    dict / list 값을 넣어 전달할 수 있다 (eval_search.py 가 그렇다). 이런
+    비숫자 값은 평균/표준편차 정의가 없으므로 무시한다 — ``aggregate`` 와
+    동일한 정책. 무시되는 키는 ``logger.debug`` 로 한 번씩 보고하여 디버깅
+    시 누락을 인지 가능하게 한다.
     """
     if not per_run_summaries:
         return {}
@@ -150,8 +159,21 @@ def aggregate_with_variance(
         keys.update(s.keys())
 
     out: dict[str, dict[str, float]] = {}
+    skipped_keys: set[str] = set()
     for k in sorted(keys):
-        values = [float(s[k]) for s in per_run_summaries if k in s]
+        numeric_values: list[float] = []
+        has_nonnumeric = False
+        for s in per_run_summaries:
+            if k not in s:
+                continue
+            v = s[k]
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                has_nonnumeric = True
+                continue
+            numeric_values.append(float(v))
+        if has_nonnumeric and not numeric_values:
+            skipped_keys.add(k)
+        values = numeric_values
         if not values:
             continue
         n = len(values)
@@ -169,4 +191,9 @@ def aggregate_with_variance(
             "max": max(values),
             "n": n,
         }
+    if skipped_keys:
+        logger.debug(
+            "aggregate_with_variance: 비숫자(dict/list/str) 값만 있는 키 무시 — %s",
+            sorted(skipped_keys),
+        )
     return out

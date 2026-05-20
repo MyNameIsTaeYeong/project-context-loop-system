@@ -344,3 +344,49 @@ def test_chunk_text_default_section_index_is_none() -> None:
     assert len(chunks) >= 1
     for c in chunks:
         assert c.section_index is None
+
+
+# ---------------------------------------------------------------------------
+# 폴백 (tiktoken 미설치) 동작 정합성
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_count_tokens_one_char_one_token(monkeypatch) -> None:
+    """tiktoken 폴백 시 1 char = 1 token. _make_codec (extraction_unit) 폴백과
+    동일 단위로 통일되어야 ``overlap_tokens`` / ``target_tokens`` 가 의도대로
+    동작한다."""
+    from context_loop.processor import chunker
+
+    monkeypatch.setattr(chunker, "_get_tokenizer", lambda model="cl100k_base": None)
+    assert chunker.count_tokens("abcde") == 5
+    assert chunker.count_tokens("한국어") == 3
+    assert chunker.count_tokens("") == 0
+
+
+def test_fallback_chunk_text_overlap_actually_applied(monkeypatch) -> None:
+    """폴백 환경에서 overlap 이 다음 청크에 텍스트로 실제 반영되어야 한다.
+
+    이전 구현은 decode 가 fallback 텍스트를 그대로 반환하고 토큰을 무시해서
+    overlap 이 사실상 0 이었다. ord/chr round-trip 으로 통일하여 수정.
+    """
+    from context_loop.processor import chunker
+
+    monkeypatch.setattr(chunker, "_get_tokenizer", lambda model="cl100k_base": None)
+
+    # 단락 두 개. 각 50 chars. chunk_size=30(=tokens), overlap=10 → 두 청크 이상.
+    text = ("alpha " * 10).strip() + "\n\n" + ("beta " * 10).strip()
+    chunks = chunker.chunk_text(text, chunk_size=30, chunk_overlap=10)
+    assert len(chunks) >= 2
+
+    # 첫 청크의 마지막 10 char 가 두 번째 청크의 시작에 prefix 로 와야 한다
+    # (단어 경계가 아니라 char 단위로 시작될 수 있다).
+    first_tail = chunks[0].content[-10:]
+    # decode 가 토큰을 chars 로 복원하므로 두 번째 청크 시작이 비어있지 않다.
+    assert chunks[1].content, "두 번째 청크가 비어있다 (decode/overlap 동작 오류)"
+    # 두 청크가 동일하면 안 됨 (overlap 만 있는 빈 청크 방지).
+    assert chunks[0].content != chunks[1].content
+    # 폴백 환경에서 1 char = 1 token. content 는 strip 으로 끝 공백이 잘려
+    # token_count 보다 같거나 작다. token_count 자체는 chunk_size 가드 적용.
+    for c in chunks:
+        assert c.token_count <= 30
+        assert len(c.content) <= c.token_count
