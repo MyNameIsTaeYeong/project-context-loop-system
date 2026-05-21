@@ -52,11 +52,29 @@
         {% endif %}
 
         {% else %}
-        {# D-042 멀티뷰: body 본문 + meta(title + section_path) #}
-        <details open>
+        {# D-042 멀티뷰: body 본문 + meta(title + section_path).
+           body 는 마크다운이므로 Rendered/Raw 토글을 제공한다. meta 는
+           title + section_path 라 마크다운이 아니어서 원본 그대로 표시. #}
+        <details open x-data="{ view: 'rendered' }">
             <summary><strong>Body</strong> <small>(임베딩 대상 — 본문)</small></summary>
-            <pre><code>{{ chunk.content }}</code></pre>
+            <div role="group" style="margin: 0.5rem 0;">
+                <button type="button"
+                        :class="view === 'rendered' ? '' : 'outline'"
+                        @click="view = 'rendered'">Rendered</button>
+                <button type="button"
+                        :class="view === 'raw' ? '' : 'outline'"
+                        @click="view = 'raw'">Raw</button>
+            </div>
+            <div x-show="view === 'rendered'"
+                 x-cloak
+                 class="markdown-body"
+                 data-markdown
+                 data-markdown-src="md-source-chunk-{{ chunk.id }}"></div>
+            <div x-show="view === 'raw'" x-cloak>
+                <pre><code>{{ chunk.content }}</code></pre>
+            </div>
         </details>
+        <pre id="md-source-chunk-{{ chunk.id }}" class="md-source" hidden>{{ chunk.content }}</pre>
 
         {% if chunk.meta_text %}
         <details>

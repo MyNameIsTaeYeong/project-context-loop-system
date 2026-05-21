@@ -49,6 +49,114 @@ async def test_document_original_tab(client, stores):
 
 
 @pytest.mark.asyncio
+async def test_document_original_tab_renders_markdown_for_confluence(client, stores):
+    """confluence_mcp 등 마크다운 소스는 Rendered/Raw 토글과 data-markdown
+    컨테이너가 노출되어야 한다. 클라이언트 측 marked.js 가 .md-source 의
+    원본 텍스트를 읽어 HTML 로 변환한다."""
+    meta_store = stores[0]
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp",
+        title="MD Doc",
+        original_content="# Title\n\nHello **world**",
+        content_hash="hmd",
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/original")
+    assert resp.status_code == 200
+    # Rendered/Raw 토글 버튼이 존재
+    assert ">Rendered<" in resp.text
+    assert ">Raw<" in resp.text
+    # 클라이언트 렌더용 컨테이너와 원본 소스 엘리먼트
+    assert "data-markdown" in resp.text
+    assert f'id="md-source-original-{doc_id}"' in resp.text
+    assert 'class="md-source"' in resp.text
+    # 원본 마크다운 문자열은 그대로 페이지에 포함되어야 한다
+    assert "# Title" in resp.text
+    assert "Hello **world**" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_document_original_tab_git_code_no_markdown(client, stores):
+    """git_code 소스는 코드이므로 마크다운 렌더링 컨테이너가 없어야 한다."""
+    meta_store = stores[0]
+    doc_id = await meta_store.create_document(
+        source_type="git_code",
+        title="src/example.py",
+        source_id="src/example.py",
+        original_content="def foo():\n    return 1\n",
+        content_hash="hcode",
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/original")
+    assert resp.status_code == 200
+    assert "data-markdown" not in resp.text
+    assert "md-source-original" not in resp.text
+    # 코드는 syntax highlight 로만 노출
+    assert "hljs" in resp.text or "highlight" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_document_chunks_tab_renders_markdown_body(client, stores):
+    """non-git_code 청크의 body 는 마크다운 토글/컨테이너가 노출되어
+    클라이언트에서 marked.js 로 렌더링될 수 있어야 한다."""
+    meta_store, _vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp",
+        title="ChunkMD",
+        original_content="본문",
+        content_hash="hcmd",
+    )
+    await meta_store.create_chunk(
+        chunk_id="md-chunk-1",
+        document_id=doc_id,
+        chunk_index=0,
+        content="## Sub\n\n- item1\n- item2",
+        token_count=12,
+        section_path="",
+        section_anchor="",
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/chunks")
+    assert resp.status_code == 200
+    # 청크별 Rendered/Raw 토글 + 마크다운 컨테이너
+    assert ">Rendered<" in resp.text
+    assert ">Raw<" in resp.text
+    assert 'id="md-source-chunk-md-chunk-1"' in resp.text
+    assert "data-markdown" in resp.text
+    # 원본 청크 텍스트도 그대로 포함
+    assert "## Sub" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_document_chunks_tab_git_code_no_markdown(client, stores):
+    """git_code 청크는 코드 본문이므로 마크다운 토글이 없어야 한다."""
+    meta_store, _vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="git_code",
+        title="src/x.py",
+        source_id="src/x.py",
+        original_content="x = 1\n",
+        content_hash="hgc",
+    )
+    await meta_store.create_chunk(
+        chunk_id="code-chunk-1",
+        document_id=doc_id,
+        chunk_index=0,
+        content="def foo():\n    return 1",
+        token_count=8,
+        section_path="",
+        section_anchor="",
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/chunks")
+    assert resp.status_code == 200
+    assert "data-markdown" not in resp.text
+    assert "md-source-chunk" not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_document_chunks_tab_empty(client, stores):
     """청크가 없는 문서의 청크 탭은 안내 메시지를 표시한다."""
     meta_store = stores[0]
