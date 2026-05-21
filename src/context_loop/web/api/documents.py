@@ -137,6 +137,7 @@ async def tab_chunks(
     request: Request,
     document_id: int,
     meta_store: MetadataStore = Depends(get_meta_store),
+    vector_store: VectorStore = Depends(get_vector_store),
 ):
     """청크 탭 HTML 파셜.
 
@@ -150,6 +151,11 @@ async def tab_chunks(
       - 그 외(Confluence/upload/manual): D-042 멀티뷰. body=``content``,
         meta=``build_meta_view_text(title, section_path)``.
 
+    R3 — 가상 질문 임베딩(view='question') 도 vector_store 에서 조회하여
+    각 청크에 묶어 표시한다. SQLite chunks 테이블에는 가상 질문이 영속화
+    되지 않으므로 (검색 키 용도) 표시 경로는 vector_store 가 단일 진실의
+    원천. 청크 ID 별로 그룹핑되어 ``chunk.questions`` 리스트로 전달된다.
+
     템플릿이 ``source_type`` 으로 분기하여 운영자가 실제 임베딩된 텍스트를
     오인하지 않도록 표시한다.
     """
@@ -158,17 +164,38 @@ async def tab_chunks(
     title = doc["title"] if doc else ""
     source_type = doc["source_type"] if doc else ""
 
+    # R3 — vector_store 에서 가상 질문 엔트리 조회 후 청크별로 그룹핑.
+    # logical_chunk_id 가 SQLite chunks.id 와 일치하므로 그것으로 조인한다.
+    questions_by_chunk: dict[str, list[str]] = {}
+    for entry in vector_store.list_by_document(document_id, view="question"):
+        meta = entry.get("metadata") or {}
+        chunk_id = meta.get("logical_chunk_id")
+        q_text = meta.get("question_text", "")
+        if not chunk_id or not q_text:
+            continue
+        questions_by_chunk.setdefault(chunk_id, []).append(q_text)
+
     enriched = []
     for chunk in chunks:
+        chunk_id = chunk.get("id", "")
+        questions = questions_by_chunk.get(chunk_id, [])
         if source_type == "git_code":
             # git_code 의 meta 뷰 입력은 파이프라인이 SQLite ``embed_text`` 에
             # 영속화한다 (D-042 후속). 재구성 없이 그대로 노출.
-            enriched.append({**chunk, "meta_text": chunk.get("embed_text", "")})
+            enriched.append({
+                **chunk,
+                "meta_text": chunk.get("embed_text", ""),
+                "questions": questions,
+            })
         else:
             meta_text = build_meta_view_text(
                 title, chunk.get("section_path", ""),
             )
-            enriched.append({**chunk, "meta_text": meta_text})
+            enriched.append({
+                **chunk,
+                "meta_text": meta_text,
+                "questions": questions,
+            })
 
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_chunks.html", {

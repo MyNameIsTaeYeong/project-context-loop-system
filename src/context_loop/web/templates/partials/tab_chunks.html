@@ -20,6 +20,10 @@
             {% else %}
             <small><mark>body only</mark></small>
             {% endif %}
+
+            {% if chunk.questions %}
+            <small><mark>+ {{ chunk.questions|length }} 가상 질문</mark></small>
+            {% endif %}
         </header>
 
         {% if source_type == "git_code" %}
@@ -62,6 +66,23 @@
             <pre><code>{{ chunk.meta_text }}</code></pre>
         </details>
         {% endif %}
+        {% endif %}
+
+        {# R3 — 가상 질문 임베딩 (proposition / question-based indexing).
+           검색 시 query(자연 질문)와 cosine 거리가 가까워져 정밀도가 향상되며,
+           각 질문이 별도의 view='question' 엔트리로 vector_store 에 저장된다.
+           SQLite chunks 에는 영속화되지 않고 vector_store 가 단일 진실의 원천. #}
+        {% if chunk.questions %}
+        <details>
+            <summary><strong>가상 질문</strong>
+                <small>(추가 임베딩 대상 — LLM 으로 생성, {{ chunk.questions|length }} 건)</small>
+            </summary>
+            <ul>
+                {% for q in chunk.questions %}
+                <li>{{ q }}</li>
+                {% endfor %}
+            </ul>
+        </details>
         {% endif %}
     </article>
     {% endfor %}
