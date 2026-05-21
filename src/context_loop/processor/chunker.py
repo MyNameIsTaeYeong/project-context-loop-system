@@ -384,6 +384,141 @@ def chunk_extracted_document(
     return all_chunks
 
 
+def chunk_extracted_document_doclevel(
+    extracted: ExtractedDocument,
+    *,
+    max_tokens: int = 8000,
+    model: str = "cl100k_base",
+) -> list[Chunk]:
+    """문서 단위 인덱싱용 청킹 — 가능하면 1 청크, 한도 초과만 섹션 폴백.
+
+    R3 — 임베딩 청크 단위를 "문서 단위"로 통일하는 핵심 함수. 검색 결과의
+    입자도는 검색 단계의 dedup 으로 문서 단위로 만들고, 인덱싱은 다음 정책을
+    따른다:
+
+    1. **작은 문서 (전체 토큰 <= max_tokens)**: 문서 전체를 1 청크로.
+       ``section_path=""``, ``section_anchor=""``, ``section_index=None``.
+    2. **큰 문서**: 섹션 단위 폴백. 각 ``Section`` 의 헤딩 + md_content 를
+       하나의 청크로. 단일 섹션이 ``max_tokens`` 초과면 그 섹션만 토큰
+       기준 추가 분할 (penses 코드/표는 atomic 보호).
+    3. **sections 가 없는 문서**: plain_text 를 1 청크 (한도 이하) 또는 토큰
+       단위 분할.
+
+    기존 ``chunk_extracted_document`` (512 토큰 임의 분할) 와 달리 의미 단위
+    (문서/섹션) 를 보존하여 가상 질문 인덱싱 (R3 ``question_generator``) 의
+    source 와 자연스럽게 정렬된다.
+
+    Args:
+        extracted: Confluence 추출 결과.
+        max_tokens: 단일 청크 토큰 한도 (사내 임베딩 모델 컨텍스트 윈도우).
+        model: 토큰화 모델 이름.
+
+    Returns:
+        Chunk 목록. 빈 문서면 빈 리스트.
+    """
+    plain = (extracted.plain_text or "").strip()
+    if not plain and not extracted.sections:
+        return []
+
+    # 케이스 1+3: sections 가 없거나 (있어도) 전체가 작으면 1 청크 우선
+    if not extracted.sections:
+        return _chunk_plain_with_fallback(
+            plain, max_tokens=max_tokens, model=model,
+        )
+
+    # 문서 전체 합본 토큰이 한도 이하면 1 청크
+    full_body_parts: list[str] = []
+    for section in extracted.sections:
+        heading_line = "#" * max(section.level, 1) + " " + section.title
+        body = section.md_content.strip()
+        full_body_parts.append(
+            heading_line + "\n\n" + body if body else heading_line,
+        )
+    full_body = "\n\n".join(full_body_parts)
+    full_token_count = count_tokens(full_body, model)
+
+    if full_token_count <= max_tokens:
+        return [Chunk(
+            index=0,
+            content=full_body,
+            token_count=full_token_count,
+            section_path="",
+            section_anchor="",
+            section_index=None,
+        )]
+
+    # 케이스 2: 섹션 단위 폴백
+    return _chunk_by_section(extracted, max_tokens=max_tokens, model=model)
+
+
+def _chunk_plain_with_fallback(
+    text: str, *, max_tokens: int, model: str,
+) -> list[Chunk]:
+    """sections 가 없는 문서를 1 청크 (한도 이하) 또는 토큰 분할."""
+    text = text.strip()
+    if not text:
+        return []
+    token_count = count_tokens(text, model)
+    if token_count <= max_tokens:
+        return [Chunk(
+            index=0,
+            content=text,
+            token_count=token_count,
+            section_path="",
+            section_anchor="",
+            section_index=None,
+        )]
+    # 한도 초과 sections-less 거대 문서 — 단락 경계 기반 분할로 폴백.
+    # 운영상 드문 경계이지만 안전을 위해 처리.
+    return chunk_text(
+        text,
+        chunk_size=max_tokens,
+        chunk_overlap=min(max_tokens // 10, 200),
+        model=model,
+    )
+
+
+def _chunk_by_section(
+    extracted: ExtractedDocument, *, max_tokens: int, model: str,
+) -> list[Chunk]:
+    """섹션 단위로 청크를 만든다. 거대 단일 섹션은 추가 분할."""
+    chunks: list[Chunk] = []
+    for section_idx, section in enumerate(extracted.sections):
+        heading_line = "#" * max(section.level, 1) + " " + section.title
+        body = section.md_content.strip()
+        section_text = heading_line + "\n\n" + body if body else heading_line
+        section_path = " > ".join(section.path) if section.path else section.title
+
+        section_token_count = count_tokens(section_text, model)
+        if section_token_count <= max_tokens:
+            chunks.append(Chunk(
+                index=len(chunks),
+                content=section_text,
+                token_count=section_token_count,
+                section_path=section_path,
+                section_anchor=section.anchor,
+                section_index=section_idx,
+            ))
+            continue
+
+        # 거대 섹션 — atomic 보호 + 토큰 분할
+        blocks = _split_markdown_blocks(section_text)
+        sub_chunks = _chunk_blocks(
+            blocks,
+            chunk_size=max_tokens,
+            chunk_overlap=min(max_tokens // 10, 200),
+            model=model,
+        )
+        for sub in sub_chunks:
+            sub.index = len(chunks)
+            sub.section_path = section_path
+            sub.section_anchor = section.anchor
+            sub.section_index = section_idx
+            chunks.append(sub)
+
+    return chunks
+
+
 def _chunk_blocks(
     blocks: list[_Block],
     *,

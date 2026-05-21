@@ -9,6 +9,7 @@ from context_loop.ingestion.confluence_extractor import (
 from context_loop.processor.chunker import (
     Chunk,
     chunk_extracted_document,
+    chunk_extracted_document_doclevel,
     chunk_text,
     count_tokens,
 )
@@ -390,3 +391,92 @@ def test_fallback_chunk_text_overlap_actually_applied(monkeypatch) -> None:
     for c in chunks:
         assert c.token_count <= 30
         assert len(c.content) <= c.token_count
+
+
+# ---------------------------------------------------------------------------
+# R3 — chunk_extracted_document_doclevel
+# ---------------------------------------------------------------------------
+
+
+def test_doclevel_small_document_yields_single_chunk() -> None:
+    """문서 전체 토큰이 max_tokens 이하면 1청크 (section_path 빈 문자열)."""
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[
+            _make_section(1, "A", "짧은 본문 A.", path=["A"]),
+            _make_section(1, "B", "짧은 본문 B.", path=["B"]),
+        ],
+    )
+    chunks = chunk_extracted_document_doclevel(extracted, max_tokens=8000)
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.section_path == ""
+    assert chunk.section_anchor == ""
+    assert chunk.section_index is None
+    # 두 섹션 헤딩이 모두 본문에 포함
+    assert "# A" in chunk.content
+    assert "# B" in chunk.content
+    assert "짧은 본문 A" in chunk.content
+    assert "짧은 본문 B" in chunk.content
+
+
+def test_doclevel_large_document_falls_back_to_sections() -> None:
+    """문서 전체가 max_tokens 초과면 섹션 단위로 분할."""
+    big_body = "본문 " * 500  # 약 1000 토큰
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[
+            _make_section(1, "First", big_body, path=["First"]),
+            _make_section(1, "Second", big_body, path=["Second"]),
+            _make_section(1, "Third", big_body, path=["Third"]),
+        ],
+    )
+    # max_tokens=1500 → 합본 ~3000 토큰 → 섹션 단위 폴백
+    chunks = chunk_extracted_document_doclevel(extracted, max_tokens=1500)
+
+    assert len(chunks) >= 3
+    paths = {c.section_path for c in chunks}
+    assert "First" in paths
+    assert "Second" in paths
+    assert "Third" in paths
+    # 각 청크의 section_index 와 anchor 가 채워져야 함
+    for c in chunks:
+        assert c.section_index is not None
+        assert c.section_anchor != ""
+
+
+def test_doclevel_oversized_single_section_splits() -> None:
+    """단일 섹션이 max_tokens 초과면 그 섹션만 토큰 단위로 분할."""
+    huge_body = "본문 " * 1000  # 약 2000 토큰
+    extracted = ExtractedDocument(
+        plain_text="ignored",
+        sections=[_make_section(1, "Big", huge_body, path=["Big"])],
+    )
+    chunks = chunk_extracted_document_doclevel(extracted, max_tokens=500)
+
+    assert len(chunks) >= 2
+    # 거대 섹션 분할 결과 모두 같은 섹션을 가리킴
+    for c in chunks:
+        assert c.section_path == "Big"
+        assert c.section_index == 0
+
+
+def test_doclevel_sectionless_small_doc_yields_single_chunk() -> None:
+    """sections 가 없고 plain_text 가 한도 이하면 1청크."""
+    extracted = ExtractedDocument(
+        plain_text="짧은 본문 텍스트입니다.",
+        sections=[],
+    )
+    chunks = chunk_extracted_document_doclevel(extracted, max_tokens=8000)
+
+    assert len(chunks) == 1
+    assert chunks[0].section_path == ""
+    assert chunks[0].section_index is None
+    assert "짧은 본문" in chunks[0].content
+
+
+def test_doclevel_empty_returns_empty() -> None:
+    """빈 문서는 빈 리스트."""
+    extracted = ExtractedDocument(plain_text="", sections=[])
+    assert chunk_extracted_document_doclevel(extracted, max_tokens=8000) == []

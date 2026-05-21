@@ -65,6 +65,93 @@ async def test_document_chunks_tab_empty(client, stores):
 
 
 @pytest.mark.asyncio
+async def test_document_chunks_tab_shows_virtual_questions(client, stores):
+    """R3 — 청크 탭이 vector_store 의 view='question' 엔트리를 청크별로 표시.
+
+    SQLite chunks 테이블에는 본문 청크만 있고, 가상 질문은 vector_store 가
+    단일 진실의 원천. logical_chunk_id 로 조인하여 UI 에 노출된다.
+    """
+    meta_store, vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp",
+        title="QDoc",
+        original_content="본문",
+        content_hash="hq1",
+    )
+    await meta_store.create_chunk(
+        chunk_id="qchunk-1",
+        document_id=doc_id,
+        chunk_index=0,
+        content="본문 내용",
+        token_count=10,
+        section_path="",
+        section_anchor="",
+    )
+    # body + 가상 질문 2개를 vector_store 에 등록 (R3 파이프라인이 만드는 형태).
+    vector_store.add_chunks(
+        chunk_ids=["qchunk-1#body", "qchunk-1#q0", "qchunk-1#q1"],
+        embeddings=[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+        documents=["본문 내용", "본문 내용", "본문 내용"],
+        metadatas=[
+            {"document_id": doc_id, "logical_chunk_id": "qchunk-1",
+             "chunk_index": 0, "view": "body"},
+            {"document_id": doc_id, "logical_chunk_id": "qchunk-1",
+             "chunk_index": 0, "view": "question",
+             "question_text": "QDoc 의 핵심 동작은?"},
+            {"document_id": doc_id, "logical_chunk_id": "qchunk-1",
+             "chunk_index": 0, "view": "question",
+             "question_text": "QDoc 의 의존성은 무엇인가?"},
+        ],
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/chunks")
+    assert resp.status_code == 200
+    # 헤더에 가상 질문 개수 배지
+    assert "+ 2 가상 질문" in resp.text
+    # 질문 본문 노출
+    assert "QDoc 의 핵심 동작은?" in resp.text
+    assert "QDoc 의 의존성은 무엇인가?" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_document_chunks_tab_no_questions_for_legacy_chunk(client, stores):
+    """가상 질문이 없는 (구버전) 청크에는 질문 섹션이 표시되지 않는다."""
+    meta_store, vector_store, _ = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp",
+        title="LegacyDoc",
+        original_content="레거시",
+        content_hash="hleg",
+    )
+    await meta_store.create_chunk(
+        chunk_id="legacy-1",
+        document_id=doc_id,
+        chunk_index=0,
+        content="레거시 본문",
+        token_count=8,
+        section_path="",
+        section_anchor="",
+    )
+    # body 만 등록 (question view 없음 — 구버전 인덱싱)
+    vector_store.add_chunks(
+        chunk_ids=["legacy-1#body"],
+        embeddings=[[0.1, 0.2]],
+        documents=["레거시 본문"],
+        metadatas=[
+            {"document_id": doc_id, "logical_chunk_id": "legacy-1",
+             "chunk_index": 0, "view": "body"},
+        ],
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/chunks")
+    assert resp.status_code == 200
+    # 가상 질문 배지/섹션 모두 없어야 함
+    assert "가상 질문" not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_document_graph_tab_empty(client, stores):
     """그래프가 없는 문서의 그래프 탭은 안내 메시지를 표시한다."""
     meta_store = stores[0]
