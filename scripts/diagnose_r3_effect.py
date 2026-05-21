@@ -231,19 +231,42 @@ def main() -> None:
     # 5. 결론
     # ------------------------------------------------------------------ #
     out("## 5. 진단 결론")
+    mrr_delta = statistics.mean(r3_mrr) - statistics.mean(base_mrr)
+
     if total_new == 0 and total_lost == 0:
-        out("  ✗ R3 의 doc-level 효과 = 0 (set 변화 없음)")
-        if statistics.mean(r3_mrr) - statistics.mean(base_mrr) > 0.01:
-            out("  ✓ MRR 미세 향상 — 같은 정답이 더 위로 올라감")
-            out("    → R3 의 가치는 ranking 정밀도 약간 향상 (precision@1 차원)")
-        else:
-            out("  ✗ MRR 도 변화 없음")
+        # 시나리오 A: 완전 동일
+        out("  · R3 와 baseline 의 정답 doc set 이 100% 동일")
+        out("    → R3 가 검색 결과 set 을 전혀 바꾸지 못함")
+        if mrr_delta > 0.01:
+            out(f"  ✓ MRR 미세 향상 Δ={mrr_delta:+.4f} — 같은 정답이 더 위로")
+            out("    → R3 의 가치는 ranking 정밀도 (precision@1 차원)")
+        elif abs(mrr_delta) <= 0.01:
+            out(f"  ✗ MRR 도 변화 없음 (Δ={mrr_delta:+.4f})")
             out("    → R3 가 doc-level metric 으로는 측정 불가. "
-                "judge / UX / chunk-level 평가로만 의미 확인 가능")
+                "judge / chunk-level / UX 평가로만 가치 확인 가능")
+        else:
+            out(f"  ✗ MRR 도 회귀 (Δ={mrr_delta:+.4f})")
     elif total_new > total_lost:
-        out(f"  ✓ R3 가 net +{net} 정답 doc 추가 발견 — doc-level 효과 양수")
+        # 시나리오 B: net 이득
+        out(f"  ✓ R3 가 net +{net} 정답 doc 추가 발견")
+        out(f"    (새로 잡음 {total_new} / 잃음 {total_lost})")
+        out(f"  · MRR Δ = {mrr_delta:+.4f}")
+        out("    → R3 의 doc-level 효과 양수")
+    elif total_new == total_lost:
+        # 시나리오 C: set 교환 (수평 이동)
+        out(f"  ~ R3 가 정답 doc set 을 일부 교환 — 새로 {total_new}, 잃음 {total_lost}")
+        out("    (net = 0 이지만 검색 결과 자체는 바뀜)")
+        out(f"  · MRR Δ = {mrr_delta:+.4f}")
+        out("    → R3 가 작동하긴 함. 그러나 새 정답과 잃은 정답이 상쇄")
+        out("    검토 필요: 잃은 정답이 (a) baseline 의 우연한 hit 였는지,")
+        out("              (b) R3 가 진짜 회귀시킨 것인지 — §1 의 잃은 질의")
+        out("              샘플을 §3 의 손해 패턴과 비교")
     else:
+        # 시나리오 D: net 손해
         out(f"  ✗ R3 가 net {net} 정답 손해")
+        out(f"    (새로 잡음 {total_new} / 잃음 {total_lost})")
+        out(f"  · MRR Δ = {mrr_delta:+.4f}")
+        out("    → R3 가 회귀를 만든 것. 폐기 고려 또는 회귀 원인 분석 필요")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
