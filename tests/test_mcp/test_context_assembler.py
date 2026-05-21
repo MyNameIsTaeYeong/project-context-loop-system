@@ -344,19 +344,26 @@ async def test_search_chunks_threshold_filters_low_similarity(stores) -> None:
 
 @pytest.mark.asyncio
 async def test_search_chunks_no_threshold_returns_all(stores) -> None:
-    """threshold=0이면 모든 결과를 반환한다."""
+    """threshold=0이면 모든 (문서 단위) 결과를 반환한다.
+
+    R3: dedup 키가 document_id 이므로 서로 다른 두 문서의 청크가 결과에
+    유지되는지 검증.
+    """
     meta_store, vector_store, _ = stores
 
-    doc_id = await meta_store.create_document(
-        source_type="manual", title="Doc", original_content="c", content_hash="hnt",
+    doc_a = await meta_store.create_document(
+        source_type="manual", title="DocA", original_content="ca", content_hash="hnta",
+    )
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="DocB", original_content="cb", content_hash="hntb",
     )
     vector_store.add_chunks(
-        chunk_ids=[f"chunk_{doc_id}_0", f"chunk_{doc_id}_1"],
+        chunk_ids=[f"chunk_{doc_a}_0", f"chunk_{doc_b}_0"],
         embeddings=[[0.9, 0.1], [0.1, 0.9]],
         documents=["내용 A", "내용 B"],
         metadatas=[
-            {"document_id": doc_id, "chunk_index": 0},
-            {"document_id": doc_id, "chunk_index": 1},
+            {"document_id": doc_a, "chunk_index": 0},
+            {"document_id": doc_b, "chunk_index": 0},
         ],
     )
 
@@ -371,30 +378,33 @@ async def test_search_chunks_no_threshold_returns_all(stores) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_chunks_dedupes_multi_view_entries(stores) -> None:
-    """D-042: 동일 논리 청크의 body/meta 뷰 중복을 dedup하여 1건만 반환.
+async def test_search_chunks_dedupes_by_document(stores) -> None:
+    """R3: 같은 document_id 의 여러 view/청크가 매칭되면 가장 가까운 1건만 반환.
 
-    두 엔트리가 같은 ``logical_chunk_id`` 를 공유하면 더 가까운 쪽의
-    distance가 유지되고, 본문은 한 번만 노출되어야 한다.
+    한 문서가 body/meta/question 등 여러 view 로 인덱싱되어도 결과는 문서
+    단위로 dedup 되어야 한다. 가장 가까운(distance 최소) view 의 metadata
+    가 보존되어 출처 라벨에 활용된다.
     """
     meta_store, vector_store, _ = stores
 
-    doc_id = await meta_store.create_document(
-        source_type="manual", title="Doc", original_content="c", content_hash="hdup",
+    doc_a = await meta_store.create_document(
+        source_type="manual", title="DocA", original_content="c", content_hash="hduba",
     )
-    # 동일 logical_chunk_id 를 공유하는 body + meta 두 엔트리.
-    # meta 쪽이 쿼리와 더 가깝다(distance ↓).
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="DocB", original_content="c", content_hash="hdubb",
+    )
+    # DocA 는 body/meta/question 3 view 모두 등록 — query 와 가장 가까운 건 question.
+    # DocB 는 body 1 view 만 등록.
     vector_store.add_chunks(
-        chunk_ids=["c1#body", "c1#meta", "c2#body"],
-        embeddings=[[0.5, 0.5], [0.9, 0.1], [0.1, 0.9]],
-        documents=["본문 A", "본문 A", "본문 B"],
+        chunk_ids=["a#body", "a#meta", "a#q0", "b#body"],
+        embeddings=[[0.5, 0.5], [0.7, 0.3], [0.9, 0.1], [0.1, 0.9]],
+        documents=["본문 A", "본문 A", "본문 A", "본문 B"],
         metadatas=[
-            {"document_id": doc_id, "chunk_index": 0,
-             "logical_chunk_id": "c1", "view": "body"},
-            {"document_id": doc_id, "chunk_index": 0,
-             "logical_chunk_id": "c1", "view": "meta"},
-            {"document_id": doc_id, "chunk_index": 1,
-             "logical_chunk_id": "c2", "view": "body"},
+            {"document_id": doc_a, "logical_chunk_id": "a", "view": "body"},
+            {"document_id": doc_a, "logical_chunk_id": "a", "view": "meta"},
+            {"document_id": doc_a, "logical_chunk_id": "a",
+             "view": "question", "question_text": "DocA 의 동작은?"},
+            {"document_id": doc_b, "logical_chunk_id": "b", "view": "body"},
         ],
     )
 
@@ -406,36 +416,43 @@ async def test_search_chunks_dedupes_multi_view_entries(stores) -> None:
         similarity_threshold=0.0,
     )
 
-    logical_ids = [r["metadata"]["logical_chunk_id"] for r in results]
-    assert len(logical_ids) == 2
-    assert logical_ids.count("c1") == 1
-    assert logical_ids.count("c2") == 1
-    # 먼저 등장한(최소 distance) meta 뷰가 남아야 한다
-    c1 = next(r for r in results if r["metadata"]["logical_chunk_id"] == "c1")
-    assert c1["metadata"]["view"] == "meta"
+    doc_ids = [r["metadata"]["document_id"] for r in results]
+    assert len(doc_ids) == 2
+    assert doc_ids.count(doc_a) == 1
+    assert doc_ids.count(doc_b) == 1
+    # DocA 의 question view 가 가장 가까웠으므로 보존
+    a_result = next(r for r in results if r["metadata"]["document_id"] == doc_a)
+    assert a_result["metadata"]["view"] == "question"
+    assert a_result["metadata"]["question_text"] == "DocA 의 동작은?"
 
 
 @pytest.mark.asyncio
 async def test_assemble_context_with_reranking(stores) -> None:
-    """리랭킹이 활성화되면 LLM 기반으로 결과가 재정렬된다."""
+    """리랭킹이 활성화되면 LLM 기반으로 결과가 재정렬된다.
+
+    R3: dedup 키가 document_id 이므로 리랭킹 후보는 서로 다른 두 문서로 둔다.
+    """
     meta_store, vector_store, graph_store = stores
 
-    doc_id = await meta_store.create_document(
-        source_type="manual", title="RerankDoc", original_content="c", content_hash="hrr",
+    doc_a = await meta_store.create_document(
+        source_type="manual", title="DocA", original_content="c", content_hash="hrra",
+    )
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="DocB", original_content="c", content_hash="hrrb",
     )
     vector_store.add_chunks(
-        chunk_ids=[f"chunk_{doc_id}_0", f"chunk_{doc_id}_1"],
+        chunk_ids=[f"chunk_{doc_a}_0", f"chunk_{doc_b}_0"],
         embeddings=[[0.9, 0.1], [0.85, 0.15]],
         documents=["일반 내용", "핵심 답변"],
         metadatas=[
-            {"document_id": doc_id, "chunk_index": 0},
-            {"document_id": doc_id, "chunk_index": 1},
+            {"document_id": doc_a, "chunk_index": 0},
+            {"document_id": doc_b, "chunk_index": 0},
         ],
     )
 
     embed_client = _make_embedding_client([0.9, 0.1])
 
-    # 리랭커가 chunk_1(핵심 답변)에 높은 점수를 부여
+    # 리랭커가 DocB(핵심 답변)에 높은 점수를 부여
     reranker = AsyncMock()
     reranker.rerank = AsyncMock(return_value=[0.3, 0.9])
 
@@ -792,3 +809,42 @@ async def test_assemble_context_source_code_disabled_by_default(stores) -> None:
     )
     assert "SECRET_CODE" not in result
     assert "원본 소스 코드" not in result
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_shows_matched_question_in_source_label(stores) -> None:
+    """R3: 매칭된 view='question' 의 question_text 가 출처 라벨에 노출된다."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="QDoc", original_content="c", content_hash="hq",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["q-body", "q-question"],
+        embeddings=[[0.5, 0.5], [0.9, 0.1]],
+        documents=["문서 본문 내용", "문서 본문 내용"],
+        metadatas=[
+            {"document_id": doc_id, "logical_chunk_id": "c1",
+             "section_path": "A", "view": "body"},
+            {"document_id": doc_id, "logical_chunk_id": "c1",
+             "section_path": "A", "view": "question",
+             "question_text": "QDoc 의 핵심 동작은?"},
+        ],
+    )
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    result = await assemble_context_with_sources(
+        query="핵심 동작",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=False,
+    )
+
+    assert "QDoc" in result.context_text
+    assert "섹션: A" in result.context_text
+    # 매칭된 질문 텍스트가 출처 라벨에 노출되어야 함
+    assert "QDoc 의 핵심 동작은?" in result.context_text
+    assert "매칭 질문" in result.context_text

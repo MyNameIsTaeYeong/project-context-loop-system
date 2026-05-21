@@ -106,7 +106,7 @@ async def test_confluence_with_raw_content_runs_extractor(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         result = await process_document(
@@ -196,7 +196,7 @@ async def test_confluence_rest_source_type_also_triggers_extractor(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         result = await process_document(
@@ -224,7 +224,7 @@ async def test_link_graph_saved_for_confluence_with_outbound_links(
     })
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ), patch(
         # 본문 그래프는 별도 테스트에서 검증 — 여기서는 링크 그래프만 격리해서 본다
@@ -269,7 +269,7 @@ async def test_link_graph_skipped_when_no_outbound_links(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         result = await process_document(
@@ -336,13 +336,13 @@ async def test_extracted_document_passed_to_structured_chunker(
     captured: dict[str, Any] = {}
 
     def fake_chunker(
-        extracted: Any, *, chunk_size: int, chunk_overlap: int, model: str,
+        extracted: Any, *, max_tokens: int, model: str,
     ) -> list[Any]:
         captured["extracted"] = extracted
         return []
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         side_effect=fake_chunker,
     ):
         await process_document(
@@ -390,7 +390,7 @@ async def test_multi_view_embeddings_stored_for_chunks(
     ]
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=fake_chunks,
     ):
         await process_document(
@@ -453,7 +453,7 @@ async def test_section_index_persisted_to_sqlite(
     ]
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=fake_chunks,
     ):
         await process_document(
@@ -632,7 +632,7 @@ async def test_body_graph_saved_for_confluence_with_signal(
     })
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         await process_document(
@@ -672,7 +672,7 @@ async def test_body_graph_skipped_when_no_signal(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         await process_document(
@@ -699,7 +699,7 @@ async def test_llm_body_extraction_skipped_when_disabled(
     llm_client.complete = AsyncMock(return_value='{"entities": [], "relations": []}')
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         await process_document(
@@ -724,7 +724,7 @@ async def test_llm_body_extraction_skipped_when_no_client(
     vector_store, graph_store, embedding_client = _make_stores()
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ):
         # llm_client 미전달 → 호출 흐름이 LLM 단계로 들어가지 않음
@@ -769,7 +769,7 @@ async def test_llm_body_extraction_runs_when_enabled(
     )
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ), patch(
         # 결정론 본문 추출은 격리
@@ -837,7 +837,7 @@ async def test_llm_body_extraction_falls_back_to_units_when_oversized(
     )
 
     with patch(
-        "context_loop.processor.pipeline.chunk_extracted_document",
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
         return_value=[],
     ), patch(
         "context_loop.processor.pipeline.extract_body_graph",
@@ -920,3 +920,179 @@ async def test_assemble_document_body_falls_back_to_plain_text() -> None:
 
     extracted = ExtractedDocument(plain_text="평문 본문 그대로", sections=[])
     assert _assemble_document_body(extracted) == "평문 본문 그대로"
+
+
+# ---------------------------------------------------------------------------
+# R3 — 가상 질문 인덱싱 통합
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_question_indexing_runs_when_enabled(
+    store: MetadataStore,
+) -> None:
+    """enable_question_indexing=True 일 때 가상 질문이 view='question' 으로 등록된다."""
+    from context_loop.processor.chunker import Chunk
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    # 단일 청크로 만들어 모든 가상 질문이 그 청크에 묶이도록 함 (section_index=None)
+    fake_chunks = [
+        Chunk(
+            id="chunk-1",
+            index=0,
+            content="문서 본문",
+            token_count=10,
+            section_path="",
+            section_anchor="",
+            section_index=None,
+        ),
+    ]
+
+    question_map = {0: ["AuthService 는 어떻게 동작하나요?", "토큰 만료 시 동작은?"]}
+
+    from context_loop.processor.question_generator import QuestionGenStats
+    fake_stats = QuestionGenStats(
+        sections_total=1, sections_with_questions=1, final_questions=2,
+        llm_called=True,
+    )
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=fake_chunks,
+    ), patch(
+        "context_loop.processor.pipeline.generate_questions_for_document",
+        new=AsyncMock(return_value=(question_map, fake_stats)),
+    ) as mock_q:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_question_indexing=True),
+            llm_client=llm_client,
+        )
+
+    mock_q.assert_awaited_once()
+    # vector_store.add_chunks 호출에서 view="question" 엔트리 검증
+    add_call = vector_store.add_chunks.call_args
+    _, _, _, metadatas = add_call.args
+    question_metas = [m for m in metadatas if m.get("view") == "question"]
+    assert len(question_metas) == 2
+    question_texts = {m["question_text"] for m in question_metas}
+    assert "AuthService 는 어떻게 동작하나요?" in question_texts
+    assert "토큰 만료 시 동작은?" in question_texts
+
+
+@pytest.mark.asyncio
+async def test_question_indexing_skipped_when_disabled(
+    store: MetadataStore,
+) -> None:
+    """enable_question_indexing=False 면 LLM 가상 질문 생성 호출 없음."""
+    from context_loop.processor.chunker import Chunk
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    fake_chunks = [
+        Chunk(
+            id="chunk-x",
+            index=0,
+            content="본문",
+            token_count=5,
+            section_path="",
+            section_anchor="",
+            section_index=None,
+        ),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=fake_chunks,
+    ), patch(
+        "context_loop.processor.pipeline.generate_questions_for_document",
+        new=AsyncMock(),
+    ) as mock_q:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_question_indexing=False),
+            llm_client=llm_client,
+        )
+
+    mock_q.assert_not_awaited()
+    # vector_store 에 question view 엔트리 없음
+    add_call = vector_store.add_chunks.call_args
+    _, _, _, metadatas = add_call.args
+    assert not any(m.get("view") == "question" for m in metadatas)
+
+
+@pytest.mark.asyncio
+async def test_question_indexing_per_section_mapping(
+    store: MetadataStore,
+) -> None:
+    """다청크(섹션 폴백) 시 가상 질문이 section_index 매칭으로 청크별 분배된다."""
+    from context_loop.processor.chunker import Chunk
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    fake_chunks = [
+        Chunk(
+            id="c-0", index=0, content="섹션0 본문", token_count=100,
+            section_path="A", section_anchor="a", section_index=0,
+        ),
+        Chunk(
+            id="c-1", index=1, content="섹션1 본문", token_count=100,
+            section_path="B", section_anchor="b", section_index=1,
+        ),
+    ]
+    question_map = {
+        0: ["A 의 동작은?"],
+        1: ["B 의 책임은?", "B 의 의존성은?"],
+    }
+    from context_loop.processor.question_generator import QuestionGenStats
+    fake_stats = QuestionGenStats(
+        sections_total=2, sections_with_questions=2, final_questions=3,
+        llm_called=True,
+    )
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=fake_chunks,
+    ), patch(
+        "context_loop.processor.pipeline.generate_questions_for_document",
+        new=AsyncMock(return_value=(question_map, fake_stats)),
+    ):
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_question_indexing=True),
+            llm_client=llm_client,
+        )
+
+    add_call = vector_store.add_chunks.call_args
+    ids, _, _, metadatas = add_call.args
+    # 청크 c-0 에 1개 질문, c-1 에 2개 질문 매핑
+    c0_q_metas = [m for m in metadatas
+                  if m.get("logical_chunk_id") == "c-0" and m.get("view") == "question"]
+    c1_q_metas = [m for m in metadatas
+                  if m.get("logical_chunk_id") == "c-1" and m.get("view") == "question"]
+    assert len(c0_q_metas) == 1
+    assert c0_q_metas[0]["question_text"] == "A 의 동작은?"
+    assert len(c1_q_metas) == 2
+    c1_texts = {m["question_text"] for m in c1_q_metas}
+    assert c1_texts == {"B 의 책임은?", "B 의 의존성은?"}
+    # vector ID 명명 규칙: {chunk_id}#q{i}
+    assert any(i.endswith("#q0") for i in ids)

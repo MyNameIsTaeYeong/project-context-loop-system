@@ -34,13 +34,21 @@ from context_loop.processor.ast_code_extractor import (
     to_graph_data,
 )
 from context_loop.processor.body_extractor import extract_body_graph
-from context_loop.processor.chunker import chunk_extracted_document, chunk_text
+from context_loop.processor.chunker import (
+    chunk_extracted_document_doclevel,
+    chunk_text,
+)
 from context_loop.processor.extraction_unit import build_extraction_units
 from context_loop.processor.link_graph_builder import build_link_graph
 from context_loop.processor.llm_body_extractor import (
     InputTooLargeError,
     extract_llm_body_graph,
     extract_llm_body_graph_for_document,
+)
+from context_loop.processor.question_generator import (
+    InputTooLargeError as QuestionInputTooLargeError,
+    QuestionGenConfig,
+    generate_questions_for_document,
 )
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
@@ -70,6 +78,16 @@ class PipelineConfig:
     # 보강하여 검색 추론 가치를 끌어올린다. 비용이 발생하지만 운영 기본을 ON 으로
     # 두어 그래프 품질을 기본 보장. LLM 호출을 끄려면 호출자가 명시적으로 False.
     enable_llm_body_extraction: bool = True
+    # R3 — 문서 단위 멀티 벡터 인덱싱.
+    # max_embedding_tokens: 단일 청크가 가질 수 있는 최대 토큰 수. 사내 임베딩
+    #   모델 컨텍스트 윈도우(8K 가정) 이하로 설정한다. 문서가 이 한도 이하면
+    #   1 청크로, 초과면 섹션 단위로 자연 폴백한다.
+    # enable_question_indexing: 인덱싱 시 LLM 으로 섹션별 가상 질문을 생성하여
+    #   별도 임베딩 view 로 등록한다. query 와 동일한 자연 질의 형태라 검색
+    #   정밀도가 향상된다 (proposition / question-based indexing). 비용 추가
+    #   발생 (문서당 LLM 호출 +1) 이지만 운영 기본 ON.
+    max_embedding_tokens: int = 8000
+    enable_question_indexing: bool = True
 
 
 async def process_document(
@@ -230,35 +248,95 @@ async def process_document(
                     len(extracted.mentions),
                 )
 
-            # 청크 (항상 실행; 본문이 비어 있으면 청커가 빈 리스트 반환)
+            # R3 — 문서 단위 청킹 (작은 문서 = 1 청크, 큰 문서 = 섹션 폴백).
+            # 임베딩 모델 컨텍스트 한도(8K 가정)를 max_embedding_tokens 로 가드.
             if extracted is not None:
-                chunks = chunk_extracted_document(
+                chunks = chunk_extracted_document_doclevel(
                     extracted,
-                    chunk_size=cfg.chunk_size,
-                    chunk_overlap=cfg.chunk_overlap,
+                    max_tokens=cfg.max_embedding_tokens,
                     model=cfg.embedding_model,
                 )
             else:
                 chunks = chunk_text(
                     content,
-                    chunk_size=cfg.chunk_size,
-                    chunk_overlap=cfg.chunk_overlap,
+                    chunk_size=cfg.max_embedding_tokens,
+                    chunk_overlap=min(cfg.max_embedding_tokens // 10, 200),
                     model=cfg.embedding_model,
                 )
             if chunks:
-                # 멀티뷰 임베딩: body(본문) + meta(title + section_path).
-                # 두 뷰는 같은 본문(document)을 가리키며 ChromaDB에는 별도 엔트리로
-                # 저장된다. 검색 단계에서 logical_chunk_id로 dedup한다.
+                # R3 — 가상 질문 생성 (옵션 — extracted 가 있고 enable_question_indexing
+                # 일 때만). LLM 호출 1회로 모든 섹션의 자연 질의를 한 번에 추출.
+                # 결과는 section_index → [questions] 매핑.
+                question_map: dict[int, list[str]] = {}
+                if (
+                    extracted is not None
+                    and cfg.enable_question_indexing
+                    and llm_client is not None
+                ):
+                    try:
+                        question_map, q_stats = (
+                            await generate_questions_for_document(
+                                doc_title=title,
+                                extracted=extracted,
+                                llm_client=llm_client,
+                            )
+                        )
+                        logger.info(
+                            "가상 질문 — doc_id=%d, sections=%d→%d, questions=%d, "
+                            "input_tokens≈%d",
+                            document_id,
+                            q_stats.sections_total,
+                            q_stats.sections_with_questions,
+                            q_stats.final_questions,
+                            q_stats.input_tokens_estimate,
+                        )
+                    except QuestionInputTooLargeError:
+                        logger.info(
+                            "가상 질문 스킵 — 문서 본문 입력 한도 초과 "
+                            "(doc_id=%d)", document_id,
+                        )
+
+                # 멀티뷰 임베딩: body(본문) + meta(title + section_path) + 가상 질문.
+                # body/meta 는 같은 청크를 가리키며 logical_chunk_id 로 dedup.
+                # 가상 질문 view 는 같은 source 청크에 연결되어 검색 매칭 시
+                # document_id 단위로 그루핑된다.
                 body_texts = [c.content for c in chunks]
                 meta_texts = [
                     build_meta_view_text(title, c.section_path) for c in chunks
                 ]
                 meta_mask = [bool(t) for t in meta_texts]
 
-                to_embed = body_texts + [t for t, keep in zip(meta_texts, meta_mask) if keep]
+                # 각 청크에 매핑할 가상 질문 목록.
+                # - 1청크 문서: 모든 가상 질문이 그 1청크에 연결
+                #   (section_index None → question_map 키와 매칭되지 않으면 다 묶음)
+                # - 다청크 (섹션 폴백): chunk.section_index 와 question_map 키 매칭
+                question_lists: list[list[str]] = []
+                for chunk in chunks:
+                    if chunk.section_index is None:
+                        # 단일 청크 — 문서의 모든 가상 질문을 묶음
+                        all_q: list[str] = []
+                        for qs in question_map.values():
+                            all_q.extend(qs)
+                        question_lists.append(all_q)
+                    else:
+                        question_lists.append(
+                            list(question_map.get(chunk.section_index, [])),
+                        )
+
+                to_embed = (
+                    body_texts
+                    + [t for t, keep in zip(meta_texts, meta_mask) if keep]
+                    + [q for qs in question_lists for q in qs]
+                )
                 embeddings = await embedding_client.aembed_documents(to_embed)
                 body_embeddings = embeddings[: len(body_texts)]
-                meta_embeddings_iter = iter(embeddings[len(body_texts):])
+                meta_count = sum(1 for keep in meta_mask if keep)
+                meta_embeddings_iter = iter(
+                    embeddings[len(body_texts): len(body_texts) + meta_count],
+                )
+                question_embeddings_iter = iter(
+                    embeddings[len(body_texts) + meta_count:],
+                )
 
                 vec_ids: list[str] = []
                 vec_embeddings: list[list[float]] = []
@@ -284,6 +362,19 @@ async def process_document(
                         vec_embeddings.append(next(meta_embeddings_iter))
                         vec_documents.append(chunk.content)
                         vec_metadatas.append({**base_meta, "view": "meta"})
+
+                    # 가상 질문 view — query 와 동일한 자연 질의 형태로 검색
+                    # 정밀도를 끌어올린다. document 컬럼에는 source 청크 본문을
+                    # 그대로 저장하여 답변 컨텍스트 조립이 본문을 받게 한다.
+                    for q_idx, q_text in enumerate(question_lists[i]):
+                        vec_ids.append(f"{chunk.id}#q{q_idx}")
+                        vec_embeddings.append(next(question_embeddings_iter))
+                        vec_documents.append(chunk.content)
+                        vec_metadatas.append({
+                            **base_meta,
+                            "view": "question",
+                            "question_text": q_text,
+                        })
 
                 vector_store.delete_by_document(document_id)
                 vector_store.add_chunks(

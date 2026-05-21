@@ -176,29 +176,34 @@ async def _search_chunks(
 ) -> list[dict[str, Any]]:
     """벡터 유사도 검색을 수행하고 threshold 이하 결과를 제외한다.
 
-    멀티뷰 임베딩(D-042)을 사용하므로 한 논리 청크가 ``body``/``meta`` 두
-    엔트리로 존재할 수 있다. 과잉 인출(over-fetch)한 뒤
-    ``logical_chunk_id`` 로 dedup하여 동일 본문이 중복 반환되지 않게 한다.
-    거리 오름차순으로 도착하므로 먼저 등장하는 항목이 해당 청크의 최소
-    distance이며, 그 값을 유지한다.
+    R3 멀티 벡터 인덱싱(body/meta/question 3 view) 을 사용하므로 한 문서가
+    여러 view 로 임베딩되어 있다. 과잉 인출(over-fetch) 후 **``document_id``
+    단위로 dedup** 하여 같은 문서가 결과를 점유하지 않게 한다 (사용자 의도:
+    "리턴은 문서 단위"). 거리 오름차순으로 도착하므로 먼저 등장하는 항목이
+    그 문서의 최소 distance 이며, 매칭된 view 의 metadata(``view``,
+    ``section_path``, ``question_text``)가 출처 라벨로 보존된다.
 
     Args:
         query_embedding: 쿼리 임베딩 벡터.
         vector_store: 벡터 저장소.
-        max_chunks: 반환할 최대 청크 수.
+        max_chunks: 반환할 최대 문서 수.
         similarity_threshold: 최소 코사인 유사도 (1 - distance).
-            이 값 미만인 청크는 제외된다. 0이면 필터링 없음.
+            이 값 미만인 결과는 제외된다. 0이면 필터링 없음.
     """
     try:
         if vector_store.count() == 0 or query_embedding is None:
             return []
-        # 뷰 수(최대 2)를 고려해 over-fetch 후 dedup.
-        raw = vector_store.search(query_embedding, n_results=max_chunks * 2)
+        # 멀티 벡터 (body/meta/가상 질문) 고려해 over-fetch 후 doc 단위 dedup.
+        # 가상 질문은 섹션당 3~5개 추가될 수 있어 over-fetch 배수를 늘림.
+        raw = vector_store.search(query_embedding, n_results=max_chunks * 6)
         seen: set[Any] = set()
         deduped: list[dict[str, Any]] = []
         for r in raw:
             meta = r.get("metadata") or {}
-            key = meta.get("logical_chunk_id") or r.get("id")
+            # R3: document_id 단위 dedup (같은 문서의 여러 view 가 매칭되면
+            # 최소 distance 항목만 결과로 반환). document_id 가 없는 외부
+            # 데이터는 logical_chunk_id 로 폴백.
+            key = meta.get("document_id") or meta.get("logical_chunk_id") or r.get("id")
             if key in seen:
                 continue
             seen.add(key)
@@ -221,11 +226,12 @@ async def _format_chunk_results(
     meta_store: MetadataStore,
 ) -> str:
     """청크 검색 결과를 텍스트로 포맷팅한다."""
-    lines = ["## 관련 문서 청크"]
+    lines = ["## 관련 문서"]
     doc_cache: dict[int, str] = {}
 
     for r in results:
-        doc_id = r.get("metadata", {}).get("document_id")
+        meta = r.get("metadata") or {}
+        doc_id = meta.get("document_id")
         if doc_id and doc_id not in doc_cache:
             doc = await meta_store.get_document(doc_id)
             doc_cache[doc_id] = doc["title"] if doc else f"문서 #{doc_id}"
@@ -233,10 +239,15 @@ async def _format_chunk_results(
         title = doc_cache.get(doc_id, "알 수 없음") if doc_id else "알 수 없음"
         content = r.get("document", "")
         distance = r.get("distance", 0)
-        section_path = r.get("metadata", {}).get("section_path", "")
+        section_path = meta.get("section_path", "")
+        view = meta.get("view", "")
+        question_text = meta.get("question_text", "")
+
         header = f"\n### [{title}] (유사도: {1 - distance:.2f})"
         if section_path:
             header += f"\n_섹션: {section_path}_"
+        if view == "question" and question_text:
+            header += f"\n_매칭 질문: {question_text}_"
         lines.append(header)
         lines.append(content)
 
@@ -403,17 +414,23 @@ async def assemble_context_with_sources(
     if chunk_results:
         lines = []
         for r in chunk_results:
-            doc_id = r.get("metadata", {}).get("document_id")
+            meta = r.get("metadata") or {}
+            doc_id = meta.get("document_id")
             if doc_id and doc_id not in doc_cache:
                 doc = await meta_store.get_document(doc_id)
                 doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
             title = doc_cache[doc_id]["title"] if doc_id and doc_id in doc_cache else "알 수 없음"
             distance = r.get("distance", 1.0)
             similarity = 1 - distance
-            section_path = r.get("metadata", {}).get("section_path", "")
+            section_path = meta.get("section_path", "")
+            view = meta.get("view", "")
+            question_text = meta.get("question_text", "")
+
             source_label = f"[출처: {title}]"
             if section_path:
                 source_label += f" (섹션: {section_path})"
+            if view == "question" and question_text:
+                source_label += f" (매칭 질문: {question_text})"
             lines.append(f"{source_label}\n{r.get('document', '')}")
             if doc_id and doc_id not in {s.document_id for s in sources}:
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))

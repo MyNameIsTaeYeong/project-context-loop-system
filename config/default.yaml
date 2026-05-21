@@ -214,4 +214,7 @@ mcp:
   sse_port: 3001
   max_context_chunks: 10
   include_graph_by_default: true
-  context_max_tokens: 4096
+  # R3 — 인덱싱을 문서 단위로 전환하면서 검색 결과가 청크가 아닌 문서 단위로
+  # dedup 된다. 한 결과의 본문 평균이 5K 토큰 안팎이므로 4096 기본은
+  # max_context_chunks 와 곱해 즉시 충돌. 256K LLM 가정 하에 32K 로 상향.
+  context_max_tokens: 32768
