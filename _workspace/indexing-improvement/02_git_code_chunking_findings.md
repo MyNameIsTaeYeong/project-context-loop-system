@@ -1,323 +1,212 @@
-# Git Code Chunking — Findings
+# Git Code Chunking — R2 Findings (심볼 청크 → 파일 청크 전환 검토)
 
 ## 요약
 
-- 총 발견 **16건** (Critical 2, High 11, Medium 2, Low 1)
-- 가장 시급한 3건:
-  - **F-G-01** Python `_extract_python`이 모듈 docstring/상수/top-level 코드를 누락 → 인덱싱 사각지대
-  - **F-G-05** Java 함수 패턴이 함수 호출(예: `int x = bar(`)을 함수 정의로 잘못 인식 — false positive 다수
-  - **F-G-13** `collect_files`가 `.venv`/`node_modules`/`__pycache__` 같은 vendored 디렉토리를 필터링하지 않음 → 검색 노이즈
+- 이번 라운드 핵심 질문: `source_type='git_code'` 의 AST 기반 **심볼 단위 청킹**을 제거하고 **파일 단위 1청크**로 인덱싱할 수 있는가?
+- 결론(미리보기): **⚠️ 조건부 가능 — 하이브리드 권고**. AST 추출 자체(`extract_code_symbols` → `to_graph_data`)는 그래프 품질의 핵심이라 반드시 유지. 청킹 함수(`to_chunks`)만 "파일 < 임베딩 한도 = 파일 1청크 / 한도 초과 = 심볼 단위" 형태로 전환 가능. 단 임베딩 한도(8192) 초과 파일이 잔존하므로 청킹 자체를 0으로 만들 수는 없다.
+- 새 발견 **6건** (이번 라운드 한정, R1 산출물과 중복 금지):
+  - **F-G-R2-01** 심볼 청크가 "강제" 분할 사유는 사실상 **임베딩 모델 입력 한도(8192)**, 그래프/검색 정밀도는 부수 효과
+  - **F-G-R2-02** 심볼 단위 메타데이터(`fqn`, `symbol_type`, `line_start/end`)는 **청크 컬럼에 영속화되어 있지 않음** — `chunk.content` 헤더와 `section_path` 로만 표현. 청크 단위 축소 시 손실폭이 예상보다 작음
+  - **F-G-R2-03** 한 파일 = 1 임베딩 벡터는 **자연어 ↔ 함수명 정밀 매칭**과 **단일 파일 내 다중 함수 disambiguation** 두 영역에서 RAG 정밀도를 떨어뜨림 (정량 추정 포함)
+  - **F-G-R2-04** AST 추출은 그래프(`to_graph_data`) 에 필수 — `to_chunks` 제거하더라도 `extract_code_symbols` 는 유지해야 함
+  - **F-G-R2-05** `file_size_limit_kb=500` 기본값과 `nomic-embed-text` 8192 토큰 한도 사이에 큰 갭(약 16배). 거대 파일 자동 분할 정책이 반드시 필요
+  - **F-G-R2-06** 하이브리드(파일 임계 미만 = 파일 1청크 / 초과 = 심볼 분할)는 구현 복잡도 작고, 멀티뷰 임베딩(body+meta)·`logical_chunk_id` dedup 구조를 그대로 재사용 가능
+
+---
+
+## 검토 대상 / 환경 사실
+
+| 항목 | 값 / 근거 |
+|---|---|
+| LLM | `qwen2.5:7b` via Ollama (context 32K, `max_tokens=32768`) |
+| 임베딩 모델 | `nomic-embed-text` via Ollama, **8192 토큰** 입력 한도 (공식 spec) |
+| `chunk_size` 기본 | 512 토큰 (`PipelineConfig`, `pipeline.py:62`) |
+| `file_size_limit_kb` 기본 | **500 KB** (`git_config.py:84`, `config/default.yaml:23`) |
+| 본 레포 `.py` 분포 | 최대 ~40KB(상위 ~10K 토큰), 평균은 훨씬 작음 (10K 토큰 이하가 다수) |
+| 500KB → 토큰 추정 | 약 125K 토큰 (대략 4 bytes/token) — **임베딩 한도의 ~16배** |
+| git_code 청킹 코드 | `ast_code_extractor.py::to_chunks` (line 143-192) — 심볼당 1청크, 헤더 prefix 추가 |
+| git_code 파이프라인 분기 | `pipeline.py:131-208` (`if source_type == "git_code":`) — 멀티뷰 임베딩(body+meta), `logical_chunk_id` dedup |
+| 청크 영속화 컬럼 | `chunks` 테이블: `id, document_id, chunk_index, content, token_count, section_path, section_anchor, embed_text, section_index` (`metadata_store.py:41-44, 166-180`) — **`symbol_type`/`line_start`/`line_end`/`fqn` 컬럼 없음** |
+| MCP/Web에서 line range 노출 | 없음 (`grep`으로 web/, mcp/, storage/ 전영역 0건) |
+
+---
 
 ## 발견 사항
 
-### F-G-01 (CRITICAL): Python `_extract_python`이 모듈 docstring/상수/top-level 표현을 누락
+### F-G-R2-01 (CORE): 심볼 단위 청크의 "강제 요인"은 임베딩 한도이며, 다른 사유는 결과적 부수 효과
 
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:291-367`
+- **위치**: `src/context_loop/processor/ast_code_extractor.py::to_chunks` (143-192)
+- **현재 동작**: 심볼(함수/메서드/클래스/모듈 docstring/모듈 상수)마다 1개 `Chunk`를 만들고, 검색용 임베딩 텍스트는 `file_title + parent + name + signature + docstring` 의 식별자 요약을 별도(`meta_texts`)로 생성.
+- **분할이 강제되는 진짜 이유 분류**:
+  1. **임베딩 모델 입력 한도** — 가장 본질적. `nomic-embed-text` 8192 토큰 초과 파일은 한 번에 임베딩 불가. 심볼 분할로 자연 회피.
+  2. **검색 정밀도** — 자연어 질의("토큰 카운트 함수") ↔ 짧은 함수 본문 매칭이 파일 전체보다 코사인 유사도가 높게 나옴 (메타뷰 텍스트가 식별자 중심이라 더 그렇다).
+  3. **검색 결과 표시 단위** — 검색 hit 1건이 "한 함수의 본문"이 되어 사용자에게 의미 있게 보임 (파일 전체 hit는 노이즈).
+  4. **그래프 입력** — 무관. `to_graph_data` 는 `extraction.symbols` 만 보고 청크에 의존 안 함 (line 210-314).
+  5. **토큰 카운트 표시** — 청크당 `token_count` 가 의미 있는 단위로 노출되지만 본질적 강제 요인은 아님.
+
+- **분류 결과**:
+  - (1)만이 **회피 불가능한 강제 요인**.
+  - (2)(3)은 "심볼 단위가 좋지만 파일 단위로 가도 어느 정도 검색 가능" — 정도의 문제.
+  - (4)는 청킹 제거와 무관.
+- **함의**: "**파일 < 8K 토큰 = 파일 1청크 / 파일 ≥ 8K = 심볼 청크**" 하이브리드는 (1)을 충족시키면서 (2)(3)의 손실폭을 측정·관리 가능한 수준으로 줄인다.
+- **심각도**: Critical (의사결정 근거 자체)
+
+---
+
+### F-G-R2-02 (HIGH): 심볼 단위 메타데이터의 대부분은 청크 컬럼에 영속화되어 있지 않다 — 손실폭이 작음
+
+- **위치**: 
+  - dataclass: `ast_code_extractor.py::CodeSymbol` (31-55) — `symbol_type`, `signature`, `line_start`, `line_end`, `docstring`, `parent_name`, `parent_signature`
+  - SQLite `chunks` 스키마: `metadata_store.py:36-46, 166-180` — `symbol_type`/`line_start`/`line_end`/`fqn`/`parent_name` **컬럼 없음**
+  - ChromaDB metadata: `pipeline.py:164-180` — `document_id, chunk_index, title, section_path, section_anchor, logical_chunk_id, view` 만 저장 (symbol-specific 필드 없음)
+- **사실**:
+  - `symbol_type`/`signature`/`parent_name` 은 **`chunk.content` 안의 헤더 문자열**(`# File: <title>\n# <parent_sig>\n# <symbol_type>: <signature>\n\n` — line 162-170)로 흡수.
+  - `parent_name`/`name` 은 `section_path` (`"<file> > <parent> > <name>"` — line 168, 171)로 흡수.
+  - `line_start`/`line_end` 은 dataclass 안에서만 존재. `to_chunks` 시점에 버려짐. 어떤 컬럼/메타데이터에도 저장되지 않음. **검색·표시 어디에서도 사용되지 않음** (web/, mcp/, storage/ grep 0건).
+  - `fqn` 은 청크에는 없고 **그래프 노드 이름**으로만 영속화됨 (`to_graph_data` line 256, 270).
+- **함의 — 파일 단위 전환 시 손실**:
+  - `section_path` 의 ` > parent > name` 꼬리 사라짐 — 그러나 `extract_code_symbols` 를 유지하면 그래프 노드에서 동일 정보 조회 가능.
+  - 청크 헤더(`# method: foo(...)`) 사라짐 — 검색 결과 표시에서 "어느 함수인지" 텍스트 단서 약화.
+  - `embed_text` (메타 뷰 입력 = 식별자 요약) — 파일 단위에서는 한 파일에 다수 심볼이 있어 단일 요약 텍스트 생성 정책이 필요 (예: 심볼 이름 카탈로그). 후술 F-G-R2-03 참조.
+  - line range 손실: **현재도 노출 안 됨 → 손실 0**. 다만 미래 IDE 통합/blame view 시 필요해질 수 있음.
+- **심각도**: High (전환 의사결정에 결정적 — 손실폭이 예상보다 작음을 입증)
+
+---
+
+### F-G-R2-03 (HIGH): 파일 1청크가 RAG 정밀도에 주는 영향 — 두 가지 명확한 손실 패턴
+
+#### (a) 자연어 ↔ 함수명 정밀 매칭 약화
+
+- **현재 동작**: 멀티뷰 임베딩. `body` 뷰는 함수 본문(자연어 주석/도메인 용어 포함), `meta` 뷰는 식별자 요약(이름+시그니처+docstring). 두 뷰를 같은 `logical_chunk_id` 로 dedup (`pipeline.py:163-180`, `context_assembler.py:195-207`).
+- **파일 단위 전환 시**: 한 파일에 N개 함수가 있어도 임베딩은 1개. 자연어 질의 "토큰 카운트하는 함수는?"에 대해
+  - 심볼 청크: `count_tokens` 함수 본문만의 임베딩이 hit → 정확도 ↑
+  - 파일 청크: 함수 본문이 파일 전체에 희석된 임베딩이 hit → 같은 distance 점수라도 의미 명확도 ↓
+- **정량 추정** (이 레포 기준): 함수 5개 평균인 파일 1청크 vs 5청크 → 임베딩 N건이 1/5로 감소, 그러나 같은 자연어 질의에서 cosine similarity 도 ~5~15% 떨어질 것으로 추정 (single-document dilution; embedding 평균화 효과). 정확한 수치는 평가 시스템(R1 verification report) 으로 측정 필요.
+
+#### (b) 단일 파일 내 다중 함수 disambiguation 약화
+
+- 사용자 질의: "`extract_code_symbols` 함수가 어떻게 동작하나"
+- 현재: `extract_code_symbols` 청크가 hit → 그 함수 본문만 반환 (메서드/parent 헤더 포함)
+- 파일 단위: `ast_code_extractor.py` 파일 1청크 hit → 전체 파일(~10K 토큰) 반환 → LLM 컨텍스트 낭비 + 사용자 결과 표시에서 "어디?" 불명확
+- **완화책**:
+  - 파일 단위라도 검색 결과에 "히트 라인 근방 ±30라인" 윈도우를 잘라서 표시 (`extract_code_symbols` 만으로 line range 찾고 후처리 trim)
+  - 또는 파일 임베딩과 별도로 "심볼 이름 카탈로그"(`module foo: functions = [extract_code_symbols, to_chunks, ...]`)를 meta 뷰로 추가 임베딩 — 식별자 매칭만 살리고 본문은 파일 단위 유지
+- **심각도**: High
+
+---
+
+### F-G-R2-04 (HIGH): `extract_code_symbols` 는 그래프 입력이라 청킹 제거와 무관하게 유지해야 함
+
+- **위치**: `pipeline.py:138, 203` — 한 번 호출된 `extraction` 이 `to_chunks` 와 `to_graph_data` 둘 다에 사용됨.
+- **사실 확인**:
+  - `to_graph_data` (ast_code_extractor.py:210-314) 가 만드는 그래프 엔티티: `module(파일)`, 각 심볼(`function`/`method`/`class`/`struct`/`interface`), import된 외부 모듈. 관계: `imports`, `contains` (class → method)
+  - 그래프는 **검색의 핵심 보강 시그널** — `get_graph_context(entity_name='UserService')` 같은 MCP tool 이 작동하려면 심볼 노드가 필요
+  - 파일 단위 청킹으로 전환해도 `extract_code_symbols` 은 **반드시 호출 유지** 해야 그래프 품질이 보존됨
+- **함의**:
+  - 청킹 전환 비용: `to_chunks` 만 교체 (또는 `to_chunks_unified` 추가) — `extract_code_symbols`/`to_graph_data` 는 무수정
+  - AST 파싱 비용은 그래프 때문에 어차피 발생 → **청킹 제거로 인한 CPU 절감 효과는 거의 없음**
+  - 절감되는 것은: 임베딩 호출 수, 벡터 저장소 row 수, 청크 row 수, 청크 검색 시 dedup 처리량
+- **심각도**: High (전환 설계의 핵심 제약)
+
+---
+
+### F-G-R2-05 (HIGH): `file_size_limit_kb=500` 과 임베딩 8192 토큰 한도 사이의 큰 갭
+
+- **위치**: `git_config.py:84`, `git_repository.py::filter_file` (185-201), `pipeline.py:154` (`embedding_client.aembed_documents(to_embed)`)
 - **현재 동작**:
-  ```python
-  for node in ast.iter_child_nodes(tree):
-      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-          ...
-      elif isinstance(node, ast.ClassDef):
-          ...
-      elif isinstance(node, ast.Import):
-          ...
-      elif isinstance(node, ast.ImportFrom):
-          ...
+  - `filter_file` 가 500KB 초과 파일을 제외 → 통과한 파일은 최대 500KB ≈ **약 125K 토큰** (코드 기준 ~4 bytes/token).
+  - 심볼 청크 단계에서는 한 함수가 8K 토큰을 넘는 경우만 발생 (드뭄) — 자연스럽게 한도 회피.
+  - 파일 단위로 임베딩하면 **8K~125K 토큰 사이 파일은 `nomic-embed-text` 입력 한도 초과** → Ollama 호출이 에러 / 토큰 잘림 발생.
+- **이 레포 자체 사실 확인**:
+  - 최상위 10개 `.py` 파일이 ~20K~40KB (대략 5K~10K 토큰). 임베딩 한도 근접/초과 파일이 이미 존재.
+  - 일반 사내 모놀리스 레포(예: `services/billing/handler.go` 등)는 500KB 가까운 파일이 종종 있음 — 거의 항상 한도 초과.
+- **함의**:
+  - 파일 단위 전환 시 **자동 분할 정책이 반드시 필요**:
+    - 옵션 A: 파일 ≥ N 토큰(예: 7000) 시에만 심볼 분할로 폴백 (하이브리드)
+    - 옵션 B: 모든 파일을 토큰 기반(`chunk_text` 활용) 청킹 — AST 의미 손실
+    - 옵션 C: 임베딩 호출에서 토큰 단위 잘림 허용 (`nomic` 자체가 truncate함) — 의미 손실 + silent failure 위험
+  - **권장 옵션 = A**. F-G-R2-04 와 결합: AST 추출은 어차피 한다 → 한도 초과 시 그 결과를 그대로 심볼 청크로 재사용 (코드 중복 없음).
+- **심각도**: High (구현 시 필수 안전장치)
+
+---
+
+### F-G-R2-06 (MEDIUM): 하이브리드 구현은 기존 멀티뷰/dedup 인프라를 그대로 재사용 가능
+
+- **위치**: `pipeline.py:131-208`, `ast_code_extractor.py::to_chunks`
+- **제안 동작**:
   ```
-  - 모듈 docstring (`"""모듈 설명"""`), 모듈 상수 (`MAX_RETRIES = 3`), top-level expression, `if __name__ == "__main__":` 블록, 모듈 레벨 타입 alias 모두 누락
-- **문제**:
-  - `MAX_RETRIES`, `DEFAULT_CONFIG` 같은 상수가 검색 불가
-  - 모듈 docstring이 청크에 없어 "이 모듈이 무엇인가" 질의 실패
-  - 사용자가 `from x import MAX_RETRIES`를 하는 코드를 코드 검색해도 정의 위치 못 찾음
-- **재현/근거**: `extract_code_symbols("MAX = 10\n\ndef foo(): pass", "x.py")` → symbols에 `foo`만, `MAX` 없음
-- **개선 방향**:
-  - (1) 모듈 docstring을 별도 `module` 심볼로 추출 (`ast.get_docstring(tree)`)
-  - (2) 모듈 레벨 Assign/AnnAssign을 모아 하나의 `module_constants` 심볼로 묶음 (개별 청크가 너무 많아지지 않게)
-  - 권장: (1)+(2) 모두
-- **영향 범위**: 모든 Python git_code 검색
-- **심각도**: Critical | **공수**: M
-
----
-
-### F-G-02 (HIGH): Python 데코레이터가 body에 포함되지 않음
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:305, 328-329`
-- **현재 동작**: `body = "".join(lines[node.lineno - 1 : node.end_lineno])` — `node.lineno`는 `def` 라인 (Python 3.8+에서 데코레이터는 lineno에서 제외됨)
-- **문제**: `@property`, `@dataclass`, `@app.route("/users")`, `@pytest.fixture` 같은 의미 결정적 데코레이터가 청크 본문에서 누락 → 검색에서 "라우트가 어떤 함수에 매핑되는지" 질의 실패
-- **재현/근거**:
-  ```python
-  @app.route("/users")
-  def list_users(): ...
+  extraction = extract_code_symbols(content, title)   # 그래프용 — 항상 호출
+  file_token_count = count_tokens(content)
+  EMBED_LIMIT = 7000  # nomic-embed-text 8192의 안전 마진
+  if file_token_count <= EMBED_LIMIT:
+      # 파일 1청크 — body 뷰 = 전체 코드, meta 뷰 = 식별자 카탈로그
+      chunks = [single file chunk]
+      meta_texts = [f"{title}\n" + symbol_catalog(extraction.symbols)]
+  else:
+      # 기존 심볼 분할 fallback
+      chunks, meta_texts = to_chunks(extraction, title)
   ```
-  → body는 `def list_users(): ...`만 추출, `@app.route("/users")` 누락
-- **개선 방향**:
-  - `node.decorator_list`가 있으면 첫 decorator의 lineno부터 body 시작
-  - signature 문자열에도 `@decorator` 한 줄 prefix 추가
-- **영향 범위**: 데코레이터 활용 프로젝트 (Flask/FastAPI/pytest/SQLAlchemy 등) — 사실상 모든 현대 Python 코드
-- **심각도**: High | **공수**: S
-
----
-
-### F-G-03 (HIGH): Python `_python_func_sig`이 *args, **kwargs, keyword-only, defaults 모두 누락
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:370-390`
-- **현재 동작**:
-  ```python
-  for arg in node.args.args:
-      name = arg.arg
-      if arg.annotation:
-          name += f": {ast.unparse(arg.annotation)}"
-      parts.append(name)
-  ```
-  - `node.args.args`만 사용 → `posonlyargs`, `kwonlyargs`, `vararg`, `kwarg`, `defaults` 모두 누락
-- **문제**: 시그니처가 부정확. 예: `def foo(a, *args, **kwargs)` → `def foo(a)`. `def bar(*, key: str)` → `def bar()`. 임베딩 입력 텍스트의 의미 정보 손실
-- **개선 방향**:
-  - `ast.unparse(node.args)` 한 줄로 모든 args 카테고리 처리
-  - 또는 `ast.unparse(node)` 시 전체 함수의 첫 라인만 시그니처로 사용
-- **영향 범위**: 모든 Python 함수/메서드 시그니처
-- **심각도**: High | **공수**: S
-
----
-
-### F-G-04 (HIGH): Python 중첩 클래스/중첩 함수 누락
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:321-323`
-- **현재 동작**:
-  ```python
-  methods = [
-      child for child in ast.iter_child_nodes(node)
-      if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-  ]
-  ```
-  - 클래스 내부의 nested ClassDef를 메서드 필터에서 누락
-- **문제**: 데이터 클래스나 enum 안의 nested class, Meta 클래스(Django) 패턴이 인덱싱 안 됨
-- **개선 방향**:
-  - 메서드 + 중첩 클래스 모두 자식으로 재귀 처리
-  - parent_name을 dotted FQN으로 (예: `Outer.Inner`)
-- **영향 범위**: Django Meta, dataclasses + Config nested, Pydantic Settings 등
-- **심각도**: High | **공수**: M
-
----
-
-### F-G-05 (CRITICAL): Java 함수 패턴이 함수 호출을 함수 정의로 잘못 인식 가능
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:404-413`
-- **현재 동작**:
-  ```python
-  "java": [
-      (re.compile(
-          r"^\s*(?:public|private|protected|static|final|synchronized|\s)*"
-          r"[\w<>\[\],\s]+\s+(\w+)\s*\(",
-      ), "function"),
-  ],
-  ```
-  - modifier 키워드 그룹이 0회 이상(`*`)이라 빈 prefix 허용 → `int foo = bar(x);`도 매칭 가능
-  - `[\w<>\[\],\s]+`이 `int`를 잡고 `(\w+)` 가 `bar`를 잡음 → `bar`가 메서드로 등록
-- **문제**: 메서드 호출 라인을 메서드 정의로 잘못 인식 → 가짜 심볼이 그래프/청크에 들어감. 사용자는 "메서드 본문이 호출 라인 한 줄" 같은 이상한 청크를 봄
-- **재현/근거**: `int x = computeSum(a, b);` 한 줄을 함수로 인식
-- **개선 방향**:
-  - modifier 키워드를 1회 이상 강제 (`+` 사용) — Java 메서드는 거의 항상 public/private/protected 등을 가짐
-  - 또는 return type 자리에 단순 식별자/제네릭만 허용 (정규식 강화)
-  - 또는 `_extract_class_methods`의 키워드 블랙리스트를 함수 패턴에도 적용
-- **영향 범위**: 모든 Java 파일. false positive 심볼 다수
-- **심각도**: Critical | **공수**: S
-
----
-
-### F-G-06 (HIGH): TypeScript/JavaScript 화살표 함수 누락
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:414-422`
-- **현재 동작**: `function` 키워드 패턴만 인식 → `const foo = () => {}`, `export const foo = async () => {}` 누락
-- **문제**: 현대 TS/JS 코드의 대다수 함수가 화살표 형태 → 인덱싱 사각지대
-- **개선 방향**:
-  - 패턴 추가:
-    ```
-    ^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?(?:\([^)]*\)|\w+)\s*=>
-    ```
-  - body 종료: 화살표 본문이 `{}` 블록이면 brace match, expression이면 `;` 까지
-- **영향 범위**: 모든 React/Node.js 프로젝트
-- **심각도**: High | **공수**: M
-
----
-
-### F-G-07 (HIGH): TypeScript에서 type alias / enum / namespace 누락
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:414-418`
-- **현재 동작**: `function`, `class`, `interface`만 인식
-- **문제**: `type Foo = ...`, `enum Color { ... }`, `namespace X { ... }` 누락 → 도메인 모델/상태 정의 검색 불가
-- **개선 방향**:
-  - `^(?:export\s+)?type\s+(\w+)\s*=` 패턴 추가 (body는 같은 라인 또는 다음 `;`까지)
-  - `^(?:export\s+)?(?:const\s+)?enum\s+(\w+)` 패턴 추가
-- **영향 범위**: TypeScript 프로젝트
-- **심각도**: High | **공수**: S
-
----
-
-### F-G-08 (MEDIUM): Brace-language의 멀티라인 시그니처 후속 처리 미흡
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:567-572` (`_METHOD_PATTERNS`)
-- **현재 동작**: `^\s*(?:public|private|protected|static|readonly|\s)*(?:async\s+)?(\w+)\s*\(` — 패턴은 첫 라인의 `(`까지만 본 후 `_find_matching_brace`로 `{` 찾음
-- **문제**: 시그니처가 멀티라인이고 `{`가 다음 라인에 있는 경우 — 작동은 함 (find가 그 다음 `{`를 찾음). 다만 시그니처 추출(`body[:sig_end].strip()`)이 첫 라인 한 줄로 좁혀짐 → 멀티라인 시그니처의 일부만 signature에 들어감
-- **개선 방향**: body가 추출되면 그 안에서 첫 `{` 위치까지 전부 시그니처로 (현재도 `body.find("{")` 사용 — 이미 OK) — 재확인하니 OK. **무효 발견 → 제외**
-- **심각도**: ~~Medium~~ → 제외
-
----
-
-### F-G-09 (HIGH): `_extract_class_methods`의 line_start 계산이 복잡하고 1-off 위험
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:643-644`
-- **현재 동작**:
-  ```python
-  line_start=class_line_offset + 1 + inner_content[:method_start_in_inner].count("\n") + 1,
-  line_end=class_line_offset + 1 + method_end_line,
-  ```
-  - `class_line_offset` 0-based + `+1`로 1-based + `count("\n")` + `+1`
-  - 수식의 의미 추적 어렵고 1-off 위험
-- **문제**: line range가 실제 코드 라인과 어긋날 수 있어 후속 분석(예: blame, 위치 표시)에서 잘못된 라인 출력
-- **재현/근거**: 단순 테스트 케이스 작성 필요. 기존 테스트가 line 정확도를 보장하는지 확인 필요
-- **개선 방향**:
-  - 헬퍼 함수로 분리하고 단위 테스트 강화
-  - 또는 `lines[class_line_offset:].splitlines()`로 직접 인덱싱
-- **영향 범위**: TS/Java/JS의 클래스 메서드 line 표시
-- **심각도**: High | **공수**: M
-
----
-
-### F-G-10 (HIGH): `_extract_brace_symbols`의 used_ranges가 0-based line_idx와 1-based end_line 혼용
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:467, 499, 552`
-- **현재 동작**:
-  ```python
-  if any(s <= line_idx < e for s, e in used_ranges):  # line 467
-      continue
-  ...
-  used_ranges.append((line_idx, end_line))  # line 552 — line_idx 0-based, end_line 1-based
-  ```
-- **문제**: end_line이 1-based (계산: `content[:block_end].count("\n") + 1`)이므로 다음 iteration의 line_idx(0-based)와 비교 시 1-off → 마지막 라인을 다시 매치할 가능성. 또는 첫 라인의 used_range가 (10, 11)이면 10번 라인만 차단, 11번도 메서드의 일부일 수 있음
-- **개선 방향**: `used_ranges.append((line_idx, end_line - 1))` 또는 일관되게 0-based로
-- **영향 범위**: brace-language 추출에서 인접 라인이 두 번 매치되거나 누락 — 가끔 중복 심볼/누락 심볼 발생
-- **심각도**: High | **공수**: S
-
----
-
-### F-G-11 (HIGH): Python `from x import (a, b)`에서 a, b 이름이 imports에 누락
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:358-365`
-- **현재 동작**:
-  ```python
-  elif isinstance(node, ast.ImportFrom):
-      if node.module:
-          imports.append(node.module)
-      elif node.level > 0:
-          ...
-  ```
-  - 모듈명만 imports에 추가, alias.name (실제 import된 이름) 누락
-- **문제**: 검색에서 "process_document 함수가 어디서 import되는가" 질의에 imports 그래프가 도움 못 줌. 의존성 추적 제한
-- **개선 방향**:
-  - `from x import y` → `x.y` 또는 `("x", "y")` 튜플 보관
-  - 또는 별도 `import_symbols: list[tuple[str, str]]` 필드 추가
-- **영향 범위**: Python 코드의 의존성 분석/검색
-- **심각도**: High | **공수**: S
-
----
-
-### F-G-12 (MEDIUM): `_extract_fallback`이 거대 unknown 파일을 통째로 한 청크로
-
-- **위치**: `src/context_loop/processor/ast_code_extractor.py:725-741`
-- **현재 동작**: 파싱 실패 또는 미지원 언어 → 전체 파일이 단일 심볼/청크
-- **문제**: 거대 마크다운, .json, 미지원 언어 파일이 단일 거대 청크 → 임베딩 모델 input 한계 초과, 검색 결과 표시 무의미
-- **개선 방향**:
-  - `_extract_fallback`이 `chunker.chunk_text`를 호출하여 토큰 기반 분할
-  - 또는 to_chunks에서 폴백 심볼은 chunk_text로 후처리
-- **영향 범위**: 미지원 언어 파일 또는 파싱 실패 파일
-- **심각도**: Medium | **공수**: M
-
----
-
-### F-G-13 (HIGH): `collect_files`이 `.gitignore`를 무시하고 vendored 디렉토리도 포함
-
-- **위치**: `src/context_loop/ingestion/git_repository.py:306-308`
-- **현재 동작**:
-  ```python
-  for abs_path in clone_dir.rglob("*"):
-      if abs_path.is_file() and ".git" not in abs_path.parts:
-          candidates.append(...)
-  ```
-  - `.git`만 제외, `.venv`/`venv`/`node_modules`/`__pycache__`/`dist`/`build`/`target` 등은 포함됨
-  - `supported_extensions` 필터로 일부 컷되지만, `.venv` 안의 `.py`, `node_modules` 안의 `.js`/`.ts`는 통과
-- **문제**:
-  - 라이브러리 코드가 인덱스에 들어가 검색 노이즈 증가
-  - 인덱싱 시간/공간 낭비
-  - 사용자가 자기 코드를 찾을 때 third-party 코드가 hit
-- **재현/근거**: `node_modules/react/cjs/react.production.min.js` 같은 파일이 후보에 들어감
-- **개선 방향**:
-  - 상수 `_DEFAULT_EXCLUDED_DIRS = {".venv", "venv", "node_modules", "__pycache__", "dist", "build", "target", ".tox", ".pytest_cache", ".mypy_cache", "vendor"}`
-  - `collect_files`에서 `any(part in _DEFAULT_EXCLUDED_DIRS for part in abs_path.parts)` 시 건너뜀
-  - 사용자 product_scopes의 paths가 이미 좁히지만, 자동 탐지(scope_analyzer) 사용 시 노이즈 큼
-- **영향 범위**: 자동 탐지된 product 또는 product paths가 광범위한 레포
-- **심각도**: High | **공수**: S
-
----
-
-### F-G-14 (HIGH): `store_git_code`이 매 파일마다 전체 git_code 목록을 list_documents → O(N²)
-
-- **위치**: `src/context_loop/ingestion/git_repository.py:361-365`
-- **현재 동작**:
-  ```python
-  existing_docs = await store.list_documents(source_type="git_code")
-  existing = next(
-      (d for d in existing_docs if d.get("source_id") == source_id), None,
-  )
-  ```
-  - N개 파일 처리에 N번의 전체 list_documents 호출
-- **문제**: 1000 파일 레포 동기화 시 100만 행 스캔 — 대용량 레포에서 동기화가 매우 느림. SQLite 부하 증대
-- **개선 방향**:
-  - `sync_repository`에서 한 번 list_documents 후 `dict[source_id, doc]` cache
-  - cache를 `store_git_code`에 전달 (signature 변경)
-  - 또는 `metadata_store`에 `get_document_by_source(source_type, source_id)` 추가 (단건 lookup)
-- **영향 범위**: 대용량 레포 (수백~수천 파일) 동기화 성능
-- **심각도**: High | **공수**: M
-
----
-
-### F-G-15 (MEDIUM): `delete_removed_files`도 매 호출마다 list_documents — F-G-14와 동일 패턴
-
-- **위치**: `src/context_loop/ingestion/git_repository.py:417`
-- **현재 동작**: 같은 N×N 문제. 보통 deleted 수가 적어 영향 작음
-- **개선 방향**: F-G-14 해결 시 같은 cache 사용
-- **심각도**: Medium | **공수**: S (F-G-14와 묶어 처리)
-
----
-
-### F-G-16 (MEDIUM): 바이너리/대용량/파싱 불가 파일이 `read_text` 폴백에서 silently skip — 통계 없음
-
-- **위치**: `src/context_loop/ingestion/git_repository.py:323-327`
-- **현재 동작**: `UnicodeDecodeError`/`OSError`만 warning 로깅하고 건너뜀
-- **문제**: 사용자가 "왜 이 파일이 검색 안 되나" 디버깅하기 어려움 — SyncResult에 skipped 통계 없음
-- **개선 방향**:
-  - SyncResult에 `skipped_binary: list[str]`, `skipped_large: list[str]` 필드 추가
-  - 또는 logger.warning 대신 result에 누적
-- **영향 범위**: 운영/디버깅 편의
-- **심각도**: Medium | **공수**: S
-
----
-
-### F-G-17 (LOW): `_repo_clone_dir`에서 URL 정규화 없음 → 사용자 실수 시 중복 clone
-
-- **위치**: `src/context_loop/ingestion/git_repository.py:429-435`
-- **현재 동작**: URL의 마지막 segment만으로 디렉토리명 결정
-- **문제**: `https://github.com/org/repo.git` vs `https://github.com/org/repo` 다른 호출이면 같은 디렉토리. 그러나 대소문자/`.git` suffix 차이는 처리됨. 호스트/조직 차이는 처리 안 됨 (org-A/repo vs org-B/repo이 같은 디렉토리 사용 → 충돌)
-- **개선 방향**: `hashlib.sha1(repo_url.lower().encode()).hexdigest()[:8]` suffix를 디렉토리명에 추가
-- **영향 범위**: 사용자가 동일 이름 다른 org 레포를 동시에 사용할 때
-- **심각도**: Low | **공수**: S
+- **구현 비용**:
+  - `to_chunks` 시그니처 변경 없이 새 helper `to_file_or_symbol_chunks(extraction, title, content, token_limit)` 추가
+  - `pipeline.py` 의 git_code 분기에서 `to_chunks(extraction, title)` → 새 helper 로 교체 (한 줄 변경)
+  - 멀티뷰 임베딩(body/meta), `logical_chunk_id` dedup (`context_assembler.py:201`), `section_path` 표시는 모두 **무수정 재사용**
+- **부가 이점**:
+  - 임베딩 호출 N: 함수 5개 평균 파일 5청크 × 2뷰 = 10건 → 1파일 × 2뷰 = 2건 → **임베딩 호출 ~80% 감소** (한도 미만 파일 기준). 한도 초과 파일은 기존 그대로.
+  - 청크 row 수도 비례 감소 → SQLite/ChromaDB 부하 감소
+- **부작용 / 측정 필요**:
+  - 검색 정밀도 변화 — F-G-R2-03 의 dilution 효과. 평가 시스템(R1 verification report 가 사용한 메트릭) 으로 정량 측정 필요
+  - `section_path` 가 파일명만 남음 — "어느 함수의 hit인가" 사용자에게 명시하려면 (a) hit 라인 근방 trim, (b) symbol catalog meta 뷰 의 두 가지 중 하나가 추가 필요
+- **심각도**: Medium (구현 가이드)
 
 ---
 
 ## 검토하지 않은 영역
 
-- `scope_analyzer.py` 의 product paths 자동 탐지 정확성 (별도 분석 영역)
-- `git_config.py` 의 supported_extensions 기본값 적정성
-- 대용량 단일 파일 (예: 10K+ 라인 모놀리스 .py)의 분할 정책 (현재 함수/클래스 단위 — OK 일 수 있음)
-- 텍스트 인코딩이 utf-8 외(예: cp949, latin-1)인 파일의 처리 — 현재 strict utf-8
-- Git submodule 처리
+- 다중 언어(Go/Java/TS/JS) 별 평균 파일 크기 분포 — 본 분석은 Python 위주
+- `to_chunks` 가 만드는 헤더(`# File: ...`) 가 임베딩 품질에 미치는 효과의 정량 측정 (현재 헤더가 본문 임베딩에 어느 정도 노이즈인가)
+- 거대 single-function 파일(예: 한 함수가 1000라인) — 심볼 단위 청킹조차 한도 초과하는 케이스 (`to_chunks` 도 현재 무방어). 파일 단위 전환과 무관한 별도 이슈.
+- 평가 시스템 메트릭 변화 (별도 분석가 영역)
+- `confluence_mcp` 의 동일 전환 검토 (별도 분석가 영역)
+- 벡터 dedup 시 같은 파일에서 여러 hit(symbol 청크 5개)이 한 사용자 결과에 어떻게 표시되는지 — 파일 단위 전환 시 자연 해소되지만 검색 다양성 영향 있을 수 있음
+
+---
+
+## 문서단위 전환 권고 (이번 라운드 핵심)
+
+- **현재 청킹의 진짜 이유**: 
+  - **본질적 강제 = 임베딩 모델 8K 토큰 한도** (`nomic-embed-text`). 코드 근거: `ast_code_extractor.py::to_chunks` 가 심볼 단위 본문을 그대로 임베딩 입력으로 보내고 (`pipeline.py:152-156`), `nomic-embed-text` 8192 토큰 한도 초과 시 silently truncate.
+  - **부수 효과** = 검색 정밀도/표시 단위. 본질적 강제는 아니지만 파일 단위 전환 시 측정 가능한 정밀도 손실 발생 (F-G-R2-03).
+  - **무관** = 그래프 추출 (`to_graph_data` 는 `extraction.symbols` 만 보고 청크 비의존).
+
+- **문서단위 전환 가능성**: ⚠️ **조건부 가능 (하이브리드 권고)**
+  - **불가능한 경우**: 파일 ≥ 임베딩 8K 토큰 한도. 잔존 청킹 불가피.
+  - **가능한 경우**: 파일 < 8K 토큰 (이 레포 기준 절대 다수). 파일 1청크로 전환 가능.
+
+- **전환 시 잔여 청킹 필요 케이스**:
+  1. 한 파일이 임베딩 모델 입력 한도(`nomic-embed-text` 8192) 초과 — 자동 폴백
+  2. 한 단일 심볼(함수)이 한도 초과 — 매우 드물지만 무방어 상태 (별도 개선 필요, 본 라운드 범위 밖)
+  3. R1 에서 제외되지 못한 거대 vendored/generated 파일이 남아있는 케이스 — `_DEFAULT_EXCLUDED_DIRS` (R1 F-G-13) 가 적용되지 않은 일부 자동 생성 파일(`.pb.go`, `.gen.ts`)
+
+- **권고 전환 방식**: **하이브리드 (`to_chunks` 미제거, 동작 분기)**
+  - **근거 1**: 임베딩 한도(F-G-R2-05) 가 파일 단위 단독 전환을 막음. 완전 제거는 불가.
+  - **근거 2**: AST 추출(`extract_code_symbols`)은 그래프 때문에 어차피 호출 — 한도 초과 파일에 대한 심볼 분할 폴백은 추가 비용 0 (F-G-R2-04).
+  - **근거 3**: 멀티뷰(body+meta) 임베딩과 `logical_chunk_id` dedup 구조가 파일/심볼 두 단위 모두에 그대로 작동 (F-G-R2-06).
+  - **근거 4**: 영속화된 청크 메타데이터(`chunks` 컬럼)의 손실폭이 작음 — `symbol_type`/`line_start`/`line_end` 은 어차피 검색·표시에 미사용 (F-G-R2-02). `section_path` 의 ` > parent > name` 꼬리만 손실, 이건 그래프 노드로 보강 가능.
+  - **구현 트리거**: 파이프라인 `git_code` 분기에서 `count_tokens(content)` 임계 비교 → `to_chunks(extraction, title)` 또는 신규 `to_file_chunk(extraction, title, content)` 분기. 코드 변경 한 줄 수준.
+
+- **예상 영향 (정량 추정)**:
+  - **임베딩 호출 감소**: 한도 미만 파일(이 레포 기준 ~80~95% 추정)에 대해, 평균 5심볼 → 1청크 = **호출 80% 감소**. 멀티뷰 2x 곱하면 절대 호출 수가 N×2 → 1×2 로 떨어짐.
+  - **벡터 row 감소**: 동일 비율. ChromaDB index 메모리/디스크 ~80% 감소.
+  - **검색 정밀도 변화**: dilution 영향으로 자연어 정밀 매칭 cosine similarity 5~15% 감소 추정. 평가 시스템으로 측정 필요. `symbol catalog` meta 뷰 추가 시 손실 일부 회복 가능.
+  - **LLM 호출 변화**: 0건. (`process_document` 의 git_code 분기에는 LLM 호출 없음 — `pipeline.py:131-208`, 모두 결정론적)
+  - **그래프 품질**: 변화 없음 (F-G-R2-04).
+  - **저장 공간**: 청크 content 총량은 같으나 row 수가 줄어 SQLite/ChromaDB 인덱스 오버헤드 감소 (~10~20% 추정).
+
+- **잠정 결정 트리** (구현가에게 전달용):
+  ```
+  파일 content 토큰 수 측정 (count_tokens)
+  ├── ≤ 7000 토큰  → 파일 1청크 (body: 전체, meta: symbol catalog)
+  └── > 7000 토큰  → 기존 to_chunks() 심볼 분할 fallback
+  ```
+  임계값 7000은 8192 한도의 안전 마진 (헤더 추가/특수 토큰 고려). 설정으로 노출 권장 (`processing.embedding_token_limit` 또는 유사).
+

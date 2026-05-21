@@ -10,8 +10,10 @@ import pytest
 
 from context_loop.processor.extraction_unit import ExtractionUnit
 from context_loop.processor.llm_body_extractor import (
+    InputTooLargeError,
     LLMBodyExtractionConfig,
     extract_llm_body_graph,
+    extract_llm_body_graph_for_document,
 )
 
 
@@ -493,3 +495,138 @@ async def test_complete_call_disables_thinking_mode() -> None:
 
     kwargs = llm.complete.await_args.kwargs
     assert kwargs.get("reasoning_mode") == "off"
+
+
+# ---------------------------------------------------------------------------
+# 문서 단위 호출 (extract_llm_body_graph_for_document)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_for_document_single_call_extracts_all_entities() -> None:
+    """문서 단위 호출은 LLM 을 정확히 1회 호출하여 모든 entity/relation 을 추출."""
+    payload = {
+        "entities": [
+            {"name": "AuthService", "type": "system", "description": "인증"},
+            {"name": "TokenStore", "type": "system", "description": "토큰 저장"},
+            {"name": "Cache", "type": "system", "description": "캐시"},
+        ],
+        "relations": [
+            {"source": "AuthService", "target": "TokenStore", "type": "depends_on"},
+            {"source": "AuthService", "target": "Cache", "type": "depends_on"},
+        ],
+    }
+    llm = _llm_returning(payload)
+    body = "AuthService 는 TokenStore 와 Cache 에 의존한다. " * 50
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="아키텍처", body=body, llm_client=llm,
+    )
+
+    assert llm.complete.await_count == 1
+    assert stats.units_total == 1
+    assert stats.units_called == 1
+    assert stats.units_failed == 0
+    assert len(g.entities) == 3
+    assert len(g.relations) == 2
+    relation_keys = {(r.source, r.target, r.relation_type) for r in g.relations}
+    assert ("AuthService", "TokenStore", "depends_on") in relation_keys
+    assert ("AuthService", "Cache", "depends_on") in relation_keys
+
+
+@pytest.mark.asyncio
+async def test_for_document_oversized_body_raises_input_too_large() -> None:
+    """body 토큰 수가 max_input_tokens 초과면 InputTooLargeError raise."""
+    llm = _llm_returning({"entities": [], "relations": []})
+    cfg = LLMBodyExtractionConfig(max_input_tokens=5)
+    # 다양한 단어를 섞어 tiktoken 도 충분히 토큰을 만들도록 한다 (반복 압축 회피).
+    body = " ".join([
+        "AuthService", "TokenStore", "Cache", "ProxyLayer", "EventBus",
+        "Scheduler", "Worker", "Notifier", "Registry", "Dispatcher",
+    ])
+
+    with pytest.raises(InputTooLargeError):
+        await extract_llm_body_graph_for_document(
+            doc_title="d", body=body, llm_client=llm, config=cfg,
+        )
+    llm.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_for_document_empty_inputs_skip_llm_call() -> None:
+    """doc_title 이 비었거나 body 가 비었으면 LLM 호출 없이 빈 GraphData 반환."""
+    llm = _llm_returning({"entities": [], "relations": []})
+
+    g1, stats1 = await extract_llm_body_graph_for_document(
+        doc_title="", body="something", llm_client=llm,
+    )
+    g2, stats2 = await extract_llm_body_graph_for_document(
+        doc_title="title", body="   ", llm_client=llm,
+    )
+
+    assert g1.entities == [] and g1.relations == []
+    assert g2.entities == [] and g2.relations == []
+    assert stats1.units_total == 0 and stats2.units_total == 0
+    llm.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_for_document_drops_unknown_vocabulary_and_dangling_endpoints() -> None:
+    """어휘 외 entity_type 또는 양끝점이 entity 에 없는 relation 은 드롭."""
+    payload = {
+        "entities": [
+            {"name": "AuthService", "type": "system"},
+            {"name": "TokenStore", "type": "system"},
+            {"name": "NoiseTerm", "type": "unknown_type"},  # 어휘 외 → drop
+        ],
+        "relations": [
+            # 유효한 관계 1건 (drops 가 정확히 셀 수 있게 하기 위함)
+            {"source": "AuthService", "target": "TokenStore", "type": "depends_on"},
+            # 끝점이 어휘에 없음 (NoiseTerm 은 drop 됨) → drop
+            {"source": "AuthService", "target": "NoiseTerm", "type": "depends_on"},
+            # 끝점이 아예 entity 목록에 없음 → drop
+            {"source": "AuthService", "target": "Ghost", "type": "depends_on"},
+            # 자기 자신 → drop
+            {"source": "AuthService", "target": "AuthService", "type": "depends_on"},
+        ],
+    }
+    llm = _llm_returning(payload)
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="AuthService 본문", llm_client=llm,
+    )
+
+    # 유효 entity 2개, 유효 relation 1개
+    assert {e.name for e in g.entities} == {"AuthService", "TokenStore"}
+    assert len(g.relations) == 1
+    assert g.relations[0].source == "AuthService"
+    assert g.relations[0].target == "TokenStore"
+    assert g.relations[0].relation_type == "depends_on"
+    # label 은 문서 단위 호출에서 빈 문자열
+    assert g.relations[0].label == ""
+
+    assert stats.dropped_entities == 1  # NoiseTerm
+    assert stats.dropped_relations == 3  # 3건 모두 drop
+
+
+@pytest.mark.asyncio
+async def test_for_document_failed_llm_returns_empty_with_failed_stat() -> None:
+    """LLM 응답 JSON 파싱 실패 시 빈 GraphData + units_failed=1."""
+    mock = AsyncMock()
+    mock.complete = AsyncMock(return_value="이건 JSON 이 아닙니다")
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=mock,
+    )
+
+    assert g.entities == [] and g.relations == []
+    assert stats.units_failed == 1
+    assert stats.units_called == 0
+
+
+@pytest.mark.asyncio
+async def test_for_document_call_disables_thinking_mode() -> None:
+    """문서 단위 호출도 reasoning_mode='off' 로 thinking 비활성화."""
+    llm = _llm_returning({"entities": [], "relations": []})
+    await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=llm,
+    )
+    assert llm.complete.await_args.kwargs.get("reasoning_mode") == "off"
+    assert llm.complete.await_args.kwargs.get("purpose") == "body_extraction_doc"

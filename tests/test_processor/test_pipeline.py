@@ -692,7 +692,7 @@ async def test_body_graph_skipped_when_no_signal(
 async def test_llm_body_extraction_skipped_when_disabled(
     store: MetadataStore,
 ) -> None:
-    """기본 PipelineConfig (enable_llm_body_extraction=False) 에서는 LLM 호출 없음."""
+    """enable_llm_body_extraction=False 면 LLM 호출 없음."""
     doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
     vector_store, graph_store, embedding_client = _make_stores()
     llm_client = AsyncMock()
@@ -708,7 +708,7 @@ async def test_llm_body_extraction_skipped_when_disabled(
             vector_store=vector_store,
             graph_store=graph_store,
             embedding_client=embedding_client,
-            config=PipelineConfig(),  # enable_llm_body_extraction=False
+            config=PipelineConfig(enable_llm_body_extraction=False),
             llm_client=llm_client,
         )
 
@@ -776,10 +776,14 @@ async def test_llm_body_extraction_runs_when_enabled(
         "context_loop.processor.pipeline.extract_body_graph",
         return_value=GraphData(),
     ), patch(
-        # LLM 추출기 자체를 patch — 게이트/실제 LLM 호출은 별도 단위 테스트에서 검증
-        "context_loop.processor.pipeline.extract_llm_body_graph",
+        # 문서 단위 LLM 호출이 기본 경로 — 이 함수가 호출되는지 검증
+        "context_loop.processor.pipeline.extract_llm_body_graph_for_document",
         new=AsyncMock(return_value=(fake_llm_graph, LLMBodyExtractionStats())),
-    ) as mock_llm_extract:
+    ) as mock_doc_extract, patch(
+        # unit 폴백은 호출되지 않아야 함
+        "context_loop.processor.pipeline.extract_llm_body_graph",
+        new=AsyncMock(return_value=(GraphData(), LLMBodyExtractionStats())),
+    ) as mock_unit_extract:
         await process_document(
             doc_id,
             meta_store=store,
@@ -790,8 +794,9 @@ async def test_llm_body_extraction_runs_when_enabled(
             llm_client=llm_client,
         )
 
-    # extract_llm_body_graph 가 호출되었는지 (게이트 통과)
-    mock_llm_extract.assert_awaited_once()
+    # 문서 단위 호출이 1회 (기본 경로) + unit 기반 폴백은 호출 안 됨
+    mock_doc_extract.assert_awaited_once()
+    mock_unit_extract.assert_not_awaited()
     # LLM 그래프가 GraphStore 에 저장되었는지
     saved_graphs = [
         call.args[1] for call in graph_store.save_graph_data.await_args_list
@@ -803,3 +808,115 @@ async def test_llm_body_extraction_runs_when_enabled(
     assert len(llm_graphs) == 1
     names = {e.name for e in llm_graphs[0].entities}
     assert {"Auth Service", "Token Validator"} <= names
+
+
+@pytest.mark.asyncio
+async def test_llm_body_extraction_falls_back_to_units_when_oversized(
+    store: MetadataStore,
+) -> None:
+    """문서 본문이 입력 한도 초과(InputTooLargeError) 면 unit 기반 호출로 폴백."""
+    from context_loop.processor.graph_extractor import Entity, Relation
+    from context_loop.processor.llm_body_extractor import (
+        InputTooLargeError,
+        LLMBodyExtractionStats,
+    )
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    unit_fallback_graph = GraphData(
+        entities=[Entity(name="FromUnit", entity_type="system")],
+        relations=[
+            Relation(
+                source="FromUnit",
+                target="FromUnit",
+                relation_type="depends_on",
+            ),
+        ],
+    )
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document",
+        return_value=[],
+    ), patch(
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ), patch(
+        # 문서 단위 호출이 InputTooLargeError raise
+        "context_loop.processor.pipeline.extract_llm_body_graph_for_document",
+        new=AsyncMock(side_effect=InputTooLargeError("too big")),
+    ) as mock_doc_extract, patch(
+        # unit 폴백 호출 결과
+        "context_loop.processor.pipeline.extract_llm_body_graph",
+        new=AsyncMock(return_value=(unit_fallback_graph, LLMBodyExtractionStats())),
+    ) as mock_unit_extract:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+            llm_client=llm_client,
+        )
+
+    # 문서 단위 호출 1회 + unit 폴백 1회 모두 발생
+    mock_doc_extract.assert_awaited_once()
+    mock_unit_extract.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_assemble_document_body_uses_sections_when_present() -> None:
+    """_assemble_document_body 는 sections 가 있으면 헤딩+본문을 트리 순서로 합본."""
+    from context_loop.ingestion.confluence_extractor import (
+        ExtractedDocument,
+        Section,
+    )
+    from context_loop.processor.pipeline import _assemble_document_body
+
+    extracted = ExtractedDocument(
+        plain_text="ignored — sections 가 우선",
+        sections=[
+            Section(
+                level=1,
+                title="A",
+                anchor="a",
+                path=["A"],
+                md_content="A 본문",
+            ),
+            Section(
+                level=2,
+                title="B",
+                anchor="b",
+                path=["A", "B"],
+                md_content="B 본문",
+            ),
+            Section(
+                level=1,
+                title="C",
+                anchor="c",
+                path=["C"],
+                md_content="",
+            ),
+        ],
+    )
+
+    body = _assemble_document_body(extracted)
+
+    assert "# A\n\nA 본문" in body
+    assert "## B\n\nB 본문" in body
+    # 빈 본문 섹션도 헤딩은 보존
+    assert "# C" in body
+    # plain_text 는 사용되지 않음
+    assert "ignored" not in body
+
+
+@pytest.mark.asyncio
+async def test_assemble_document_body_falls_back_to_plain_text() -> None:
+    """sections 가 없으면 plain_text 를 그대로 사용한다."""
+    from context_loop.ingestion.confluence_extractor import ExtractedDocument
+    from context_loop.processor.pipeline import _assemble_document_body
+
+    extracted = ExtractedDocument(plain_text="평문 본문 그대로", sections=[])
+    assert _assemble_document_body(extracted) == "평문 본문 그대로"

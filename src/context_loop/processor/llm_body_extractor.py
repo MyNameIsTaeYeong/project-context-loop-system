@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from context_loop.processor.chunker import count_tokens
 from context_loop.processor.extraction_unit import ExtractionUnit
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 from context_loop.processor.graph_vocabulary import (
@@ -32,6 +33,10 @@ from context_loop.processor.graph_vocabulary import (
     llm_body_relation_types_vocab,
 )
 from context_loop.processor.llm_client import LLMClient, extract_json
+
+
+class InputTooLargeError(Exception):
+    """문서 본문이 LLM 입력 한도를 초과해 unit 기반 폴백이 필요할 때 raise."""
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,11 @@ class LLMBodyExtractionConfig:
     # 작은 한도를 가지면 서버가 클램프하거나 401 에러로 보고하므로 운영상 안전.
     max_tokens: int = 32768
     temperature: float = 0.0
+    # 문서 단위 1회 호출(``extract_llm_body_graph_for_document``)의 입력 가드.
+    # 256K 컨텍스트 사내 모델 기준, 시스템 프롬프트(~500) + 응답 예산(32768) +
+    # 안전 마진을 빼고 200K 를 입력 한도로 둔다. 한도 초과 시 호출자는
+    # ``InputTooLargeError`` 를 받아 unit 기반 호출로 폴백한다.
+    max_input_tokens: int = 200_000
 
 
 @dataclass
@@ -251,6 +261,153 @@ async def extract_llm_body_graph(
                     relation_type=rtype,
                     label=section_label,
                 )
+
+    stats.final_entities = len(entities)
+    stats.final_relations = len(relations)
+
+    if not relations:
+        return GraphData(), stats
+
+    return GraphData(
+        entities=list(entities.values()),
+        relations=list(relations.values()),
+    ), stats
+
+
+async def extract_llm_body_graph_for_document(
+    *,
+    doc_title: str,
+    body: str,
+    llm_client: LLMClient,
+    config: LLMBodyExtractionConfig | None = None,
+) -> tuple[GraphData, LLMBodyExtractionStats]:
+    """문서 전체 본문을 1회 LLM 호출로 처리하여 ``GraphData`` 를 반환한다.
+
+    256K 컨텍스트 모델 환경에서는 문서를 ExtractionUnit 으로 분할하지 않고
+    통째로 LLM 에 넘기는 것이 더 정확하고 저렴하다 — cross-section 엔티티
+    중복/단절이 자연 해결되며 호출 수가 N→1 로 감소한다 (R1 F-CG-04).
+
+    ``body`` 토큰 수가 ``config.max_input_tokens`` 를 초과하면
+    ``InputTooLargeError`` 를 raise 한다. 호출자는 이 예외를 잡아 기존
+    ``extract_llm_body_graph(units, ...)`` 로 폴백해야 한다.
+
+    Args:
+        doc_title: 문서 제목. 프롬프트 메타로 사용 + 빈 입력 가드.
+        body: 문서 전체 본문 (마크다운/plain_text).
+        llm_client: LLM 클라이언트.
+        config: 추출 옵션. None 이면 기본값.
+
+    Returns:
+        ``(GraphData, LLMBodyExtractionStats)`` 튜플. ``stats.units_total``/
+        ``units_called`` 는 문서 호출이 1번 일어났음을 나타내기 위해 1 로
+        세팅된다 (LLM 호출이 실제로 발생한 경우).
+
+    Raises:
+        InputTooLargeError: ``body`` 가 ``max_input_tokens`` 초과.
+    """
+    cfg = config or LLMBodyExtractionConfig()
+    stats = LLMBodyExtractionStats(units_total=1)
+
+    if not doc_title or not body.strip():
+        stats.units_total = 0
+        return GraphData(), stats
+
+    body_tokens = count_tokens(body)
+    if body_tokens > cfg.max_input_tokens:
+        raise InputTooLargeError(
+            f"문서 본문 {body_tokens} 토큰 > 한도 {cfg.max_input_tokens}",
+        )
+
+    system = _SYSTEM_PROMPT_TEMPLATE.format(
+        entity_types=_format_vocab_with_descriptions(
+            cfg.allowed_entity_types, llm_body_entity_types_vocab(),
+        ),
+        relation_types=_format_vocab_with_descriptions(
+            cfg.allowed_relation_types, llm_body_relation_types_vocab(),
+        ),
+    )
+    user = _USER_PROMPT_TEMPLATE.format(doc_title=doc_title, body=body)
+
+    try:
+        response = await llm_client.complete(
+            user,
+            system=system,
+            max_tokens=cfg.max_tokens,
+            temperature=cfg.temperature,
+            reasoning_mode="off",
+            purpose="body_extraction_doc",
+        )
+        payload = extract_json(response)
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"LLM 응답이 JSON object 가 아님: {type(payload).__name__}",
+            )
+    except Exception:
+        logger.warning(
+            "문서 단위 LLM 본문 추출 실패 — doc_title=%s", doc_title, exc_info=True,
+        )
+        stats.units_failed = 1
+        return GraphData(), stats
+
+    stats.units_called = 1
+
+    raw_entities = payload.get("entities") or []
+    raw_relations = payload.get("relations") or []
+    stats.raw_entities = len(raw_entities)
+    stats.raw_relations = len(raw_relations)
+
+    allowed_etypes = set(cfg.allowed_entity_types)
+    allowed_rtypes = set(cfg.allowed_relation_types)
+
+    entities: dict[tuple[str, str], Entity] = {}
+    valid_names: set[str] = set()
+
+    for ent in raw_entities:
+        if not isinstance(ent, dict):
+            stats.dropped_entities += 1
+            continue
+        name = str(ent.get("name", "")).strip()
+        etype = str(ent.get("type", "")).strip()
+        if not name or etype not in allowed_etypes:
+            stats.dropped_entities += 1
+            continue
+        description = str(ent.get("description", "")).strip()
+        key = (name.lower(), etype)
+        if key not in entities:
+            entities[key] = Entity(
+                name=name, entity_type=etype, description=description,
+            )
+        valid_names.add(name.lower())
+
+    relations: dict[tuple[str, str, str], Relation] = {}
+    for rel in raw_relations:
+        if not isinstance(rel, dict):
+            stats.dropped_relations += 1
+            continue
+        src = str(rel.get("source", "")).strip()
+        tgt = str(rel.get("target", "")).strip()
+        rtype = str(rel.get("type", "")).strip()
+        if (
+            not src or not tgt or rtype not in allowed_rtypes
+            or src.lower() not in valid_names
+            or tgt.lower() not in valid_names
+            or src.lower() == tgt.lower()
+        ):
+            stats.dropped_relations += 1
+            continue
+        rel_key = (src.lower(), tgt.lower(), rtype)
+        if rel_key not in relations:
+            src_canon = _canonical_name(entities, src, src.lower())
+            tgt_canon = _canonical_name(entities, tgt, tgt.lower())
+            # 문서 단위 호출에서는 단일 섹션 경로를 특정할 수 없다 — 빈 label.
+            # 결정론 ``body_extractor`` 가 unit 단위로 ``section_path`` 라벨을
+            # 별도로 보강하므로 그래프 카드의 위치 시그널은 그쪽에서 유지된다.
+            relations[rel_key] = Relation(
+                source=src_canon,
+                target=tgt_canon,
+                relation_type=rtype,
+                label="",
+            )
 
     stats.final_entities = len(entities)
     stats.final_relations = len(relations)

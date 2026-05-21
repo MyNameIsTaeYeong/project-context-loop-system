@@ -37,7 +37,11 @@ from context_loop.processor.body_extractor import extract_body_graph
 from context_loop.processor.chunker import chunk_extracted_document, chunk_text
 from context_loop.processor.extraction_unit import build_extraction_units
 from context_loop.processor.link_graph_builder import build_link_graph
-from context_loop.processor.llm_body_extractor import extract_llm_body_graph
+from context_loop.processor.llm_body_extractor import (
+    InputTooLargeError,
+    extract_llm_body_graph,
+    extract_llm_body_graph_for_document,
+)
 from context_loop.processor.reprocessor import (
     complete_reprocessing,
     start_reprocessing,
@@ -349,10 +353,40 @@ async def process_document(
                     # 결정론 본문 그래프와 같은 ``document`` 노드로 수렴하지는
                     # 않지만, 도메인 엔티티 간 의미 관계 (depends_on, implements,
                     # owned_by 등) 를 추가하여 그래프의 추론 가치를 끌어올린다.
+                    #
+                    # 호출 단위: 문서 단위 1회 호출이 기본 (256K 컨텍스트 모델
+                    # 가정). cross-section entity 통합·중복 제거가 LLM 자체에서
+                    # 해소되어 그래프 품질이 향상되고 호출 비용이 N→1 로 준다.
+                    # 본문 토큰이 입력 한도 초과인 거대 문서는 자동으로 기존
+                    # unit 단위 폴백으로 전환된다.
                     if cfg.enable_llm_body_extraction and llm_client is not None:
-                        llm_graph, llm_stats = await extract_llm_body_graph(
-                            units, doc_title=title, llm_client=llm_client,
-                        )
+                        doc_body = _assemble_document_body(extracted)
+                        try:
+                            llm_graph, llm_stats = (
+                                await extract_llm_body_graph_for_document(
+                                    doc_title=title,
+                                    body=doc_body,
+                                    llm_client=llm_client,
+                                )
+                            )
+                            logger.info(
+                                "LLM 본문 그래프(문서 단위) — doc_id=%d, "
+                                "input_chars=%d, raw_entities=%d, raw_relations=%d",
+                                document_id,
+                                len(doc_body),
+                                llm_stats.raw_entities,
+                                llm_stats.raw_relations,
+                            )
+                        except InputTooLargeError:
+                            logger.info(
+                                "문서 본문이 LLM 입력 한도 초과 — unit 기반 "
+                                "폴백 (doc_id=%d, units=%d)",
+                                document_id,
+                                len(units),
+                            )
+                            llm_graph, llm_stats = await extract_llm_body_graph(
+                                units, doc_title=title, llm_client=llm_client,
+                            )
                         if llm_graph.entities:
                             llm_result = await graph_store.save_graph_data(
                                 document_id, llm_graph,
@@ -421,6 +455,30 @@ def _derive_storage_method(*, has_chunks: bool, has_graph: bool) -> str:
     if has_graph:
         return "graph"
     return "chunk"
+
+
+def _assemble_document_body(extracted: ExtractedDocument) -> str:
+    """문서 단위 LLM 본문 추출 입력으로 사용할 전체 본문을 조립한다.
+
+    ``ExtractedDocument.sections`` 가 있으면 헤딩 + md_content 를 트리 순서대로
+    이어붙여 LLM 에게 섹션 경계가 보이게 한다. 섹션이 없으면 ``plain_text`` 를
+    그대로 사용한다.
+
+    breadcrumb (문서 제목, 위치, lead paragraph) 은 추가하지 않는다 — 문서
+    전체를 넣는 경로에서 doc_title 은 user prompt 의 별도 필드(``# 문서 제목``)
+    로 노출되므로 중복이며, 위치 정보는 본문 헤딩 자체에 이미 들어 있다.
+    """
+    if extracted.sections:
+        parts: list[str] = []
+        for section in extracted.sections:
+            heading_line = "#" * max(section.level, 1) + " " + section.title
+            body = section.md_content.strip()
+            if body:
+                parts.append(heading_line + "\n\n" + body)
+            else:
+                parts.append(heading_line)
+        return "\n\n".join(parts)
+    return extracted.plain_text
 
 
 def build_meta_view_text(title: str, section_path: str) -> str:
