@@ -18,13 +18,17 @@
                 @click="view = 'raw'">Raw</button>
     </div>
     <div x-show="view === 'rendered'"
-         x-cloak
          class="markdown-body"
          data-markdown
          data-markdown-src="md-source-original-{{ doc.id }}"></div>
-    <div x-show="view === 'raw'" x-cloak>
+    <div x-show="view === 'raw'">
         <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
     </div>
 </article>
 <pre id="md-source-original-{{ doc.id }}" class="md-source" hidden>{{ doc.original_content or '' }}</pre>
+{# 인라인 호출 — htmx:afterSwap 리스너가 어떤 이유로든 동작하지 않거나
+   본 파셜이 HTMX 외 경로(직접 fetch 등)로 삽입돼도 즉시 렌더한다. #}
+<script>
+    if (window.renderAllMarkdown) { window.renderAllMarkdown(); }
+</script>
 {% endif %}
