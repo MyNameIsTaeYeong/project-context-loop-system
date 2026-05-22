@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
+from context_loop.processor.chunker import count_tokens
 from context_loop.processor.graph_search_planner import (
     GraphSearchResult,
     execute_graph_search,
@@ -71,6 +72,8 @@ async def assemble_context(
     rerank_score_threshold: float = 0.0,
     hyde_enabled: bool = False,
     include_source_code: bool = False,
+    max_graph_docs: int = 3,
+    max_graph_tokens: int = 6000,
 ) -> str:
     """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
@@ -129,9 +132,19 @@ async def assemble_context(
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
-    # 3. 그래프 탐색 결과 처리
+    # 3. 그래프 탐색 결과 처리 — 엔티티/관계 요약 + 연결 문서 본문 첨부 (설계 A)
     if graph_result:
         sections.append(graph_result.text)
+        graph_chunks = await _search_graph_sourced_chunks(
+            query_embedding, vector_store,
+            graph_result.document_ids, _extract_doc_ids(chunk_results),
+            max_graph_docs=max_graph_docs,
+            max_graph_tokens=max_graph_tokens,
+        )
+        if graph_chunks:
+            sections.append(
+                await _format_graph_chunk_results(graph_chunks, meta_store)
+            )
 
     # 4. Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:
@@ -254,6 +267,121 @@ async def _format_chunk_results(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# 그래프 연결 문서 첨부 (설계 A)
+# ---------------------------------------------------------------------------
+#
+# 그래프 탐색은 ``GraphSearchResult.document_ids`` 로 "관계로 도달한 문서" 를
+# 알지만, 기존 조립기는 엔티티/관계 텍스트만 컨텍스트에 넣고 그 문서 본문은
+# 넣지 않았다. 이 헬퍼는 그래프가 도달한 문서 중 **벡터 검색이 못 찾은 것**의
+# 가장 관련된 청크를 인출하여 별도 섹션으로 첨부한다 — 임베딩 유사도로는
+# 닿지 않지만 관계로 연결된 문서를 LLM 에게 실제 산문으로 전달하는 것이 목적.
+#
+# 청크가 문서 단위(작은 문서=1청크=문서 전체, 큰 문서=섹션)임을 전제로,
+# document_id 단위 dedup + 개수 상한(max_graph_docs) + 토큰 상한
+# (max_graph_tokens) 을 함께 적용해 컨텍스트 예산을 보호한다.
+
+# ``$in`` 필터에 넣을 doc_id 최대 개수 — 멀티홉으로 너무 많은 문서를 한 번에
+# 필터링하지 않도록 가드한다. 쿼리 유사도로 어차피 상위만 추리므로 충분.
+_MAX_GRAPH_DOC_FILTER = 50
+
+
+async def _search_graph_sourced_chunks(
+    query_embedding: list[float] | None,
+    vector_store: VectorStore,
+    graph_doc_ids: set[int],
+    existing_doc_ids: set[int],
+    *,
+    max_graph_docs: int,
+    max_graph_tokens: int,
+) -> list[dict[str, Any]]:
+    """그래프가 도달한 문서 중 벡터가 못 찾은 것들의 가장 관련된 청크를 인출한다.
+
+    벡터 결과와 겹치는 문서는 제외하여 **순수 추가분**만 첨부한다. 청크는
+    문서 단위라 작은 문서는 문서 전체가 1청크이므로, 개수(``max_graph_docs``)와
+    토큰(``max_graph_tokens``) 상한을 함께 적용한다.
+
+    Args:
+        query_embedding: 쿼리 임베딩. None 이면 빈 리스트.
+        vector_store: 벡터 저장소.
+        graph_doc_ids: 그래프 탐색이 도달한 문서 ID 집합.
+        existing_doc_ids: 벡터 검색이 이미 찾은 문서 ID 집합 (제외 대상).
+        max_graph_docs: 첨부할 최대 문서 수. 0 이면 기능 off.
+        max_graph_tokens: 첨부 청크의 토큰 합 상한.
+
+    Returns:
+        document_id 단위로 dedup 된 청크 결과 리스트 (distance 오름차순).
+    """
+    if query_embedding is None or max_graph_docs <= 0:
+        return []
+    new_doc_ids = [d for d in graph_doc_ids if d not in existing_doc_ids]
+    if not new_doc_ids:
+        return []
+    # 멀티홉으로 doc_id 가 폭증해도 필터 크기를 가드 (쿼리 유사도가 상위를 추림)
+    new_doc_ids = new_doc_ids[:_MAX_GRAPH_DOC_FILTER]
+
+    try:
+        # 멀티뷰(body/meta/question) 고려 over-fetch + document_id 단위 dedup.
+        raw = vector_store.search(
+            query_embedding,
+            n_results=len(new_doc_ids) * 6,
+            where={"document_id": {"$in": new_doc_ids}},
+        )
+    except Exception:
+        logger.warning("그래프 문서 청크 검색 실패", exc_info=True)
+        return []
+
+    seen: set[Any] = set()
+    selected: list[dict[str, Any]] = []
+    token_total = 0
+    for r in raw:  # distance 오름차순 → 문서당 첫 항목이 최소 distance
+        meta = r.get("metadata") or {}
+        key = meta.get("document_id") or meta.get("logical_chunk_id") or r.get("id")
+        if key in seen:
+            continue
+        seen.add(key)
+        # 토큰 예산 가드 (doc-level 청크는 문서 전체일 수 있어 무거움)
+        chunk_tokens = count_tokens(r.get("document", ""))
+        if selected and token_total + chunk_tokens > max_graph_tokens:
+            break
+        selected.append(r)
+        token_total += chunk_tokens
+        if len(selected) >= max_graph_docs:
+            break
+    return selected
+
+
+async def _format_graph_chunk_results(
+    results: list[dict[str, Any]],
+    meta_store: MetadataStore,
+) -> str:
+    """그래프 연결 문서 청크를 텍스트로 포맷팅한다.
+
+    벡터 검색 섹션('## 관련 문서')과 구분되도록 별도 헤더를 쓴다.
+    """
+    lines = ["## 그래프 연결 문서"]
+    doc_cache: dict[int, str] = {}
+
+    for r in results:
+        meta = r.get("metadata") or {}
+        doc_id = meta.get("document_id")
+        if doc_id and doc_id not in doc_cache:
+            doc = await meta_store.get_document(doc_id)
+            doc_cache[doc_id] = doc["title"] if doc else f"문서 #{doc_id}"
+
+        title = doc_cache.get(doc_id, "알 수 없음") if doc_id else "알 수 없음"
+        content = r.get("document", "")
+        section_path = meta.get("section_path", "")
+
+        header = f"\n### [{title}] (그래프 경로로 도달)"
+        if section_path:
+            header += f"\n_섹션: {section_path}_"
+        lines.append(header)
+        lines.append(content)
+
+    return "\n".join(lines)
+
+
 async def _search_graph_with_llm(
     query: str,
     graph_store: GraphStore,
@@ -355,6 +483,8 @@ async def assemble_context_with_sources(
     rerank_score_threshold: float = 0.0,
     hyde_enabled: bool = False,
     include_source_code: bool = False,
+    max_graph_docs: int = 3,
+    max_graph_tokens: int = 6000,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -436,10 +566,28 @@ async def assemble_context_with_sources(
                 sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
         sections.append("\n\n".join(lines))
 
-    # 3. 그래프 탐색 결과 처리 (쿼리 임베딩으로 관련 스키마 생성)
+    # 3. 그래프 탐색 결과 처리 — 엔티티/관계 요약 + 연결 문서 본문 첨부 (설계 A)
     if graph_result:
         sections.append(graph_result.text)
-        # 그래프 탐색 결과에서 출처 추출
+
+        # 연결 문서 본문 첨부 (벡터가 못 찾은 그래프 도달 문서)
+        graph_chunks = await _search_graph_sourced_chunks(
+            query_embedding, vector_store,
+            graph_result.document_ids, _extract_doc_ids(chunk_results),
+            max_graph_docs=max_graph_docs,
+            max_graph_tokens=max_graph_tokens,
+        )
+        fetched_sim: dict[int, float] = {}
+        if graph_chunks:
+            sections.append(
+                await _format_graph_chunk_results(graph_chunks, meta_store)
+            )
+            for r in graph_chunks:
+                did = (r.get("metadata") or {}).get("document_id")
+                if did is not None:
+                    fetched_sim[did] = 1 - r.get("distance", 1.0)
+
+        # 그래프 탐색 결과에서 출처 추출 — 본문 인출된 문서는 실제 유사도 부여
         existing_doc_ids = {s.document_id for s in sources}
         for doc_id in graph_result.document_ids:
             if doc_id not in existing_doc_ids:
@@ -447,7 +595,10 @@ async def assemble_context_with_sources(
                     doc = await meta_store.get_document(doc_id)
                     doc_cache[doc_id] = doc if doc else {"title": f"문서 #{doc_id}"}
                 title = doc_cache[doc_id]["title"]
-                sources.append(Source(document_id=doc_id, title=title, similarity=0.0))
+                sources.append(Source(
+                    document_id=doc_id, title=title,
+                    similarity=fetched_sim.get(doc_id, 0.0),
+                ))
 
     # Phase 9.7: 원본 소스 코드 첨부
     if include_source_code and chunk_results:

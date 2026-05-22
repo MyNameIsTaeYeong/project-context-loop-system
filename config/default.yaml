@@ -218,3 +218,8 @@ mcp:
   # dedup 된다. 한 결과의 본문 평균이 5K 토큰 안팎이므로 4096 기본은
   # max_context_chunks 와 곱해 즉시 충돌. 256K LLM 가정 하에 32K 로 상향.
   context_max_tokens: 32768
+  # 그래프 탐색이 도달했지만 벡터 검색이 못 찾은 문서의 본문을 컨텍스트에
+  # 첨부할 때의 상한 (설계 A). 청크가 문서 단위라 무거우므로 개수와 토큰을
+  # 함께 가드한다. 0 이면 그래프 연결 문서 첨부 off (= 엔티티/관계 텍스트만).
+  max_graph_context_docs: 3
+  max_graph_context_tokens: 6000
