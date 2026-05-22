@@ -495,6 +495,240 @@ def test_make_graph_gold_item_falls_back_to_node_description() -> None:
     assert item.relevant_graph_entities[0].description == "노드 자체 설명"
 
 
+# ---------------------------------------------------------------------------
+# R3 — graph 다중-doc → OR 그룹 자동 변환
+# ---------------------------------------------------------------------------
+
+
+def test_graph_multi_doc_becomes_or_group() -> None:
+    """sg.document_ids=[A,B,C] → relevant_doc_groups=[[A,B,C]] (단일 OR 그룹)."""
+    from context_loop.eval.synth import GeneratedGraphQuestion
+
+    subgraph = {
+        "entity_name": "공유 엔티티",
+        "entity_type": "system",
+        "entity_description": "여러 문서에 등장",
+        "document_ids": [7, 3, 5],
+        "primary_document_id": 7,
+        "source_type": "confluence",
+    }
+    gq = GeneratedGraphQuestion(query="?", evidence_description="설명")
+    item = builder._make_graph_gold_item(subgraph, gq)
+    assert item.relevant_doc_ids == [3, 5, 7]
+    assert item.relevant_doc_groups == [[3, 5, 7]]
+    assert item.cross_document is False
+
+
+def test_graph_single_doc_no_group() -> None:
+    """sg.document_ids=[A] → relevant_doc_groups=[] (그룹 불필요)."""
+    from context_loop.eval.synth import GeneratedGraphQuestion
+
+    subgraph = {
+        "entity_name": "단일 엔티티",
+        "entity_type": "system",
+        "entity_description": "",
+        "document_ids": [42],
+        "primary_document_id": 42,
+        "source_type": "confluence",
+    }
+    gq = GeneratedGraphQuestion(query="?", evidence_description="설명")
+    item = builder._make_graph_gold_item(subgraph, gq)
+    assert item.relevant_doc_ids == [42]
+    assert item.relevant_doc_groups == []
+
+
+# ---------------------------------------------------------------------------
+# R2 — cross-document 씨앗 추출 + emit
+# ---------------------------------------------------------------------------
+
+
+async def test_load_cross_doc_seeds_disjoint(meta_store: MetadataStore) -> None:
+    """노드 소유 문서가 서로소인 엣지만 cross-doc 씨앗으로 추출.
+
+    같은 엔티티가 두 문서에 모두 등장하면 노드가 병합되어 소유 문서가
+    겹치므로 cross-doc 아님. 서로 다른 엔티티가 다른 문서를 잇는 엣지만 통과.
+    """
+    doc_a = await meta_store.create_document(
+        source_type="confluence", title="A",
+        original_content="", content_hash="ha",
+    )
+    doc_b = await meta_store.create_document(
+        source_type="confluence", title="B",
+        original_content="", content_hash="hb",
+    )
+    graph_store = GraphStore(meta_store)
+    await graph_store.load_from_db()
+    # 문서 A: 결제 서비스 -> 인증 서비스 (둘 다 A 소유)
+    await graph_store.save_graph_data(
+        doc_a,
+        GraphData(
+            entities=[
+                Entity(name="결제 서비스", entity_type="system"),
+                Entity(name="인증 서비스", entity_type="system"),
+            ],
+            relations=[Relation(
+                source="결제 서비스", target="인증 서비스",
+                relation_type="depends_on",
+            )],
+        ),
+    )
+    # 문서 B: 인증 서비스(A 와 병합) -> 보안 팀 (보안 팀은 B 만 소유)
+    await graph_store.save_graph_data(
+        doc_b,
+        GraphData(
+            entities=[
+                Entity(name="인증 서비스", entity_type="system"),
+                Entity(name="보안 팀", entity_type="team"),
+            ],
+            relations=[Relation(
+                source="인증 서비스", target="보안 팀",
+                relation_type="owned_by",
+            )],
+        ),
+    )
+
+    seeds = await builder.load_cross_doc_seeds(
+        meta_store, graph_store,
+        source_types=["confluence"],
+        max_seeds=None,
+    )
+    # 결제 서비스(A) -> 인증 서비스(A,B): 소유 문서 {A} vs {A,B} → 겹침 → 제외
+    # 인증 서비스(A,B) -> 보안 팀(B): {A,B} vs {B} → 겹침 → 제외
+    # 즉 서로소 엣지가 없으므로 씨앗 0개여야 한다.
+    assert seeds == []
+
+
+async def test_load_cross_doc_seeds_true_disjoint(
+    meta_store: MetadataStore,
+) -> None:
+    """완전히 서로 다른 엔티티가 두 문서를 잇는 엣지는 cross-doc 씨앗."""
+    doc_a = await meta_store.create_document(
+        source_type="confluence", title="A",
+        original_content="", content_hash="ha",
+    )
+    doc_b = await meta_store.create_document(
+        source_type="confluence", title="B",
+        original_content="", content_hash="hb",
+    )
+    graph_store = GraphStore(meta_store)
+    await graph_store.load_from_db()
+    # A 만 소유하는 엔티티 X, B 만 소유하는 엔티티 Y. 엣지는 한 문서가 추가.
+    await graph_store.save_graph_data(
+        doc_a,
+        GraphData(
+            entities=[Entity(name="엔티티X", entity_type="system")],
+            relations=[],
+        ),
+    )
+    await graph_store.save_graph_data(
+        doc_b,
+        GraphData(
+            entities=[Entity(name="엔티티Y", entity_type="team")],
+            relations=[],
+        ),
+    )
+    # X@A -> Y@B 엣지를 직접 추가 (소유 문서 서로소: {A} vs {B}).
+    x_id = next(
+        n["id"] for n in await meta_store.get_all_graph_nodes()
+        if n["entity_name"] == "엔티티X"
+    )
+    y_id = next(
+        n["id"] for n in await meta_store.get_all_graph_nodes()
+        if n["entity_name"] == "엔티티Y"
+    )
+    graph_store.graph.add_edge(
+        x_id, y_id, id=999, relation_type="references", document_id=doc_a,
+        properties={},
+    )
+
+    seeds = await builder.load_cross_doc_seeds(
+        meta_store, graph_store,
+        source_types=["confluence"],
+        max_seeds=None,
+    )
+    assert len(seeds) == 1
+    seed = seeds[0]
+    assert seed["source_entity"]["name"] == "엔티티X"
+    assert seed["target_entity"]["name"] == "엔티티Y"
+    assert seed["source_entity"]["doc_id"] == doc_a
+    assert seed["target_entity"]["doc_id"] == doc_b
+    assert sorted(seed["document_ids"]) == sorted([doc_a, doc_b])
+    assert seed["relation_type"] == "references"
+
+
+async def test_cross_doc_seed_deterministic(meta_store: MetadataStore) -> None:
+    """같은 입력 → 같은 정렬·동일 씨앗 리스트 (결정론)."""
+    doc_a = await meta_store.create_document(
+        source_type="confluence", title="A",
+        original_content="", content_hash="ha",
+    )
+    doc_b = await meta_store.create_document(
+        source_type="confluence", title="B",
+        original_content="", content_hash="hb",
+    )
+    graph_store = GraphStore(meta_store)
+    await graph_store.load_from_db()
+    await graph_store.save_graph_data(
+        doc_a, GraphData(entities=[Entity(name="X", entity_type="s")], relations=[]),
+    )
+    await graph_store.save_graph_data(
+        doc_b, GraphData(entities=[Entity(name="Y", entity_type="t")], relations=[]),
+    )
+    nodes = await meta_store.get_all_graph_nodes()
+    x_id = next(n["id"] for n in nodes if n["entity_name"] == "X")
+    y_id = next(n["id"] for n in nodes if n["entity_name"] == "Y")
+    graph_store.graph.add_edge(
+        x_id, y_id, id=1, relation_type="r", document_id=doc_a, properties={},
+    )
+
+    s1 = await builder.load_cross_doc_seeds(
+        meta_store, graph_store, source_types=None, max_seeds=None,
+    )
+    s2 = await builder.load_cross_doc_seeds(
+        meta_store, graph_store, source_types=None, max_seeds=None,
+    )
+    assert s1 == s2
+
+
+def test_make_cross_doc_item_and_groups() -> None:
+    """씨앗 → relevant_doc_groups=[[A],[B]], cross_document=True."""
+    from context_loop.eval.synth import GeneratedGraphQuestion
+
+    seed = {
+        "source_entity": {"name": "A", "type": "system", "doc_id": 3},
+        "target_entity": {"name": "B", "type": "team", "doc_id": 7},
+        "relation_type": "owned_by",
+        "document_ids": [3, 7],
+        "source_type": "confluence",
+    }
+    gq = GeneratedGraphQuestion(
+        query="A 를 운영하는 팀은?", difficulty="medium",
+        entity_aliases=["Alias A"],
+    )
+    item = builder._make_cross_doc_gold_item(seed, gq)
+    assert item.cross_document is True
+    assert item.relevant_doc_groups == [[3], [7]]
+    assert item.relevant_doc_ids == [3, 7]
+    assert {e.name for e in item.relevant_graph_entities} == {"A", "B"}
+    assert item.notes == "cross_document"
+
+
+def test_classify_mode_cross_doc_priority() -> None:
+    """cross_document=True 면 mode 가 'cross_doc' 우선."""
+    import eval_search  # type: ignore[import-not-found]
+
+    from context_loop.eval.gold_set import GoldItem, GraphEntityRef
+
+    item = GoldItem(
+        id="q1", query="?",
+        relevant_doc_ids=[3, 7],
+        relevant_doc_groups=[[3], [7]],
+        cross_document=True,
+        relevant_graph_entities=[GraphEntityRef(name="A", type="t")],
+    )
+    assert eval_search._classify_mode(item) == "cross_doc"
+
+
 import pytest as _pytest  # noqa: E402
 
 
@@ -600,6 +834,9 @@ def test_cli_exposes_new_options() -> None:
     assert "--graph-match-threshold" in source
     # 3차 — 항목 단위 병렬 처리 CLI.
     assert "--concurrency" in source
+    # R2 — cross-document 생성 CLI.
+    assert "--enable-cross-doc" in source
+    assert "--cross-doc-max-seeds" in source
 
 
 def test_eval_search_cli_exposes_new_options() -> None:

@@ -340,6 +340,53 @@ def test_gold_item_no_relations_field_omitted_on_emit() -> None:
     assert "relevant_graph_relations" not in d
 
 
+# ---------------------------------------------------------------------------
+# R3/R2 — relevant_doc_groups (동치 집합) + cross_document 플래그
+# ---------------------------------------------------------------------------
+
+
+def test_roundtrip_equivalence_groups() -> None:
+    """relevant_doc_groups + cross_document round-trip 무손실."""
+    item = GoldItem(
+        id="qc1",
+        query="cross-doc 질의",
+        relevant_doc_ids=[3, 5, 9],
+        relevant_doc_groups=[[3, 5], [9]],
+        cross_document=True,
+    )
+    d = item.to_dict()
+    assert d["relevant_doc_groups"] == [[3, 5], [9]]
+    assert d["cross_document"] is True
+    rehydrated = GoldItem.from_dict(d)
+    assert rehydrated == item
+
+
+def test_legacy_yaml_no_groups_loads() -> None:
+    """그룹 키 없는 옛 YAML → groups=[], cross_document=False."""
+    item = GoldItem.from_dict({
+        "id": "q1", "query": "?", "relevant_doc_ids": [1, 2],
+    })
+    assert item.relevant_doc_groups == []
+    assert item.cross_document is False
+
+
+def test_groups_dedup_and_drop_empty() -> None:
+    """그룹 내 중복 제거 + 빈 그룹 드롭."""
+    item = GoldItem.from_dict({
+        "id": "q1", "query": "?", "relevant_doc_ids": [3, 5],
+        "relevant_doc_groups": [[3, 3, 5], []],
+    })
+    assert item.relevant_doc_groups == [[3, 5]]
+
+
+def test_groups_omitted_when_empty_on_emit() -> None:
+    """빈 relevant_doc_groups / cross_document=False 는 to_dict 에서 빠진다."""
+    item = GoldItem(id="q1", query="?", relevant_doc_ids=[1])
+    d = item.to_dict()
+    assert "relevant_doc_groups" not in d
+    assert "cross_document" not in d
+
+
 def test_gold_item_backward_compat_with_extended_yaml(tmp_path: Path) -> None:
     """2차 골드셋 YAML 을 저장→로드 round-trip 후 모든 확장 필드 보존."""
     gold = GoldSet(

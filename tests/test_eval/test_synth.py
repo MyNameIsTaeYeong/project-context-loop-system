@@ -17,6 +17,7 @@ from context_loop.eval.synth import (
     extract_unique_tokens,
     filter_question,
     format_edges_for_prompt,
+    generate_cross_doc_questions,
     generate_graph_questions,
     generate_questions,
     has_demonstrative_reference,
@@ -765,3 +766,29 @@ async def test_generate_graph_questions_graceful_on_minimal_output() -> None:
     assert questions[0].evidence_description == ""
     assert questions[0].entity_aliases == []
     assert questions[0].relation is None
+
+
+@pytest.mark.asyncio
+async def test_generate_cross_doc_questions_prompt() -> None:
+    """cross-doc 프롬프트에 두 엔티티 + '두 문서 모두' 취지 + judge 재사용."""
+    stub = StubLLM(['[{"q": "결제가 의존하는 인증 모듈은 누가 관리?", "difficulty": "hard"}]'])
+    seed = {
+        "source_entity": {"name": "결제 서비스", "type": "system", "doc_id": 1},
+        "target_entity": {"name": "인증 서비스", "type": "system", "doc_id": 2},
+        "relation_type": "depends_on",
+        "document_ids": [1, 2],
+        "source_type": "confluence",
+    }
+    questions = await generate_cross_doc_questions(
+        seed, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    assert len(questions) == 1
+    assert questions[0].query == "결제가 의존하는 인증 모듈은 누가 관리?"
+    prompt = stub.calls[0]["prompt"]
+    # 두 엔티티가 모두 프롬프트에 등장
+    assert "결제 서비스" in prompt
+    assert "인증 서비스" in prompt
+    # cross-document 취지가 명시됨
+    assert "두 문서" in prompt
+    # purpose 라벨이 cross-doc 전용
+    assert stub.calls[0]["purpose"] == "goldset_generate_cross_doc"

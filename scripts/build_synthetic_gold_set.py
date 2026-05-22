@@ -51,6 +51,13 @@ source_type 제한, 시드 고정 (재현성)::
         --score-relations --graph-match-threshold 0.78 \\
         --output eval/gold_set.yaml
 
+cross-document 질문 생성 (R2 — 그래프 성능 측정용)::
+
+    python scripts/build_synthetic_gold_set.py \\
+        --enable-cross-doc --source-types confluence_mcp git_code \\
+        --cross-doc-max-seeds 50 \\
+        --output eval/gold_set.yaml
+
 변동성 측정용 다중 골드셋 (같은 source_type 으로 N개 빌드)::
 
     python scripts/build_synthetic_gold_set.py \\
@@ -105,6 +112,7 @@ from context_loop.eval.synth import (  # noqa: E402
     build_korean_stopwords_from_corpus,
     build_subgraph_snippet,
     filter_question,
+    generate_cross_doc_questions,
     generate_graph_questions,
     generate_questions,
     make_text_anchor,
@@ -299,6 +307,84 @@ async def load_candidate_subgraphs(
     return out
 
 
+async def load_cross_doc_seeds(
+    meta_store: MetadataStore,
+    graph_store: GraphStore,
+    *,
+    source_types: list[str] | None,
+    max_seeds: int | None = None,
+) -> list[dict[str, Any]]:
+    """서로 다른 문서를 잇는 엣지에서 cross-doc 질의 씨앗을 결정론적으로 추출 (R2).
+
+    각 씨앗 dict::
+
+        {
+            "source_entity": {"name": str, "type": str, "doc_id": int},
+            "target_entity": {"name": str, "type": str, "doc_id": int},
+            "relation_type": str,
+            "document_ids": [src_doc_id, tgt_doc_id],   # AND 그룹의 재료
+            "source_type": str,                          # 대표 source_type
+        }
+
+    'cross-doc' 정의: 엣지의 source 노드 소유 문서집합과 target 노드 소유 문서
+    집합이 서로소(겹치지 않음)인 엣지. → 한 문서만 봐서는 양쪽 엔티티를 모두
+    알 수 없음. 같은 입력 + 정렬키면 항상 같은 씨앗 리스트 (결정론).
+    """
+    documents = await meta_store.list_documents()
+    doc_by_id = {d["id"]: d for d in documents}
+
+    g = graph_store.graph
+    out: list[dict[str, Any]] = []
+    for u, v, data in g.edges(data=True):
+        if not (g.has_node(u) and g.has_node(v)):
+            continue
+        docs_u = set(g.nodes[u].get("document_ids") or set())
+        docs_v = set(g.nodes[v].get("document_ids") or set())
+        if not (docs_u and docs_v and docs_u.isdisjoint(docs_v)):
+            continue
+
+        # source_type 필터 — 양쪽 소유 문서 중 하나라도 화이트리스트면 통과.
+        owning_types = {
+            doc_by_id[d].get("source_type", "")
+            for d in (docs_u | docs_v)
+            if d in doc_by_id
+        }
+        if source_types and not (set(source_types) & owning_types):
+            continue
+
+        src_doc = min(docs_u)
+        tgt_doc = min(docs_v)
+        src_name = str(g.nodes[u].get("entity_name") or "")
+        tgt_name = str(g.nodes[v].get("entity_name") or "")
+        if not (src_name and tgt_name):
+            continue
+        src_type = str(g.nodes[u].get("entity_type") or "")
+        tgt_type = str(g.nodes[v].get("entity_type") or "")
+        relation_type = str(data.get("relation_type") or "")
+        primary_source_type = doc_by_id.get(src_doc, {}).get("source_type", "")
+
+        out.append({
+            "source_entity": {"name": src_name, "type": src_type, "doc_id": src_doc},
+            "target_entity": {"name": tgt_name, "type": tgt_type, "doc_id": tgt_doc},
+            "relation_type": relation_type,
+            "document_ids": [src_doc, tgt_doc],
+            "source_type": primary_source_type,
+        })
+
+    # 결정론적 정렬 — (src_doc, tgt_doc, source_name, target_name, relation_type)
+    out.sort(key=lambda s: (
+        s["source_entity"]["doc_id"],
+        s["target_entity"]["doc_id"],
+        s["source_entity"]["name"],
+        s["target_entity"]["name"],
+        s["relation_type"],
+    ))
+    if max_seeds is not None and max_seeds >= 0:
+        out = out[:max_seeds]
+    logger.info("cross-doc 씨앗 로드 완료 — total=%d", len(out))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -320,6 +406,8 @@ async def build(
     min_chars: int,
     max_chars: int,
     enable_graph_mode: bool = False,
+    enable_cross_doc: bool = False,
+    cross_doc_max_seeds: int | None = None,
     n_graph_nodes: int = 0,
     min_graph_neighbors: int = 1,
     embed_graph_evidence: bool = True,
@@ -378,7 +466,7 @@ async def build(
     await store.initialize()
 
     graph_store: GraphStore | None = None
-    if enable_graph_mode:
+    if enable_graph_mode or enable_cross_doc:
         graph_store = GraphStore(store)
         await graph_store.load_from_db()
 
@@ -432,6 +520,8 @@ async def build(
             "fail_runtime": 0,
             "graph_generated": 0,
             "graph_passed": 0,
+            "cross_doc_generated": 0,
+            "cross_doc_passed": 0,
         }
 
         effective_concurrency = max(1, concurrency)
@@ -484,9 +574,32 @@ async def build(
                 extra_korean_stopwords=extra_korean_stopwords,
             )
 
+        # cross-doc 모드 실행 — graph 모드 이후에 머지 (R2)
+        if enable_cross_doc and graph_store is not None:
+            next_id = await _run_cross_doc_mode(
+                meta_store=store,
+                graph_store=graph_store,
+                source_types=source_types,
+                max_seeds=cross_doc_max_seeds,
+                questions_per_chunk=questions_per_chunk,
+                generator=generator,
+                judge=judge,
+                reasoning_mode=reasoning_mode,
+                apply_filter=apply_filter,
+                items=items,
+                stats=stats,
+                sem=sem,
+                next_id=next_id,
+                generator_temperature=generator_temperature,
+                generator_seed_base=generator_seed_base,
+                extra_korean_stopwords=extra_korean_stopwords,
+            )
+
         generation_modes = ["chunk"]
         if enable_graph_mode:
             generation_modes.append("graph")
+        if enable_cross_doc:
+            generation_modes.append("cross_doc")
 
         metadata: dict[str, Any] = {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -516,6 +629,11 @@ async def build(
             metadata["graph_match_threshold_default"] = graph_match_threshold
             metadata["score_relations"] = score_relations
             metadata["embed_graph_evidence"] = embed_graph_evidence
+        if enable_cross_doc:
+            # cross-doc 생성 정책 추적성 (R2 — 결정론 씨앗 + LLM 문장화).
+            metadata["cross_doc_enabled"] = True
+            metadata["cross_doc_max_seeds"] = cross_doc_max_seeds
+            metadata["cross_doc_generation"] = "deterministic_seed+llm_phrasing"
 
         gold = GoldSet(version=1, items=items, metadata=metadata)
         save_gold_set(gold, output_path)
@@ -946,6 +1064,201 @@ async def _run_graph_mode(
     return next_id
 
 
+def _cross_doc_seed_snippet(seed: dict[str, Any]) -> str:
+    """cross-doc 씨앗을 judge 게이트 입력용 텍스트로 포맷팅 (양쪽 엔티티+관계)."""
+    src = seed["source_entity"]
+    tgt = seed["target_entity"]
+    lines = [
+        f"엔티티 A: {src['name']} ({src['type']})",
+        f"엔티티 B: {tgt['name']} ({tgt['type']})",
+        f"관계: {src['name']} --[{seed.get('relation_type') or '관련'}]--> {tgt['name']}",
+    ]
+    return "\n".join(lines)
+
+
+async def _process_cross_doc_item(
+    idx: int,
+    seed: dict[str, Any],
+    *,
+    distractor_snippets: list[str],
+    skip_generic_gate: bool,
+    generator: LLMClient,
+    judge: LLMClient,
+    questions_per_chunk: int,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    sem: asyncio.Semaphore,
+    total: int,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> tuple[list[GoldItem], dict[str, int]]:
+    """cross-doc 씨앗 1개 처리 — 질문 생성·게이트.
+
+    id 는 호출자가 후처리에서 부여 — placeholder ``id=""``.
+    """
+    async with sem:
+        logger.info(
+            "[cross-doc start %d/%d] %s -> %s (%s)",
+            idx, total,
+            seed["source_entity"]["name"], seed["target_entity"]["name"],
+            seed["relation_type"],
+        )
+        local_items: list[GoldItem] = []
+        local_stats: dict[str, int] = {}
+
+        sg_seed = (
+            generator_seed_base + idx if generator_seed_base is not None else None
+        )
+        generated = await generate_cross_doc_questions(
+            seed,
+            n=questions_per_chunk,
+            generator=generator,
+            reasoning_mode=reasoning_mode,
+            temperature=generator_temperature,
+            seed=sg_seed,
+        )
+        local_stats["cross_doc_generated"] = (
+            local_stats.get("cross_doc_generated", 0) + len(generated)
+        )
+        local_stats["generated"] = local_stats.get("generated", 0) + len(generated)
+
+        if not generated:
+            logger.warning("  → cross-doc 생성 실패 (빈 응답)")
+            local_stats["fail_parse"] = local_stats.get("fail_parse", 0) + 1
+            logger.info("[cross-doc done %d/%d]", idx, total)
+            return local_items, local_stats
+
+        snippet = _cross_doc_seed_snippet(seed)
+        gate_distractors = [] if skip_generic_gate else distractor_snippets
+
+        for j, gq in enumerate(generated):
+            if not apply_filter:
+                local_items.append(_make_cross_doc_gold_item(seed, gq))
+                local_stats["passed"] = local_stats.get("passed", 0) + 1
+                local_stats["cross_doc_passed"] = (
+                    local_stats.get("cross_doc_passed", 0) + 1
+                )
+                continue
+
+            judge_seed = (sg_seed + 10000 + j) if sg_seed is not None else None
+            report = await filter_question(
+                gq.query,
+                snippet,
+                gate_distractors,
+                judge=judge,
+                reasoning_mode=reasoning_mode,
+                seed=judge_seed,
+                extra_korean_stopwords=extra_korean_stopwords,
+            )
+            if not report.passed:
+                key = f"fail_{report.reason}" if report.reason else "fail_parse"
+                local_stats[key] = local_stats.get(key, 0) + 1
+                logger.info(
+                    "  cross-doc q%d 탈락 — reason=%s, query=%s",
+                    j + 1, report.reason, gq.query[:80],
+                )
+                continue
+
+            local_items.append(_make_cross_doc_gold_item(seed, gq))
+            local_stats["passed"] = local_stats.get("passed", 0) + 1
+            local_stats["cross_doc_passed"] = (
+                local_stats.get("cross_doc_passed", 0) + 1
+            )
+            logger.info("  cross-doc q%d 통과 — query=%s", j + 1, gq.query[:80])
+
+        logger.info("[cross-doc done %d/%d]", idx, total)
+        return local_items, local_stats
+
+
+async def _run_cross_doc_mode(
+    *,
+    meta_store: MetadataStore,
+    graph_store: GraphStore,
+    source_types: list[str] | None,
+    max_seeds: int | None,
+    questions_per_chunk: int,
+    generator: LLMClient,
+    judge: LLMClient,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    items: list[GoldItem],
+    stats: dict[str, int],
+    sem: asyncio.Semaphore | None = None,
+    next_id: int = 1,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> int:
+    """cross-doc 모드 — 서로 다른 문서를 잇는 엣지 씨앗에서 질문 생성·게이트.
+
+    Returns: 다음에 부여될 ``next_id`` (chunk + graph + cross-doc 연속 공간).
+    """
+    seeds = await load_cross_doc_seeds(
+        meta_store,
+        graph_store,
+        source_types=source_types,
+        max_seeds=max_seeds,
+    )
+    if not seeds:
+        logger.warning(
+            "cross-doc 씨앗이 0개 — 서로 다른 문서를 잇는 그래프 엣지가 없거나 "
+            "source_type 필터에 매칭되지 않습니다. cross-doc 모드를 건너뜁니다.",
+        )
+        return next_id
+
+    # 일반성 게이트용 distractor 풀: 씨앗 자체 snippet 들 (자기 자신 제외).
+    all_snippets = [_cross_doc_seed_snippet(s) for s in seeds]
+    skip_generic_gate = len(seeds) < 5
+    if skip_generic_gate:
+        logger.warning(
+            "cross-doc 씨앗 풀이 5개 미만 — 일반성 게이트 신뢰도가 낮습니다.",
+        )
+
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+
+    total = len(seeds)
+    tasks = [
+        _process_cross_doc_item(
+            idx, seed,
+            distractor_snippets=[
+                s for k, s in enumerate(all_snippets) if k != idx - 1
+            ][:5],
+            skip_generic_gate=skip_generic_gate,
+            generator=generator,
+            judge=judge,
+            questions_per_chunk=questions_per_chunk,
+            reasoning_mode=reasoning_mode,
+            apply_filter=apply_filter,
+            sem=sem,
+            total=total,
+            generator_temperature=generator_temperature,
+            generator_seed_base=generator_seed_base,
+            extra_korean_stopwords=extra_korean_stopwords,
+        )
+        for idx, seed in enumerate(seeds, start=1)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for idx, r in enumerate(results, start=1):
+        if isinstance(r, BaseException):
+            logger.exception(
+                "[cross-doc fail %d/%d] %s", idx, total, r,
+                exc_info=r if isinstance(r, Exception) else None,
+            )
+            stats["fail_runtime"] = stats.get("fail_runtime", 0) + 1
+            continue
+        local_items, local_stats = r
+        for item in local_items:
+            item.id = f"q{next_id:04d}"
+            items.append(item)
+            next_id += 1
+        _merge_stats(stats, local_stats)
+
+    return next_id
+
+
 def _make_graph_gold_item(
     sg: dict[str, Any],
     gq: GeneratedGraphQuestion,
@@ -991,10 +1304,14 @@ def _make_graph_gold_item(
             description_embedding=None,
         ))
 
+    # 같은 엔티티가 N개 문서에 등장 = "그 중 어디서든 찾으면 OK" = 단일 OR 그룹
+    # (R3). doc 가 1개뿐이면 그룹 불필요 (평탄 채점과 동일) → 빈 그룹으로 둠.
+    doc_ids = sorted(set(int(d) for d in sg["document_ids"]))
     return GoldItem(
         id="",
         query=gq.query,
-        relevant_doc_ids=list(sg["document_ids"]),
+        relevant_doc_ids=doc_ids,  # 평탄 — 하위호환/CSV용
+        relevant_doc_groups=[doc_ids] if len(doc_ids) > 1 else [],
         relevant_graph_entities=[entity_ref],
         relevant_graph_relations=relations,
         source_type=sg["source_type"],
@@ -1002,6 +1319,41 @@ def _make_graph_gold_item(
         source_text_anchor=None,
         difficulty=gq.difficulty,
         synthesized=True,
+    )
+
+
+def _make_cross_doc_gold_item(
+    seed: dict[str, Any],
+    gq: GeneratedGraphQuestion,
+) -> GoldItem:
+    """cross-doc 씨앗 + 생성 질문을 GoldItem 으로 직렬화한다 (R2).
+
+    두 문서를 '모두' 봐야 답 가능 → AND 다중그룹 ``[[src_doc], [tgt_doc]]``.
+    각 그룹은 단일 doc 라 OR 은 자명. ``cross_document=True`` 로 식별한다.
+    id 는 호출자가 후처리에서 부여 — placeholder ``id=""``.
+    """
+    src = seed["source_entity"]
+    tgt = seed["target_entity"]
+    src_doc = int(src["doc_id"])
+    tgt_doc = int(tgt["doc_id"])
+    return GoldItem(
+        id="",
+        query=gq.query,
+        relevant_doc_ids=sorted({src_doc, tgt_doc}),  # 평탄(하위호환)
+        relevant_doc_groups=[[src_doc], [tgt_doc]],
+        cross_document=True,
+        relevant_graph_entities=[
+            GraphEntityRef(
+                name=src["name"], type=src["type"],
+                aliases=list(gq.entity_aliases),
+            ),
+            GraphEntityRef(name=tgt["name"], type=tgt["type"]),
+        ],
+        source_type=seed["source_type"],
+        source_document_id=src_doc,
+        difficulty=gq.difficulty,
+        synthesized=True,
+        notes="cross_document",
     )
 
 
@@ -1202,6 +1554,17 @@ def main() -> None:
         "--min-graph-neighbors", type=int, default=1,
         help="graph 후보의 1-hop 이웃 최소 수 (W-2, 기본 1).",
     )
+    # cross-document 질문 생성 — R2 (그래프 성능 측정용).
+    parser.add_argument(
+        "--enable-cross-doc", action="store_true",
+        help="서로 다른 문서를 잇는 그래프 엣지에서 cross-document 질문을 "
+             "생성한다 (R2). 결정론 씨앗 추출 + LLM 문장화. 기본 False.",
+    )
+    parser.add_argument(
+        "--cross-doc-max-seeds", type=int, default=None,
+        help="cross-doc 씨앗 상한 (None=무제한). 결정론적 정렬 후 head 절단. "
+             "--enable-cross-doc 가 꺼져 있으면 무시.",
+    )
     # 2차 — 그래프 인덱싱 강건성 (R1/R2/R3).
     parser.add_argument(
         "--embed-graph-evidence", type=lambda v: _parse_optional_bool(v),
@@ -1388,6 +1751,8 @@ def main() -> None:
                 min_chars=args.min_chars,
                 max_chars=args.max_chars,
                 enable_graph_mode=args.include_graph_questions,
+                enable_cross_doc=bool(args.enable_cross_doc),
+                cross_doc_max_seeds=args.cross_doc_max_seeds,
                 n_graph_nodes=effective_n_graph_nodes,
                 min_graph_neighbors=args.min_graph_neighbors,
                 embed_graph_evidence=bool(args.embed_graph_evidence),
