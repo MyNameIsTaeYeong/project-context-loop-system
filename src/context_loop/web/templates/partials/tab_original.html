@@ -1,25 +1,5 @@
-{% if doc.source_type in ('code_file_summary', 'code_doc', 'code_summary') %}
-<article x-data="{ view: 'rendered' }">
-    <div role="group" style="margin-bottom: 1rem;">
-        <button :class="view === 'rendered' ? '' : 'outline'"
-                @click="view = 'rendered'">Rendered</button>
-        <button :class="view === 'raw' ? '' : 'outline'"
-                @click="view = 'raw'">Raw</button>
-    </div>
-    <div x-show="view === 'rendered'" x-cloak id="md-rendered"></div>
-    <div x-show="view === 'raw'" x-cloak>
-        <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
-    </div>
-</article>
-<pre id="md-raw-content" style="display:none">{{ doc.original_content or '' }}</pre>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script>
-    (function() {
-        var raw = document.getElementById('md-raw-content').textContent;
-        document.getElementById('md-rendered').innerHTML = marked.parse(raw);
-    })();
-</script>
-{% elif doc.source_type == 'git_code' %}
+{% if doc.source_type == 'git_code' %}
+{# 코드 파일은 마크다운이 아니라 소스 코드이므로 syntax highlight 만 적용. #}
 <article>
     <pre><code class="language-{{ lang_hint or '' }}">{{ doc.original_content or '(no content)' }}</code></pre>
 </article>
@@ -27,7 +7,28 @@
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
 <script>hljs.highlightAll();</script>
 {% else %}
-<article>
-    <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
+{# 그 외(confluence, confluence_mcp, code_*, manual, upload)는 본문이 마크다운
+   이므로 Rendered/Raw 토글을 제공하고 기본은 Rendered. 원본 텍스트는 별도의
+   숨김 <pre class="md-source"> 에 보관해 marked + DOMPurify 로 안전 렌더. #}
+<article x-data="{ view: 'rendered' }">
+    <div role="group" style="margin-bottom: 1rem;">
+        <button :class="view === 'rendered' ? '' : 'outline'"
+                @click="view = 'rendered'">Rendered</button>
+        <button :class="view === 'raw' ? '' : 'outline'"
+                @click="view = 'raw'">Raw</button>
+    </div>
+    <div x-show="view === 'rendered'"
+         class="markdown-body"
+         data-markdown
+         data-markdown-src="md-source-original-{{ doc.id }}"></div>
+    <div x-show="view === 'raw'">
+        <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
+    </div>
 </article>
+<pre id="md-source-original-{{ doc.id }}" class="md-source" hidden>{{ doc.original_content or '' }}</pre>
+{# 인라인 호출 — htmx:afterSwap 리스너가 어떤 이유로든 동작하지 않거나
+   본 파셜이 HTMX 외 경로(직접 fetch 등)로 삽입돼도 즉시 렌더한다. #}
+<script>
+    if (window.renderAllMarkdown) { window.renderAllMarkdown(); }
+</script>
 {% endif %}
