@@ -383,7 +383,14 @@ async def evaluate_one(
         key=lambda s: (-(s.similarity or 0.0), s.document_id),
     )
     retrieved_doc_ids = [s.document_id for s in sorted_sources]
-    relevant = set(item.relevant_doc_ids)
+    # R3 — 동치 그룹이 있으면 '대표 1개' 축약 후 기존 메트릭 재사용
+    # (metrics.py 무변경). 없으면 평탄 채점으로 폴백 (하위호환).
+    if item.relevant_doc_groups:
+        scoring_retrieved, relevant = _reduce_equivalence(
+            retrieved_doc_ids, item.relevant_doc_groups,
+        )
+    else:
+        scoring_retrieved, relevant = retrieved_doc_ids, set(item.relevant_doc_ids)
 
     # graph-level 채점 — 4-tier cascade (exact → alias → normalize → embedding).
     # 임베딩 단계의 비용 통제는 외부 주입된 LRU 캐시 embed_fn 으로 흡수.
@@ -404,13 +411,15 @@ async def evaluate_one(
         "source_document_id": item.source_document_id,
         "retrieved_doc_ids": retrieved_doc_ids[:top_k],
         "retrieved_count": len(retrieved_doc_ids),
-        "relevant_doc_ids": sorted(relevant),
-        # chunk/doc-level (기존)
-        f"recall@{top_k}": recall_at_k(retrieved_doc_ids, relevant, top_k),
-        f"precision@{top_k}": precision_at_k(retrieved_doc_ids, relevant, top_k),
-        f"hit@{top_k}": int(hit_at_k(retrieved_doc_ids, relevant, top_k)),
-        f"ndcg@{top_k}": ndcg_at_k(retrieved_doc_ids, relevant, top_k),
-        "mrr": mrr(retrieved_doc_ids, relevant),
+        # CSV/외부 진단(diagnose_r3_effect) 호환 — 평탄 원본 유지(축약 X).
+        "relevant_doc_ids": sorted(set(item.relevant_doc_ids)),
+        "n_answer_units": len(item.relevant_doc_groups or item.relevant_doc_ids),
+        # chunk/doc-level (기존) — R3 동치 축약된 retrieved/relevant 로 채점.
+        f"recall@{top_k}": recall_at_k(scoring_retrieved, relevant, top_k),
+        f"precision@{top_k}": precision_at_k(scoring_retrieved, relevant, top_k),
+        f"hit@{top_k}": int(hit_at_k(scoring_retrieved, relevant, top_k)),
+        f"ndcg@{top_k}": ndcg_at_k(scoring_retrieved, relevant, top_k),
+        "mrr": mrr(scoring_retrieved, relevant),
         # graph-level (D-5) — 매칭된 retrieved/relevant 키를 메트릭에 전달.
         # all_relevant_keys 가 골든 전체이므로 recall 분모는 정상 유지된다.
         f"graph_recall@{top_k}": recall_at_k(
@@ -544,13 +553,55 @@ async def evaluate_one(
     return row
 
 
-def _classify_mode(item: GoldItem) -> str:
-    """GoldItem 을 chunk / graph / hybrid 로 분류한다.
+def _reduce_equivalence(
+    retrieved_doc_ids: list[int],
+    groups: list[list[int]],
+) -> tuple[list[int], set[int]]:
+    """동치 그룹을 '대표 1개' 단위로 축약하여 (retrieved', relevant') 반환.
 
+    각 동치 그룹 = 정답 1개 단위 (R3). 그룹의 대표 ID 는 'retrieved 안에서
+    가장 먼저 등장하는 그룹 멤버'. retrieved 에 그룹 멤버가 없으면 그룹의 첫
+    원소(정렬된)를 대표로 둔다 (=miss 로 카운트되어 recall 분모에 잡힘).
+
+    반환된 retrieved' 는 원래 retrieved 의 순서를 보존하되, 한 그룹의 멤버는
+    '첫 등장 1회'만 남기고 (중복 정답 캡), relevant' 는 그룹별 대표 set.
+    그룹 외 doc(정답 아님)은 retrieved' 에 그대로 보존 → precision 분모 정확.
+    """
+    rep_of_group: list[int] = []
+    member_to_rep: dict[int, int] = {}
+    rank = {d: i for i, d in enumerate(retrieved_doc_ids)}
+    for g in groups:
+        present = [d for d in g if d in rank]
+        rep = min(present, key=lambda d: rank[d]) if present else min(g)
+        rep_of_group.append(rep)
+        for d in g:
+            member_to_rep[d] = rep
+    relevant_reduced = set(rep_of_group)
+
+    seen_reps: set[int] = set()
+    retrieved_reduced: list[int] = []
+    for d in retrieved_doc_ids:
+        if d in member_to_rep:
+            rep = member_to_rep[d]
+            if rep in seen_reps:
+                continue  # 같은 그룹 두 번째 출현 → drop (중복 정답 캡)
+            seen_reps.add(rep)
+            retrieved_reduced.append(rep)
+        else:
+            retrieved_reduced.append(d)  # 정답 아닌 doc → 보존 (precision 분모)
+    return retrieved_reduced, relevant_reduced
+
+
+def _classify_mode(item: GoldItem) -> str:
+    """GoldItem 을 cross_doc / chunk / graph / hybrid 로 분류한다.
+
+    - cross_document=True 면 "cross_doc" (우선)
     - relevant_doc_ids 만 있으면 "chunk"
     - relevant_graph_entities 만 있으면 "graph"
     - 둘 다 있으면 "hybrid"
     """
+    if item.cross_document:
+        return "cross_doc"
     has_doc = bool(item.relevant_doc_ids)
     has_graph = bool(item.relevant_graph_entities)
     if has_doc and has_graph:
@@ -650,7 +701,8 @@ def write_summary(
 ) -> dict[str, Any]:
     """집계 요약을 JSON 으로 저장하고 반환.
 
-    전체 메트릭 평균 + mode 별 split (chunk / graph / hybrid) 도 함께 보고한다.
+    전체 메트릭 평균 + mode 별 split (chunk / graph / hybrid / cross_doc) 도
+    함께 보고한다.
     chunk-only 항목의 ``graph_*`` 메트릭은 자연 0.0 이라 전체 평균을 끌어내릴
     수 있어 W-5 의 권장 대응으로 mode 별 분리 보고를 추가했다.
 
@@ -661,7 +713,7 @@ def write_summary(
     summary = aggregate(rows, exclude=excluded)
 
     rows_by_mode: dict[str, list[dict[str, Any]]] = {
-        "chunk": [], "graph": [], "hybrid": [],
+        "chunk": [], "graph": [], "hybrid": [], "cross_doc": [],
     }
     for r in rows:
         mode = r.get("mode")

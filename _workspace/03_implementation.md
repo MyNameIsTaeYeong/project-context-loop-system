@@ -1,224 +1,180 @@
-# 03_implementation.md — 골드셋 생성·평가 병렬화 구현 (3차)
+# 03_implementation — 골드셋 cross-doc / answer-equivalence 구현
 
-**작성**: 2026-05-18
-**상위**: `_workspace/02_design.md` (19개 결정 + 의사코드)
-**참조**: `_workspace/00_requirements.md`, `_workspace/01_analysis.md`
+작성: 2026-05-22 (implementer, eval-gold-set-improvement)
+입력: `02_design.md` (작업 지시서), `01_analysis.md`, `00_requirements.md`
+대상 HEAD: PR#64 병합 후 (브랜치 `claude/gold-set-cross-doc-equivalence`)
 
-이 문서는 02_design 의 §11 변경 파일 표를 체크리스트로 사용해 구현한
-실제 코드 변경과 검증 결과를 요약한다.
-
----
-
-## 1. 수정·신규 파일
-
-| 파일 | 변경 종류 | 한 줄 변경 설명 |
-|------|---------|---------|
-| `scripts/build_synthetic_gold_set.py` | 수정 | chunk·graph 항목 단위 동시 처리, `--concurrency` CLI, id 사전 부여 후처리, exception 격리, LocalStats 머지, `metadata["concurrency"]` 기록. |
-| `scripts/eval_search.py` | 수정 | 골드셋 내 항목 동시 처리, `--concurrency` CLI, `embed_fn` 1회 빌드 외부 주입, `graph_store.build_entity_embeddings` 사전 빌드, `_idx` 정렬 기반 결정성 회복, `config_summary["concurrency"]`. |
-| `src/context_loop/eval/graph_match.py` | 수정 | `EmbedFn` 을 `__all__` 에 추가 (외부에서 타입 import 가능). |
-| `tests/test_eval/test_build_synthetic_gold_set.py` | 수정 | `_make_graph_gold_item(existing_items=...)` 제거에 따른 호출 갱신, `_merge_stats` 단위 테스트 2개, `--concurrency` CLI 노출 검증. |
-| `tests/test_eval/test_concurrency.py` | 신규 | 11개 결정성·격리·cap 회귀 테스트 (설계 §10 의 전략 그대로). |
-
-**총 변경 파일**: 스크립트 2 + 모듈 1 (한 줄 export) + 테스트 2 = **5 파일**.
+> 02_design.md 의 변경 파일/시그니처를 그대로 따랐다. 사용자 확정 결정 3건
+> (기존 graph 골드셋 재생성 방식 / R2 하이브리드 / YAML 기준) 모두 반영.
 
 ---
 
-## 2. 추가한 테스트 시나리오
+## 1. 변경 파일 목록
 
-### 2.1 `tests/test_eval/test_concurrency.py` (신규 11개)
+| 파일 | 변경 | 핵심 |
+|---|---|---|
+| `src/context_loop/eval/gold_set.py` | 수정 | `GoldItem` 에 `relevant_doc_groups: list[list[int]]` + `cross_document: bool` 2필드. `to_dict` omit-if-empty emit, `from_dict` 기본값 폴백 + 그룹 내 중복제거/빈그룹 드롭. 모듈/`GoldItem` docstring 갱신 |
+| `src/context_loop/eval/metrics.py` | **무변경** | (b)안 — 전처리 축약으로 재사용 (test_metrics 23개 무영향, 실측 34개 green) |
+| `scripts/eval_search.py` | 수정 | `_reduce_equivalence` 신규(§3.2), `evaluate_one` 채점 진입 분기(§3.3), `_classify_mode` cross_doc 우선 분기(§6.1), `write_summary` `rows_by_mode` 에 `cross_doc` 슬롯(§6.2), CSV 평탄 `relevant_doc_ids` 유지 + `n_answer_units` 추가 |
+| `src/context_loop/eval/synth.py` | 수정 | `CROSS_DOC_GENERATE_PROMPT_TEMPLATE` 신규, `generate_cross_doc_questions` 신규 (generator/judge 분리 유지, 반환 타입 `GeneratedGraphQuestion` 재사용) |
+| `scripts/build_synthetic_gold_set.py` | 수정 | `_make_graph_gold_item` OR 그룹 자동변환(§4), `load_cross_doc_seeds` 신규(§5.2), `_make_cross_doc_gold_item`/`_cross_doc_seed_snippet`/`_process_cross_doc_item`/`_run_cross_doc_mode` 신규(§5), `build()` 파라미터+호출+metadata+stats, CLI `--enable-cross-doc`/`--cross-doc-max-seeds`, docstring 사용법 예시 |
+| `tests/test_eval/test_gold_set.py` | 수정 | 동치 그룹/플래그 round-trip·폴백·dedup·omit 4건 |
+| `tests/test_eval/test_equivalence_scoring.py` | **신규** | 동치 채점 9건 (recall/precision cap/AND/mrr/ndcg/보존/miss/폴백가드/결정론) |
+| `tests/test_eval/test_build_synthetic_gold_set.py` | 수정 | graph OR 변환 2건 + cross-doc 씨앗 3건 + emit 1건 + classify cross_doc 1건 + CLI 옵션 2건 |
+| `tests/test_eval/test_synth.py` | 수정 | cross-doc 프롬프트 1건 |
 
-| 테스트 | 검증 대상 | 설계 매핑 |
-|-------|---------|---------|
-| `test_process_chunk_item_returns_items_with_empty_ids` | `_process_chunk_item` 의 GoldItem.id="" placeholder + local stats 반환 | D-3, §4.1 |
-| `test_process_chunk_item_handles_empty_generation` | 빈 응답 시 fail_parse 카운트, 정상 종료 | §6.1 |
-| `test_process_subgraph_item_returns_items_with_empty_ids` | graph 항목도 id="" + graph_generated/graph_passed 카운트 | D-3 |
-| `test_run_chunk_mode_ids_assigned_in_idx_order` | concurrency=4 로 5청크 처리 후에도 id=q0001..q0010 단조 증가 | D-3, §3 |
-| `test_run_chunk_mode_deterministic_across_concurrency` | 같은 입력 + concurrency 1 vs 4 vs 8 → ids/docs/stats 완전 동일 | R2, §10.1 |
-| `test_run_chunk_mode_isolates_exceptions` | 1청크가 raise 해도 나머지 정상 + stats["fail_runtime"]==1 + id 연속 | R4, §6 |
-| `test_run_chunk_mode_respects_concurrency_cap` | Semaphore 안에서 generator in-flight ≤ cap | R1, §2 |
-| `test_chunk_and_graph_modes_share_continuous_id_space` | next_id 가 chunk → graph 모드로 carry over | D-3, §3.3 |
-| `test_build_embed_fn_caches_repeated_text` | LRU 캐시로 같은 텍스트는 1번만 embed_query | §7.1 |
-| `test_evaluate_gold_set_prebuilds_entity_embeddings_once` | eval_search 안에 `build_entity_embeddings` 사전 빌드 코드 존재 | D-7, §7.2 |
-| `test_evaluate_gold_set_concurrent_results_match_serial` | rows.sort(key=_idx) 가 도착 순서를 결정성 순서로 회복 | §4.2, §6.2 |
-
-### 2.2 `tests/test_eval/test_build_synthetic_gold_set.py` (추가 2개)
-
-| 테스트 | 검증 |
-|-------|------|
-| `test_merge_stats_adds_known_and_dynamic_keys` | 알려진 키 + 동적 fail_<reason> 키 모두 더해짐 |
-| `test_merge_stats_empty_local_noop` | 빈 local 은 target 변경 없음 |
-
-### 2.3 회귀 — 기존 테스트 유지
-
-- `test_make_graph_gold_item_*` 3 개 — `_make_graph_gold_item` 의
-  `existing_items` 인자 제거에 맞춰 호출 갱신 (id 비교 자체는 검증 안 함, item 의 다른 필드만).
-- `test_cli_exposes_new_options` / `test_eval_search_cli_exposes_new_options` — `--concurrency` 노출 검증 추가.
+**diagnose_r3_effect.py / compare_runs.py / metrics.py**: 무변경 (CSV 평탄 컬럼 보존으로 호환).
 
 ---
 
-## 3. 검증 결과
+## 2. 사용자 확정 결정 반영
 
-### 3.1 pytest tests/test_eval/
+1. **기존 graph 골드셋 = 재생성 방식.** 로더(`from_dict`)는 평탄 list 를 OR 로 자동
+   승격하지 **않는다**. `relevant_doc_groups` 누락 시 `[]` → R3 비활성 → 기존 평탄
+   채점 폴백만 한다. OR 그룹화는 오직 생성기(`_make_graph_gold_item`)에서만 수행 →
+   기존 평탄 골드셋은 명시적 재생성으로만 갱신.
+2. **R2 = 하이브리드.** `load_cross_doc_seeds` 가 "노드 소유 문서 서로소" 엣지를
+   결정론적으로 추출(정답 씨앗). LLM 은 `generate_cross_doc_questions` 로 자연어 질의
+   문장화만 담당. 기존 `filter_question`(judge 3-gate) 그대로 재사용.
+3. **YAML 기준.** `save_gold_set`/`load_gold_set` 가 `yaml.safe_dump`/`safe_load` — 변경 없음.
+
+---
+
+## 3. 추가한 테스트 시나리오
+
+### test_gold_set.py
+- `test_roundtrip_equivalence_groups` — `[[3,5],[9]]` + `cross_document=True` 무손실.
+- `test_legacy_yaml_no_groups_loads` — 옛 YAML → `groups=[]`, `cross_document=False`.
+- `test_groups_dedup_and_drop_empty` — `[[3,3,5],[]]` → `[[3,5]]`.
+- `test_groups_omitted_when_empty_on_emit` — 빈 필드 to_dict omit.
+
+### test_equivalence_scoring.py (신규)
+- `test_reduce_or_group_recall` — `[[3,5]]`, retrieved `[5]` → recall=1.0 (평탄이면 0.5).
+- `test_reduce_precision_cap` — `[[3,5]]`, retrieved `[3,5]` → precision@2=0.5 (hits 캡).
+- `test_reduce_and_groups` — `[[3],[9]]`, retrieved `[3]` → recall=0.5; 둘 다 → 1.0.
+- `test_reduce_mrr_first_member` — `[[3,5]]`, retrieved `[7,5]` → mrr=0.5.
+- `test_reduce_ndcg_idcg_denom` — `[[3,5],[9]]` 분모 2단위 → ndcg=1.0.
+- `test_reduce_preserves_non_answer_docs` — 정답 외 doc 보존, 그룹 중복 drop.
+- `test_reduce_miss_group_counts_in_denominator` — 미검색 그룹도 recall 분모에.
+- `test_no_groups_fallback_flat` — 빈 그룹 시 relevant 빈 set (분기 가드 고정).
+- `test_reduce_is_deterministic` — 순수 함수 결정성.
+
+### test_build_synthetic_gold_set.py
+- `test_graph_multi_doc_becomes_or_group` — `[7,3,5]` → `groups=[[3,5,7]]`.
+- `test_graph_single_doc_no_group` — `[42]` → `groups=[]`.
+- `test_load_cross_doc_seeds_disjoint` — 엔티티 병합으로 소유문서 겹치면 씨앗 0건.
+- `test_load_cross_doc_seeds_true_disjoint` — 완전 서로소 엣지 1건만 씨앗.
+- `test_cross_doc_seed_deterministic` — 같은 입력 → 동일 씨앗 리스트.
+- `test_make_cross_doc_item_and_groups` — 씨앗 → `groups=[[A],[B]]`, `cross_document=True`.
+- `test_classify_mode_cross_doc_priority` — `cross_document=True` → mode="cross_doc".
+- CLI: `--enable-cross-doc`, `--cross-doc-max-seeds` 노출 확인.
+
+### test_synth.py
+- `test_generate_cross_doc_questions_prompt` — 두 엔티티 + "두 문서" 취지 + purpose 라벨.
+
+---
+
+## 4. 검증 결과
 
 ```
-271 passed in 0.49s
+pytest tests/test_eval/            → 291 passed, 5 failed (전부 선재 실패 — 아래 §5)
+pytest tests/test_eval/test_metrics.py → 34 passed (metrics.py 무변경 확인)
+ruff check (변경 파일 8개)         → All checks passed
+  (예외: scripts/build_synthetic_gold_set.py:1501 E501 — 선재 위반, 내 변경 아님)
+python scripts/build_synthetic_gold_set.py --help → --enable-cross-doc / --cross-doc-max-seeds 노출
+import 검증: eval_search, build_synthetic_gold_set, gold_set, synth 모두 OK
 ```
 
-- 기존 260개 + 신규 11개. **100% 통과**.
+신규 테스트 추가로 통과 수가 270 → 291 (+21).
 
-### 3.2 pytest -x (전체)
+---
 
+## 5. 설계와 어긋난 부분 / 주의
+
+### 5.1 선재 실패 5건 (내 변경과 무관 — 손대지 않음)
+대상 브랜치(PR#64 병합) HEAD 에서 이미 실패하던 테스트. `git stash` 로 내 변경을
+제거한 상태에서도 동일하게 실패함을 확인했다. 설계 원칙(기존 테스트 보존)상 이들은
+본 PR 범위 밖이라 수정하지 않았다:
+
+- `test_fetch_source_text_anchor_match`, `test_fetch_source_text_legacy_chunk_id_fallback`
+  — `_fetch_source_text` 가 `tuple[str, str]` 를 반환하도록 바뀌었는데 테스트는 옛
+  `str` 반환을 가정. (테스트가 stale)
+- `test_make_graph_gold_item_falls_back_to_node_description` — `_make_graph_gold_item`
+  이 노드 description 폴백을 제거(감사 H6: T4 trivial 1.0 방지)했는데 테스트는 옛
+  폴백 동작을 가정. (테스트가 stale)
+- `test_filter_question_passes_clean`, `test_filter_question_fails_generic` — `filter_question`
+  의 게이트 호출 순서/StubLLM 응답 큐 mismatch. (테스트가 stale)
+
+→ 별도 정리 권장(out of scope). 본 작업 산출물에는 영향 없음.
+
+### 5.2 설계 §3.2 와의 미세 차이 (의도된 보강)
+`_reduce_equivalence` 는 설계 의사코드를 그대로 따랐다. 추가로 `test_no_groups_fallback_flat`
+에서 빈 그룹 입력 시 동작(빈 relevant set)을 고정해, 빈 그룹은 `evaluate_one` 의 분기
+(`if item.relevant_doc_groups:`)에서 호출되지 않음을 명시했다 — 설계의 "R3 비활성 폴백"
+보장을 테스트로 못박은 것.
+
+### 5.3 cross-doc distractor 풀 (설계 §5.4 보강)
+`_run_cross_doc_mode` 의 일반성 게이트 distractor 는 다른 씨앗들의 snippet 에서 자기
+자신을 제외하고 최대 5개를 사용(graph 모드의 `skip_generic_gate < 5` 정책과 동일).
+설계가 distractor 출처를 명시하지 않아 graph 모드 패턴을 복제했다.
+
+---
+
+## 6. 새 스키마 / CLI 사용 예시
+
+### 6.1 YAML 스키마 (R3 동치 집합 + R2 cross-doc)
+
+```yaml
+version: 1
+items:
+  # graph 다중-doc → 단일 OR 그룹 (3 또는 5 중 하나면 정답)
+  - id: q0007
+    query: "인증 게이트웨이는 어느 팀이 운영하나요?"
+    relevant_doc_ids: [3, 5]          # 평탄(하위호환/CSV)
+    relevant_doc_groups: [[3, 5]]     # OR 그룹 1개
+    relevant_graph_entities:
+      - {name: "인증 서비스", type: "system"}
+    synthesized: true
+  # cross-document → AND 다중그룹 (3 과 7 둘 다 봐야 답)
+  - id: q0012
+    query: "결제 서비스가 의존하는 인증 모듈은 어느 팀이 관리하나요?"
+    relevant_doc_ids: [3, 7]
+    relevant_doc_groups: [[3], [7]]   # (3) AND (7)
+    cross_document: true              # R2 식별 플래그
+    relevant_graph_entities:
+      - {name: "결제 서비스", type: "system"}
+      - {name: "인증 서비스", type: "system"}
+    notes: "cross_document"
+    synthesized: true
 ```
-998 passed, 11 warnings in 5.35s
-```
 
-- 11개 warning 은 starlette `TemplateResponse` deprecation (변경 영역 무관, 사전 존재).
+옛 골드셋(두 신규 키 없음)은 `relevant_doc_groups=[]` / `cross_document=False` 로
+로드되어 기존 평탄 채점과 bit-identical 동작.
 
-### 3.3 ruff check (변경 영역)
-
-- `scripts/eval_search.py`, `src/context_loop/eval/graph_match.py`,
-  `tests/test_eval/test_concurrency.py`, `tests/test_eval/test_build_synthetic_gold_set.py`:
-  **All checks passed!**
-- `scripts/build_synthetic_gold_set.py`: 1 error (E501, line 996 `--source-types` help string).
-  **이 에러는 사전 존재 — 본 PR 변경 영역 외**. `git stash` 검증 완료.
-
-### 3.4 CLI 노출 확인
+### 6.2 CLI
 
 ```bash
-$ python scripts/build_synthetic_gold_set.py --help | grep -A2 concurrency
-  --concurrency CONCURRENCY
-                        항목(chunk/subgraph) 단위 동시 처리 수 (기본 1, 직렬). LLM endpoint
-                        rate limit 에 맞춰 4~8 권장. metadata 에 기록.
-
-$ python scripts/eval_search.py --help | grep -A2 concurrency
-  --concurrency CONCURRENCY
-                        골드셋 내 항목 동시 처리 수 (기본 1, 직렬). LLM endpoint rate limit 에
-                        맞춰 4~8 권장. summary 에 기록.
-```
-
-### 3.5 결정성 회귀 테스트 통과 증거
-
-`test_run_chunk_mode_deterministic_across_concurrency` 는 mock 환경에서 같은 입력 +
-`concurrency` 1 / 4 / 8 로 `_run_chunk_mode` 를 세 번 호출한 뒤 다음을 검증:
-
-```python
-assert ids1 == ids4 == ids8           # id 순서·내용 동등
-assert docs1 == docs4 == docs8         # 항목 매핑 동등
-assert stats1 == stats4 == stats8      # stats 머지 결과 동등
-```
-
-LLM stub 은 `asyncio.sleep(random uniform jitter)` 로 응답 도착 순서를
-의도적으로 흔들지만, 응답 자체는 prompt 내용으로 결정론적이므로 결과가
-동등하다 — 이것이 D-3 (id 사전 부여) + D-8 (LocalStats 머지) 의 핵심.
-
-테스트 통과:
-```
-test_run_chunk_mode_deterministic_across_concurrency PASSED [ 45%]
-```
-
----
-
-## 4. 설계 어긋난 점 + 이유
-
-### 4.1 `_run_graph_mode` 의 `sem` 기본값을 `None` 으로 둠 (방어적)
-
-설계 §2.2 / §4.1 는 `sem` 을 필수 인자로 명시했으나, 외부 테스트나 단독 호출
-(예: 향후 graph-only entry point) 에서 sem 없이도 직렬 동작하도록
-`sem: asyncio.Semaphore | None = None` + 진입 시 `if sem is None: sem = asyncio.Semaphore(1)`
-방어 코드를 두었다.
-
-**근거**: 본 PR 범위 외의 호출자가 안전하게 함수를 부를 수 있도록 — backward
-compatibility 보호. 일반 호출 경로 (`build()`) 는 항상 sem 을 전달.
-
-### 4.2 stats 시드 키에 `fail_demonstrative` 추가 안 함
-
-설계 §5.3 의 위험 §12.2 에서 implementer 선택권 부여 — "dict.get 패턴 유지 권고".
-구현은 **현 코드 그대로** dict.get 패턴 유지하고 `fail_runtime` 만 명시적으로 시드.
-
-**근거**: §5.3 권고대로 단순성 우선. `fail_demonstrative` 는 첫 발생 시 자동 생성.
-
-### 4.3 `LocalStats` dataclass 미도입
-
-설계 §4.1 는 `LocalStats` dataclass 와 `dict[str, int]` typealias 둘 다 옵션으로
-언급 — 구현은 **`dict[str, int]` 그대로**. 함수 시그니처는
-`tuple[list[GoldItem], dict[str, int]]`.
-
-**근거**: 동적 키 (`fail_<reason>`) 호환 + Counter/dict 기반 머지 단순성 + main
-stats 도 dict — 일관성.
-
-### 4.4 `evaluate_one` 의 `idx` 인자 — 동치 처리
-
-설계 §4.2 는 `idx` 를 `evaluate_one` 의 인자로 전달하라 했으나, 구현은 _process_item
-안에서 row 에 `_idx` 를 직접 박는다 (`row["_idx"] = idx`). `evaluate_one` 시그니처
-변경 최소화.
-
-**근거**: 단일 책임 — `evaluate_one` 은 채점 로직, `_idx` 는 외부 정렬용 메타.
-
----
-
-## 5. CLI 사용 예시
-
-### 5.1 직렬 (기본, 현 동작과 동일)
-
-```bash
+# cross-document 케이스 포함 골드셋 생성 (R2)
 python scripts/build_synthetic_gold_set.py \
-    --source-types confluence_mcp,git_code \
-    --seed 42 \
+    --enable-cross-doc --source-types confluence_mcp,git_code \
+    --cross-doc-max-seeds 50 \
     --output eval/gold_set.yaml
-# (--concurrency 1 가 기본)
-```
 
-### 5.2 동시성 8 — 일반적 sweet spot
-
-```bash
+# graph 다중-doc OR 그룹은 --include-graph-questions 만으로 자동 생성 (R3)
 python scripts/build_synthetic_gold_set.py \
-    --source-types git_code \
-    --seed 42 --n-gold-sets 5 \
-    --concurrency 8 \
-    --output eval/gold_sets/git_code.yaml
+    --include-graph-questions --n-graph-nodes 20 \
+    --output eval/gold_set.yaml
 ```
 
-300 항목 골드셋 직렬 ≈ 15 분 → concurrency=8 ≈ 2 분 (예측, endpoint TPS 의존).
+평가(`eval_search.py`)는 골드셋에 `relevant_doc_groups`/`cross_document` 가 있으면
+자동으로 동치-aware 채점 + `metrics_by_mode["cross_doc"]` 분리 집계를 수행한다
+(추가 CLI 플래그 불필요).
 
-### 5.3 평가 측 동시 채점
+### 6.3 채점 의미 (metrics.py 무변경, 전처리 축약으로 달성)
 
-```bash
-python scripts/eval_search.py \
-    --gold-set-glob "eval/gold_sets/git_code_*.yaml" \
-    --label baseline_par8 \
-    --concurrency 8
-```
-
-5 골드셋 × 60 항목, 항목당 1~3 LLM call → 직렬 ~5분 → concurrency=8 ~1분.
-
----
-
-## 6. 예상 효과
-
-| 항목 | 직렬 (concurrency=1) | concurrency=8 | 비고 |
-|------|---------------------|---------------|------|
-| 생성: 300 chunks × 7 LLM calls | ~15 분 | ~2 분 | endpoint TPS 가 8 동시 받쳐주면 8x |
-| 평가: 300 items × ~2 LLM calls | ~5~10 분 | ~0.75~1.25 분 | 동일 |
-| 메모리 | ~동일 | 약간 증가 | sem cap 으로 in-flight 8 제한 |
-| 결정성 | YAML byte-identical 보장 (mock 환경) | 동일 | id 사전 부여 + idx 정렬 |
-| 에러 격리 | 1 항목 실패 → 전체 abort 가능 | 1 항목 실패 → fail_runtime+=1, 나머지 진행 | gather(return_exceptions=True) |
-
-지배 비용은 LLM 호출 (~90%) → cap=N 일 때 throughput 은 N 까지 거의 선형 증가
-(endpoint TPS 가 받쳐주는 영역에서). N≥16 부터는 endpoint rate limit 천장 가능
-→ `--concurrency` > 32 시 경고 로그 발동.
-
----
-
-## 7. backward-compat 확인
-
-- `--concurrency` 미지정 (기본 1) → `Semaphore(1)` → 사실상 직렬 동작
-- 기존 `gold_set.yaml` 스키마 변경 없음 (metadata 에 `concurrency` 키 추가만)
-- 기존 CLI 옵션 (`--seed`, `--n-gold-sets`, `--source-types`, …) 그대로
-- 기존 998 개 테스트 100% 통과 (변경 영역 외 0 regression)
-
----
-
-## 8. 변경 이력
-
-- 2026-05-18: 초안 작성. 19개 결정 모두 코드 반영. 11개 결정성 회귀 테스트 추가.
-  pytest 998 / ruff (변경 영역) 통과. CLI `--concurrency` 노출 확인.
+| 케이스 | groups | retrieved | recall | 비고 |
+|---|---|---|---|---|
+| OR 동치 | `[[3,5]]` | `[5]` | 1.0 | 그룹 1단위, 하나면 hit |
+| OR precision cap | `[[3,5]]` | `[3,5]` top2 | precision=0.5 | 중복 정답 1로 캡 |
+| cross-doc AND | `[[3],[7]]` | `[3]` | 0.5 | 2단위 중 1개 |
+| cross-doc AND | `[[3],[7]]` | `[3,7]` | 1.0 | 둘 다 |
