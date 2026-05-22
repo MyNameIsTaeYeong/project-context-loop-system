@@ -1,55 +1,61 @@
-# 요구사항 — 골드셋 생성 + 평가 채점 개선 (cross-doc / answer equivalence)
+# 요구사항 — 문서 기반 골드셋 생성 (인덱싱 변경에 robust)
 
 ## 배경
 
-- PR#64 병합 완료: 그래프 탐색이 도달한 문서 본문을 컨텍스트에 첨부하는 기능
-  (`_search_graph_sourced_chunks`, `context_assembler.py`). 그래프가 "관계로
-  연결된, 벡터로는 못 찾는 문서"를 끌어오므로, 그래프 성능을 제대로 측정하려면
-  골드셋에 **여러 문서를 봐야 답이 가능한 케이스**가 필요하다.
-- 대상 파일: `scripts/build_synthetic_gold_set.py` (생성), `scripts/eval_search.py`
-  (채점), 필요 시 `src/context_loop/eval/*` (스키마/메트릭).
+- 현재 chunk 모드는 `load_candidate_chunks`(chunks 테이블)에서 후보를 뽑고
+  `chunk["content"]`로 질의를 생성한다. chunk_size 등 인덱싱 설정이 바뀌면
+  후보 청크 집합·source_text_anchor가 달라져 **재생성 재현성/추적성이 깨진다.**
+- 채점은 이미 doc 단위(`relevant_doc_groups`/`relevant_doc_ids`, PR#65)라 robust.
+  취약점은 **생성 단계의 청크 의존**뿐.
+- 이 작업은 PR#65(answer equivalence + cross-doc) 위에 스택으로 올린다
+  (`relevant_doc_groups` 스키마 사용).
+
+## 사용자 확정 결정
+
+1. **대체** — 기존 chunk 모드(청크 기반 생성)를 **문서 기반 생성으로 대체**한다.
+   청크 기반 생성 경로는 제거/치환. (모드 추가가 아니라 교체.)
+2. **통째** — 큰 문서도 **섹션 분할 없이 문서 원본 전체**를 generator 입력으로 넣는다.
+   (단, generator LLM 입력 한도를 넘는 극단적 문서는 안전 가드 필요 — 무한정
+   넣을 수 없으므로 designer가 한도 초과 처리 정책을 명시.)
+3. **그래프 보강** — graph 모드 질의 생성 시, 1-hop 서브그래프 스니펫에 더해
+   **엔티티 소유 문서의 원문(`original_content`)**도 입력으로 보강한다.
 
 ## 요구사항
 
-### R1 — 저장된 문서 기준 질의 생성
-- 골드셋 질의는 **실제 저장된 문서**(metadata_store/벡터/그래프에 인덱싱된 문서)를
-  기준으로 생성한다. (현행 동작 확인 후, 부족하면 보강.)
-- 질의의 정답(relevant) 문서가 실제 인덱싱된 문서 id 와 매핑되어야 한다.
+### R1 — 문서 기반 후보 로딩 (chunk 모드 대체)
+- `load_candidate_chunks`(chunks 테이블 의존)를 **문서 기반 로더**로 대체한다.
+  - `documents.original_content`를 소스로 사용 (chunks 테이블 비의존).
+  - source_type 필터, min/max 크기 필터(문자 기준)는 문서 단위로 재정의.
+  - 정답은 그대로 doc 단위(`relevant_doc_ids=[doc]` + `relevant_doc_groups`).
+- 질의 생성은 문서 원문 **통째**를 generator에 입력.
+- distractor(유일성 게이트)는 **다른 문서** 단위로 변경 (다른 청크가 아니라).
+- `source_text_anchor`는 문서 원문 기준으로 재정의(추적성 유지).
 
-### R2 — Cross-document 케이스 (그래프 성능 측정용)
-- **서로 다른 문서를 함께 봐야 답이 가능한** 질의 케이스를 골드셋에 포함한다.
-  - 예: 문서 A의 엔티티와 문서 B의 엔티티 간 관계를 알아야 답할 수 있는 질의.
-- 이런 케이스는 그래프 탐색(문서 간 관계 도달)이 벡터 단독 대비 이득을 주는지
-  측정하는 데 쓰인다.
-- 골드셋 항목에 "이 질의는 cross-document 인가" 식별이 가능해야 한다 (메트릭
-  분리 집계용).
+### R2 — generator 입력 한도 가드 (통째 정책의 안전장치)
+- 문서 원문이 generator 입력 한도를 초과하면 어떻게 처리할지 정책 명시
+  (예: skip + 통계 기록 / 앞부분 truncate). 기본 동작은 "통째"이되 극단값만 가드.
 
-### R3 — Answer equivalence set (정답 문서 동치 집합)
-- 한 질의의 정답이 **여러 문서에 동시에 존재**할 수 있다.
-  - 예시(사용자 명시): "1번 질의의 답이 3번 문서였는데 5번 문서로도 답이 가능"
-    → 검색 결과에 **3번 또는 5번 중 하나만** 포함되어도 정답으로 채점.
-- 골드셋 스키마에 정답 문서의 **동치 집합(equivalence set)** 을 표현할 수 있어야
-  한다. (단일 relevant id 목록이 아니라 "이 중 아무거나 하나면 OK"인 그룹.)
-- `eval_search.py` 채점 로직이 이 동치 집합을 인식하여, 집합 내 하나라도
-  검색되면 해당 정답을 hit 으로 처리한다.
-  - hit/precision/recall/MRR/NDCG 등 기존 메트릭이 동치 집합 의미와 일관되게
-    동작해야 한다 (예: recall 계산 시 동치 집합은 1개 정답 단위로 카운트).
+### R3 — 그래프 질의 소유 문서 원문 보강
+- `_process_subgraph_item`(graph 질의 생성)에서 서브그래프 스니펫 + **primary
+  소유 문서의 original_content**를 함께 generator 입력으로 제공.
+- 정답·식별 스키마는 불변(노드 소유 문서 → OR 그룹). 보강은 **생성 입력에만** 영향.
+- 보강도 입력 한도 가드 적용(R2와 일관).
 
 ## 비기능 요구사항
 
-- **하위 호환**: 기존 골드셋(JSON) 포맷을 읽을 수 있어야 한다. 새 필드는 optional
-  로 추가하고, 없으면 기존 단일-정답 채점으로 폴백.
-- **메트릭 무결성**: 동치 집합/ cross-doc 도입이 기존 메트릭 정의를 왜곡하지 않도록,
-  채점 로직 변경의 의미를 문서화한다 (rag-eval-audit 영역과 충돌 없게).
-- **테스트**: 골드셋 생성 + 채점 양쪽에 단위 테스트 추가. pytest + ruff 통과.
-- **R2/R3 의 LLM 생성 의존도**: cross-doc/동치 케이스 생성에 LLM 을 쓰는지,
-  결정론적으로 만드는지 designer 가 명시 (비용/재현성 고려).
+- **하위 호환**: GoldItem 스키마 불변(PR#65 그대로). 골드셋 파일 포맷 YAML 유지.
+- **graph/cross_doc 모드 비침범**: 후보 로딩 외 graph/cross_doc 생성 로직은
+  R3 보강 외에는 건드리지 않는다 (코드 경로 분리 확인).
+- **결정성**: 문서 단위 deterministic seed 유지(재현성).
+- **테스트**: 문서 기반 로더 + distractor + 한도 가드 + graph 보강 단위 테스트.
+  pytest + ruff 통과. PR#65에서 확인된 선재 실패 5건은 본 작업과 무관(건드리지 않음).
 
 ## 만족 조건 (Definition of Done)
 
-- [ ] R1: 저장 문서 기준 질의 생성 경로 확인/보강
-- [ ] R2: cross-document 케이스 생성 + 골드셋 식별 필드
-- [ ] R3: 동치 집합 스키마 + eval_search.py 채점 로직 (집합 중 하나만 hit 이면 정답)
-- [ ] 하위 호환 (기존 골드셋 로드 가능)
+- [ ] R1: 문서 기반 로더로 chunk 모드 대체 (chunks 테이블 비의존)
+- [ ] R1: doc 단위 distractor 유일성 게이트
+- [ ] R2: generator 입력 한도 가드 정책 구현
+- [ ] R3: graph 질의에 소유 문서 원문 보강
+- [ ] 하위 호환 (스키마/포맷 불변, graph/cross_doc 비침범)
 - [ ] 단위 테스트 + pytest/ruff 통과
-- [ ] 변경 요약 + 새 CLI/스키마 사용 예시
+- [ ] 변경 요약 + 새 CLI/동작 예시

@@ -1,304 +1,320 @@
-# 01_analysis — 골드셋 생성·채점 cross-doc / answer-equivalence 분석
+# 01_analysis — 문서 기반 골드셋 생성 전환 분석 (R1/R2/R3)
 
 작성: 2026-05-22 (analyst, eval-gold-set-improvement)
-대상 HEAD: PR#64 (그래프 도달 문서 본문 첨부) 병합 후
-분석 범위: R1(저장 문서 기준 질의), R2(cross-document), R3(answer equivalence set)
+기준: 현재 HEAD (PR#65 stack — `relevant_doc_groups` 이미 반영됨)
+요구: `_workspace/00_requirements.md` (R1 대체 / R2 입력 한도 / R3 그래프 보강)
 
-> 모든 주장은 코드 인용(`파일:라인`) 근거. 추측 없음.
+분석 대상 코드(모두 정독):
+- `scripts/build_synthetic_gold_set.py`
+- `src/context_loop/eval/synth.py`
+- `src/context_loop/eval/gold_set.py`
+- `src/context_loop/storage/metadata_store.py`
+- `src/context_loop/processor/chunker.py` (`count_tokens`)
+- `tests/test_eval/test_build_synthetic_gold_set.py`, `test_concurrency.py`, `test_synth.py`
 
----
-
-## 0. 용어 충돌 경고 (designer 필독)
-
-코드베이스에는 이미 "R1/R2/R3" 와 "cross-doc/equivalence" 라는 단어가 **다른
-의미로** 존재한다. 요구사항(`_workspace/00_requirements.md`)의 R1/R2/R3 와
-혼동 금지:
-
-| 코드/파일의 기존 표기 | 코드 내 의미 | 요구사항 R1/R2/R3 와의 관계 |
-|---|---|---|
-| `scripts/diagnose_r3_effect.py` | "R3 = 가상 질문 인덱싱(hypothetical-question indexing)" 효과 진단 | **무관**. 요구사항 R3(answer equivalence)와 이름만 같음 |
-| `context_assembler.py:216,339` 주석 `# R3:` | "R3 = document_id 단위 dedup" | **무관** |
-| `build_synthetic_gold_set.py` docstring `(R1 — chunk + graph 평가)` | "R1 = chunk+graph 동시 평가" | 요구사항 R1(저장 문서 기준 질의)과 다름 |
-| `scripts/compare_runs.py:42` `EQUIVALENCE_KEYS` | run config 동치성 비교 키 | **무관**. answer equivalence 아님 |
-| `tests/test_storage/test_graph_store.py:728+` `test_cross_doc_*` | 엔티티 **병합**(같은 엔티티가 여러 문서 소유) | 요구사항 R2(cross-document 질의)와 무관 |
-
-→ 요구사항 의미의 cross-document 질의 / answer-equivalence-set 개념은 **현재
-코드에 전혀 없다**. 신규 도입이 필요하다.
+추측 없음. 모든 근거는 파일:라인 인용.
 
 ---
 
-## 1. GoldItem 스키마의 정답 표현 방식
+## 0. 현재 chunk 모드 데이터 흐름 (사실)
 
-정의: `src/context_loop/eval/gold_set.py:158-251` (`GoldItem`).
+```
+build()                                            scripts/build_synthetic_gold_set.py:393
+ └─ load_candidate_chunks(store, ...)              :474  ← R1 대체 대상
+     · store.list_documents()                      :156
+     · for doc: store.get_chunks_by_document(id)    :163  ← chunks 테이블 의존
+     · min/max_chars 필터 (len(content))            :166
+     · dict{chunk_id,chunk_index,document_id,        :168-176
+            source_type,content,section_path,title}
+     · sort by (document_id, chunk_index)           :178
+ └─ stratified_sample(candidates, key=source_type)  :483
+ └─ distractor_pool = candidates - sampled (chunk)   :491-495
+ └─ build_korean_stopwords_from_corpus([c.content])  :499
+ └─ _run_chunk_mode(...)                              :532
+     └─ _process_chunk_item(idx, chunk, ...)          :650 / 797
+         · item_seed = seed_base + chunk_index        :682  ← R1 결정성 키
+         · generate_questions(chunk["content"], ...)  :687
+         · same_type_distractors (source_type 필터)    :704-710
+         · anchor = make_text_anchor(chunk["content"]) :712
+         · filter_question(q, chunk["content"],         :735
+              [d["content"] for d in distractors])     :738
+         · GoldItem(relevant_doc_ids=[document_id],     :716-726 / 753-763
+              source_document_id, source_text_anchor=anchor,
+              source_section_path=section_path)
+```
 
-현재 정답 필드 (`gold_set.py:169-183`):
-
-| 필드 | 타입 | 라인 | 정답 표현 |
-|---|---|---|---|
-| `relevant_doc_ids` | `list[int]` | 171 | **단일 평탄 리스트**. "이 목록의 모든 문서가 정답" |
-| `relevant_graph_entities` | `list[GraphEntityRef]` | 172 | (name,type) 정답 엔티티 목록 |
-| `relevant_graph_relations` | `list[GraphRelationRef]` | 173 | 정답 관계 목록 (옵셔널, `--score-relations`) |
-
-핵심 사실:
-
-- **동치 집합(equivalence set) 개념은 없다.** `relevant_doc_ids` 는 평탄한
-  `list[int]` 한 개뿐이다 (`gold_set.py:171`). "이 중 아무거나 하나면 OK"인
-  그룹을 표현할 수 있는 중첩 구조(`list[list[int]]` 또는 그룹 dict)가 없다.
-- 채점 시 이 리스트는 그대로 `set()` 으로 변환되어 **모든 원소가 독립 정답**으로
-  취급된다 (`eval_search.py:386` → `relevant = set(item.relevant_doc_ids)`).
-  즉 `relevant_doc_ids=[3,5]` 는 "3과 5 **둘 다** 정답(둘 다 찾아야 recall=1.0)"
-  이지, 요구사항 R3 의 "3 **또는** 5 중 하나면 OK"가 **아니다**.
-- cross-document 식별 플래그도 없다. `_classify_mode`(`eval_search.py:547-560`)
-  의 분류는 chunk / graph / hybrid 3종뿐이며, 정답 doc 개수와 무관하다.
-
-YAML 입출력: `to_dict`(`gold_set.py:185-215`) / `from_dict`(`217-251`).
-- `to_dict` 는 빈 필드를 omit (`186-215`) → 신규 옵셔널 필드 추가 시 라운드트립
-  무손실 패턴을 그대로 따르면 된다.
-- `from_dict` 는 누락 키를 기본값 처리 (`232` `d.get("relevant_doc_ids", [])`
-  등) → **새 옵셔널 필드 추가 시 기존 YAML 자동 폴백 가능**.
-
----
-
-## 2. R1 — 저장 문서 기준 질의 생성 (충족도: 이미 충족)
-
-### 생성이 실제 인덱싱 문서를 참조하는가 — 예.
-
-chunk 모드:
-- 후보 청크는 `metadata_store` 에서 직접 로드 — `load_candidate_chunks`
-  (`build_synthetic_gold_set.py:124-175`). `store.list_documents()`(148) →
-  `store.get_chunks_by_document(doc["id"])`(155) 로 **실제 인덱싱된 문서·청크만**
-  후보가 된다.
-- 정답 매핑: `relevant_doc_ids=[chunk["document_id"]]`
-  (`build_synthetic_gold_set.py:601` no-filter 경로, `637` filter 통과 경로).
-  `chunk["document_id"]` 는 `load_candidate_chunks` 가 `doc["id"]` 에서 채운 값
-  (`build_synthetic_gold_set.py:162`) → 실제 DB document.id 와 1:1.
-- 디버그 출처: `source_document_id=chunk["document_id"]` (`604,640`),
-  `source_text_anchor=anchor` (`606,642`, anchor 는 `make_text_anchor`, synth.py:230).
-
-graph 모드:
-- 후보 subgraph 는 `load_candidate_subgraphs`(`build_synthetic_gold_set.py:183-299`)
-  가 `meta_store.get_all_graph_nodes()`(211) + 노드 소유 문서
-  `meta_store.get_node_document_ids()`(226) 로 로드 → 실제 그래프 노드만.
-- 정답 매핑: `_make_graph_gold_item` 의 `relevant_doc_ids=list(sg["document_ids"])`
-  (`build_synthetic_gold_set.py:997`). `sg["document_ids"]` 는 노드 소유 문서 전체
-  (`282`, `doc_ids` from `226`).
-
-### 결론 R1 = 이미 충족.
-질의 정답 doc_id 는 실제 인덱싱된 document.id 와 매핑된다 (`build:162,601,637,997`).
-보강 불필요. 단, **graph 모드의 다중 doc 처리는 R3 와 충돌**(아래 2.1).
-
-### 2.1 graph 모드 다중-doc 의 의미적 함정 (R3 와 직결)
-`_make_graph_gold_item` 이 `relevant_doc_ids=list(sg["document_ids"])`
-(`build:997`) 로 **노드 소유 문서 전체**를 정답에 넣는다. 같은 엔티티가 3개
-문서에 등장하면 `relevant_doc_ids=[A,B,C]`. 현재 채점(`eval_search.py:386` →
-`recall_at_k`)은 이를 "A,B,C 모두 찾아야 recall=1.0"으로 해석한다
-(`metrics.py:26-35`, `len(top_k & rel_set) / len(rel_set)`).
-
-그러나 의미상 이건 "A·B·C **중 어디서든** 그 엔티티 정보를 찾으면 됨" =
-**answer equivalence set 의 전형**이다. 현재 스키마로는 이 의도를 표현 못 해서
-graph 항목의 recall 이 구조적으로 과소평가된다. → R3 도입의 1차 수혜처.
+graph 모드(`_run_graph_mode` :950) 와 cross-doc 모드(`_run_cross_doc_mode` :1174)
+는 chunk 모드 **이후** 별도로 실행되며 `next_id` 만 이어받는다(:552, :579).
 
 ---
 
-## 3. R2 — cross-document 케이스 (충족도: 미충족)
+## 1. R1 — 대체 영향 범위 (load_candidate_chunks → 문서 기반 로더)
 
-### 현재 cross-document 질의 생성 경로 = 없음.
+### 1.1 호출부 / 하류 의존 (전부)
 
-- chunk 모드: 질문은 **단일 청크 본문 1개**만 보고 생성된다
-  (`generate_questions(chunk["content"], ...)`, `build:569` / `synth.py:690`).
-  정답도 그 청크의 단일 문서 (`build:601,637`). 두 문서를 함께 봐야 답이
-  가능한 질의를 만드는 로직이 없다.
-- graph 모드: 질문은 **단일 엔티티 + 1-hop 이웃 snippet**에서 생성
-  (`generate_graph_questions(sg, ...)`, `build:757` / `synth.py:729`). snippet 은
-  `build_subgraph_snippet`(`synth.py:242-279`) 으로 엔티티 1개 중심.
-  `relevant_doc_ids` 가 다중일 수 있으나(§2.1), 이는 **같은 엔티티가 여러 문서에
-  걸친 것**이지 "문서 A 엔티티와 문서 B 엔티티 간 관계"를 묻는 cross-doc 질의가
-  아니다. 또한 그 다중 doc 의 의미는 R3(equivalence)이지 R2(conjunction)가 아니다.
+| 위치 | 파일:라인 | 사용 내용 | 대체 시 처리 |
+|------|-----------|-----------|--------------|
+| 호출 1곳 | `build()` `scripts/build_synthetic_gold_set.py:474` | `candidates = await load_candidate_chunks(...)` | 문서 로더 호출로 교체. 시그니처(`store, source_types, min_chars, max_chars`) 유지 가능 — `min/max_chars` 의미가 청크→문서로 바뀜(R1) |
+| 빈 후보 가드 | :480-481 | `if not candidates: raise RuntimeError("후보 청크가 없습니다…")` | 메시지만 "후보 문서" 로. 로직 동일 |
+| 샘플링 | :483-485 | `stratified_sample(candidates, key="source_type")` | dict 에 `source_type` 키만 있으면 무변경 |
+| distractor 풀 | :491-495 | `sampled_chunk_ids = {s["chunk_id"]}` → `distractor_pool = [c if c["chunk_id"] not in ...]` | **`chunk_id` 키 의존 → `document_id` 로 변경**(§1.4) |
+| 한글 stopword 학습 | :499-503 | `build_korean_stopwords_from_corpus([c["content"] for c in candidates])` | `content` 키만 있으면 무변경. 단 코퍼스가 문서 전체로 커져 빈도/메모리 특성 변화(미해결 Q1) |
+| `_run_chunk_mode` | :532-548 | `sampled`, `distractor_pool` 전달 | 무변경(전달만) |
+| `_process_chunk_item` | :650-770 | chunk dict 키 다수 사용 | §1.2 상세 |
 
-### cross-document 식별 필드 = 없음.
-- `GoldItem` 에 "cross-document 여부" 플래그 없음 (`gold_set.py:169-183`).
-- `_classify_mode`(`eval_search.py:547-560`)는 chunk/graph/hybrid 만 분류,
-  cross-doc 분리 집계 불가.
-- 메트릭 분리 집계는 mode 별로만 split 됨 (`write_summary`,
-  `eval_search.py:663-685`, `rows_by_mode` = chunk/graph/hybrid). cross-doc 별
-  split 슬롯 없음.
+`stratified_sample` (`synth.py:1002`) 은 `c.get(key, "_unknown")` 만 읽으므로
+`source_type` 외 키에 비의존 — **dict 키 이름이 chunk→document 로 바뀌어도 무변경**.
 
-### PR#64 와의 연결 (R2 가 측정하려는 대상).
-그래프 도달 문서를 sources 에 첨부하는 PR#64 로직은
-`context_assembler.py:574-599` 에 존재: `_search_graph_sourced_chunks`(574)로
-그래프 도달 문서 본문을 가져오고, `592-599` 에서 `graph_result.document_ids` 의
-문서를 `Source(document_id=doc_id, ...)` 로 sources 에 추가한다. 이 doc_id 들이
-`eval_search.py:385` `retrieved_doc_ids = [s.document_id for s in sorted_sources]`
-에 그대로 들어가 doc-level recall 에 반영된다. → **채점 인프라는 그래프 도달
-문서를 이미 retrieved 로 카운트**한다. R2 의 갭은 "그것을 정답으로 요구하는
-cross-doc 질의가 골드셋에 없다"는 **생성** 쪽이다.
+### 1.2 `_process_chunk_item` 이 chunk dict 에서 읽는 키 전부 (`:650-770`)
 
-### 결론 R2 = 미충족.
-cross-doc 질의 생성 로직(없음) + 식별 필드(없음) + 분리 집계(없음) 모두 신규.
+| 키 | 사용 라인 | 용도 | 문서 dict 로 대체 시 |
+|----|-----------|------|---------------------|
+| `content` | :687(generate), :712(anchor), :738(distractor 본문) | Generator 입력 + anchor + distractor 본문 | **`original_content` 로 대체**(R1 통째 입력) |
+| `chunk_index` | :675(log), :682(seed) | 결정성 seed 키 + 로그 | **사라짐. `document_id` 로 대체**(§1.3) |
+| `document_id` | :675(log), :719/756(`relevant_doc_ids`), :720/759(`source_document_id`) | 정답 doc + 출처 | **그대로 사용**(문서 dict 에도 존재). 정답 스키마 불변 |
+| `source_type` | :676(log), :704/706(distractor 필터), :721/760(`source_type`) | distractor 동일 타입 우선 + 메타 | **그대로**(문서 dict 에 존재) |
+| `chunk_id` | (`_process_chunk_item` 내 직접 사용 **없음** — 풀 분리는 build() :491) | — | 함수 자체는 `chunk_id` 미사용. build() 풀 분리만 영향 |
+| `section_path` | :723/762(`source_section_path`) | 디버깅용 메타 | **문서엔 청크 단위 섹션 경로 없음. 사라짐** → `""` 또는 문서 title/url(미해결 Q2) |
+| `title` | (chunk dict 에 있으나 `_process_chunk_item` 미사용) | — | 무영향 |
 
----
+→ **사라지는 것**: `chunk_index`(seed/정렬), `section_path`(청크 섹션 경로).
+→ **반드시 대체**: seed 키(`chunk_index`→`document_id`), distractor 풀 분리 키
+(`chunk_id`→`document_id`), Generator/anchor/distractor 본문 소스
+(`content`→`original_content`).
 
-## 4. R3 — Answer equivalence set (충족도: 미충족) + 채점 영향 범위
+### 1.3 deterministic seed (chunk_index 기반, :682)
 
-### 4.1 스키마 — equivalence set 표현 불가 (§1 참조).
+```python
+item_seed = generator_seed_base + int(chunk.get("chunk_index") or 0)  # :682
+judge_seed = item_seed + 10000 + j                                     # :732
+```
+- `chunk_index` 가 문서 dict 에 없음. 문서는 1 doc = 1 후보 → **`document_id` 가
+  자연스러운 안정 seed 키** (문서당 1회 처리, 충돌 없음).
+- `_run_chunk_mode` 의 `id` 부여(:826)는 idx 순서 기반이라 seed 와 무관 — 무영향.
+- 비기능요구 "문서 단위 deterministic seed 유지"(00_requirements.md:49) 충족 가능:
+  `item_seed = generator_seed_base + document_id`.
 
-### 4.2 채점이 정답을 카운트하는 정확한 지점 (전수)
+### 1.4 distractor_pool (:491-495)
 
-doc-level 채점은 `eval_search.py:evaluate_one`(318-544)에 집중.
+```python
+sampled_chunk_ids = {s["chunk_id"] for s in sampled}              # :491
+distractor_pool = [c for c in candidates
+                   if c["chunk_id"] not in sampled_chunk_ids]      # :492-494
+```
+- `chunk_id` 로 "샘플과 다른 항목" 구분 → 문서 모드에서는 **`document_id`** 로 구분.
+- `_process_chunk_item` 내 distractor 사용(:704-710): 같은 `source_type` 우선,
+  부족분 다른 타입 충당. 문서 dict 도 동일 키로 동작.
+- distractor 본문 입력(:738): `[d["content"] for d in same_type_distractors]`
+  → 문서 모드에서는 `d["original_content"]`. **distractor 가 통째 문서가 되면
+  judge `is_answerable` 호출당 입력 토큰 급증**(R2 가드 동일 이슈 — §3, 미해결 Q5).
 
-**진입점 (정답 set 생성):**
-- `eval_search.py:386` `relevant = set(item.relevant_doc_ids)` — 평탄 set.
-  여기가 동치-집합 도입 시 **반드시 바뀌어야 할 단일 진입점**. 현재 모든 메트릭이
-  이 `relevant` 를 공유한다.
+### 1.5 source_text_anchor 재정의 (:712)
 
-**`relevant` 를 소비하는 메트릭 호출 (eval_search.py):**
-| 라인 | 메트릭 | 함수(`metrics.py`) |
-|---|---|---|
-| 409 | `recall@k` | `recall_at_k` (`metrics.py:26-35`) |
-| 410 | `precision@k` | `precision_at_k` (`metrics.py:38-50`) |
-| 411 | `hit@k` | `hit_at_k` (`metrics.py:90-93`) |
-| 412 | `ndcg@k` | `ndcg_at_k` (`metrics.py:65-87`) |
-| 413 | `mrr` | `mrr` (`metrics.py:53-62`) |
-| 407 | `relevant_doc_ids` (CSV 기록) | — (출력용) |
+```python
+anchor = make_text_anchor(chunk["content"])  # :712
+```
+- `make_text_anchor` (`synth.py:277`) 는 whitespace 정규화 후 앞 200자 prefix.
+- 문서 원문에 적용해도 **로직상 문제 없음** — 임의 텍스트 prefix 추출(테스트
+  `test_synth.py:468-490` 확인). 문서 원문 앞부분이 anchor → 추적성 유지
+  (00_requirements.md:32 충족).
+- 단 anchor 가 "문서 도입부" 만 가리키게 됨 — 청크 단위로 본문 위치를 좁히던
+  추적성은 약화(디버그 용도, 채점 키 아니므로 기능 영향 없음).
 
-**메트릭 함수 내부의 카운트 키 (metrics.py) — 동치 집합이 깨뜨리는 가정:**
-- `recall_at_k`(26-35): `len(top_k & rel_set) / len(rel_set)`. **분모 `len(rel_set)`**
-  가 정답 "개수". 동치 집합 `{3,5}` 가 1개 정답 단위여야 하는데 현재는 2로 셈 →
-  **recall 분모 왜곡**. R3 핵심 수정 지점.
-- `precision_at_k`(38-50): `hits / k`. 동치 집합 내 2개가 동시에 top-k 에 들면
-  hits 가 2로 셈 → precision 부풀려짐. 동치 의미면 1로 캡해야 함.
-- `mrr`(53-62): 첫 매칭 위치 역수. 동치 집합은 "집합 중 첫 매칭"이면 되므로
-  현 로직(`r in rel_set`)이 **거의 호환** — 단 여러 동치 집합이 있을 때 "집합당
-  첫 매칭"의 평균이어야 정확.
-- `ndcg_at_k`(65-87): `idcg` 가 `min(len(rel_set), k)` 기반(83). `len(rel_set)`
-  이 동치 단위로 줄면 idcg 도 바뀜 → 영향 받음.
-- `hit_at_k`(90-93): `any(r in rel_set)`. 동치 의미와 **자연 호환**(하나라도 있으면
-  True). 수정 거의 불필요.
+### 1.6 load_candidate_chunks 자체 구현 (대체 대상, :132-183)
 
-**집계 단계 (영향 간접):**
-- `aggregate`(`metrics.py:96-126`) / `aggregate_with_variance`(129-199): row 의
-  숫자 메트릭 평균. 위 메트릭 값이 동치 의미로 바뀌면 자동 반영. **함수 자체는
-  수정 불필요**(키 추가만 하면 됨).
-- `write_summary`(`eval_search.py:644-742`): mode별 split(663-685). cross-doc
-  분리 집계(R2) 추가 시 여기 `rows_by_mode` 확장 필요.
-
-**graph-level 채점 (별도, R3 와 동일 패턴 위험):**
-- `eval_search.py:416-439` `graph_recall@k` 등도 `entity_report.all_relevant_keys`
-  를 `recall_at_k` 분모로 씀. 그래프 엔티티에도 "동치 엔티티(여러 표현 중 하나)"
-  개념이 4-tier 매칭(`graph_match.py`)으로 부분 존재하나, equivalence-set
-  단위 카운트는 아님. R3 를 graph 에도 적용할지는 designer 결정(§8).
-
-### 4.3 동치 집합 도입 시 영향받는 함수 전부
-
-| 파일:라인 | 함수 | 영향 | 수정 필요도 |
-|---|---|---|---|
-| `eval_search.py:386` | `evaluate_one` 진입 `relevant=set(...)` | 정답 표현 변환점 | **필수** |
-| `eval_search.py:409-413` | 메트릭 호출 5개 | 새 동치-aware 메트릭으로 교체 | **필수** |
-| `metrics.py:26-35` | `recall_at_k` | 분모=집합 수 | **필수**(또는 동치 wrapper) |
-| `metrics.py:38-50` | `precision_at_k` | 집합 내 중복 캡 | **필수** |
-| `metrics.py:65-87` | `ndcg_at_k` | idcg 분모 | **필수** |
-| `metrics.py:53-62` | `mrr` | 집합당 첫 매칭 | 권장 |
-| `metrics.py:90-93` | `hit_at_k` | 자연 호환 | 검토만 |
-| `gold_set.py:171,185-251` | `GoldItem` 스키마 + to/from_dict | 새 필드 | **필수** |
-| `build_synthetic_gold_set.py:601,637,997` | 정답 emit | 동치 집합 채우기(특히 graph §2.1) | R3 생성 시 |
-| `eval_search.py:547-560` | `_classify_mode` | cross-doc 분류(R2) | R2 시 |
-| `eval_search.py:663-685` | `write_summary` split | cross-doc 분리 집계(R2) | R2 시 |
-| `eval_search.py:96-114` | `diagnose_r3_effect._parse_ids`/set 비교 | (외부 진단 스크립트) `relevant_doc_ids` 평탄 가정 | 호환 검토 |
-
-> 설계 선택지: (a) `metrics.py` 함수를 동치-aware 로 직접 수정 vs
-> (b) `eval_search.py` 에서 동치 집합을 "대표 1개로 축약한 retrieved/relevant"로
-> 전처리 후 기존 메트릭 재사용. (b)가 backward-compat·테스트 영향 최소.
+- `store.get_chunks_by_document` (`metadata_store.py:349`) 의존 = **chunks 테이블 의존**.
+  R1 핵심 제거 대상.
+- 대체 로더는 `store.list_documents()` (`metadata_store.py:233`, `SELECT *`)
+  결과의 `original_content` 직접 사용 가능 — chunks 테이블 완전 비의존.
+  `list_documents` 는 모든 컬럼 반환(documents 스키마 `metadata_store.py:17-33`):
+  `id, source_type, title, original_content, content_hash, ... url, author`.
+- 필터 재정의: `len(original_content)` 기준 min/max_chars(문서 단위).
+  `original_content` 가 `NULL`/빈 문자열인 문서 가드 필요(스키마상 nullable
+  `metadata_store.py:22`).
 
 ---
 
-## 5. 하위 호환 제약 / 마이그레이션
+## 2. R1 — distractor 게이트 의미 변화
 
-### 5.1 기존 골드셋 포맷 (실측)
-포맷은 **YAML** (요구사항 본문은 "JSON"이라 했으나 코드 실측은 YAML —
-`gold_set.py:278-294` `yaml.safe_dump`/`safe_load`, 파일 확장자 `.yaml`).
-designer 는 이 불일치를 인지할 것. `load_gold_set`(290-294)은 YAML 만 읽는다.
+### 2.1 filter_question 의 distractor 사용 (`synth.py:911-994`)
 
-기존 항목 필드 (omit-if-empty 라 실제 YAML 에 존재하는 키):
-`id`, `query`, `relevant_doc_ids`(항상), 선택적으로
-`relevant_graph_entities`/`relevant_graph_relations`/`source_type`/
-`source_document_id`/`source_text_anchor`/`source_section_path`/`difficulty`/
-`synthesized`/`notes`/`source_chunk_id`(deprecated).
-(`to_dict` `gold_set.py:185-215`)
+게이트 순서(`:942-994`):
+1. (a) `is_answerable(q, source)` — LLM (:944)
+2. (b1) ASCII 식별자 누출 — 결정론 (:954)
+3. (b2) 한국어 고유명사 누출 — 결정론 (:960)
+4. (c) 지시대명사 — 결정론 (:968)
+5. (d1) `is_unique_source(q, source)` — LLM (:974)
+6. (d2) **distractor 루프**: 각 distractor 에 `is_answerable(q, distractor)`,
+   하나라도 `True` 면 `generic` 탈락 (:984-992)
 
-### 5.2 폴백 메커니즘 (이미 견고)
-- `from_dict`(`gold_set.py:217-251`)는 모든 필드를 `d.get(..., 기본값)` 으로 읽음.
-  → 새 옵셔널 필드(`relevant_doc_groups` / `cross_document` 등) 누락 시 기본값으로
-  로드. 기존 YAML 무수정 로드 가능.
-- 요구사항 NFR "없으면 기존 단일-정답 채점으로 폴백" → `evaluate_one:386` 에서
-  새 필드 부재 시 `relevant_doc_ids` 기반 기존 경로 유지하도록 분기하면 충족.
+→ distractor 는 (d2) 단일 용도: **"무관 항목으로도 답이 되면 generic"** = 정답
+출처 유일성 보조 검증. `make_text_anchor` 와 무관(anchor 는 게이트에 안 들어감).
 
-### 5.3 마이그레이션 고려사항
-- **GraphRelationRef/GraphEntityRef 전례**가 좋은 마이그레이션 패턴: 옵셔널 필드를
-  `to_dict` omit-if-empty + `from_dict` 기본값으로 추가한 선례(`gold_set.py:77-103`,
-  `129-155`)를 그대로 따르면 무손실·하위호환.
-- 메타데이터: `GoldSet.metadata`(`gold_set.py:260`)는 자유 dict → cross-doc/equiv
-  생성 정책(LLM 사용 여부, 결정론 여부)을 metadata 에 기록하면 추적 가능
-  (build 의 metadata 기록 패턴 `build:491-518`).
-- **diagnose_r3_effect.py 호환**(`diagnose_r3_effect.py:96` `_parse_ids(b.get(
-  "relevant_doc_ids"))`): CSV 의 `relevant_doc_ids` 컬럼을 평탄 int 리스트로 파싱.
-  동치 집합 도입 후에도 CSV `relevant_doc_ids` 컬럼이 평탄 리스트로 유지되면
-  이 스크립트는 깨지지 않음 — CSV 직렬화(`eval_search.py:407`) 형태 보존 권장.
+### 2.2 청크 distractor → 문서 distractor 의미 변화
 
----
+- 현재: distractor = "다른 청크". build() :492 가 `chunk_id` 만 제외하고
+  **`document_id` 는 제외 안 함** → **자기 문서의 옆 청크가 distractor 가 되는
+  케이스 존재**. 같은 문서 내용이라 `is_answerable=True` 로 과도하게 generic
+  탈락시킬 잠재 약점(현 코드).
+- 문서 distractor 로 바뀌면: distractor = "다른 문서" 통째. 정답 문서와 명확히
+  분리(같은 doc 가 distractor 가 될 수 없음). **게이트 의미가 "다른 문서로도 답
+  가능하면 generic" 으로 더 깨끗해짐** — doc 단위 채점과 정합. R1 의도와 일치.
+- 부작용: distractor 가 통째 문서 → (d2) `is_answerable` LLM 입력 급증(§3, 미해결 Q5).
+  distractor 개수(`n_distractors` 기본 2) × 큰 입력 = judge 토큰 비용 증가.
 
-## 6. R1/R2/R3 충족도 요약
+### 2.3 make_text_anchor 의 문서 원문 적용 (재확인)
 
-| 요구사항 | 상태 | 근거 |
-|---|---|---|
-| **R1** 저장 문서 기준 질의 생성 + doc_id 매핑 | **이미 충족** | chunk: `build:148,155,162,601,637`; graph: `build:211,226,997`. 정답 doc_id = 실제 DB document.id |
-| **R2** cross-document 케이스 생성 + 식별 필드 | **미충족** | 생성: 단일 청크/단일 엔티티만 입력(`build:569,757`); 식별 필드 없음(`gold_set.py:169-183`); 분리 집계 없음(`eval_search.py:547-560,663-685`) |
-| **R3** answer equivalence set 스키마 + 채점 | **미충족** | 스키마: 평탄 `list[int]` 만(`gold_set.py:171`); 채점: `set(relevant_doc_ids)` 전원 정답(`eval_search.py:386`, `metrics.py:26-35`). graph 다중-doc 은 equivalence 의도이나 conjunction 으로 오채점(§2.1) |
-
-부분 충족 사항:
-- R3 의 채점 인프라(메트릭 함수, 집계, CSV)는 **존재**하나 의미가 conjunction.
-- R2 의 측정 대상(그래프 도달 문서의 retrieved 카운트)은 PR#64 로 **이미 작동**
-  (`context_assembler.py:574-599` → `eval_search.py:385`). 갭은 생성/식별/집계뿐.
+- `make_text_anchor` 는 게이트(`filter_question`)에 입력되지 **않음** — GoldItem 의
+  `source_text_anchor` 필드에만 들어감(`:712,759`). 게이트 의미와 무관.
+- 문서 원문 적용 시 로직 안전(§1.5). **문제 없음.**
 
 ---
 
-## 7. 영향 범위 매트릭스
+## 3. R2 — generator 입력 한도 현황
 
-| 변경 영역 | 영향 파일 | 영향 테스트 | 마이그레이션 |
-|---|---|---|---|
-| GoldItem 동치/cross-doc 필드 | `eval/gold_set.py:169-251` | `tests/test_eval/test_gold_set.py`(roundtrip 17,34,48,60) | 옵셔널 추가 → 기존 YAML 무수정 |
-| 동치-aware 메트릭 | `eval/metrics.py:26-87` | `tests/test_eval/test_metrics.py:20-114` | 기존 시그니처 보존 시 무영향 |
-| 채점 진입 `relevant` 변환 | `scripts/eval_search.py:386,407-413` | (직접 테스트 없음 — 추가 필요) | CSV `relevant_doc_ids` 평탄 유지 권장 |
-| cross-doc 분류·집계 | `eval_search.py:547-560,663-685` | (추가 필요) | metadata 정책 기록 |
-| 생성: equiv/cross-doc | `build_synthetic_gold_set.py:601,637,997` + 신규 경로 | `tests/test_eval/test_build_synthetic_gold_set.py`, `test_synth.py` | metadata 기록 |
-| 외부 진단 호환 | `scripts/diagnose_r3_effect.py:96-113` | (없음) | CSV 포맷 보존 |
+### 3.1 현재 입력 가드 현황 (사실)
+
+- **build 경로에 토큰 기반 입력 가드 없음.** 유일한 크기 제한:
+  - chunk 모드: `min_chars`/`max_chars` (기본 200/8000자, CLI `:1530-1537`,
+    필터 위치 `load_candidate_chunks` :166). **문자 기준, 청크 단위.**
+  - graph 모드: `GRAPH_SNIPPET_MAX_CHARS=8000` (`synth.py:266`),
+    `build_subgraph_snippet` 가 8000자 초과 시 절단(`synth.py:324-325`).
+- `generate_questions` (`synth.py:718`) 는 `chunk_content` 를 그대로 프롬프트에
+  format(:737) — **입력 길이 검사 없음**. `max_tokens=1024` 는 출력 한도일 뿐.
+- 청크는 max_chars=8000(약 2000~3000 토큰, `:154` 주석)으로 작아 문제 없었음.
+
+### 3.2 문서 통째의 위험
+
+- 문서 `original_content` 는 청크 합집합 → 수만~수십만 자 가능. R1 통째 입력 시
+  generator 프롬프트가 endpoint context window 초과 가능.
+- distractor(§2.2)도 통째 문서 → (d2) `is_answerable` 입력도 초과 가능.
+- R3 graph 보강(§4)에서 subgraph_snippet + 문서 원문 합치면 동일 위험.
+
+### 3.3 토큰 카운터 가용성
+
+- **`count_tokens` 존재**: `src/context_loop/processor/chunker.py:94`
+  (tiktoken, 없으면 1 char=1 token 폴백 `:108`). build 스크립트에서 import 가능.
+- 현재 `build_synthetic_gold_set.py` 는 `count_tokens` 를 import/사용하지 않음.
+- LLMClient 인터페이스(`processor/llm_client.py:32,61`)에 입력 한도/컨텍스트
+  윈도우 노출 없음 — endpoint 별 한도를 코드에서 알 수 없음(미해결 Q3).
+
+### 3.4 가드 추가 지점(designer 결정 필요)
+
+- 추가 위치 후보:
+  - 문서 로더(§1.6) 단계: `max_chars`(또는 신규 `--max-doc-tokens`)로 문서 단위
+    1차 필터 — 현 `max_chars` 의미를 청크→문서로 재정의(R1 명시).
+  - `_process_chunk_item` 의 `generate_questions` 직전(:687): 토큰/문자 초과 시
+    skip+통계 또는 truncate. 통계 키 추가 필요(예 `fail_too_large`,
+    stats dict 초기화 `:510-525`).
+- 정책(skip vs truncate)은 00_requirements.md:35-37 이 designer 에게 위임.
+  기본 동작은 "통째", 극단값만 가드.
 
 ---
 
-## 8. 미해결 질문 (designer 에게)
+## 4. R3 — graph 보강 지점 (소유 문서 original_content)
 
-1. **스키마 형태**: 동치 집합을 `relevant_doc_groups: list[list[int]]` (그룹별 OR,
-   그룹 간 AND)로 할지, 아니면 그룹 객체(`{any_of: [...]}`)로 할지. 후자가 cross-doc
-   AND 와 혼합 표현이 명확. R2(AND)와 R3(OR)를 한 스키마에서 어떻게 합성?
-2. **graph 다중-doc 재해석**(§2.1): `_make_graph_gold_item:997` 의
-   `list(sg["document_ids"])` 를 R3 동치 집합으로 자동 변환할지(권장) — 기존
-   graph 골드셋 recall 의미가 바뀜. 마이그레이션/재생성 필요 여부.
-3. **메트릭 구현 위치**: `metrics.py` 함수 직접 수정 vs `eval_search.py` 전처리
-   (대표 1개 축약). 후자가 test_metrics 23개 테스트 무영향. 결정 필요.
-4. **precision 동치 의미**: 동치 집합 내 2개가 top-k 에 동시 출현 시 hits=1 로
-   캡할지(중복 정답은 1개 가치) vs 그대로 둘지. recall 과 일관성 위해 캡 권장.
-5. **R2 생성의 LLM 의존**(NFR): 두 문서를 잇는 cross-doc 질의를 LLM 으로 생성할지
-   (비용·재현성), 그래프 엣지(`graph_store.get_edges_between`, `build:250`)에서
-   서로 다른 문서를 잇는 엣지를 **결정론적으로** 추출해 질의 시드를 만들지.
-6. **요구사항 "JSON" vs 코드 "YAML"** 불일치(§5.1) — 어느 쪽 기준으로 진행?
-7. **cross-doc 식별 필드 vs mode 확장**: `_classify_mode`(`eval_search.py:547`)에
-   `cross_doc` mode 를 추가할지, 별도 boolean 플래그를 둘지.
+### 4.1 현재 graph 입력 (사실)
+
+- `_process_subgraph_item` (`:839`) 은 `generate_graph_questions(sg, ...)` 호출(:875).
+- `generate_graph_questions` (`synth.py:750`) 는 `sg` 에서 `entity_name`,
+  `entity_type`, `entity_description`, `edges` 만 사용(:776-781) →
+  **subgraph_snippet/edges 만 입력. 소유 문서 원문 미사용.**
+- judge 게이트도 `sg["subgraph_snippet"]` 만 입력(`:919-927`).
+
+### 4.2 소유 문서 조회 경로
+
+- `load_candidate_subgraphs` (`:191`) 가 만드는 sg dict 에 이미:
+  - `primary_document_id` (:291) — `doc_ids[0]` (`:246`).
+  - `document_ids` (:290) — 노드 소유 문서 전체.
+- 문서 원문은 `meta_store.get_document(primary_document_id)` (`metadata_store.py:227`,
+  `SELECT *`) 또는 `list_documents()` 결과 dict 의 `original_content` 로 조회.
+- `load_candidate_subgraphs` 는 이미 `documents = await meta_store.list_documents()`
+  (`:220`) 와 `doc_by_id` (`:221`) 를 보유 → **여기서 `original_content` 를 sg dict
+  에 함께 실어두면 추가 DB 호출 없이 보강 가능**(예 `sg["primary_document_content"]`).
+
+### 4.3 합치는 지점(designer 결정 필요)
+
+- 입력 합성 후보:
+  - `generate_graph_questions` 의 프롬프트(`GRAPH_GENERATE_PROMPT_TEMPLATE`
+    `synth.py:161-214`)에 문서 원문 슬롯 추가, 또는
+  - sg dict 에 원문을 실어 `_process_subgraph_item` → `generate_graph_questions` 전달.
+- **정답/식별 스키마 불변**(00_requirements.md:40): `_make_graph_gold_item`
+  (`:1262`) 의 `relevant_doc_ids`/`relevant_doc_groups`/`relevant_graph_entities`
+  생성 로직 무변경. 보강은 **generator 입력에만**.
+- R2 가드와 일관(00_requirements.md:42): subgraph_snippet + 문서 원문 합산이
+  한도 초과 시 동일 truncate/skip 정책. judge 게이트 입력(`sg["subgraph_snippet"]`
+  :920)을 보강 원문까지 포함할지는 designer 결정(미해결 Q4).
+- cross-doc 모드(`generate_cross_doc_questions` `synth.py:795`)는 R3 범위 밖
+  (요구사항이 graph 모드만 명시) — 비침범 유지.
 
 ---
 
-요약: R1 은 코드상 이미 충족(`build:162,601,637,997`). R2(cross-doc 생성/식별/
-집계)와 R3(equivalence set 스키마/채점)는 **전부 미충족** — 코드에 해당 개념 없음.
-채점 변경의 단일 진입점은 `eval_search.py:386`, 메트릭 분모 왜곡 핵심은
-`metrics.py:26-35,65-87`. 스키마 확장은 기존 `from_dict` 기본값 폴백
-(`gold_set.py:217-251`)으로 하위호환 안전. graph 모드 다중-doc(`build:997`)은
-이미 equivalence 의도이나 conjunction 으로 오채점되어 R3 의 1차 수혜처.
-미해결 질문 7개, 영향 파일 6개.
+## 5. 비침범 확인 (graph/cross_doc 모드 ↔ load_candidate_chunks)
+
+코드로 확정: **graph/cross_doc 모드는 `load_candidate_chunks` 에 비의존, 독립 경로.**
+
+| 모드 | 후보 로더 | distractor 풀 | load_candidate_chunks 참조? |
+|------|-----------|---------------|------------------------------|
+| chunk | `load_candidate_chunks` :474 | candidates 기반 :491-495 | — (대체 대상) |
+| graph | `load_candidate_subgraphs` :979 | subgraphs 기반 :1005-1008 | **없음** |
+| cross_doc | `load_cross_doc_seeds` :1197 | seeds snippet 기반 :1211,1225-1227 | **없음** |
+
+- `_run_graph_mode`(:950)는 자체 `load_candidate_subgraphs` + 자체 distractor 풀.
+- `_run_cross_doc_mode`(:1174)는 자체 `load_cross_doc_seeds` + 자체 distractor.
+- 공유 자원: `extra_korean_stopwords`(build() :499 에서 chunk content 코퍼스로
+  학습 후 graph/cross_doc 에도 전달 :574,595) → **R1 으로 코퍼스가 문서 전체로
+  바뀌면 graph/cross_doc 게이트의 한국어 stopword 셋도 간접 변화**(미해결 Q1).
+  게이트 입력이 아니라 stopword 화이트리스트라 "생성 로직" 변경은 아니지만 결과
+  셋이 달라질 수 있음을 designer 가 인지해야 함.
+- 그 외 graph/cross_doc 생성 로직은 R3 보강 외 무변경 가능(00_requirements.md:39-42 충족).
+
+---
+
+## 6. R1/R2/R3 충족 판정 + 미해결 질문
+
+### 충족 매트릭스 (현재 HEAD 기준)
+
+| 요구 | 상태 | 근거 |
+|------|------|------|
+| R1 문서 기반 로더(chunks 비의존) | **미충족** | `load_candidate_chunks` 가 `get_chunks_by_document` :163 로 chunks 테이블 의존. 대체 필요. 단 대체 인프라(`list_documents`+`original_content` `metadata_store.py:233,22`) 이미 존재 |
+| R1 doc 단위 distractor 유일성 게이트 | **부분** | 게이트 메커니즘(filter_question d2 `synth.py:984-992`) 그대로 재사용 가능. 풀 분리 키 `chunk_id`(:491) → `document_id` 변경 필요 |
+| R1 source_text_anchor 문서 기준 | **부분** | `make_text_anchor`(`synth.py:277`) 문서 원문에 그대로 적용 가능(로직 안전). 호출부 입력만 `content`→`original_content` 교체 |
+| R2 입력 한도 가드 | **미충족** | build 경로에 토큰 가드 없음(§3.1). `count_tokens`(`chunker.py:94`) 존재하나 미사용. 정책+구현 필요 |
+| R3 graph 소유 문서 원문 보강 | **미충족** | `generate_graph_questions`(`synth.py:776-781`)가 subgraph 만 입력. `primary_document_id`(:291) 로 조회 경로는 확보됨 |
+| 하위호환(스키마/포맷 불변) | **충족(영향 없음)** | GoldItem(`gold_set.py:162`) round-trip 무변경. R1/R3 는 생성 입력만 변경, 스키마 미변경 |
+| graph/cross_doc 비침범 | **충족(경로 분리 확인)** | §5 — 별도 로더/풀. R3 보강만 graph 입력에 영향 |
+| 결정성(문서 단위 seed) | **부분** | seed 키 `chunk_index`(:682) → `document_id` 재정의하면 유지 가능 |
+
+### 미해결 질문 (designer 에게)
+
+- **Q1 — 한글 stopword 코퍼스 변화**: `build_korean_stopwords_from_corpus`
+  (build() :499) 입력이 청크 content → 문서 original_content 전체로 바뀌면
+  빈도 분포/메모리(`max_stopwords=500`)가 달라져 게이트 결과가 변할 수 있음.
+  코퍼스를 문서 전체로 둘지, threshold 재조정할지?
+- **Q2 — source_section_path 대체**: 문서 모드엔 청크 섹션 경로 없음(:723,762).
+  빈 문자열로 둘지, 문서 title/url 로 대체할지? (디버그 필드, 채점 무관)
+- **Q3 — endpoint 입력 한도 미상**: LLMClient(`llm_client.py`)가 context window 를
+  노출 안 함. R2 가드 한도값을 CLI 옵션(`--max-doc-tokens`)으로 받을지, 하드코딩
+  기본값(예 16k/32k 토큰)으로 둘지? truncate vs skip 기본값은?
+- **Q4 — R3 judge 게이트 입력 범위**: graph 보강 원문을 generator 입력에만 넣을지,
+  judge `filter_question`(:919)의 source 입력(현 `subgraph_snippet`)에도 합칠지?
+  judge 입력까지 합치면 (a)`is_answerable`/(d1)`is_unique_source` 의미가 바뀜.
+- **Q5 — distractor 통째 문서 비용**: doc distractor 가 통째라 (d2) judge 호출
+  입력이 큼(§2.2). distractor 도 anchor/prefix 로 잘라 넣을지(게이트 신뢰도
+  vs 토큰 비용 트레이드오프)? R2 가드를 distractor 에도 적용?
+
+### 영향받는 테스트 (마이그레이션 필요)
+
+- `tests/test_eval/test_build_synthetic_gold_set.py:46-118` —
+  `test_load_candidate_chunks_*` 2건: 함수 대체 시 **재작성/대체** 필요(문서 기반
+  로더용 신규 테스트).
+- `tests/test_eval/test_concurrency.py:122-187` — `_process_chunk_item` 테스트가
+  chunk dict(`chunk_index`/`content`/`section_path` 키, `:126-134`,`:168-172`)를
+  직접 구성. dict 키 스키마 변경 시 **수정** 필요.
+- `tests/test_eval/test_concurrency.py:234-` `_run_chunk_mode` 테스트도 chunk dict
+  사용 — 키 변경 영향.
+- `tests/test_eval/test_synth.py:468-490` `make_text_anchor` 테스트 — **영향 없음**
+  (함수 시그니처/로직 불변).
+- graph/cross_doc 테스트(`test_build_synthetic_gold_set.py:126+`,
+  `test_concurrency.py:189+`): R3 보강이 sg dict 에 키를 **추가**만 하면 기존 테스트
+  무영향. 단 `generate_graph_questions` 프롬프트 변경 시 관련 테스트 확인.
