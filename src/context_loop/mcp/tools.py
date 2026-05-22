@@ -26,6 +26,8 @@ def register_tools(mcp: FastMCP) -> None:
         """질의 문자열로 관련 사내 지식 컨텍스트를 검색·조립하여 반환한다.
 
         벡터 유사도 검색과 그래프 탐색을 결합하여 관련 컨텍스트를 조립한다.
+        그래프 탐색이 도달한 문서 중 벡터가 못 찾은 것은 본문(연결 문서)을
+        함께 첨부한다 (개수/토큰 상한은 ``mcp.max_graph_context_*`` 설정).
 
         Args:
             query: 검색 질의 문자열.
@@ -59,6 +61,8 @@ def register_tools(mcp: FastMCP) -> None:
             rerank_top_k=_config.get("search.reranker_top_k", None) if _config else None,
             rerank_score_threshold=_config.get("search.reranker_score_threshold", 0.0) if _config else 0.0,
             hyde_enabled=_config.get("search.hyde_enabled", False) if _config else False,
+            max_graph_docs=_config.get("mcp.max_graph_context_docs", 3) if _config else 3,
+            max_graph_tokens=_config.get("mcp.max_graph_context_tokens", 6000) if _config else 6000,
         )
 
     @mcp.tool()

@@ -10,7 +10,9 @@ import pytest
 
 from context_loop.mcp.context_assembler import (
     _fetch_and_format_source_code,
+    _format_graph_chunk_results,
     _search_chunks,
+    _search_graph_sourced_chunks,
     _search_graph_with_llm,
     assemble_context,
     assemble_context_with_sources,
@@ -848,3 +850,279 @@ async def test_assemble_context_shows_matched_question_in_source_label(stores) -
     # 매칭된 질문 텍스트가 출처 라벨에 노출되어야 함
     assert "QDoc 의 핵심 동작은?" in result.context_text
     assert "매칭 질문" in result.context_text
+
+
+# ---------------------------------------------------------------------------
+# 설계 A — 그래프 연결 문서 첨부
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_graph_sourced_chunks_excludes_vector_docs(stores) -> None:
+    """벡터가 이미 찾은 문서는 그래프 첨부에서 제외된다 (순수 추가분만)."""
+    meta_store, vector_store, _ = stores
+    doc_a = await meta_store.create_document(
+        source_type="manual", title="A", original_content="c", content_hash="gsca",
+    )
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="B", original_content="c", content_hash="gscb",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["a#body", "b#body"],
+        embeddings=[[0.9, 0.1], [0.8, 0.2]],
+        documents=["본문 A", "본문 B"],
+        metadatas=[
+            {"document_id": doc_a, "logical_chunk_id": "a", "view": "body"},
+            {"document_id": doc_b, "logical_chunk_id": "b", "view": "body"},
+        ],
+    )
+
+    results = await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store,
+        graph_doc_ids={doc_a, doc_b}, existing_doc_ids={doc_a},
+        max_graph_docs=10, max_graph_tokens=100000,
+    )
+    assert [r["metadata"]["document_id"] for r in results] == [doc_b]
+
+
+@pytest.mark.asyncio
+async def test_graph_sourced_chunks_dedupes_and_caps(stores) -> None:
+    """문서당 1청크 dedup + max_graph_docs 개수 상한."""
+    meta_store, vector_store, _ = stores
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="B", original_content="c", content_hash="gscdb",
+    )
+    doc_c = await meta_store.create_document(
+        source_type="manual", title="C", original_content="c", content_hash="gscdc",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["b#body", "b#q0", "c#body"],
+        embeddings=[[0.9, 0.1], [0.85, 0.15], [0.7, 0.3]],
+        documents=["본문 B", "본문 B", "본문 C"],
+        metadatas=[
+            {"document_id": doc_b, "logical_chunk_id": "b", "view": "body"},
+            {"document_id": doc_b, "logical_chunk_id": "b",
+             "view": "question", "question_text": "q"},
+            {"document_id": doc_c, "logical_chunk_id": "c", "view": "body"},
+        ],
+    )
+
+    res = await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store, {doc_b, doc_c}, set(),
+        max_graph_docs=10, max_graph_tokens=100000,
+    )
+    ids = [r["metadata"]["document_id"] for r in res]
+    assert sorted(ids) == sorted([doc_b, doc_c])
+    assert ids.count(doc_b) == 1  # 두 view 가 1건으로 dedup
+
+    res_cap = await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store, {doc_b, doc_c}, set(),
+        max_graph_docs=1, max_graph_tokens=100000,
+    )
+    assert [r["metadata"]["document_id"] for r in res_cap] == [doc_b]
+
+
+@pytest.mark.asyncio
+async def test_graph_sourced_chunks_token_budget(stores) -> None:
+    """토큰 상한을 넘으면 첫 문서만 첨부된다 (doc-level 청크는 무거움)."""
+    meta_store, vector_store, _ = stores
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="B", original_content="c", content_hash="gsctb",
+    )
+    doc_c = await meta_store.create_document(
+        source_type="manual", title="C", original_content="c", content_hash="gsctc",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["b#body", "c#body"],
+        embeddings=[[0.9, 0.1], [0.7, 0.3]],
+        documents=["B" * 400, "C" * 400],
+        metadatas=[
+            {"document_id": doc_b, "logical_chunk_id": "b", "view": "body"},
+            {"document_id": doc_c, "logical_chunk_id": "c", "view": "body"},
+        ],
+    )
+
+    res = await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store, {doc_b, doc_c}, set(),
+        max_graph_docs=10, max_graph_tokens=10,
+    )
+    # 첫 문서는 항상 포함, 둘째는 예산 초과로 제외
+    assert [r["metadata"]["document_id"] for r in res] == [doc_b]
+
+
+@pytest.mark.asyncio
+async def test_graph_sourced_chunks_empty_conditions(stores) -> None:
+    """query_embedding None / max_graph_docs=0 / 전부 겹침 → 빈 리스트."""
+    meta_store, vector_store, _ = stores
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="B", original_content="c", content_hash="gsce",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["b#body"], embeddings=[[0.9, 0.1]], documents=["본문 B"],
+        metadatas=[{"document_id": doc_b, "logical_chunk_id": "b", "view": "body"}],
+    )
+
+    assert await _search_graph_sourced_chunks(
+        None, vector_store, {doc_b}, set(),
+        max_graph_docs=3, max_graph_tokens=6000,
+    ) == []
+    assert await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store, {doc_b}, set(),
+        max_graph_docs=0, max_graph_tokens=6000,
+    ) == []
+    # 그래프 문서가 벡터 결과와 전부 겹침 → 추가분 없음
+    assert await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store, {doc_b}, {doc_b},
+        max_graph_docs=3, max_graph_tokens=6000,
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_graph_sourced_chunks_ignores_doc_without_vector(stores) -> None:
+    """벡터 엔트리가 없는 그래프 노드(예: 미임포트 페이지)는 본문 첨부에서 제외."""
+    meta_store, vector_store, _ = stores
+    doc_b = await meta_store.create_document(
+        source_type="manual", title="B", original_content="c", content_hash="gscnv",
+    )
+    doc_x = await meta_store.create_document(
+        source_type="manual", title="X", original_content="c", content_hash="gscnvx",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["b#body"], embeddings=[[0.9, 0.1]], documents=["본문 B"],
+        metadatas=[{"document_id": doc_b, "logical_chunk_id": "b", "view": "body"}],
+    )
+
+    res = await _search_graph_sourced_chunks(
+        [0.9, 0.1], vector_store, {doc_b, doc_x}, set(),
+        max_graph_docs=3, max_graph_tokens=6000,
+    )
+    assert [r["metadata"]["document_id"] for r in res] == [doc_b]
+
+
+@pytest.mark.asyncio
+async def test_format_graph_chunk_results_header(stores) -> None:
+    """그래프 연결 문서 섹션은 전용 헤더와 도달 라벨을 갖는다."""
+    meta_store, _, _ = stores
+    doc = await meta_store.create_document(
+        source_type="manual", title="MyDoc", original_content="c", content_hash="hfmt",
+    )
+    results = [
+        {"metadata": {"document_id": doc, "section_path": "A > B"},
+         "document": "본문 내용"},
+    ]
+    text = await _format_graph_chunk_results(results, meta_store)
+    assert "## 그래프 연결 문서" in text
+    assert "MyDoc" in text
+    assert "본문 내용" in text
+    assert "그래프 경로로 도달" in text
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_attaches_graph_sourced_document(stores) -> None:
+    """벡터가 못 찾고 그래프만 도달한 문서의 본문이 컨텍스트에 첨부된다."""
+    meta_store, vector_store, graph_store = stores
+    doc_vec = await meta_store.create_document(
+        source_type="manual", title="VecDoc", original_content="c", content_hash="hgv1",
+    )
+    doc_graph = await meta_store.create_document(
+        source_type="manual", title="GraphDoc", original_content="c", content_hash="hgv2",
+    )
+    # doc_vec 은 query 와 가까워 threshold 통과, doc_graph 는 멀어 본 검색에서 제외
+    vector_store.add_chunks(
+        chunk_ids=["v#body", "g#body"],
+        embeddings=[[0.9, 0.1], [0.1, 0.9]],
+        documents=["벡터로 찾은 본문", "그래프 전용 문서 본문"],
+        metadatas=[
+            {"document_id": doc_vec, "logical_chunk_id": "v", "view": "body"},
+            {"document_id": doc_graph, "logical_chunk_id": "g", "view": "body"},
+        ],
+    )
+    # 그래프 엔티티를 doc_graph 에 연결
+    await graph_store.save_graph_data(doc_graph, GraphData(
+        entities=[Entity(name="GraphEntity", entity_type="service")],
+        relations=[],
+    ))
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = _make_llm_client({
+        "should_search": True, "reasoning": "x",
+        "search_steps": [
+            {"entity_name": "GraphEntity", "depth": 1, "focus_relations": []},
+        ],
+    })
+
+    result = await assemble_context(
+        query="GraphEntity 관련",
+        meta_store=meta_store, vector_store=vector_store, graph_store=graph_store,
+        embedding_client=embed_client, llm_client=llm,
+        include_graph=True, similarity_threshold=0.5, max_graph_docs=3,
+    )
+    assert "## 그래프 연결 문서" in result
+    assert "그래프 전용 문서 본문" in result
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_graph_doc_overlaps_vector_no_section(stores) -> None:
+    """그래프 문서가 벡터 결과와 겹치면 그래프 연결 문서 섹션이 생기지 않는다."""
+    meta_store, vector_store, graph_store = stores
+    doc = await meta_store.create_document(
+        source_type="manual", title="D", original_content="c", content_hash="hovl",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["d#body"], embeddings=[[0.9, 0.1]], documents=["본문 D"],
+        metadatas=[{"document_id": doc, "logical_chunk_id": "d", "view": "body"}],
+    )
+    await graph_store.save_graph_data(doc, GraphData(
+        entities=[Entity(name="EntD", entity_type="service")], relations=[],
+    ))
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = _make_llm_client({
+        "should_search": True, "reasoning": "x",
+        "search_steps": [{"entity_name": "EntD", "depth": 1, "focus_relations": []}],
+    })
+
+    result = await assemble_context(
+        query="EntD", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client, llm_client=llm,
+        include_graph=True, max_graph_docs=3,
+    )
+    assert "## 그래프 연결 문서" not in result
+
+
+@pytest.mark.asyncio
+async def test_with_sources_graph_doc_gets_real_similarity(stores) -> None:
+    """본문이 인출된 그래프 문서의 Source.similarity 가 0.0 이 아닌 실제 값이다."""
+    meta_store, vector_store, graph_store = stores
+    doc_vec = await meta_store.create_document(
+        source_type="manual", title="VecDoc", original_content="c", content_hash="hws1",
+    )
+    doc_graph = await meta_store.create_document(
+        source_type="manual", title="GraphDoc", original_content="c", content_hash="hws2",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["v#body", "g#body"],
+        embeddings=[[0.9, 0.1], [0.1, 0.9]],
+        documents=["벡터 본문", "그래프 본문"],
+        metadatas=[
+            {"document_id": doc_vec, "logical_chunk_id": "v", "view": "body"},
+            {"document_id": doc_graph, "logical_chunk_id": "g", "view": "body"},
+        ],
+    )
+    await graph_store.save_graph_data(doc_graph, GraphData(
+        entities=[Entity(name="GEnt", entity_type="service")], relations=[],
+    ))
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = _make_llm_client({
+        "should_search": True, "reasoning": "x",
+        "search_steps": [{"entity_name": "GEnt", "depth": 1, "focus_relations": []}],
+    })
+
+    ctx = await assemble_context_with_sources(
+        query="GEnt", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client, llm_client=llm,
+        include_graph=True, similarity_threshold=0.5, max_graph_docs=3,
+    )
+    graph_source = next(s for s in ctx.sources if s.document_id == doc_graph)
+    assert graph_source.similarity > 0.0
