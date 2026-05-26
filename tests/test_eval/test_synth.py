@@ -27,6 +27,7 @@ from context_loop.eval.synth import (
     parse_generated_questions,
     parse_yes_no,
     stratified_sample,
+    truncate_to_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -563,17 +564,19 @@ def test_format_edges_for_prompt_deterministic_order() -> None:
 
 
 def test_graph_generate_prompt_template_slots() -> None:
-    """프롬프트 템플릿이 entity_name/type/edges/n 슬롯을 모두 가진다."""
+    """프롬프트 템플릿이 entity_name/type/edges/document_excerpt/n 슬롯을 모두 가진다."""
     rendered = GRAPH_GENERATE_PROMPT_TEMPLATE.format(
         entity_name="결제 서비스",
         entity_type="system",
         entity_description="결제 처리 컴포넌트",
         edges_text="- 결제 서비스 --[depends_on]--> 결제 게이트웨이",
+        document_excerpt="결제 서비스 소유 문서 원문 발췌",
         n=3,
     )
     assert "결제 서비스 (system)" in rendered
     assert "결제 처리 컴포넌트" in rendered
     assert "결제 게이트웨이" in rendered
+    assert "결제 서비스 소유 문서 원문 발췌" in rendered
     assert "3개" in rendered
 
 
@@ -620,6 +623,88 @@ async def test_generate_graph_questions_handles_missing_description() -> None:
     )
     assert len(questions) == 1
     assert "(설명 없음)" in stub.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_injects_document_excerpt() -> None:
+    """R3 — primary_document_content 가 프롬프트의 소유 문서 발췌 슬롯에 주입된다."""
+    stub = StubLLM(['[{"q": "Q", "difficulty": "easy"}]'])
+    subgraph = {
+        "entity_name": "결제 서비스",
+        "entity_type": "system",
+        "entity_description": "결제 처리",
+        "edges": [],
+        "primary_document_content": "결제 도메인 아키텍처 원문 전체 본문.",
+    }
+    await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    prompt = stub.calls[0]["prompt"]
+    assert "소유 문서 발췌" in prompt
+    assert "결제 도메인 아키텍처 원문 전체 본문." in prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_no_document_content_placeholder() -> None:
+    """보강 원문이 없으면 (문서 원문 없음) placeholder 가 들어간다."""
+    stub = StubLLM(['[{"q": "Q", "difficulty": "easy"}]'])
+    subgraph = {
+        "entity_name": "X", "entity_type": "t", "edges": [],
+    }
+    await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+    )
+    assert "(문서 원문 없음)" in stub.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_generate_graph_questions_truncates_document_excerpt() -> None:
+    """doc_max_tokens 한도 초과 시 보강 원문이 앞부분만 프롬프트에 들어간다."""
+    stub = StubLLM(['[{"q": "Q", "difficulty": "easy"}]'])
+    big = "토큰" * 5000  # tiktoken 부재 시 1char=1token 폴백 기준으로도 초과
+    subgraph = {
+        "entity_name": "X", "entity_type": "t", "edges": [],
+        "primary_document_content": big,
+    }
+    await generate_graph_questions(
+        subgraph, n=1, generator=stub,  # type: ignore[arg-type]
+        doc_max_tokens=100,
+    )
+    prompt = stub.calls[0]["prompt"]
+    # 전체 원문이 그대로 들어가지 않았다 (truncate 적용).
+    assert big not in prompt
+
+
+# ---------------------------------------------------------------------------
+# truncate_to_tokens (R2 — generator 입력 한도 가드)
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_to_tokens_disabled() -> None:
+    """max_tokens<=0 이면 원본 그대로 + truncated=False."""
+    text = "본문 " * 1000
+    out, truncated = truncate_to_tokens(text, 0)
+    assert out == text
+    assert truncated is False
+
+
+def test_truncate_to_tokens_under_limit() -> None:
+    """한도 이하면 원본 그대로 + truncated=False."""
+    text = "짧은 본문"
+    out, truncated = truncate_to_tokens(text, 10000)
+    assert out == text
+    assert truncated is False
+
+
+def test_truncate_to_tokens_over_limit() -> None:
+    """한도 초과면 잘린 텍스트 + truncated=True, 결과는 한도 이하."""
+    from context_loop.processor.chunker import count_tokens
+
+    text = "가나다라마바사 " * 5000
+    out, truncated = truncate_to_tokens(text, 200)
+    assert truncated is True
+    assert len(out) < len(text)
+    assert count_tokens(out) <= 200
 
 
 @pytest.mark.parametrize("question", [

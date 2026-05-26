@@ -1,180 +1,111 @@
-# 03_implementation — 골드셋 cross-doc / answer-equivalence 구현
+# 03_implementation — 문서 기반 골드셋 생성 전환 구현 (R1/R2/R3)
 
 작성: 2026-05-22 (implementer, eval-gold-set-improvement)
-입력: `02_design.md` (작업 지시서), `01_analysis.md`, `00_requirements.md`
-대상 HEAD: PR#64 병합 후 (브랜치 `claude/gold-set-cross-doc-equivalence`)
+기준: 02_design.md 지시서 + 사용자 확정 결정(대체/통째/그래프 보강, D6-1~D6-5)
 
-> 02_design.md 의 변경 파일/시그니처를 그대로 따랐다. 사용자 확정 결정 3건
-> (기존 graph 골드셋 재생성 방식 / R2 하이브리드 / YAML 기준) 모두 반영.
+> 변경 이력: 이전 03_implementation(PR#65 cross-doc/answer-equivalence)을 본 작업
+> (문서 기반 전환) 스코프로 전면 교체. 설계 문서(02_design.md)가 전면 교체된 것과 동일.
 
 ---
 
 ## 1. 변경 파일 목록
 
-| 파일 | 변경 | 핵심 |
-|---|---|---|
-| `src/context_loop/eval/gold_set.py` | 수정 | `GoldItem` 에 `relevant_doc_groups: list[list[int]]` + `cross_document: bool` 2필드. `to_dict` omit-if-empty emit, `from_dict` 기본값 폴백 + 그룹 내 중복제거/빈그룹 드롭. 모듈/`GoldItem` docstring 갱신 |
-| `src/context_loop/eval/metrics.py` | **무변경** | (b)안 — 전처리 축약으로 재사용 (test_metrics 23개 무영향, 실측 34개 green) |
-| `scripts/eval_search.py` | 수정 | `_reduce_equivalence` 신규(§3.2), `evaluate_one` 채점 진입 분기(§3.3), `_classify_mode` cross_doc 우선 분기(§6.1), `write_summary` `rows_by_mode` 에 `cross_doc` 슬롯(§6.2), CSV 평탄 `relevant_doc_ids` 유지 + `n_answer_units` 추가 |
-| `src/context_loop/eval/synth.py` | 수정 | `CROSS_DOC_GENERATE_PROMPT_TEMPLATE` 신규, `generate_cross_doc_questions` 신규 (generator/judge 분리 유지, 반환 타입 `GeneratedGraphQuestion` 재사용) |
-| `scripts/build_synthetic_gold_set.py` | 수정 | `_make_graph_gold_item` OR 그룹 자동변환(§4), `load_cross_doc_seeds` 신규(§5.2), `_make_cross_doc_gold_item`/`_cross_doc_seed_snippet`/`_process_cross_doc_item`/`_run_cross_doc_mode` 신규(§5), `build()` 파라미터+호출+metadata+stats, CLI `--enable-cross-doc`/`--cross-doc-max-seeds`, docstring 사용법 예시 |
-| `tests/test_eval/test_gold_set.py` | 수정 | 동치 그룹/플래그 round-trip·폴백·dedup·omit 4건 |
-| `tests/test_eval/test_equivalence_scoring.py` | **신규** | 동치 채점 9건 (recall/precision cap/AND/mrr/ndcg/보존/miss/폴백가드/결정론) |
-| `tests/test_eval/test_build_synthetic_gold_set.py` | 수정 | graph OR 변환 2건 + cross-doc 씨앗 3건 + emit 1건 + classify cross_doc 1건 + CLI 옵션 2건 |
-| `tests/test_eval/test_synth.py` | 수정 | cross-doc 프롬프트 1건 |
-
-**diagnose_r3_effect.py / compare_runs.py / metrics.py**: 무변경 (CSV 평탄 컬럼 보존으로 호환).
+| 파일 | 종류 | 핵심 변경 |
+|------|------|-----------|
+| `src/context_loop/eval/synth.py` | 수정 | `count_tokens` import; `truncate_to_tokens` public 헬퍼 신설(§3.2); `GRAPH_GENERATE_PROMPT_TEMPLATE` 에 `{document_excerpt}` 슬롯 추가(§4.2); `generate_graph_questions` 에 `doc_max_tokens` 파라미터 + 보강 원문 슬롯 채움 + truncate(§4.2-4.3); stopword docstring 문구 갱신. |
+| `scripts/build_synthetic_gold_set.py` | 수정 | `load_candidate_chunks`→`load_candidate_documents`(chunks 비의존, §1); `DISTRACTOR_EXCERPT_CHARS`+`_distractor_excerpt`(§2.2); build() 로더 호출/distractor 풀 키 `chunk_id`→`document_id`/stopword `min_corpus_freq` 5→8(§2.1,§5.4); seed `chunk_index`→`document_id`(§1.4); `source_section_path`=title(§1.5); R2 truncate 가드 적용 + `truncated_too_large` stats(§3.3-3.4); sg dict 에 `primary_document_content`(§4.1); `max_doc_tokens` plumbing(build/_run_chunk_mode/_process_chunk_item/_run_graph_mode/_process_subgraph_item); CLI `--max-doc-tokens` 신규 + `--n-chunks`/`--min-chars`/`--max-chars`/`--n-distractors` help·기본값(§5.2); 로그 `[chunk …]`→`[doc …]`; 모듈 docstring 사용법 갱신. |
+| `tests/test_eval/test_build_synthetic_gold_set.py` | 수정 | `load_candidate_chunks` 테스트 2건 → `load_candidate_documents` 테스트 5건으로 재작성; `_distractor_excerpt` 테스트; subgraph `primary_document_content` 테스트 2건. |
+| `tests/test_eval/test_concurrency.py` | 수정 | chunk dict → 문서 dict 스키마(document_id/source_type/content/title/url)로 교체(전 sampled/chunk 픽스처); `source_section_path==title` 검증; R2 truncate stats + anchor 추적성 + truncate-비활성 테스트 2건 추가. |
+| `tests/test_eval/test_synth.py` | 수정 | `GRAPH_GENERATE_PROMPT_TEMPLATE.format` 에 `document_excerpt` 슬롯 반영; `truncate_to_tokens` 3건 + graph 보강(document_excerpt 주입/placeholder/truncate) 3건 추가. |
+| `src/context_loop/eval/gold_set.py` | **무변경** | GoldItem 스키마 불변(D5). |
+| `src/context_loop/processor/chunker.py` | **무변경** | `count_tokens` 재사용만. |
 
 ---
 
-## 2. 사용자 확정 결정 반영
+## 2. 사용자 확정 결정 반영 확인
 
-1. **기존 graph 골드셋 = 재생성 방식.** 로더(`from_dict`)는 평탄 list 를 OR 로 자동
-   승격하지 **않는다**. `relevant_doc_groups` 누락 시 `[]` → R3 비활성 → 기존 평탄
-   채점 폴백만 한다. OR 그룹화는 오직 생성기(`_make_graph_gold_item`)에서만 수행 →
-   기존 평탄 골드셋은 명시적 재생성으로만 갱신.
-2. **R2 = 하이브리드.** `load_cross_doc_seeds` 가 "노드 소유 문서 서로소" 엣지를
-   결정론적으로 추출(정답 씨앗). LLM 은 `generate_cross_doc_questions` 로 자연어 질의
-   문장화만 담당. 기존 `filter_question`(judge 3-gate) 그대로 재사용.
-3. **YAML 기준.** `save_gold_set`/`load_gold_set` 가 `yaml.safe_dump`/`safe_load` — 변경 없음.
+1. **대체** — `load_candidate_chunks` 완전 삭제, `load_candidate_documents`(original_content 기반, `get_chunks_by_document` 미호출)로 교체. chunks 테이블 비의존.
+2. **통째 + 한도 가드** — generator 입력은 문서 원문 전체. `--max-doc-tokens` 기본 24000, 초과 시 앞부분 truncate(skip 아님). `truncated_too_large` stats 기록. `--max-chars` 기본 200000 으로 상향(통째 정책 — 큰 문서 후보 보존).
+3. **그래프 보강** — sg dict 에 `primary_document_content`(소유 문서 원문, 추가 DB 호출 없음) 적재 → `generate_graph_questions` 프롬프트의 "소유 문서 발췌" 슬롯에 주입. judge 게이트는 `subgraph_snippet` 그대로 유지(D6-4).
+4. **D6-1** stopword `min_corpus_freq` 5→8. **D6-2** section_path→title. **D6-3** truncate/24000. **D6-4** judge subgraph_snippet 유지. **D6-5** distractor 앞부분 2000자 prefix.
 
 ---
 
-## 3. 추가한 테스트 시나리오
+## 3. 테스트 결과
 
-### test_gold_set.py
-- `test_roundtrip_equivalence_groups` — `[[3,5],[9]]` + `cross_document=True` 무손실.
-- `test_legacy_yaml_no_groups_loads` — 옛 YAML → `groups=[]`, `cross_document=False`.
-- `test_groups_dedup_and_drop_empty` — `[[3,3,5],[]]` → `[[3,5]]`.
-- `test_groups_omitted_when_empty_on_emit` — 빈 필드 to_dict omit.
-
-### test_equivalence_scoring.py (신규)
-- `test_reduce_or_group_recall` — `[[3,5]]`, retrieved `[5]` → recall=1.0 (평탄이면 0.5).
-- `test_reduce_precision_cap` — `[[3,5]]`, retrieved `[3,5]` → precision@2=0.5 (hits 캡).
-- `test_reduce_and_groups` — `[[3],[9]]`, retrieved `[3]` → recall=0.5; 둘 다 → 1.0.
-- `test_reduce_mrr_first_member` — `[[3,5]]`, retrieved `[7,5]` → mrr=0.5.
-- `test_reduce_ndcg_idcg_denom` — `[[3,5],[9]]` 분모 2단위 → ndcg=1.0.
-- `test_reduce_preserves_non_answer_docs` — 정답 외 doc 보존, 그룹 중복 drop.
-- `test_reduce_miss_group_counts_in_denominator` — 미검색 그룹도 recall 분모에.
-- `test_no_groups_fallback_flat` — 빈 그룹 시 relevant 빈 set (분기 가드 고정).
-- `test_reduce_is_deterministic` — 순수 함수 결정성.
-
-### test_build_synthetic_gold_set.py
-- `test_graph_multi_doc_becomes_or_group` — `[7,3,5]` → `groups=[[3,5,7]]`.
-- `test_graph_single_doc_no_group` — `[42]` → `groups=[]`.
-- `test_load_cross_doc_seeds_disjoint` — 엔티티 병합으로 소유문서 겹치면 씨앗 0건.
-- `test_load_cross_doc_seeds_true_disjoint` — 완전 서로소 엣지 1건만 씨앗.
-- `test_cross_doc_seed_deterministic` — 같은 입력 → 동일 씨앗 리스트.
-- `test_make_cross_doc_item_and_groups` — 씨앗 → `groups=[[A],[B]]`, `cross_document=True`.
-- `test_classify_mode_cross_doc_priority` — `cross_document=True` → mode="cross_doc".
-- CLI: `--enable-cross-doc`, `--cross-doc-max-seeds` 노출 확인.
-
-### test_synth.py
-- `test_generate_cross_doc_questions_prompt` — 두 엔티티 + "두 문서" 취지 + purpose 라벨.
-
----
-
-## 4. 검증 결과
-
+### pytest tests/test_eval/
 ```
-pytest tests/test_eval/            → 291 passed, 5 failed (전부 선재 실패 — 아래 §5)
-pytest tests/test_eval/test_metrics.py → 34 passed (metrics.py 무변경 확인)
-ruff check (변경 파일 8개)         → All checks passed
-  (예외: scripts/build_synthetic_gold_set.py:1501 E501 — 선재 위반, 내 변경 아님)
-python scripts/build_synthetic_gold_set.py --help → --enable-cross-doc / --cross-doc-max-seeds 노출
-import 검증: eval_search, build_synthetic_gold_set, gold_set, synth 모두 OK
+5 failed, 304 passed
 ```
+변경 전 baseline: 5 failed, 291 passed. 신규/재작성 테스트가 통과하며 신규 실패 0.
 
-신규 테스트 추가로 통과 수가 270 → 291 (+21).
+### 선재 실패 vs 신규 실패 (git stash 대조)
+작업 트리 전체를 `git stash` 한 뒤 동일 5건 테스트 실행 → 5건 모두 변경 전에도 실패 확인.
+**선재 실패 5건 (PR#65 시점부터 존재, 본 작업과 무관 — 손대지 않음):**
+- `test_build_synthetic_gold_set.py::test_fetch_source_text_anchor_match`
+- `test_build_synthetic_gold_set.py::test_fetch_source_text_legacy_chunk_id_fallback`
+- `test_build_synthetic_gold_set.py::test_make_graph_gold_item_falls_back_to_node_description`
+- `test_synth.py::test_filter_question_passes_clean`
+- `test_synth.py::test_filter_question_fails_generic`
+
+**신규 실패: 0건.** 본 변경으로 새로 깨진 테스트 없음.
+
+### 추가/재작성한 테스트 (시나리오)
+- `test_load_candidate_documents_uses_original_content` — original_content 기반 로드, 청크 없어도 동작, chunk 전용 키 부재.
+- `test_load_candidate_documents_char_filter` — min/max_chars 가 문서 길이 기준.
+- `test_load_candidate_documents_skips_empty_content` — NULL/공백 본문 제외.
+- `test_load_candidate_documents_filters_source_types` — source_type 화이트리스트.
+- `test_load_candidate_documents_sorted_by_document_id` — document_id 오름차순(결정론).
+- `test_distractor_excerpt_truncates_to_constant` — DISTRACTOR_EXCERPT_CHARS 절단.
+- `test_load_candidate_subgraphs_basic`(키 존재 assert 추가) + `test_load_candidate_subgraphs_includes_primary_document_content` — R3 sg dict 보강.
+- `test_process_chunk_item_*`(2건) — 문서 dict 스키마, source_section_path==title, R2 truncate stats + anchor 원문 추적성 + truncate 비활성.
+- `test_generate_graph_questions_injects_document_excerpt` / `_no_document_content_placeholder` / `_truncates_document_excerpt` — R3 프롬프트 주입/placeholder/truncate.
+- `test_truncate_to_tokens_disabled` / `_under_limit` / `_over_limit` — R2 헬퍼 경계.
+- judge 입력 보존: `_process_subgraph_item` 기존 테스트가 `subgraph_snippet` 게이트 입력을 그대로 유지(보강 원문 미포함) — 무영향 통과로 D6-4 확인.
+
+### ruff
+변경 파일 5개 ruff check → **신규 코드 클린**. 잔여 E501 1건은 `--source-types` help(라인 1534)로 **선재 E501**(git stash 대조로 변경 전에도 동일 1건 존재). 무시.
+
+### CLI 확인
+`python scripts/build_synthetic_gold_set.py --help` → `--max-doc-tokens`(기본 24000), `--n-chunks`(문서 수), `--max-chars`(기본 200000) 노출 확인.
+
+### collateral
+`tests/test_processor/test_chunker.py` + `tests/test_eval/` → 336 passed, 5 failed(동일 선재). import 결합(synth→chunker) 부작용 없음.
 
 ---
 
-## 5. 설계와 어긋난 부분 / 주의
+## 4. 설계-구현 불일치 / 비고
 
-### 5.1 선재 실패 5건 (내 변경과 무관 — 손대지 않음)
-대상 브랜치(PR#64 병합) HEAD 에서 이미 실패하던 테스트. `git stash` 로 내 변경을
-제거한 상태에서도 동일하게 실패함을 확인했다. 설계 원칙(기존 테스트 보존)상 이들은
-본 PR 범위 밖이라 수정하지 않았다:
-
-- `test_fetch_source_text_anchor_match`, `test_fetch_source_text_legacy_chunk_id_fallback`
-  — `_fetch_source_text` 가 `tuple[str, str]` 를 반환하도록 바뀌었는데 테스트는 옛
-  `str` 반환을 가정. (테스트가 stale)
-- `test_make_graph_gold_item_falls_back_to_node_description` — `_make_graph_gold_item`
-  이 노드 description 폴백을 제거(감사 H6: T4 trivial 1.0 방지)했는데 테스트는 옛
-  폴백 동작을 가정. (테스트가 stale)
-- `test_filter_question_passes_clean`, `test_filter_question_fails_generic` — `filter_question`
-  의 게이트 호출 순서/StubLLM 응답 큐 mismatch. (테스트가 stale)
-
-→ 별도 정리 권장(out of scope). 본 작업 산출물에는 영향 없음.
-
-### 5.2 설계 §3.2 와의 미세 차이 (의도된 보강)
-`_reduce_equivalence` 는 설계 의사코드를 그대로 따랐다. 추가로 `test_no_groups_fallback_flat`
-에서 빈 그룹 입력 시 동작(빈 relevant set)을 고정해, 빈 그룹은 `evaluate_one` 의 분기
-(`if item.relevant_doc_groups:`)에서 호출되지 않음을 명시했다 — 설계의 "R3 비활성 폴백"
-보장을 테스트로 못박은 것.
-
-### 5.3 cross-doc distractor 풀 (설계 §5.4 보강)
-`_run_cross_doc_mode` 의 일반성 게이트 distractor 는 다른 씨앗들의 snippet 에서 자기
-자신을 제외하고 최대 5개를 사용(graph 모드의 `skip_generic_gate < 5` 정책과 동일).
-설계가 distractor 출처를 명시하지 않아 graph 모드 패턴을 복제했다.
+1. **`count_tokens` 폴백 동작**: tiktoken 부재 폴백은 02_design 의 "1char=1token" 서술과 일치(`_FALLBACK_CHARS_PER_TOKEN=1`). `truncate_to_tokens` while 루프가 폴백/실측 모두에서 한도 이하로 수렴함을 `test_truncate_to_tokens_over_limit` 로 검증.
+2. **함수 리네임 미적용(설계 §1.7 — 선택)**: `_process_chunk_item`/`_run_chunk_mode` 이름 유지(테스트 import 호환). docstring 으로 "문서 1건 처리"임을 명시. 내부 로그만 `[doc …]` 로 변경.
+3. **build()-레벨 distractor 풀 제외 테스트**: 풀 분리(`document_id` 기준 제외)는 build() 인라인 코드라 LLM 전체 mock 없이 단위 호출 불가. `_distractor_excerpt`(prefix 절단) 단위 테스트로 D6-5 의 검증 가능한 핵심을 커버. 풀 분리 키 변경 자체는 코드로 확인(§2.1, chunk_id→document_id).
+4. **`--max-doc-tokens` 기본값 24000(D6-3, 위험 §9.1)**: 사내 generator endpoint context window 미상. 운영 endpoint 가 작으면(예 8k) truncate 빈발 → metadata.stats.truncated_too_large 로 사후 확인 후 CLI 조정 권장.
+5. **`_workspace/00,01,02.md` 작업 트리 변경**: 본 implementer 가 수정하지 않음(읽기 전용). git diff 에 나타나는 변경은 본 작업 외 출처.
 
 ---
 
-## 6. 새 스키마 / CLI 사용 예시
-
-### 6.1 YAML 스키마 (R3 동치 집합 + R2 cross-doc)
-
-```yaml
-version: 1
-items:
-  # graph 다중-doc → 단일 OR 그룹 (3 또는 5 중 하나면 정답)
-  - id: q0007
-    query: "인증 게이트웨이는 어느 팀이 운영하나요?"
-    relevant_doc_ids: [3, 5]          # 평탄(하위호환/CSV)
-    relevant_doc_groups: [[3, 5]]     # OR 그룹 1개
-    relevant_graph_entities:
-      - {name: "인증 서비스", type: "system"}
-    synthesized: true
-  # cross-document → AND 다중그룹 (3 과 7 둘 다 봐야 답)
-  - id: q0012
-    query: "결제 서비스가 의존하는 인증 모듈은 어느 팀이 관리하나요?"
-    relevant_doc_ids: [3, 7]
-    relevant_doc_groups: [[3], [7]]   # (3) AND (7)
-    cross_document: true              # R2 식별 플래그
-    relevant_graph_entities:
-      - {name: "결제 서비스", type: "system"}
-      - {name: "인증 서비스", type: "system"}
-    notes: "cross_document"
-    synthesized: true
-```
-
-옛 골드셋(두 신규 키 없음)은 `relevant_doc_groups=[]` / `cross_document=False` 로
-로드되어 기존 평탄 채점과 bit-identical 동작.
-
-### 6.2 CLI
+## 5. 새 CLI 사용 예시
 
 ```bash
-# cross-document 케이스 포함 골드셋 생성 (R2)
+# 문서 기반 골드셋 (통째 입력, 24000 토큰 초과 시 앞부분 truncate)
 python scripts/build_synthetic_gold_set.py \
-    --enable-cross-doc --source-types confluence_mcp,git_code \
-    --cross-doc-max-seeds 50 \
+    --source-types confluence_mcp,git_code \
+    --n-chunks 50 \
+    --max-chars 200000 \
+    --max-doc-tokens 24000 \
     --output eval/gold_set.yaml
 
-# graph 다중-doc OR 그룹은 --include-graph-questions 만으로 자동 생성 (R3)
+# endpoint context window 가 작을 때 한도 하향
+python scripts/build_synthetic_gold_set.py \
+    --n-chunks 30 --max-doc-tokens 8000 \
+    --output eval/gold_set.yaml
+
+# graph 모드 — 소유 문서 원문 보강 자동 적용 (max-doc-tokens 공유)
 python scripts/build_synthetic_gold_set.py \
     --include-graph-questions --n-graph-nodes 20 \
+    --max-doc-tokens 16000 \
     --output eval/gold_set.yaml
+
+# 토큰 가드 비활성 (무제한 — 입력 한도 확실할 때만)
+python scripts/build_synthetic_gold_set.py --max-doc-tokens 0
 ```
-
-평가(`eval_search.py`)는 골드셋에 `relevant_doc_groups`/`cross_document` 가 있으면
-자동으로 동치-aware 채점 + `metrics_by_mode["cross_doc"]` 분리 집계를 수행한다
-(추가 CLI 플래그 불필요).
-
-### 6.3 채점 의미 (metrics.py 무변경, 전처리 축약으로 달성)
-
-| 케이스 | groups | retrieved | recall | 비고 |
-|---|---|---|---|---|
-| OR 동치 | `[[3,5]]` | `[5]` | 1.0 | 그룹 1단위, 하나면 hit |
-| OR precision cap | `[[3,5]]` | `[3,5]` top2 | precision=0.5 | 중복 정답 1로 캡 |
-| cross-doc AND | `[[3],[7]]` | `[3]` | 0.5 | 2단위 중 1개 |
-| cross-doc AND | `[[3],[7]]` | `[3,7]` | 1.0 | 둘 다 |

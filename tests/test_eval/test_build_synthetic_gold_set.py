@@ -39,83 +39,140 @@ async def meta_store(tmp_path: Path) -> MetadataStore:
 
 
 # ---------------------------------------------------------------------------
-# load_candidate_chunks — 정렬 키 (D-7)
+# load_candidate_documents (R1 — chunks 테이블 비의존 문서 로더)
 # ---------------------------------------------------------------------------
 
 
-async def test_load_candidate_chunks_sorted_by_chunk_index(
+async def test_load_candidate_documents_uses_original_content(
     meta_store: MetadataStore,
 ) -> None:
-    """후보 청크 정렬 키가 (document_id, chunk_index) 인지 확인."""
+    """original_content 기반 후보 로드 — chunks 테이블 미조회로도 동작."""
     doc_id = await meta_store.create_document(
         source_type="confluence",
         title="문서A",
-        original_content="원본 본문",
+        original_content="문서 원문 본문. " * 30,
         content_hash="h1",
+        url="https://wiki/A",
     )
-    # 청크를 역순으로 삽입 — 정렬이 동작하는지 검증
-    await meta_store.create_chunk(
-        chunk_id="uuid-2",
-        document_id=doc_id,
-        chunk_index=2,
-        content="두 번째 청크 내용. " * 30,
-        token_count=10,
-        section_path="A/B",
-    )
-    await meta_store.create_chunk(
-        chunk_id="uuid-1",
-        document_id=doc_id,
-        chunk_index=1,
-        content="첫 번째 청크 내용. " * 30,
-        token_count=10,
-        section_path="A",
-    )
-
-    out = await builder.load_candidate_chunks(
-        meta_store,
-        source_types=["confluence"],
-        min_chars=100,
-        max_chars=10000,
-    )
-    assert len(out) == 2
-    # chunk_index 가 더 작은 것이 먼저
-    assert out[0]["chunk_index"] == 1
-    assert out[1]["chunk_index"] == 2
-
-
-async def test_load_candidate_chunks_filters_source_types(
-    meta_store: MetadataStore,
-) -> None:
-    """source_type 화이트리스트로 필터링."""
-    conf_doc = await meta_store.create_document(
-        source_type="confluence",
-        title="conf",
-        original_content="x",
-        content_hash="h1",
-    )
-    git_doc = await meta_store.create_document(
-        source_type="git_code",
-        title="git",
-        original_content="x",
-        content_hash="h2",
-    )
-    await meta_store.create_chunk(
-        chunk_id="c1", document_id=conf_doc, chunk_index=0,
-        content="conf 본문 " * 50, token_count=10,
-    )
-    await meta_store.create_chunk(
-        chunk_id="g1", document_id=git_doc, chunk_index=0,
-        content="git 본문 " * 50, token_count=10,
-    )
-
-    out = await builder.load_candidate_chunks(
+    # 청크를 만들지 않아도 문서 후보가 로드되어야 한다 (chunks 비의존).
+    out = await builder.load_candidate_documents(
         meta_store,
         source_types=["confluence"],
         min_chars=100,
         max_chars=10000,
     )
     assert len(out) == 1
+    item = out[0]
+    assert item["document_id"] == doc_id
+    assert item["source_type"] == "confluence"
+    assert item["content"].startswith("문서 원문 본문.")
+    assert item["title"] == "문서A"
+    assert item["url"] == "https://wiki/A"
+    # chunk 전용 키는 더 이상 존재하지 않는다.
+    assert "chunk_id" not in item
+    assert "chunk_index" not in item
+    assert "section_path" not in item
+
+
+async def test_load_candidate_documents_char_filter(
+    meta_store: MetadataStore,
+) -> None:
+    """min/max_chars 가 문서 original_content 길이 기준으로 동작."""
+    short_doc = await meta_store.create_document(
+        source_type="confluence", title="짧음",
+        original_content="짧다", content_hash="hs",
+    )
+    ok_doc = await meta_store.create_document(
+        source_type="confluence", title="적당",
+        original_content="가" * 500, content_hash="hk",
+    )
+    big_doc = await meta_store.create_document(
+        source_type="confluence", title="큼",
+        original_content="나" * 5000, content_hash="hb",
+    )
+    out = await builder.load_candidate_documents(
+        meta_store, source_types=["confluence"],
+        min_chars=100, max_chars=2000,
+    )
+    ids = {o["document_id"] for o in out}
+    assert ok_doc in ids
+    assert short_doc not in ids  # min_chars 미만
+    assert big_doc not in ids    # max_chars 초과
+
+
+async def test_load_candidate_documents_skips_empty_content(
+    meta_store: MetadataStore,
+) -> None:
+    """original_content 가 NULL/빈/공백뿐인 문서는 제외."""
+    empty_doc = await meta_store.create_document(
+        source_type="confluence", title="빈본문",
+        original_content="   \n  ", content_hash="he",
+    )
+    ok_doc = await meta_store.create_document(
+        source_type="confluence", title="정상",
+        original_content="정상 본문. " * 30, content_hash="ho",
+    )
+    out = await builder.load_candidate_documents(
+        meta_store, source_types=None, min_chars=10, max_chars=10000,
+    )
+    ids = {o["document_id"] for o in out}
+    assert ok_doc in ids
+    assert empty_doc not in ids
+
+
+async def test_load_candidate_documents_filters_source_types(
+    meta_store: MetadataStore,
+) -> None:
+    """source_type 화이트리스트로 필터링."""
+    conf_doc = await meta_store.create_document(
+        source_type="confluence", title="conf",
+        original_content="conf 본문 " * 50, content_hash="h1",
+    )
+    await meta_store.create_document(
+        source_type="git_code", title="git",
+        original_content="git 본문 " * 50, content_hash="h2",
+    )
+    out = await builder.load_candidate_documents(
+        meta_store, source_types=["confluence"],
+        min_chars=100, max_chars=10000,
+    )
+    assert len(out) == 1
+    assert out[0]["document_id"] == conf_doc
     assert out[0]["source_type"] == "confluence"
+
+
+async def test_load_candidate_documents_sorted_by_document_id(
+    meta_store: MetadataStore,
+) -> None:
+    """후보가 document_id 오름차순으로 정렬됨 (결정론)."""
+    d1 = await meta_store.create_document(
+        source_type="confluence", title="1",
+        original_content="첫 문서 " * 40, content_hash="h1",
+    )
+    d2 = await meta_store.create_document(
+        source_type="confluence", title="2",
+        original_content="둘째 문서 " * 40, content_hash="h2",
+    )
+    out = await builder.load_candidate_documents(
+        meta_store, source_types=["confluence"],
+        min_chars=10, max_chars=10000,
+    )
+    assert [o["document_id"] for o in out] == sorted([d1, d2])
+
+
+# ---------------------------------------------------------------------------
+# _distractor_excerpt (R1/R2 — distractor 본문 prefix 절단)
+# ---------------------------------------------------------------------------
+
+
+def test_distractor_excerpt_truncates_to_constant() -> None:
+    """긴 distractor 본문은 DISTRACTOR_EXCERPT_CHARS 로 잘린다."""
+    long_text = "가" * 5000
+    out = builder._distractor_excerpt(long_text)
+    assert len(out) == builder.DISTRACTOR_EXCERPT_CHARS
+    # 짧은 본문은 그대로
+    short = "짧은 본문"
+    assert builder._distractor_excerpt(short) == short
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +232,45 @@ async def test_load_candidate_subgraphs_basic(meta_store: MetadataStore) -> None
     # edges 리스트도 정상
     assert any(
         e["relation_type"] == "owned_by" for e in auth["edges"]
+    )
+    # R3 — sg dict 에 소유 문서 원문 키가 있다 (추가 DB 호출 없이 doc_by_id 재활용).
+    assert "primary_document_content" in auth
+
+
+async def test_load_candidate_subgraphs_includes_primary_document_content(
+    meta_store: MetadataStore,
+) -> None:
+    """R3 — primary 소유 문서의 original_content 가 sg dict 에 적재된다."""
+    doc_id = await meta_store.create_document(
+        source_type="confluence",
+        title="아키텍처 문서",
+        original_content="인증 서비스는 사내 인증 게이트웨이 원문 전체 본문.",
+        content_hash="h-arch-doc",
+    )
+    graph_store = GraphStore(meta_store)
+    await graph_store.load_from_db()
+    await graph_store.save_graph_data(
+        doc_id,
+        GraphData(
+            entities=[
+                Entity(name="인증 서비스", entity_type="system"),
+                Entity(name="플랫폼 팀", entity_type="team"),
+            ],
+            relations=[
+                Relation(
+                    source="인증 서비스",
+                    target="플랫폼 팀",
+                    relation_type="owned_by",
+                ),
+            ],
+        ),
+    )
+    out = await builder.load_candidate_subgraphs(
+        meta_store, graph_store, source_types=["confluence"], min_neighbors=1,
+    )
+    auth = next(sg for sg in out if sg["entity_name"] == "인증 서비스")
+    assert auth["primary_document_content"] == (
+        "인증 서비스는 사내 인증 게이트웨이 원문 전체 본문."
     )
 
 

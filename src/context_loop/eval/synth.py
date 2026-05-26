@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.processor.chunker import count_tokens
 from context_loop.processor.llm_client import LLMClient, extract_json
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,9 @@ GRAPH_GENERATE_PROMPT_TEMPLATE = """\
 주변 관계:
 {edges_text}
 
+소유 문서 발췌(참고용 — 질문 표현 다양화/정확도 향상):
+{document_excerpt}
+
 이 엔티티 또는 관계에서 답을 찾을 수 있는, 사람이 자연스럽게 물어볼 만한
 한국어 질문을 {n}개 생성해라.
 
@@ -284,6 +288,24 @@ def make_text_anchor(content: str, *, max_chars: int = ANCHOR_MAX_CHARS) -> str:
     if len(normalized) <= max_chars:
         return normalized
     return normalized[:max_chars]
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> tuple[str, bool]:
+    """text 가 max_tokens 초과면 앞부분으로 truncate. (잘린 텍스트, truncated?) 반환.
+
+    max_tokens<=0 이면 가드 비활성 — 원본 그대로 반환.
+    tiktoken 부재 시 count_tokens 는 1char=1token 폴백이므로 보수적으로 동작.
+    """
+    if max_tokens <= 0:
+        return text, False
+    if count_tokens(text) <= max_tokens:
+        return text, False
+    # 토큰→문자 환산이 비결정적이므로 비례 1차 절단 후 초과분만 추가 축소(결정론).
+    approx_chars = max_tokens * 3  # cl100k 한국어/코드 혼합 보수적 환산
+    cut = text[:approx_chars]
+    while count_tokens(cut) > max_tokens and len(cut) > 100:
+        cut = cut[: int(len(cut) * 0.9)]
+    return cut, True
 
 
 def build_subgraph_snippet(
@@ -537,7 +559,7 @@ def build_korean_stopwords_from_corpus(
     `extra_stopwords` 로 누설 검사에서 제외해 false positive 감소.
 
     Args:
-        corpus: 청크 본문 리스트 (build_synthetic_gold_set 의 load_candidate_chunks
+        corpus: 문서 본문 리스트 (build_synthetic_gold_set 의 load_candidate_documents
             결과의 content 들).
         min_corpus_freq: 이 빈도 이상 등장한 stem 을 stopword 후보로. 작으면
             stopword 가 많아져 false negative 위험.
@@ -756,6 +778,7 @@ async def generate_graph_questions(
     max_tokens: int = 1024,
     temperature: float = 0.0,
     seed: int | None = None,
+    doc_max_tokens: int = 0,
 ) -> list[GeneratedGraphQuestion]:
     """그래프 subgraph 에서 질문 N개 생성.
 
@@ -763,21 +786,31 @@ async def generate_graph_questions(
     ``evidence_description`` / ``entity_aliases`` / ``relation`` 까지 함께
     파싱된다. 1차 호환 — LLM 이 ``q`` 만 반환해도 다른 필드는 기본값.
 
+    R3 보강: subgraph 에 ``primary_document_content`` (소유 문서 원문) 가 있으면
+    프롬프트의 ``소유 문서 발췌`` 슬롯에 함께 넣어 질문 표현을 다양화/정확화한다.
+    judge 게이트 입력에는 합치지 않는다(생성 입력에만 영향).
+
     Args:
         subgraph: ``load_candidate_subgraphs`` 산출물 dict. ``entity_name`` /
             ``entity_type`` / ``entity_description`` / ``edges`` 키를 사용.
+            ``primary_document_content`` 가 있으면 보강 원문으로 사용.
         n: 생성할 질문 수.
         generator: Generator LLM.
         reasoning_mode: 추론 프로파일 (chunk 모드와 동일).
         max_tokens: 응답 최대 토큰.
         temperature: 샘플링 온도 (기본 0.0, 재현성 우선).
         seed: 결정성용 seed (endpoint 지원 시 전달).
+        doc_max_tokens: 보강 원문의 토큰 한도 (R2 일관). 초과 시 앞부분 truncate.
+            0=무제한.
     """
+    doc_excerpt = subgraph.get("primary_document_content", "") or "(문서 원문 없음)"
+    doc_excerpt, _ = truncate_to_tokens(doc_excerpt, doc_max_tokens)
     prompt = GRAPH_GENERATE_PROMPT_TEMPLATE.format(
         entity_name=subgraph.get("entity_name", ""),
         entity_type=subgraph.get("entity_type", ""),
         entity_description=subgraph.get("entity_description", "") or "(설명 없음)",
         edges_text=format_edges_for_prompt(subgraph.get("edges") or []),
+        document_excerpt=doc_excerpt,
         n=n,
     )
     call_kwargs: dict[str, Any] = {

@@ -124,13 +124,11 @@ async def test_process_chunk_item_returns_items_with_empty_ids() -> None:
     generator = DeterministicStubLLM(jitter_seed=1)
     judge = DeterministicStubLLM(jitter_seed=2)
     chunk = {
-        "chunk_id": "uuid-1",
-        "chunk_index": 0,
         "document_id": 10,
         "source_type": "confluence",
         "content": "결제 서비스는 결제 처리를 담당하는 사내 시스템이다." * 5,
-        "section_path": "A/B",
         "title": "결제",
+        "url": "https://wiki/pay",
     }
 
     sem = asyncio.Semaphore(1)
@@ -152,6 +150,8 @@ async def test_process_chunk_item_returns_items_with_empty_ids() -> None:
         assert it.id == ""  # placeholder — main 에서 후처리 부여
         assert it.relevant_doc_ids == [10]
         assert it.source_type == "confluence"
+        # 문서 모드 — source_section_path 에 문서 title (D6-2)
+        assert it.source_section_path == "결제"
     # local stats — generated + passed 카운트
     assert local_stats.get("generated") == 2
     assert local_stats.get("passed") == 2
@@ -166,9 +166,9 @@ async def test_process_chunk_item_handles_empty_generation() -> None:
             return ""
 
     chunk = {
-        "chunk_id": "u", "chunk_index": 0, "document_id": 1,
+        "document_id": 1,
         "source_type": "x", "content": "본문" * 200,
-        "section_path": "", "title": "",
+        "title": "", "url": "",
     }
     items, stats = await builder._process_chunk_item(
         1, chunk,
@@ -184,6 +184,85 @@ async def test_process_chunk_item_handles_empty_generation() -> None:
     )
     assert items == []
     assert stats.get("fail_parse") == 1
+
+
+@pytest.mark.asyncio
+async def test_process_chunk_item_truncates_large_document() -> None:
+    """R2 — 한도 초과 문서는 generator 입력이 truncate 되고 stats 에 기록.
+
+    anchor 는 truncate 전 원문(도입부) 기준이므로 추적성이 유지된다.
+    """
+    class CapturingGen:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def complete(self, prompt: str, **kwargs: Any) -> str:
+            self.calls.append(prompt)
+            return json.dumps(
+                [{"q": "질문", "difficulty": "easy"}], ensure_ascii=False,
+            )
+
+    big = "선두 본문. " + ("토큰 채우기 " * 5000)
+    chunk = {
+        "document_id": 7, "source_type": "confluence",
+        "content": big, "title": "큰 문서", "url": "",
+    }
+    generator = CapturingGen()
+    items, stats = await builder._process_chunk_item(
+        1, chunk,
+        distractor_pool=[],
+        generator=generator,  # type: ignore[arg-type]
+        judge=generator,  # type: ignore[arg-type]
+        questions_per_chunk=1,
+        n_distractors=0,
+        reasoning_mode="off",
+        apply_filter=False,
+        sem=asyncio.Semaphore(1),
+        total=1,
+        max_doc_tokens=100,
+    )
+    assert stats.get("truncated_too_large") == 1
+    # generator 프롬프트에 전체 원문이 그대로 들어가지 않았다.
+    gen_prompt = generator.calls[0]
+    assert big not in gen_prompt
+    # anchor 는 원문 도입부 기준 (truncate 무관) — 출처 추적성 유지.
+    assert items[0].source_text_anchor.startswith("선두 본문.")
+
+
+@pytest.mark.asyncio
+async def test_process_chunk_item_no_truncate_when_disabled() -> None:
+    """max_doc_tokens=0 이면 truncate 안 함 — stats 미기록, 전체 원문 입력."""
+    class CapturingGen:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def complete(self, prompt: str, **kwargs: Any) -> str:
+            self.calls.append(prompt)
+            return json.dumps(
+                [{"q": "질문", "difficulty": "easy"}], ensure_ascii=False,
+            )
+
+    content = "결제 서비스 본문 내용. " * 30
+    chunk = {
+        "document_id": 8, "source_type": "confluence",
+        "content": content, "title": "문서", "url": "",
+    }
+    generator = CapturingGen()
+    items, stats = await builder._process_chunk_item(
+        1, chunk,
+        distractor_pool=[],
+        generator=generator,  # type: ignore[arg-type]
+        judge=generator,  # type: ignore[arg-type]
+        questions_per_chunk=1,
+        n_distractors=0,
+        reasoning_mode="off",
+        apply_filter=False,
+        sem=asyncio.Semaphore(1),
+        total=1,
+        max_doc_tokens=0,
+    )
+    assert "truncated_too_large" not in stats
+    assert content in generator.calls[0]
 
 
 @pytest.mark.asyncio
@@ -237,11 +316,10 @@ async def test_run_chunk_mode_ids_assigned_in_idx_order() -> None:
     judge = DeterministicStubLLM(jitter_seed=20)
     sampled = [
         {
-            "chunk_id": f"c{i}", "chunk_index": i, "document_id": 100 + i,
+            "document_id": 100 + i,
             "source_type": "confluence",
             "content": f"청크 {i} 의 내용 본문 " * 30,
-            "section_path": f"sec/{i}",
-            "title": f"문서 {i}",
+            "title": f"문서 {i}", "url": "",
         }
         for i in range(5)
     ]
@@ -286,11 +364,10 @@ async def test_run_chunk_mode_deterministic_across_concurrency() -> None:
     """같은 입력 + 다른 concurrency 면 동일한 items / stats / id 가 나와야 한다 (R2)."""
     sampled = [
         {
-            "chunk_id": f"c{i}", "chunk_index": i, "document_id": 100 + i,
+            "document_id": 100 + i,
             "source_type": "confluence",
             "content": f"청크 {i} — 결제 시스템 설명 " * 20,
-            "section_path": f"sec/{i}",
-            "title": f"문서 {i}",
+            "title": f"문서 {i}", "url": "",
         }
         for i in range(8)
     ]
@@ -356,11 +433,10 @@ async def test_run_chunk_mode_isolates_exceptions() -> None:
     """한 청크가 raise 해도 다른 청크 결과는 수집되고, stats['fail_runtime'] 증가."""
     sampled = [
         {
-            "chunk_id": f"c{i}", "chunk_index": i, "document_id": 200 + i,
+            "document_id": 200 + i,
             "source_type": "confluence",
             "content": f"청크 {i} 의 본문 — 항목 {i} 식별자 BAD-{i if i != 2 else 'XPLODE'} " * 20,
-            "section_path": f"sec/{i}",
-            "title": f"문서 {i}",
+            "title": f"문서 {i}", "url": "",
         }
         for i in range(4)
     ]
@@ -407,11 +483,10 @@ async def test_run_chunk_mode_respects_concurrency_cap() -> None:
     """generator 의 동시 in-flight 가 cap (concurrency) 이하인지."""
     sampled = [
         {
-            "chunk_id": f"c{i}", "chunk_index": i, "document_id": 300 + i,
+            "document_id": 300 + i,
             "source_type": "confluence",
             "content": f"청크 {i} 본문 — 결제 시스템 동작 원리 설명 " * 20,
-            "section_path": "",
-            "title": f"t{i}",
+            "title": f"t{i}", "url": "",
         }
         for i in range(12)
     ]
