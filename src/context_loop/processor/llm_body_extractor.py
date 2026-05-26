@@ -31,12 +31,26 @@ from context_loop.processor.graph_vocabulary import (
     llm_body_entity_types_vocab,
     llm_body_relation_type_names,
     llm_body_relation_types_vocab,
+    normalize_entity_type,
+    normalize_name_stem,
+    normalize_relation_type,
 )
 from context_loop.processor.llm_client import LLMClient, extract_json
 
 
 class InputTooLargeError(Exception):
     """문서 본문이 LLM 입력 한도를 초과해 unit 기반 폴백이 필요할 때 raise."""
+
+
+class OutputTruncatedError(Exception):
+    """문서 단위 LLM 호출의 JSON 파싱이 실패했을 때(출력 잘림 추정 포함) raise.
+
+    호출자는 :class:`InputTooLargeError` 와 동일하게 unit 기반 폴백으로 라우팅
+    해야 한다. JSON 파싱 실패의 원인은 출력 토큰 한도 도달(잘림), 모델의 형식
+    위반 등 여러 경로가 있지만, 어느 쪽이든 unit 분할로 입력·출력 규모를
+    줄이면 회복 가능성이 높다.
+    """
+
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +96,16 @@ class LLMBodyExtractionConfig:
     max_tokens: int = 32768
     temperature: float = 0.0
     # 문서 단위 1회 호출(``extract_llm_body_graph_for_document``)의 입력 가드.
-    # 256K 컨텍스트 사내 모델 기준, 시스템 프롬프트(~500) + 응답 예산(32768) +
-    # 안전 마진을 빼고 200K 를 입력 한도로 둔다. 한도 초과 시 호출자는
-    # ``InputTooLargeError`` 를 받아 unit 기반 호출로 폴백한다.
-    max_input_tokens: int = 200_000
+    # 32K 컨텍스트 운영 모델(qwen2.5:7b 등) 기준, 시스템 프롬프트(~500) + 응답
+    # 예산(``max_tokens``) + 안전 마진을 고려해 16K 를 디폴트 입력 한도로 둔다.
+    # 256K 컨텍스트 모델 환경에서는 호출자가 cfg 로 override 한다. 한도 초과
+    # 시 호출자는 ``InputTooLargeError`` 를 받아 unit 기반 호출로 폴백한다.
+    max_input_tokens: int = 16_000
+    # 문서 단위 호출이 JSON 파싱에 실패하면(출력 잘림 추정 포함) ``True`` 인 경우
+    # ``OutputTruncatedError`` 를 raise 하여 호출자(``pipeline``)가 unit 기반
+    # 폴백으로 라우팅하도록 한다. ``False`` 이면 기존 동작(빈 그래프 + units_failed=1)
+    # 을 유지한다.
+    fallback_on_output_truncation: bool = True
 
 
 @dataclass
@@ -193,13 +213,20 @@ async def extract_llm_body_graph(
 
     results = await asyncio.gather(*[run(u) for u in targets])
 
-    # 엔티티: (name_lower, type) → Entity
+    # 엔티티: (name_stem, type) → Entity. stem 은 ``normalize_name_stem`` 으로
+    # 공백/하이픈/언더스코어/대소문자 변형을 통합한 키 — F-CG2-06.
     entities: dict[tuple[str, str], Entity] = {}
-    # 관계: (source_lower, target_lower, type) → Relation (link_graph_builder 패턴)
+    # 관계: (source_stem, target_stem, type) → Relation (link_graph_builder 패턴)
     relations: dict[tuple[str, str, str], Relation] = {}
 
     allowed_etypes = set(cfg.allowed_entity_types)
     allowed_rtypes = set(cfg.allowed_relation_types)
+
+    # F-CG-04: 끝점 검증 set 을 *문서 누적* 으로 끌어올린다. 한 문서의 unit A 에서
+    # 등장한 entity 가 unit B 의 관계 끝점으로 쓰여도 보존되도록 — 매 unit 마다
+    # 초기화하면 cross-unit 관계가 통째로 드롭된다. 함수 호출이 1 문서당 1회
+    # 이므로 문서 간 누출은 발생하지 않는다.
+    document_valid_entity_names: set[str] = set()
 
     for unit, payload in results:
         if payload is None:
@@ -212,26 +239,28 @@ async def extract_llm_body_graph(
         stats.raw_entities += len(raw_entities)
         stats.raw_relations += len(raw_relations)
 
-        # 엔티티 검증/등록 — 어휘 통과한 이름만 같은 unit 관계의 끝점으로 인정
-        unit_valid_entity_names: set[str] = set()
+        # 엔티티 검증/등록 — 어휘 통과한 이름은 문서 누적 set 에 추가하여 이후
+        # unit 의 관계 끝점 검증에서도 통과 가능하게 한다.
         for ent in raw_entities:
             if not isinstance(ent, dict):
                 stats.dropped_entities += 1
                 continue
             name = str(ent.get("name", "")).strip()
-            etype = str(ent.get("type", "")).strip()
+            etype_raw = str(ent.get("type", "")).strip()
+            etype = normalize_entity_type(etype_raw)  # F-CG2-08
             if not name or etype not in allowed_etypes:
                 stats.dropped_entities += 1
                 continue
             description = str(ent.get("description", "")).strip()
-            key = (name.lower(), etype)
+            name_stem = normalize_name_stem(name)  # F-CG2-06
+            key = (name_stem, etype)
             if key not in entities:
                 entities[key] = Entity(
                     name=name, entity_type=etype, description=description,
                 )
-            unit_valid_entity_names.add(name.lower())
+            document_valid_entity_names.add(name_stem)
 
-        # 관계 검증/등록 (끝점이 같은 unit 에서 어휘를 통과한 entities 에 있어야 함)
+        # 관계 검증/등록 (끝점이 *문서 내* 어휘를 통과한 entities 에 있으면 OK)
         section_label = " > ".join(unit.section_path)
 
         for rel in raw_relations:
@@ -240,21 +269,24 @@ async def extract_llm_body_graph(
                 continue
             src = str(rel.get("source", "")).strip()
             tgt = str(rel.get("target", "")).strip()
-            rtype = str(rel.get("type", "")).strip()
+            rtype_raw = str(rel.get("type", "")).strip()
+            rtype = normalize_relation_type(rtype_raw)  # F-CG2-08
+            src_stem = normalize_name_stem(src)  # F-CG2-06
+            tgt_stem = normalize_name_stem(tgt)
             if (
                 not src or not tgt or rtype not in allowed_rtypes
-                or src.lower() not in unit_valid_entity_names
-                or tgt.lower() not in unit_valid_entity_names
-                or src.lower() == tgt.lower()
+                or src_stem not in document_valid_entity_names
+                or tgt_stem not in document_valid_entity_names
+                or src_stem == tgt_stem
             ):
                 stats.dropped_relations += 1
                 continue
 
-            rel_key = (src.lower(), tgt.lower(), rtype)
+            rel_key = (src_stem, tgt_stem, rtype)
             if rel_key not in relations:
-                # 정규 표기: 등록된 entity 의 표기를 사용 (대소문자 일관성)
-                src_canon = _canonical_name(entities, src, src.lower())
-                tgt_canon = _canonical_name(entities, tgt, tgt.lower())
+                # 정규 표기: 등록된 entity 의 표기를 사용 (첫 등장 표기 보존)
+                src_canon = _canonical_name(entities, src, src_stem)
+                tgt_canon = _canonical_name(entities, tgt, tgt_stem)
                 relations[rel_key] = Relation(
                     source=src_canon,
                     target=tgt_canon,
@@ -342,10 +374,17 @@ async def extract_llm_body_graph_for_document(
             raise ValueError(
                 f"LLM 응답이 JSON object 가 아님: {type(payload).__name__}",
             )
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "문서 단위 LLM 본문 추출 실패 — doc_title=%s", doc_title, exc_info=True,
         )
+        if cfg.fallback_on_output_truncation:
+            # F-CG2-04: JSON 파싱 실패를 unit 폴백 트리거로 승격. 호출자
+            # (``pipeline``) 가 ``InputTooLargeError`` 와 동일하게 잡아 unit
+            # 기반 호출로 라우팅한다.
+            raise OutputTruncatedError(
+                f"문서 단위 LLM 응답 JSON 파싱 실패 — doc_title={doc_title}",
+            ) from exc
         stats.units_failed = 1
         return GraphData(), stats
 
@@ -367,17 +406,19 @@ async def extract_llm_body_graph_for_document(
             stats.dropped_entities += 1
             continue
         name = str(ent.get("name", "")).strip()
-        etype = str(ent.get("type", "")).strip()
+        etype_raw = str(ent.get("type", "")).strip()
+        etype = normalize_entity_type(etype_raw)  # F-CG2-08
         if not name or etype not in allowed_etypes:
             stats.dropped_entities += 1
             continue
         description = str(ent.get("description", "")).strip()
-        key = (name.lower(), etype)
+        name_stem = normalize_name_stem(name)  # F-CG2-06
+        key = (name_stem, etype)
         if key not in entities:
             entities[key] = Entity(
                 name=name, entity_type=etype, description=description,
             )
-        valid_names.add(name.lower())
+        valid_names.add(name_stem)
 
     relations: dict[tuple[str, str, str], Relation] = {}
     for rel in raw_relations:
@@ -386,19 +427,22 @@ async def extract_llm_body_graph_for_document(
             continue
         src = str(rel.get("source", "")).strip()
         tgt = str(rel.get("target", "")).strip()
-        rtype = str(rel.get("type", "")).strip()
+        rtype_raw = str(rel.get("type", "")).strip()
+        rtype = normalize_relation_type(rtype_raw)  # F-CG2-08
+        src_stem = normalize_name_stem(src)  # F-CG2-06
+        tgt_stem = normalize_name_stem(tgt)
         if (
             not src or not tgt or rtype not in allowed_rtypes
-            or src.lower() not in valid_names
-            or tgt.lower() not in valid_names
-            or src.lower() == tgt.lower()
+            or src_stem not in valid_names
+            or tgt_stem not in valid_names
+            or src_stem == tgt_stem
         ):
             stats.dropped_relations += 1
             continue
-        rel_key = (src.lower(), tgt.lower(), rtype)
+        rel_key = (src_stem, tgt_stem, rtype)
         if rel_key not in relations:
-            src_canon = _canonical_name(entities, src, src.lower())
-            tgt_canon = _canonical_name(entities, tgt, tgt.lower())
+            src_canon = _canonical_name(entities, src, src_stem)
+            tgt_canon = _canonical_name(entities, tgt, tgt_stem)
             # 문서 단위 호출에서는 단일 섹션 경로를 특정할 수 없다 — 빈 label.
             # 결정론 ``body_extractor`` 가 unit 단위로 ``section_path`` 라벨을
             # 별도로 보강하므로 그래프 카드의 위치 시그널은 그쪽에서 유지된다.
@@ -522,10 +566,15 @@ def _format_vocab_with_descriptions(
 def _canonical_name(
     entities: dict[tuple[str, str], Entity],
     raw_name: str,
-    raw_lower: str,
+    raw_stem: str,
 ) -> str:
-    """등록된 entity 중 같은 이름이 있으면 그 표기를 우선 반환."""
-    for (name_lower, _etype), ent in entities.items():
-        if name_lower == raw_lower:
+    """등록된 entity 중 같은 stem 키가 있으면 그 표기를 우선 반환.
+
+    ``entities`` dict 의 key 첫 요소는 :func:`normalize_name_stem` 으로 정규화된
+    stem 이므로(F-CG2-06), lookup 도 같은 stem 으로 매칭한다. 첫 등장 표기가
+    보존된다.
+    """
+    for (name_stem, _etype), ent in entities.items():
+        if name_stem == raw_stem:
             return ent.name
     return raw_name

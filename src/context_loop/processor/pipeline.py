@@ -42,6 +42,7 @@ from context_loop.processor.extraction_unit import build_extraction_units
 from context_loop.processor.link_graph_builder import build_link_graph
 from context_loop.processor.llm_body_extractor import (
     InputTooLargeError,
+    OutputTruncatedError,
     extract_llm_body_graph,
     extract_llm_body_graph_for_document,
 )
@@ -468,12 +469,17 @@ async def process_document(
                                 llm_stats.raw_entities,
                                 llm_stats.raw_relations,
                             )
-                        except InputTooLargeError:
+                        except (InputTooLargeError, OutputTruncatedError) as exc:
+                            # F-CG2-02/04: 입력 한도 초과뿐 아니라 출력 잘림
+                            # (JSON 파싱 실패) 도 unit 기반 폴백으로 라우팅.
+                            # 두 예외 모두 unit 분할로 입력·출력 규모를 줄이면
+                            # 회복 가능성이 높다.
                             logger.info(
-                                "문서 본문이 LLM 입력 한도 초과 — unit 기반 "
-                                "폴백 (doc_id=%d, units=%d)",
+                                "문서 단위 LLM 추출 폴백 — doc_id=%d, units=%d, "
+                                "reason=%s",
                                 document_id,
                                 len(units),
+                                type(exc).__name__,
                             )
                             llm_graph, llm_stats = await extract_llm_body_graph(
                                 units, doc_title=title, llm_client=llm_client,

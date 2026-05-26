@@ -12,6 +12,7 @@ from context_loop.processor.extraction_unit import ExtractionUnit
 from context_loop.processor.llm_body_extractor import (
     InputTooLargeError,
     LLMBodyExtractionConfig,
+    OutputTruncatedError,
     extract_llm_body_graph,
     extract_llm_body_graph_for_document,
 )
@@ -234,6 +235,61 @@ async def test_disallowed_relation_type_dropped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relation_type_alias_normalized() -> None:
+    """F-CG2-08: ``depending_on`` / ``implement`` 등 LLM 표기 변형이 canonical
+    로 정규화되어 vocab 검증을 통과한다. alias 표에 없는 변형(``blesses``) 은
+    여전히 drop 유지.
+    """
+    payload = {
+        "entities": [
+            {"name": "A", "type": "system"},
+            {"name": "B", "type": "system"},
+            {"name": "C", "type": "system"},
+        ],
+        "relations": [
+            {"source": "A", "target": "B", "type": "depending_on"},  # → depends_on
+            {"source": "B", "target": "C", "type": "implement"},      # → implements
+            {"source": "A", "target": "C", "type": "blesses"},        # alias 없음 → drop
+        ],
+    }
+    llm = _llm_returning(payload)
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=llm,
+    )
+    rtypes = {r.relation_type for r in g.relations}
+    assert rtypes == {"depends_on", "implements"}, (
+        "alias 매핑이 canonical 로 변환되어야 함"
+    )
+    assert stats.dropped_relations == 1, "blesses 만 drop"
+
+
+@pytest.mark.asyncio
+async def test_entity_type_alias_normalized_via_relation() -> None:
+    """F-CG2-08 entity 측: ``components`` / ``policies`` 같은 복수형이 canonical
+    (``module`` / ``policy``) 로 정규화되어 vocab 검증을 통과하고, 정규화된 타입
+    으로 노드가 emit 된다.
+    """
+    payload = {
+        "entities": [
+            {"name": "Cache Pool", "type": "components"},  # → module
+            {"name": "Token Validator", "type": "module"},
+        ],
+        "relations": [
+            {"source": "Cache Pool", "target": "Token Validator", "type": "uses"},
+        ],
+    }
+    llm = _llm_returning(payload)
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=llm,
+    )
+    etypes = {(e.name, e.entity_type) for e in g.entities}
+    assert ("Cache Pool", "module") in etypes, (
+        "components → module alias 정규화로 vocab 통과 + 정규화된 타입 보존"
+    )
+    assert stats.dropped_entities == 0
+
+
+@pytest.mark.asyncio
 async def test_relation_endpoint_not_in_entities_dropped() -> None:
     """LLM 이 entities 에 없는 이름을 source/target 으로 만들면 그 관계는 드롭."""
     payload = {
@@ -296,6 +352,84 @@ async def test_cross_unit_entity_dedup_keeps_first_casing() -> None:
     # 관계 정규화: source 가 첫 표기로 통일
     rels_by_type = {r.relation_type: r for r in g.relations}
     assert rels_by_type["uses"].source == "Auth Service"
+
+
+@pytest.mark.asyncio
+async def test_cross_unit_relation_endpoint_preserved() -> None:
+    """F-CG-04: unit A 에서 등장한 entity 가 unit B 관계의 끝점이어도 보존.
+
+    이전 동작에서는 끝점 검증이 매 unit 마다 초기화되어 cross-unit 관계가 통째로
+    드롭됐다. 문서 누적 set 으로 끌어올린 뒤로는 unit A 에서 emit 된 entity 만
+    있어도 unit B 의 관계가 살아남는다. dangling endpoint (entity 어디에도 없는
+    이름) 는 여전히 drop 됨도 함께 검증.
+    """
+    a_payload = {
+        "entities": [
+            {"name": "Auth Service", "type": "system"},
+            {"name": "Cache", "type": "module"},
+        ],
+        "relations": [],
+    }
+    b_payload = {
+        "entities": [],
+        "relations": [
+            # cross-unit relation: 끝점은 모두 unit A 에서 등장한 이름.
+            {"source": "Auth Service", "target": "Cache", "type": "uses"},
+            # dangling endpoint: Ghost 는 어디에도 없음 → drop 유지.
+            {"source": "Auth Service", "target": "Ghost", "type": "uses"},
+        ],
+    }
+    llm = _llm_with_responses([a_payload, b_payload])
+    units = [
+        _unit(section_path=("A",), ordinal=0),
+        _unit(section_path=("B",), ordinal=1),
+    ]
+    g, stats = await extract_llm_body_graph(units, doc_title="d", llm_client=llm)
+
+    rels = [
+        r for r in g.relations
+        if r.source == "Auth Service" and r.target == "Cache"
+        and r.relation_type == "uses"
+    ]
+    assert len(rels) == 1, "cross-unit 관계가 보존되어야 함 (F-CG-04)"
+    # dangling endpoint 1건은 여전히 drop
+    assert stats.dropped_relations == 1
+
+
+@pytest.mark.asyncio
+async def test_name_stem_dedup_across_casings_and_punctuation() -> None:
+    """F-CG2-06: ``AuthService`` / ``Auth Service`` / ``auth-service`` 가 단일
+    노드로 수렴하고, 같은 stem 의 관계도 dedup 된다.
+
+    공백·하이픈·언더스코어·대소문자 변형만 통합. 형태론적 변형(복수형 등)은
+    의도적으로 분리 유지된다(``test_normalize_name_stem_does_not_collapse_plural_forms``).
+    """
+    payload = {
+        "entities": [
+            {"name": "AuthService", "type": "system"},
+            {"name": "Auth Service", "type": "system"},     # 공백 변형
+            {"name": "auth-service", "type": "system"},     # 하이픈 + 소문자
+            {"name": "Cache", "type": "module"},
+        ],
+        "relations": [
+            {"source": "AuthService", "target": "Cache", "type": "uses"},
+            # 같은 stem 의 source 표기 변형 — rel_key 도 stem 화되어 dedup 1건.
+            {"source": "auth-service", "target": "Cache", "type": "uses"},
+        ],
+    }
+    llm = _llm_returning(payload)
+    g, _stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=llm,
+    )
+
+    auths = [e for e in g.entities if e.entity_type == "system"]
+    assert len(auths) == 1, "표기 변형이 단일 노드로 수렴해야 함"
+    assert auths[0].name == "AuthService"  # 첫 등장 표기 보존
+
+    uses_rels = [r for r in g.relations if r.relation_type == "uses"]
+    assert len(uses_rels) == 1, "stem 기반 dedup 으로 관계도 1건"
+    assert uses_rels[0].source == "AuthService"
+    assert uses_rels[0].target == "Cache"
 
 
 @pytest.mark.asyncio
@@ -609,16 +743,63 @@ async def test_for_document_drops_unknown_vocabulary_and_dangling_endpoints() ->
 
 @pytest.mark.asyncio
 async def test_for_document_failed_llm_returns_empty_with_failed_stat() -> None:
-    """LLM 응답 JSON 파싱 실패 시 빈 GraphData + units_failed=1."""
+    """LLM 응답 JSON 파싱 실패 + ``fallback_on_output_truncation=False`` 면
+    기존 동작(빈 GraphData + units_failed=1) 유지.
+
+    F-CG2-04: 디폴트(``True``) 에서는 ``OutputTruncatedError`` raise 로 동작이
+    바뀌므로, 옵트아웃 동작을 명시적으로 검증한다. raise 케이스는
+    ``test_for_document_output_truncation_raises_for_fallback`` 가 커버.
+    """
     mock = AsyncMock()
     mock.complete = AsyncMock(return_value="이건 JSON 이 아닙니다")
+    cfg = LLMBodyExtractionConfig(fallback_on_output_truncation=False)
     g, stats = await extract_llm_body_graph_for_document(
-        doc_title="d", body="본문", llm_client=mock,
+        doc_title="d", body="본문", llm_client=mock, config=cfg,
     )
 
     assert g.entities == [] and g.relations == []
     assert stats.units_failed == 1
     assert stats.units_called == 0
+
+
+@pytest.mark.asyncio
+async def test_for_document_output_truncation_raises_for_fallback() -> None:
+    """F-CG2-04: 디폴트 cfg(``fallback_on_output_truncation=True``) 에서 JSON 파싱
+    실패는 ``OutputTruncatedError`` raise — 호출자(pipeline) 가 unit 폴백으로
+    라우팅한다.
+    """
+    mock = AsyncMock()
+    mock.complete = AsyncMock(return_value="잘린-JSON-같은-텍스트")
+    with pytest.raises(OutputTruncatedError):
+        await extract_llm_body_graph_for_document(
+            doc_title="d", body="본문", llm_client=mock,
+        )
+
+
+@pytest.mark.asyncio
+async def test_for_document_output_truncation_opt_out_returns_empty() -> None:
+    """F-CG2-04: ``fallback_on_output_truncation=False`` 옵트아웃 명시 시 raise
+    하지 않고 빈 그래프를 반환한다.
+    """
+    mock = AsyncMock()
+    mock.complete = AsyncMock(return_value="잘린-JSON-같은-텍스트")
+    cfg = LLMBodyExtractionConfig(fallback_on_output_truncation=False)
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=mock, config=cfg,
+    )
+    assert g.entities == [] and g.relations == []
+    assert stats.units_failed == 1
+
+
+def test_max_input_tokens_default_is_16k() -> None:
+    """F-CG2-02: 디폴트 ``max_input_tokens`` 가 32K 모델 환경 기준 16_000.
+
+    이전 디폴트 ``200_000`` 은 256K 컨텍스트 모델 가정값으로, 사내 운영
+    환경(qwen2.5:7b @ 32K) 과 어긋났다.
+    """
+    cfg = LLMBodyExtractionConfig()
+    assert cfg.max_input_tokens == 16_000
+    assert cfg.fallback_on_output_truncation is True
 
 
 @pytest.mark.asyncio
