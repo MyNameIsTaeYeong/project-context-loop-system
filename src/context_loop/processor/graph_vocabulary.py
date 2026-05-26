@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -196,3 +197,73 @@ def format_vocab_entries_for_prompt(entries: tuple[VocabEntry, ...]) -> str:
     보도록 한다 — mental model 정합.
     """
     return "\n".join(f"- **{e.name}**: {e.description}" for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# Alias 정규화 (F-CG2-08) + 이름 stem 정규화 (F-CG2-06)
+# ---------------------------------------------------------------------------
+# LLM 출력의 형태론적 변형(``depending_on`` 등)이나 표기 변형
+# (``AuthService``/``Auth Service``/``auth-service``)을 canonical 어휘 또는
+# 단일 stem 키로 통합하여, vocab strict 검증과 dedup 키가 의도된 노드/엣지를
+# 잃지 않도록 한다. 보수적 화이트리스트만 등록 — 의미 위험(방향 반전, 도메인
+# 모호성)이 있는 매핑은 의도적으로 제외한다.
+
+ENTITY_TYPE_ALIASES: dict[str, str] = {
+    # 복수형/단수형/직접 동의어 — 의미 위험 낮은 매핑만 등록.
+    # ``service``, ``user``, ``group`` 등은 도메인 충돌 위험이 있어 제외.
+    "policies": "policy",
+    "rules": "policy",
+    "component": "module",
+    "components": "module",
+}
+
+RELATION_TYPE_ALIASES: dict[str, str] = {
+    # 동명사/현재형/형용사 변형 (F-CG2-08 보고서 인용)
+    "depending_on": "depends_on",
+    "depend_on": "depends_on",
+    "dependent_on": "depends_on",
+    # 방향 동일한 동의어/시제 변형
+    "owns": "owned_by",
+    "owner": "owned_by",
+    "implement": "implements",
+    "implementing": "implements",
+    "documents_in": "documented_in",
+    "described_in": "documented_in",
+    # 방향 반전(``has_part`` ↔ ``part_of``, ``supersedes`` ↔ ``replaces``)은
+    # 단순 type 매핑으로 처리하면 source/target 의미가 뒤집히므로 제외.
+}
+
+
+def normalize_entity_type(raw: str) -> str:
+    """LLM 출력 entity_type 을 canonical 어휘로 정규화.
+
+    ``raw.strip().lower()`` 후 :data:`ENTITY_TYPE_ALIASES` 매핑을 적용한다.
+    매핑이 없으면 ``raw.strip()`` 를 그대로 반환한다 — 호출자가 이후 vocab
+    화이트리스트와 비교한다.
+    """
+    key = raw.strip().lower()
+    return ENTITY_TYPE_ALIASES.get(key, raw.strip())
+
+
+def normalize_relation_type(raw: str) -> str:
+    """LLM 출력 relation_type 을 canonical 어휘로 정규화. 동일 정책."""
+    key = raw.strip().lower()
+    return RELATION_TYPE_ALIASES.get(key, raw.strip())
+
+
+# 표기 변형(공백 / 하이픈 / 언더스코어) 만 정규화하는 패턴.
+# 형태론적 변형(복수형/동사형) 은 의도적으로 제외 — 의미 경계가 모호한 통합을
+# 피하기 위한 보수적 정책.
+_NAME_STEM_PUNCT_RE = re.compile(r"[\s\-_]+")
+
+
+def normalize_name_stem(name: str) -> str:
+    """표기 변형(공백/하이픈/언더스코어/대소문자)을 통합한 stem 키 생성.
+
+    예) ``AuthService`` / ``Auth Service`` / ``auth-service`` / ``auth_service``
+    → ``"authservice"``.
+
+    *형태론적 변형* (예: ``User Service`` vs ``Users``) 은 *통합하지 않는다*.
+    의미 경계가 모호한 통합을 피하기 위한 보수적 정책.
+    """
+    return _NAME_STEM_PUNCT_RE.sub("", name).lower()

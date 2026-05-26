@@ -154,3 +154,62 @@ def test_format_vocab_entries_for_prompt_includes_descriptions() -> None:
     for entry in vocab:
         assert f"**{entry.name}**" in text
         assert entry.description in text
+
+
+# ---------------------------------------------------------------------------
+# Alias 정규화 (F-CG2-08) + 이름 stem 정규화 (F-CG2-06)
+# ---------------------------------------------------------------------------
+
+
+def test_relation_type_alias_table_is_unique_mapping() -> None:
+    """relation_type alias 표가 canonical 자기 참조를 갖지 않고, 모든 canonical
+    이 실제 vocab 에 존재한다."""
+    from context_loop.processor.graph_vocabulary import RELATION_TYPE_ALIASES
+
+    # canonical 자기 참조 금지 (자기로 매핑되는 alias 는 무의미)
+    for alias, canonical in RELATION_TYPE_ALIASES.items():
+        assert alias != canonical, (
+            f"alias '{alias}' 가 자기 자신으로 매핑됨 — 무의미한 매핑"
+        )
+
+    # 모든 canonical 은 실제 vocab 에 존재
+    canonicals = set(RELATION_TYPE_ALIASES.values())
+    valid = all_relation_type_names()
+    missing = canonicals - valid
+    assert not missing, f"alias 표의 canonical 이 vocab 에 없음: {missing}"
+
+
+def test_entity_type_alias_table_is_unique_mapping() -> None:
+    """entity_type alias 표가 canonical 자기 참조를 갖지 않고, 모든 canonical
+    이 실제 vocab 에 존재한다."""
+    from context_loop.processor.graph_vocabulary import ENTITY_TYPE_ALIASES
+
+    for alias, canonical in ENTITY_TYPE_ALIASES.items():
+        assert alias != canonical, (
+            f"alias '{alias}' 가 자기 자신으로 매핑됨 — 무의미한 매핑"
+        )
+
+    canonicals = set(ENTITY_TYPE_ALIASES.values())
+    valid = all_entity_type_names()
+    missing = canonicals - valid
+    assert not missing, f"alias 표의 canonical 이 vocab 에 없음: {missing}"
+
+
+def test_normalize_name_stem_does_not_collapse_plural_forms() -> None:
+    """형태론적 변형(복수형/동사형)은 stem 정규화에서 의도적으로 제외.
+
+    공백/하이픈/언더스코어/대소문자만 통합하고, ``User Service`` vs ``Users`` 같은
+    단·복수형 차이는 그대로 보존한다.
+    """
+    from context_loop.processor.graph_vocabulary import normalize_name_stem
+
+    # 공백/하이픈/언더스코어/대소문자는 통합
+    assert normalize_name_stem("AuthService") == "authservice"
+    assert normalize_name_stem("Auth Service") == "authservice"
+    assert normalize_name_stem("auth-service") == "authservice"
+    assert normalize_name_stem("auth_service") == "authservice"
+    assert normalize_name_stem("AUTH SERVICE") == "authservice"
+
+    # 형태론적 변형(복수형)은 통합되지 않아야 함
+    assert normalize_name_stem("User Service") != normalize_name_stem("Users")
+    assert normalize_name_stem("Policy") != normalize_name_stem("Policies")
