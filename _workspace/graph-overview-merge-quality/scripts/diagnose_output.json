@@ -1,0 +1,79 @@
+{
+  "schema_status": {
+    "has_link_table": false,
+    "note": "graph_node_documents 테이블 부재 — 레거시 스키마 (앱이 한 번도 신스키마로 초기화되지 않음). node_doc_links 는 graph_nodes.document_id 를 사용함."
+  },
+  "stats": {
+    "total_documents": 4,
+    "documents_with_graph_nodes": 1,
+    "total_nodes": 21,
+    "total_edges": 16,
+    "avg_nodes_per_doc_with_graph": 21.0,
+    "entity_type_distribution": {
+      "service": 6,
+      "team": 6,
+      "component": 5,
+      "system": 4
+    },
+    "relation_type_distribution": {
+      "uses": 7,
+      "depends_on": 6,
+      "publishes_to": 2,
+      "consumes_from": 1
+    },
+    "leading_or_trailing_whitespace_nodes": [
+      {
+        "id": 12,
+        "name": " 결제 DB (PostgreSQL)",
+        "type": "component"
+      }
+    ]
+  },
+  "duplication_surface": {
+    "group_count": 0,
+    "affected_nodes": 0,
+    "ratio": 0.0,
+    "groups": []
+  },
+  "duplication_surface_same_type": {
+    "group_count": 0,
+    "affected_nodes": 0,
+    "ratio": 0.0,
+    "groups": []
+  },
+  "type_conflicts": {
+    "exact_lower_match_with_diff_type": {
+      "group_count": 0,
+      "groups": []
+    },
+    "surface_match_with_diff_type": {
+      "group_count": 0,
+      "groups": []
+    }
+  },
+  "fuzzy_candidates": {
+    "count": 0,
+    "threshold": 0.85,
+    "method": "SequenceMatcher ratio after surface normalization",
+    "pairs": []
+  },
+  "fqn_handling": {
+    "fqn_nodes_total": 0,
+    "short_name_collisions": {
+      "group_count": 0,
+      "groups": []
+    },
+    "scoped_name_collisions": {
+      "group_count": 0
+    }
+  },
+  "merge_realization": {
+    "cross_document_nodes": 0,
+    "cross_document_ratio": 0.0,
+    "note": "신스키마(graph_node_documents) 부재 시 모든 노드는 단일 문서에 종속 — 크로스-문서 병합 실현 여부를 측정 불가."
+  },
+  "integrity": {
+    "orphan_edge_count": 0,
+    "orphan_edges": []
+  }
+}

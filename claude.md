@@ -749,3 +749,16 @@ python3 -m uvicorn "context_loop.web.app:create_app" --factory --host 127.0.0.1 
 | 날짜 | 변경 내용 | 대상 | 사유 |
 |------|----------|------|------|
 | 2026-05-20 | 초기 구성 (3 진단가 + designer + implementer + verifier 6-에이전트, graph-search-diagnosis 오케스트레이터) | 전체 | graph_hit/precision/recall < 10%, MRR/NDCG=0.065 보고 — 인덱싱/평가와 분리하여 검색 funnel 진단 자산화 |
+
+---
+
+## 하네스: 그래프 가시화·엔티티 통합 품질
+
+**목표:** 웹 대시보드에 전역 그래프 페이지(`/graph`)를 구축하여 모든 노드 관계 · 엔티티별 출처 문서 · 의미론적 통합 품질 메트릭을 한 화면에서 노출한다. 자동 병합은 영역 밖 — 진단 + 가시화 + 메트릭 도구화에 집중. `graph-search-diagnosis`는 검색측 funnel, `indexing-improvement`는 추출 로직 자체 — 본 하네스는 **운영자가 보는 그래프 페이지 + 통합 품질 측정**에 초점.
+
+**트리거:** "전역 그래프 탭", "/graph 페이지", "엔티티 통합 품질", "의미론적 머지/병합 진단", "그래프 엔터티가 어느 문서에서 추출됐는지", "merge quality", "duplicate entity detection", "그래프 가시화", "전역 그래프 보기", 후속 요청("재실행", "merge-quality만 다시", "노드 상세 보강", "보완") 시 `graph-overview-merge-quality` 스킬을 사용하라.
+
+**변경 이력:**
+| 날짜 | 변경 내용 | 대상 | 사유 |
+|------|----------|------|------|
+| 2026-05-26 | 초기 구성 (graph-merge-analyst + graph-overview-api-builder + graph-overview-ui-builder + graph-overview-qa 4-에이전트, graph-overview-merge-quality 오케스트레이터) | 전체 | 사용자 요청 — 전역 그래프 탭, 엔터티별 출처 문서 표시, 의미론적 통합 진단을 통합 자산화 |

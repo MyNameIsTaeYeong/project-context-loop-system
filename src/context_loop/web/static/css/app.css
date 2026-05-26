@@ -153,3 +153,201 @@ pre code {
 
 /* 숨겨진 마크다운 원본 컨테이너 — JS 가 .textContent 로만 읽음. */
 .md-source { display: none !important; }
+
+/* ============================================================
+   Graph Overview Page (/graph)
+   ============================================================ */
+
+/* KPI 그리드 */
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.75rem;
+}
+.kpi-card {
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--pico-muted-border-color, #ddd);
+    background: var(--pico-card-background-color, #fff);
+    margin: 0;
+}
+.kpi-card .stat-number {
+    font-size: 1.6rem;
+    margin: 0.25rem 0;
+}
+.kpi-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.85rem;
+    color: var(--pico-muted-color, #666);
+}
+.kpi-help {
+    display: inline-block;
+    width: 1.1rem;
+    height: 1.1rem;
+    line-height: 1.1rem;
+    text-align: center;
+    border-radius: 50%;
+    background: var(--pico-muted-border-color, #ddd);
+    color: var(--pico-color, #333);
+    font-size: 0.7rem;
+    cursor: help;
+}
+.kpi-card.kpi-good      { border-color: #28a745; background: #d4edda; }
+.kpi-card.kpi-good .stat-number { color: #155724; }
+.kpi-card.kpi-warn      { border-color: #ffc107; background: #fff3cd; }
+.kpi-card.kpi-warn .stat-number { color: #856404; }
+.kpi-card.kpi-bad       { border-color: #dc3545; background: #f8d7da; }
+.kpi-card.kpi-bad .stat-number  { color: #721c24; }
+.kpi-card.kpi-info      { border-color: #17a2b8; background: #d1ecf1; }
+.kpi-card.kpi-muted-card,
+.kpi-muted              { color: #999; }
+.kpi-error {
+    border: 1px solid #dc3545;
+    background: #f8d7da;
+    color: #721c24;
+    padding: 0.75rem 1rem;
+}
+
+/* 중복 그룹 그리드 */
+.dup-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+}
+.dup-card {
+    padding: 0.75rem;
+    border-radius: 0.4rem;
+    border: 1px solid var(--pico-muted-border-color, #ddd);
+    background: var(--pico-card-background-color, #fff);
+    margin: 0;
+    cursor: pointer;
+    transition: box-shadow 0.15s ease;
+}
+.dup-card:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+.dup-card header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+.dup-card header code {
+    font-size: 0.85rem;
+    word-break: break-all;
+}
+.dup-members {
+    margin: 0;
+    padding-left: 1.2rem;
+    font-size: 0.85rem;
+}
+.dup-members li {
+    margin: 0.15rem 0;
+}
+.dup-card footer {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+}
+.dup-card footer button {
+    padding: 0.15rem 0.6rem;
+    font-size: 0.75rem;
+    margin: 0;
+}
+.badge-dup-kind { background: #fff3cd; color: #856404; }
+
+/* 클러스터 카드 그리드 */
+.cluster-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.75rem;
+}
+.cluster-card {
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--pico-muted-border-color, #ddd);
+    background: var(--pico-card-background-color, #fff);
+    margin: 0;
+    cursor: pointer;
+    transition: box-shadow 0.15s ease, transform 0.1s ease;
+}
+.cluster-card:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    transform: translateY(-1px);
+}
+.cluster-card.cluster-card-active {
+    border-color: var(--pico-primary, #1095c1);
+    box-shadow: 0 0 0 2px rgba(16, 149, 193, 0.25);
+}
+.cluster-card .stat-number {
+    font-size: 1.8rem;
+    text-align: left;
+    margin: 0.1rem 0;
+}
+.cluster-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.95rem;
+}
+.cluster-dot {
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 50%;
+}
+.cluster-top {
+    margin: 0.5rem 0 0;
+    padding-left: 1.1rem;
+    font-size: 0.8rem;
+}
+.cluster-top li { margin: 0.1rem 0; }
+
+/* 클러스터 펼침 레이아웃: 그래프 + 사이드 패널 */
+.cluster-layout {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 1rem;
+}
+@media (max-width: 900px) {
+    .cluster-layout {
+        grid-template-columns: 1fr;
+    }
+}
+.cluster-graph-wrap {
+    min-width: 0;
+}
+.node-detail-panel {
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--pico-muted-border-color, #ddd);
+    background: var(--pico-card-background-color, #fff);
+    max-height: 640px;
+    overflow-y: auto;
+}
+.node-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+}
+.node-docs,
+.node-neighbors {
+    margin: 0;
+    padding-left: 1.2rem;
+    font-size: 0.9rem;
+}
+.node-docs li,
+.node-neighbors li {
+    margin: 0.2rem 0;
+}
+.neighbor-arrow {
+    display: inline-block;
+    width: 1rem;
+    color: var(--pico-muted-color, #666);
+    font-weight: bold;
+}
