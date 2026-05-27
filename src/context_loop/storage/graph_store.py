@@ -17,6 +17,7 @@ from typing import Any
 import networkx as nx
 
 from context_loop.processor.graph_extractor import GraphData
+from context_loop.processor.graph_vocabulary import normalize_name_stem
 from context_loop.storage.metadata_store import MetadataStore
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ class GraphStore:
                 node["id"],
                 entity_name=node["entity_name"],
                 entity_type=node.get("entity_type", "other"),
+                name_stem=node.get("name_stem"),
                 document_ids=doc_ids,
                 properties=json.loads(node["properties"] or "{}"),
             )
@@ -159,8 +161,13 @@ class GraphStore:
 
         for entity in graph_data.entities:
             props = {"description": entity.description} if entity.description else {}
+            # 표기 변형(공백/하이픈/언더스코어/대소문자) 흡수한 stem 키 — 한 번
+            # 계산해서 ``find_graph_node_by_entity`` 내부 재계산과 ``create_*``
+            # 호출 양쪽에 일관되게 흘려보낸다.
+            entity_stem = normalize_name_stem(entity.name)
 
-            # 기존 정규 노드 검색
+            # 기존 정규 노드 검색 — find 측 SQL 이 내부에서 동일 stem 을 다시
+            # 계산하므로 호출 시그니처는 그대로 (raw entity_name).
             existing = await self._store.find_graph_node_by_entity(
                 entity.name, entity.entity_type,
             )
@@ -187,6 +194,7 @@ class GraphStore:
                         node_id,
                         entity_name=entity.name,
                         entity_type=entity.entity_type,
+                        name_stem=entity_stem,
                         document_ids={document_id},
                         properties=existing_props,
                     )
@@ -199,6 +207,7 @@ class GraphStore:
                 node_id = await self._store.create_graph_node_with_link(
                     document_id=document_id,
                     entity_name=entity.name,
+                    name_stem=entity_stem,
                     entity_type=entity.entity_type,
                     properties=json.dumps(props, ensure_ascii=False),
                 )
@@ -207,6 +216,7 @@ class GraphStore:
                     node_id,
                     entity_name=entity.name,
                     entity_type=entity.entity_type,
+                    name_stem=entity_stem,
                     document_ids={document_id},
                     properties=props,
                 )

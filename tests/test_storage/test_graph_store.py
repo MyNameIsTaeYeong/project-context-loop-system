@@ -1029,6 +1029,72 @@ async def test_cross_doc_load_from_db_preserves_document_ids(
 
 
 @pytest.mark.asyncio
+async def test_save_graph_data_dedups_across_documents_by_stem(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """R5: 문서 A 에 ``AuthService``, 문서 B 에 ``Auth Service`` 를 저장하면
+    단일 정규 노드로 통합되고, ``document_ids`` 에 양쪽 문서가 모두 들어간다.
+
+    R4 의 추출 측 stem 정규화가 한 문서 내 변형을 흡수하지만, 표기만 다른
+    동일 엔티티가 *다른 문서* 에서 들어오면 저장 측 ``find_graph_node_by_entity``
+    가 stem 매칭으로 통합해야 한다 — multi-doc pivot 노드 양 ↑.
+    """
+    d1 = await _create_doc_with_title(meta_store, "Doc A")
+    d2 = await _create_doc_with_title(meta_store, "Doc B")
+
+    await graph_store.save_graph_data(d1, GraphData(
+        entities=[Entity(name="AuthService", entity_type="system")],
+        relations=[],
+    ))
+    await graph_store.save_graph_data(d2, GraphData(
+        entities=[Entity(name="Auth Service", entity_type="system")],
+        relations=[],
+    ))
+
+    # 단일 노드로 dedup 됐는지 — system 타입 노드는 1 개여야 함.
+    all_nodes = await meta_store.get_all_graph_nodes()
+    system_nodes = [n for n in all_nodes if n["entity_type"] == "system"]
+    assert len(system_nodes) == 1, (
+        "공백 변형이 저장 측 stem 매칭으로 통합되지 않았다 — "
+        f"{[n['entity_name'] for n in system_nodes]}"
+    )
+
+    # 두 문서가 같은 노드에 link 되어 있다.
+    node_id = system_nodes[0]["id"]
+    doc_ids = await meta_store.get_node_document_ids(node_id)
+    assert set(doc_ids) == {d1, d2}
+
+    # NetworkX 측 document_ids 도 동일하게 두 문서 포함.
+    nx_node = graph_store.graph.nodes[node_id]
+    assert nx_node["document_ids"] == {d1, d2}
+
+
+@pytest.mark.asyncio
+async def test_load_from_db_exposes_name_stem_attribute(
+    meta_store: MetadataStore,
+) -> None:
+    """R5: ``load_from_db`` 가 NetworkX 노드에 ``name_stem`` 속성을 노출한다 —
+    백필 이후 / 정상 신규 노드 모두 동일 경로로 처리.
+    """
+    store1 = GraphStore(meta_store)
+    doc_id = await _create_doc_with_title(meta_store, "Doc A")
+    await store1.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="Auth Service", entity_type="system")],
+        relations=[],
+    ))
+
+    store2 = GraphStore(meta_store)
+    await store2.load_from_db()
+
+    nodes = list(store2.graph.nodes(data=True))
+    assert len(nodes) == 1
+    _, data = nodes[0]
+    assert data.get("name_stem") == "authservice", (
+        f"name_stem 속성이 NetworkX 노드에 노출되지 않음: {data!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cross_doc_embedding_no_duplicates(
     graph_store: GraphStore, meta_store: MetadataStore,
 ) -> None:

@@ -13,6 +13,8 @@ from typing import Any
 
 import aiosqlite
 
+from context_loop.processor.graph_vocabulary import normalize_name_stem
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
     entity_name TEXT NOT NULL,
     entity_type TEXT,
+    name_stem TEXT,
     properties TEXT
 );
 
@@ -179,6 +182,48 @@ class MetadataStore:
             await self.db.execute(
                 "ALTER TABLE chunks ADD COLUMN section_index INTEGER",
             )
+
+        # graph_nodes — R5: name_stem 컬럼 + 백필.
+        # 표기 변형(공백/하이픈/언더스코어/대소문자)을 흡수한 stem 키로 dedup
+        # 매칭하기 위한 컬럼이다. 기존 데이터는 NULL 인 행만 골라 한 번
+        # 백필한다 — 데이터 *통합* 은 하지 않지만, 신규 노드가 옵션 1 SQL
+        # (``WHERE name_stem = ?``) 으로 들어와도 기존 노드와 매칭되도록
+        # stem *키* 만 채운다.
+        cursor = await self.db.execute("PRAGMA table_info(graph_nodes)")
+        node_columns = {row["name"] for row in await cursor.fetchall()}
+        if "name_stem" not in node_columns:
+            # SQLite 의 ALTER TABLE ADD COLUMN 은 기본값 없는 TEXT 컬럼을
+            # 허용 (모든 기존 행에 NULL 채움).
+            await self.db.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN name_stem TEXT"
+            )
+
+        # NULL 백필 — name_stem 이 비어 있는 행만 채운다 (멱등). 두 번째
+        # initialize() 호출에서는 SELECT 가 빈 결과를 반환해 비용 0.
+        cursor = await self.db.execute(
+            "SELECT id, entity_name FROM graph_nodes WHERE name_stem IS NULL"
+        )
+        rows = await cursor.fetchall()
+        if rows:
+            updates = [
+                (normalize_name_stem(row["entity_name"]), row["id"])
+                for row in rows
+            ]
+            await self.db.executemany(
+                "UPDATE graph_nodes SET name_stem = ? WHERE id = ?",
+                updates,
+            )
+
+        # 복합 INDEX 는 ALTER 직후·백필 직후에 명시적으로 만든다. ``_SCHEMA_SQL``
+        # 의 ``executescript`` 단계는 ALTER 보다 *먼저* 실행되므로, R5 이전
+        # 스키마 (``name_stem`` 컬럼 없음) 의 DB 에서 INDEX 정의가 executescript
+        # 안에 있으면 "no such column: name_stem" 으로 실패한다. 마이그레이션
+        # 분기 안으로 옮겨 ALTER 뒤에서만 평가되도록 한다 — ``IF NOT EXISTS`` 로
+        # 멱등성 유지.
+        await self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_nodes_stem_type "
+            "ON graph_nodes(name_stem, entity_type)"
+        )
 
     async def close(self) -> None:
         """DB 연결을 닫는다."""
@@ -391,6 +436,7 @@ class MetadataStore:
         *,
         document_id: int,
         entity_name: str,
+        name_stem: str,
         entity_type: str | None = None,
         properties: str | None = None,
     ) -> int:
@@ -403,13 +449,24 @@ class MetadataStore:
         일으키는 race window 가 있었다 (재인덱싱 산발 실패의 근본 원인).
         본 메서드는 두 INSERT 를 단일 commit 으로 묶어 race window 를 제거한다.
 
+        Args:
+            document_id: 노드가 속할 문서 ID.
+            entity_name: 원본 표기를 보존한 엔티티 이름.
+            name_stem: ``normalize_name_stem(entity_name)`` 결과. 표기 변형
+                (공백/하이픈/언더스코어/대소문자) 을 흡수한 dedup 키. 필수
+                키워드 — 호출자가 잊으면 ``TypeError`` 로 빠른 실패하여
+                silent dedup 손실을 차단한다.
+            entity_type: 엔티티 타입(어휘 화이트리스트 기반).
+            properties: 직렬화된 JSON 속성.
+
         Returns:
             새로 생성된 ``graph_nodes.id``.
         """
         cursor = await self.db.execute(
             "INSERT INTO graph_nodes "
-            "(document_id, entity_name, entity_type, properties) VALUES (?, ?, ?, ?)",
-            (document_id, entity_name, entity_type, properties),
+            "(document_id, entity_name, entity_type, name_stem, properties) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (document_id, entity_name, entity_type, name_stem, properties),
         )
         node_id = cursor.lastrowid
         assert node_id is not None
@@ -449,12 +506,26 @@ class MetadataStore:
         entity_name: str,
         entity_type: str,
     ) -> dict[str, Any] | None:
-        """엔티티 이름+타입으로 기존 정규 노드를 검색한다 (대소문자 무시)."""
+        """엔티티 이름+타입으로 기존 정규 노드를 stem 매칭으로 검색한다.
+
+        ``name_stem`` (``normalize_name_stem(entity_name)``) 과 ``entity_type``
+        의 정확 매칭. R4 에서 추출 측이 한 문서 내 표기 변형을 흡수했지만,
+        문서 간 동일 엔티티가 표기만 다르게 들어오는 경우 (``AuthService`` vs
+        ``Auth Service``) 저장 측에서 한 번 더 통합한다. ``(name_stem,
+        entity_type)`` 복합 INDEX 가 WHERE 절을 그대로 커버한다.
+
+        동등 stem 의 다중 노드가 존재할 때 ``ORDER BY id ASC`` 로 결정성 부여
+        — 마이그레이션 백필 이전 데이터의 분리 노드들이 동일 stem 으로 채워질
+        경우, 항상 *최초 생성된* 노드를 winner 로 선택해 멱등성·재현성을
+        보장한다.
+        """
+        stem = normalize_name_stem(entity_name)
         cursor = await self.db.execute(
             """SELECT * FROM graph_nodes
-               WHERE LOWER(entity_name) = LOWER(?) AND entity_type = ?
+               WHERE name_stem = ? AND entity_type = ?
+               ORDER BY id ASC
                LIMIT 1""",
-            (entity_name, entity_type),
+            (stem, entity_type),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None

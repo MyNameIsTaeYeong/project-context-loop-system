@@ -339,7 +339,7 @@ async def test_create_graph_node_with_link_atomic(store: MetadataStore) -> None:
         source_type="manual", title="d", original_content="x", content_hash="h",
     )
     node_id = await store.create_graph_node_with_link(
-        document_id=doc_id, entity_name="X", entity_type="system",
+        document_id=doc_id, entity_name="X", name_stem="x", entity_type="system",
     )
     # 노드와 link 가 동시에 보인다 — 별도 add_node_document_link 호출 없이도
     # get_graph_nodes_by_document 에서 조회 가능.
@@ -370,7 +370,7 @@ async def test_delete_graph_data_by_document_narrow_orphan_cleanup(
     )
     # A 의 노드 X (link 동반)
     x_id = await store.create_graph_node_with_link(
-        document_id=doc_a, entity_name="X", entity_type="system",
+        document_id=doc_a, entity_name="X", name_stem="x", entity_type="system",
     )
     # B 의 노드 Y — link 등록 직전 상태를 흉내내기 위해 단독 INSERT 만
     y_id = await store.create_graph_node(
@@ -489,6 +489,223 @@ async def test_document_sources_cascade_on_source_delete(store: MetadataStore) -
     await store.delete_document(src_id)
     sources = await store.get_document_sources(doc_id)
     assert len(sources) == 0
+
+
+async def test_graph_nodes_has_name_stem_column_and_index(
+    store: MetadataStore,
+) -> None:
+    """R5: ``graph_nodes`` 테이블에 ``name_stem`` 컬럼과
+    ``idx_graph_nodes_stem_type`` 복합 INDEX 가 초기화 직후 존재한다.
+
+    표기 변형(공백/하이픈/언더스코어/대소문자) 을 흡수한 stem 키로 dedup
+    매칭하는 R5 의 토대. 컬럼·INDEX 가 신규 DB 부팅 시점에 만들어졌는지 회귀
+    가드.
+    """
+    cursor = await store.db.execute("PRAGMA table_info(graph_nodes)")
+    cols = {row["name"] for row in await cursor.fetchall()}
+    assert "name_stem" in cols, "name_stem 컬럼이 누락됨"
+
+    cursor = await store.db.execute("PRAGMA index_list(graph_nodes)")
+    indexes = {row["name"] for row in await cursor.fetchall()}
+    assert "idx_graph_nodes_stem_type" in indexes, (
+        "복합 INDEX (name_stem, entity_type) 가 누락됨"
+    )
+
+
+async def test_find_graph_node_by_entity_stem_match_hit_surface_variant(
+    store: MetadataStore,
+) -> None:
+    """R5: ``AuthService`` 저장 후 ``Auth Service`` (공백 변형) 로 조회하면
+    동일 stem (``"authservice"``) 매칭으로 hit.
+
+    R4 의 추출 측 stem 정규화가 한 문서 내 변형을 흡수하지만, 문서 간 변형은
+    저장 측 SQL 이 stem 매칭으로 통합해야 한다.
+    """
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    nid = await store.create_graph_node_with_link(
+        document_id=doc_id,
+        entity_name="AuthService",
+        name_stem="authservice",
+        entity_type="system",
+    )
+    found = await store.find_graph_node_by_entity("Auth Service", "system")
+    assert found is not None
+    assert found["id"] == nid
+
+
+async def test_find_graph_node_by_entity_stem_match_hit_case_variant(
+    store: MetadataStore,
+) -> None:
+    """R5: ``AuthService`` 저장 후 ``authservice`` (case 변형) 로 조회 → hit."""
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    nid = await store.create_graph_node_with_link(
+        document_id=doc_id,
+        entity_name="AuthService",
+        name_stem="authservice",
+        entity_type="system",
+    )
+    found = await store.find_graph_node_by_entity("authservice", "system")
+    assert found is not None
+    assert found["id"] == nid
+
+
+async def test_find_graph_node_by_entity_stem_match_miss_different_root(
+    store: MetadataStore,
+) -> None:
+    """R5: ``AuthService`` 저장 후 ``AuthorizationService`` 조회는 miss.
+
+    stem 이 다르므로(``authservice`` vs ``authorizationservice``) 동일 노드로
+    오 매칭되지 않는다 — 보수적 정책 (의미 경계 모호한 통합 회피) 회귀 가드.
+    """
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    await store.create_graph_node_with_link(
+        document_id=doc_id,
+        entity_name="AuthService",
+        name_stem="authservice",
+        entity_type="system",
+    )
+    found = await store.find_graph_node_by_entity(
+        "AuthorizationService", "system",
+    )
+    assert found is None
+
+
+async def test_find_graph_node_by_entity_stem_match_miss_plural(
+    store: MetadataStore,
+) -> None:
+    """R5: ``User`` 저장 후 ``Users`` 조회는 miss.
+
+    형태론적 변형(단수형 vs 복수형) 은 ``normalize_name_stem`` 이
+    *의도적으로* 통합하지 않는다 — 의미 경계가 모호한 통합을 피하기 위한
+    보수적 정책.
+    """
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    await store.create_graph_node_with_link(
+        document_id=doc_id,
+        entity_name="User",
+        name_stem="user",
+        entity_type="system",
+    )
+    found = await store.find_graph_node_by_entity("Users", "system")
+    assert found is None
+
+
+async def test_find_graph_node_by_entity_stem_match_order_by_id_asc(
+    store: MetadataStore,
+) -> None:
+    """R5: 동일 stem 의 다중 노드가 있을 때 ``ORDER BY id ASC LIMIT 1`` 로 항상
+    최초 생성된 노드를 winner 로 선택한다 — 마이그레이션 백필 이전 데이터의
+    분리 노드들이 동일 stem 으로 채워지더라도 멱등·재현 가능.
+    """
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    # 동일 stem("authservice") 으로 표기만 다른 두 노드를 단독 INSERT 로 만들고
+    # 두 행 모두 name_stem 을 같은 값으로 채워둔다 — 백필 이후 상태를 흉내냄.
+    first = await store.create_graph_node(
+        document_id=doc_id, entity_name="AuthService", entity_type="system",
+    )
+    second = await store.create_graph_node(
+        document_id=doc_id, entity_name="Auth Service", entity_type="system",
+    )
+    await store.db.execute(
+        "UPDATE graph_nodes SET name_stem = 'authservice' WHERE id IN (?, ?)",
+        (first, second),
+    )
+    await store.db.commit()
+
+    found = await store.find_graph_node_by_entity("auth-service", "system")
+    assert found is not None
+    assert found["id"] == first, "ORDER BY id ASC 로 최초 생성 노드가 winner"
+
+
+async def test_migrate_schema_backfills_legacy_graph_nodes_name_stem(
+    tmp_path: Path,
+) -> None:
+    """R5: 기존 DB (``name_stem`` 컬럼 없음) 에 노드를 만들어 두고
+    ``MetadataStore.initialize()`` 가 호출되면 ``_migrate_schema`` 가
+    ALTER + Python 루프 백필을 수행하여 모든 노드의 ``name_stem`` 이
+    ``normalize_name_stem(entity_name)`` 으로 채워진다.
+    """
+    import aiosqlite
+
+    from context_loop.processor.graph_vocabulary import normalize_name_stem
+
+    db_path = tmp_path / "legacy_graph_nodes.db"
+
+    # R5 이전 스키마로 graph_nodes 만 위조 (name_stem 컬럼 없음).
+    async with aiosqlite.connect(db_path) as legacy:
+        await legacy.execute(
+            """CREATE TABLE graph_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER,
+                entity_name TEXT NOT NULL,
+                entity_type TEXT,
+                properties TEXT
+            )"""
+        )
+        await legacy.executemany(
+            "INSERT INTO graph_nodes (entity_name, entity_type) VALUES (?, ?)",
+            [
+                ("AuthService", "system"),
+                ("Auth Service", "system"),
+                ("user_service.py", "module"),
+                ("UserDB", "system"),
+            ],
+        )
+        await legacy.commit()
+
+    store = MetadataStore(db_path)
+    await store.initialize()
+    try:
+        cursor = await store.db.execute(
+            "SELECT entity_name, name_stem FROM graph_nodes ORDER BY id ASC"
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 4
+        for row in rows:
+            assert row["name_stem"] == normalize_name_stem(row["entity_name"]), (
+                f"백필이 누락된 행: {row['entity_name']!r}"
+            )
+    finally:
+        await store.close()
+
+
+async def test_migrate_schema_is_idempotent_for_name_stem(
+    store: MetadataStore,
+) -> None:
+    """R5: ``_migrate_schema`` 를 두 번째로 호출해도 안전 — ALTER 가드와
+    ``WHERE name_stem IS NULL`` 가드로 멱등성 보장.
+    """
+    # 정상 노드 하나 만들어 둠 (name_stem 채워진 상태).
+    doc_id = await store.create_document(
+        source_type="manual", title="d", original_content="x", content_hash="h",
+    )
+    await store.create_graph_node_with_link(
+        document_id=doc_id,
+        entity_name="AuthService",
+        name_stem="authservice",
+        entity_type="system",
+    )
+
+    # 두 번째 호출 — 컬럼 존재 / NULL 행 없음 → 사실상 no-op.
+    await store._migrate_schema()
+    await store.db.commit()
+
+    cursor = await store.db.execute(
+        "SELECT COUNT(*) AS cnt FROM graph_nodes WHERE name_stem IS NULL"
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["cnt"] == 0
 
 
 async def test_get_stats(store: MetadataStore) -> None:
