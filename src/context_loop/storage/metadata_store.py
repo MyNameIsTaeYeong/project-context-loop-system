@@ -13,6 +13,8 @@ from typing import Any
 
 import aiosqlite
 
+from context_loop.storage.entity_normalizer import normalize_entity_name
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +51,8 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
     entity_name TEXT NOT NULL,
     entity_type TEXT,
-    properties TEXT
+    properties TEXT,
+    normalized_name TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS graph_edges (
@@ -65,6 +68,24 @@ CREATE TABLE IF NOT EXISTS graph_node_documents (
     node_id INTEGER REFERENCES graph_nodes(id) ON DELETE CASCADE,
     document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
     PRIMARY KEY (node_id, document_id)
+);
+
+-- R3: 그래프 노드 머지/신규 결정의 관측성 로그.
+-- save_graph_data 가 entity 마다 한 행 INSERT — 운영 디버깅과 향후 평가
+-- (precision/recall 계산) 의 baseline 데이터로 활용. 본 단계는 binary 매칭
+-- 이므로 similarity_score 는 NULL. merge_method:
+--   'exact'      — 원본과 정규화 키가 동일했던 정확 매치 (즉 표기 변형 없음)
+--   'normalized' — 정규화 키 매칭으로 표기 변형 흡수
+--   'new'        — 매칭 실패, 신규 노드 생성
+CREATE TABLE IF NOT EXISTS graph_merge_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_node_id INTEGER NOT NULL,
+    raw_entity_name TEXT NOT NULL,
+    raw_entity_type TEXT NOT NULL,
+    source_document_id INTEGER NOT NULL,
+    merge_method TEXT NOT NULL,
+    similarity_score REAL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS processing_history (
@@ -121,6 +142,10 @@ CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type, source
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_document ON graph_nodes(document_id);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_normalized
+    ON graph_nodes(normalized_name, entity_type);
+CREATE INDEX IF NOT EXISTS idx_graph_merge_log_canonical
+    ON graph_merge_log(canonical_node_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_document ON graph_edges(document_id);
 CREATE INDEX IF NOT EXISTS idx_graph_node_documents_node ON graph_node_documents(node_id);
 CREATE INDEX IF NOT EXISTS idx_graph_node_documents_document ON graph_node_documents(document_id);
@@ -179,6 +204,51 @@ class MetadataStore:
             await self.db.execute(
                 "ALTER TABLE chunks ADD COLUMN section_index INTEGER",
             )
+
+        # R3: graph_nodes.normalized_name 컬럼 추가 + 백필. 정규화 키로
+        # find_graph_node_by_entity 가 매칭하기 위한 컬럼 — 표기 변형
+        # (공백/하이픈/언더스코어/케이스) 을 흡수해 머지 recall 을 끌어올린다.
+        cursor = await self.db.execute("PRAGMA table_info(graph_nodes)")
+        graph_node_columns = {row["name"] for row in await cursor.fetchall()}
+        if "normalized_name" not in graph_node_columns:
+            # SQLite ALTER TABLE 은 NOT NULL 컬럼을 DEFAULT 와 함께 추가하는
+            # 패턴이 안전 — 모든 기존 행이 default 값('')로 채워진다. 이후
+            # 백필 UPDATE 로 실제 정규화 값을 적용한다.
+            await self.db.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN "
+                "normalized_name TEXT NOT NULL DEFAULT ''",
+            )
+            # 인덱스도 함께 — schema script 의 CREATE INDEX 는 idempotent 이지만,
+            # ALTER 직후에 명시적으로 인덱스 보장.
+            await self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_graph_nodes_normalized "
+                "ON graph_nodes(normalized_name, entity_type)",
+            )
+
+        # 백필: normalized_name 이 비어있는 행만 채운다 (idempotent — 이미
+        # 정규화된 행은 skip). 신규 DB 면 행이 없어 no-op.
+        await self._backfill_normalized_names()
+
+    async def _backfill_normalized_names(self) -> None:
+        """``graph_nodes.normalized_name`` 이 비어있는 행을 일회성 백필.
+
+        Idempotent — 이미 비어있지 않은 행은 건드리지 않는다. 신규 DB 또는
+        이전 백필이 완료된 DB 에서는 no-op.
+        """
+        cursor = await self.db.execute(
+            "SELECT id, entity_name FROM graph_nodes WHERE normalized_name = ''",
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+        # 같은 트랜잭션에서 일괄 업데이트. executemany 로 row count 만큼 호출.
+        updates = [
+            (normalize_entity_name(row["entity_name"]), row["id"]) for row in rows
+        ]
+        await self.db.executemany(
+            "UPDATE graph_nodes SET normalized_name = ? WHERE id = ?",
+            updates,
+        )
 
     async def close(self) -> None:
         """DB 연결을 닫는다."""
@@ -369,6 +439,7 @@ class MetadataStore:
         entity_name: str,
         entity_type: str | None = None,
         properties: str | None = None,
+        normalized_name: str | None = None,
     ) -> int:
         """그래프 노드를 생성하고 ID를 반환한다.
 
@@ -378,10 +449,21 @@ class MetadataStore:
         정리 SQL 을 실행하여 방금 만든 노드가 잘못 삭제될 수 있다 (FK violation
         원인). 본 단독 메서드는 link 없는 노드 생성이 필요한 마이그레이션/
         테스트 전용으로 보존.
+
+        Args:
+            normalized_name: R3 정규화 키. 미지정 시 ``entity_name`` 으로부터
+                내부 정규화한다.
         """
+        key = (
+            normalized_name
+            if normalized_name is not None
+            else normalize_entity_name(entity_name)
+        )
         cursor = await self.db.execute(
-            "INSERT INTO graph_nodes (document_id, entity_name, entity_type, properties) VALUES (?, ?, ?, ?)",
-            (document_id, entity_name, entity_type, properties),
+            "INSERT INTO graph_nodes "
+            "(document_id, entity_name, entity_type, properties, normalized_name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (document_id, entity_name, entity_type, properties, key),
         )
         await self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
@@ -393,6 +475,7 @@ class MetadataStore:
         entity_name: str,
         entity_type: str | None = None,
         properties: str | None = None,
+        normalized_name: str | None = None,
     ) -> int:
         """그래프 노드 INSERT 와 graph_node_documents link INSERT 를 같은
         트랜잭션에서 처리하고 한 번에 commit 한다.
@@ -403,13 +486,22 @@ class MetadataStore:
         일으키는 race window 가 있었다 (재인덱싱 산발 실패의 근본 원인).
         본 메서드는 두 INSERT 를 단일 commit 으로 묶어 race window 를 제거한다.
 
+        R3: ``normalized_name`` 도 함께 INSERT — 정규화 키 기반 머지가 신규
+        노드부터 일관되게 동작하도록 한다.
+
         Returns:
             새로 생성된 ``graph_nodes.id``.
         """
+        key = (
+            normalized_name
+            if normalized_name is not None
+            else normalize_entity_name(entity_name)
+        )
         cursor = await self.db.execute(
             "INSERT INTO graph_nodes "
-            "(document_id, entity_name, entity_type, properties) VALUES (?, ?, ?, ?)",
-            (document_id, entity_name, entity_type, properties),
+            "(document_id, entity_name, entity_type, properties, normalized_name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (document_id, entity_name, entity_type, properties, key),
         )
         node_id = cursor.lastrowid
         assert node_id is not None
@@ -448,13 +540,30 @@ class MetadataStore:
         self,
         entity_name: str,
         entity_type: str,
+        *,
+        normalized_name: str | None = None,
     ) -> dict[str, Any] | None:
-        """엔티티 이름+타입으로 기존 정규 노드를 검색한다 (대소문자 무시)."""
+        """정규화 키로 기존 정규 노드를 검색한다.
+
+        R3: 매칭 키를 ``LOWER(entity_name) = LOWER(?)`` → ``normalized_name = ?``
+        로 변경. 공백/하이픈/언더스코어/케이스 표기 변형을 흡수해 머지 recall 을
+        높인다. ``idx_graph_nodes_normalized(normalized_name, entity_type)`` 인덱스
+        활용으로 LOWER() 함수 호출 제거 (인덱스 적용 가능 형태).
+
+        Args:
+            entity_name: 원본 엔티티 이름. ``normalized_name`` 미지정 시 내부에서
+                정규화하여 사용한다.
+            entity_type: 엔티티 타입 (정확 매치).
+            normalized_name: 이미 정규화된 키. 호출자가 책임지고 정규화한 결과를
+                전달하면 중복 정규화 비용을 절약한다. 권장: graph_store 가
+                정규화 → 본 메서드에 전달.
+        """
+        key = normalized_name if normalized_name is not None else normalize_entity_name(entity_name)
         cursor = await self.db.execute(
             """SELECT * FROM graph_nodes
-               WHERE LOWER(entity_name) = LOWER(?) AND entity_type = ?
+               WHERE normalized_name = ? AND entity_type = ?
                LIMIT 1""",
-            (entity_name, entity_type),
+            (key, entity_type),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -535,6 +644,72 @@ class MetadataStore:
             node_ids,
         )
         await self.db.commit()
+
+    # --- Graph Merge Log (R3) ---
+
+    async def record_graph_merge(
+        self,
+        *,
+        canonical_node_id: int,
+        raw_entity_name: str,
+        raw_entity_type: str,
+        source_document_id: int,
+        merge_method: str,
+        similarity_score: float | None = None,
+    ) -> None:
+        """그래프 머지/신규 결정을 ``graph_merge_log`` 에 한 행 기록한다.
+
+        R3: 정규화 머지 도입과 함께 도입된 관측성 로그. 머지/신규 결정마다
+        한 행 INSERT. ``merge_method`` 값:
+
+        - ``'exact'`` — 원본 ``entity_name`` 이 정규화 키와 동일했던 케이스
+          (즉 표기 변형이 전혀 없었던 정확 매치)
+        - ``'normalized'`` — 정규화 키 매칭으로 표기 변형 흡수
+        - ``'new'`` — 매칭 실패, 신규 노드 생성
+
+        Args:
+            similarity_score: D 단계는 binary 매칭이므로 항상 ``None`` 전달.
+                향후 임베딩(A)/LLM(B) 도입 시 cosine 점수 또는 LLM verdict
+                점수 기록 슬롯.
+        """
+        await self.db.execute(
+            """INSERT INTO graph_merge_log
+               (canonical_node_id, raw_entity_name, raw_entity_type,
+                source_document_id, merge_method, similarity_score)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                canonical_node_id,
+                raw_entity_name,
+                raw_entity_type,
+                source_document_id,
+                merge_method,
+                similarity_score,
+            ),
+        )
+        await self.db.commit()
+
+    async def get_graph_merge_log(
+        self,
+        *,
+        canonical_node_id: int | None = None,
+        source_document_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """머지 로그를 조회한다 (디버깅·평가용).
+
+        둘 다 ``None`` 이면 전체 로그를 반환. 필터를 결합하면 AND.
+        """
+        query = "SELECT * FROM graph_merge_log WHERE 1=1"
+        params: list[Any] = []
+        if canonical_node_id is not None:
+            query += " AND canonical_node_id = ?"
+            params.append(canonical_node_id)
+        if source_document_id is not None:
+            query += " AND source_document_id = ?"
+            params.append(source_document_id)
+        query += " ORDER BY id"
+        cursor = await self.db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
     async def delete_graph_data_by_document(self, document_id: int) -> None:
         """문서의 그래프 엣지를 삭제하고, 노드-문서 연결을 해제한다.
