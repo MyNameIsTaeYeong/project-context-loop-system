@@ -113,6 +113,53 @@ class TestBackfillMigration:
         finally:
             await store.close()
 
+    async def test_initialize_on_legacy_db_without_normalized_column(
+        self, tmp_path: Path,
+    ) -> None:
+        """기존 (R3 이전) DB — graph_nodes 에 normalized_name 컬럼이 없는 상태 — 를
+        새 코드로 열어도 마이그레이션이 정상 동작해야 한다.
+
+        회귀 보호: _SCHEMA_SQL 의 ``CREATE INDEX ... ON graph_nodes(normalized_name)`` 가
+        ALTER 이전에 실행되면 ``no such column: normalized_name`` 으로 executescript 가
+        실패하여 마이그레이션 자체가 도달 못 한다.
+        """
+        db_path = tmp_path / "legacy_pre_r3.db"
+        # R3 이전 스키마 — normalized_name 컬럼 없음
+        async with aiosqlite.connect(db_path) as raw:
+            await raw.execute(
+                """CREATE TABLE graph_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id INTEGER,
+                    entity_name TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    properties TEXT
+                )""",
+            )
+            await raw.execute(
+                "INSERT INTO graph_nodes (document_id, entity_name, entity_type) "
+                "VALUES (?, ?, ?)",
+                (1, "결제 시스템", "system"),
+            )
+            await raw.commit()
+
+        # 새 코드로 열기 — 예외 없이 마이그레이션 + 백필 완료해야 한다
+        store = MetadataStore(db_path)
+        await store.initialize()
+        try:
+            cursor = await store.db.execute("PRAGMA table_info(graph_nodes)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            assert "normalized_name" in cols, "마이그레이션이 컬럼을 추가하지 못함"
+
+            cursor = await store.db.execute(
+                "SELECT normalized_name FROM graph_nodes WHERE entity_name = ?",
+                ("결제 시스템",),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["normalized_name"] == normalize_entity_name("결제 시스템")
+        finally:
+            await store.close()
+
     async def test_migration_runs_twice_safely(self, tmp_path: Path) -> None:
         """``initialize`` 가 두 번 호출되어도 ALTER/CREATE INDEX/백필 모두 안전."""
         db_path = tmp_path / "twice.db"

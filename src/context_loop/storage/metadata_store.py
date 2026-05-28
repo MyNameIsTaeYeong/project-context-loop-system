@@ -142,8 +142,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_type, source
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_document ON graph_nodes(document_id);
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_normalized
-    ON graph_nodes(normalized_name, entity_type);
+-- idx_graph_nodes_normalized 는 _migrate_schema 에서 ALTER 이후 생성.
+-- (executescript 는 단일 트랜잭션이라 이 시점에 normalized_name 컬럼이
+-- 아직 없는 기존 DB 에서 CREATE INDEX 가 실패하기 때문.)
 CREATE INDEX IF NOT EXISTS idx_graph_merge_log_canonical
     ON graph_merge_log(canonical_node_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_document ON graph_edges(document_id);
@@ -218,12 +219,12 @@ class MetadataStore:
                 "ALTER TABLE graph_nodes ADD COLUMN "
                 "normalized_name TEXT NOT NULL DEFAULT ''",
             )
-            # 인덱스도 함께 — schema script 의 CREATE INDEX 는 idempotent 이지만,
-            # ALTER 직후에 명시적으로 인덱스 보장.
-            await self.db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_graph_nodes_normalized "
-                "ON graph_nodes(normalized_name, entity_type)",
-            )
+        # 인덱스는 컬럼 존재 여부와 무관하게 항상 보장 — _SCHEMA_SQL 에서
+        # 빼냈기 때문에 신규 DB 든 마이그레이션된 DB 든 여기서 한 번 만든다.
+        await self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_nodes_normalized "
+            "ON graph_nodes(normalized_name, entity_type)",
+        )
 
         # 백필: normalized_name 이 비어있는 행만 채운다 (idempotent — 이미
         # 정규화된 행은 skip). 신규 DB 면 행이 없어 no-op.
