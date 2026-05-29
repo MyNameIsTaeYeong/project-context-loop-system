@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css">
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
 <script>hljs.highlightAll();</script>
-{% else %}
+{% elif doc.original_content %}
 {# 그 외(confluence, confluence_mcp, code_*, manual, upload)는 본문이 마크다운
    이므로 Rendered/Raw 토글을 제공하고 기본은 Rendered. 원본 텍스트는 별도의
    숨김 <pre class="md-source"> 에 보관해 marked + DOMPurify 로 안전 렌더. #}
@@ -22,13 +22,27 @@
          data-markdown
          data-markdown-src="md-source-original-{{ doc.id }}"></div>
     <div x-show="view === 'raw'">
-        <pre><code>{{ doc.original_content or '(no content)' }}</code></pre>
+        <pre><code>{{ doc.original_content }}</code></pre>
     </div>
 </article>
-<pre id="md-source-original-{{ doc.id }}" class="md-source" hidden>{{ doc.original_content or '' }}</pre>
+<pre id="md-source-original-{{ doc.id }}" class="md-source" hidden>{{ doc.original_content }}</pre>
 {# 인라인 호출 — htmx:afterSwap 리스너가 어떤 이유로든 동작하지 않거나
    본 파셜이 HTMX 외 경로(직접 fetch 등)로 삽입돼도 즉시 렌더한다. #}
 <script>
     if (window.renderAllMarkdown) { window.renderAllMarkdown(); }
 </script>
+{% elif doc.raw_content %}
+{# 폴백: 마크다운 본문(original_content)이 비어 있는 경우(예: 큰/중첩 깊은
+   Confluence 문서에서 HTML→마크다운 변환 실패) 원본 HTML(raw_content)을
+   소스 그대로 표시한다. 변환 결과는 없어도 원본은 보존돼 있으므로 재처리
+   없이 내용을 확인할 수 있다. raw_content 는 Confluence storage format
+   HTML 이라 마크다운 렌더 대신 소스 텍스트로 노출한다. #}
+<article>
+    <p><small>⚠️ 변환된 본문이 비어 있어 원본 HTML을 표시합니다.</small></p>
+    <pre><code>{{ doc.raw_content }}</code></pre>
+</article>
+{% else %}
+<article>
+    <pre><code>(no content)</code></pre>
+</article>
 {% endif %}
