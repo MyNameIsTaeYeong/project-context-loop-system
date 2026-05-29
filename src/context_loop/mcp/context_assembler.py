@@ -587,9 +587,14 @@ async def assemble_context_with_sources(
                 if did is not None:
                     fetched_sim[did] = 1 - r.get("distance", 1.0)
 
-        # 그래프 탐색 결과에서 출처 추출 — 본문 인출된 문서는 실제 유사도 부여
+        # 그래프 탐색 결과에서 출처 추출 — 본문이 실제로 컨텍스트에 첨부된
+        # 문서만 포함한다. graph_result.document_ids 전체(탐색된 모든 노드의
+        # 문서 합집합, 개수 무제한)가 아니라, _search_graph_sourced_chunks 가
+        # 개수(max_graph_docs)/토큰(max_graph_tokens) 상한 안에서 본문을 인출한
+        # 문서(fetched_sim 의 키)만 노출하여, 출처 목록을 실제 컨텍스트에 들어간
+        # 최종 문서와 일치시킨다.
         existing_doc_ids = {s.document_id for s in sources}
-        for doc_id in graph_result.document_ids:
+        for doc_id, similarity in fetched_sim.items():
             if doc_id not in existing_doc_ids:
                 if doc_id not in doc_cache:
                     doc = await meta_store.get_document(doc_id)
@@ -597,7 +602,7 @@ async def assemble_context_with_sources(
                 title = doc_cache[doc_id]["title"]
                 sources.append(Source(
                     document_id=doc_id, title=title,
-                    similarity=fetched_sim.get(doc_id, 0.0),
+                    similarity=similarity,
                 ))
 
     # Phase 9.7: 원본 소스 코드 첨부
