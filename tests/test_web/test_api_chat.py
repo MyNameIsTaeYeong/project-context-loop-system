@@ -179,13 +179,22 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
     """그래프 컨텍스트가 포함된 질의도 정상 동작한다."""
     from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 
-    meta_store, _, graph_store = chat_stores
+    meta_store, vector_store, graph_store = chat_stores
 
     doc_id = await meta_store.create_document(
         source_type="manual",
         title="아키텍처 문서",
         original_content="시스템 구조",
         content_hash="h2",
+    )
+    # 그래프로 발견된 문서가 출처가 되려면 본문이 실제 컨텍스트에 첨부되어야
+    # 한다(그래프 출처 = 본문 첨부된 최종 문서 정책). 해당 문서에 벡터 청크를
+    # 넣어 _search_graph_sourced_chunks 가 본문을 인출하게 한다.
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.0, 1.0, 0.0, 0.0]],
+        documents=["Gateway 는 AuthService 에 의존한다."],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
     )
     await graph_store.save_graph_data(doc_id, GraphData(
         entities=[
