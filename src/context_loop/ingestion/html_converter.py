@@ -23,6 +23,37 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from markdownify import MarkdownConverter, markdownify
 
 
+def confluence_storage_to_html(html: str) -> str:
+    """Confluence Storage Format HTML을 브라우저 표시용 표준 HTML로 변환한다.
+
+    ``ac:structured-macro``(코드/패널), ``ac:link``, ``ac:image`` 등 Confluence
+    전용 네임스페이스 태그를 표준 HTML 요소로 치환하고 script/style 을 제거한다.
+    ``markdownify`` 를 호출하지 않으므로(BeautifulSoup 트리 순회만 사용) 깊게
+    중첩된 큰 문서에서도 ``RecursionError`` 없이 동작한다 — 마크다운 변환이
+    실패한 문서를 원본 그대로 렌더 표시하는 폴백 경로에 사용한다.
+
+    Args:
+        html: Confluence Storage Format HTML 문자열.
+
+    Returns:
+        표준 HTML 문자열. 입력이 비어 있으면 빈 문자열.
+    """
+    if not html or not html.strip():
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Confluence 매크로 전처리
+    _preprocess_confluence_macros(soup)
+
+    # 2. script/style 태그 제거
+    for tag_name in ("script", "style"):
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    return str(soup)
+
+
 def html_to_markdown(html: str) -> str:
     """HTML을 마크다운으로 변환한다.
 
@@ -35,27 +66,17 @@ def html_to_markdown(html: str) -> str:
     Returns:
         마크다운 형식의 문자열.
     """
-    if not html or not html.strip():
+    processed_html = confluence_storage_to_html(html)
+    if not processed_html:
         return ""
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Confluence 매크로 전처리
-    _preprocess_confluence_macros(soup)
-
-    # 2. script/style 태그 제거 (markdownify에 strip과 convert를 동시에 넘길 수 없으므로)
-    for tag_name in ("script", "style"):
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
-
-    # 3. markdownify 변환
-    processed_html = str(soup)
+    # markdownify 변환
     md = markdownify(
         processed_html,
         heading_style="ATX",
     )
 
-    # 4. 후처리
+    # 후처리
     md = _postprocess(md)
 
     return md.strip()

@@ -10,6 +10,7 @@ from langchain_core.embeddings import Embeddings
 
 from context_loop.config import Config
 from context_loop.ingestion.editor import save_document
+from context_loop.ingestion.html_converter import confluence_storage_to_html
 from context_loop.processor.llm_client import LLMClient
 from context_loop.processor.pipeline import build_meta_view_text
 from context_loop.storage.cascade import delete_document_cascade
@@ -124,11 +125,19 @@ async def tab_original(
     lang_hint = ""
     if doc.get("source_type") == "git_code" and doc.get("source_id"):
         lang_hint = _guess_language(doc["source_id"])
+    # 마크다운 본문(original_content)이 비었지만 원본 HTML(raw_content)이 있는
+    # 폴백 케이스(큰/중첩 깊은 Confluence 문서의 변환 실패): Storage Format 을
+    # 브라우저 표시용 표준 HTML 로 전처리해 템플릿에 넘긴다. 클라이언트가
+    # DOMPurify 로 sanitize 후 렌더하므로 XSS 안전.
+    raw_html_view = ""
+    if not doc.get("original_content") and doc.get("raw_content"):
+        raw_html_view = confluence_storage_to_html(doc["raw_content"])
     templates = get_templates(request)
     return templates.TemplateResponse("partials/tab_original.html", {
         "request": request,
         "doc": doc,
         "lang_hint": lang_hint,
+        "raw_html_view": raw_html_view,
     })
 
 

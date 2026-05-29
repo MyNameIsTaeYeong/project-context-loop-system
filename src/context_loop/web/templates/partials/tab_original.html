@@ -31,16 +31,32 @@
 <script>
     if (window.renderAllMarkdown) { window.renderAllMarkdown(); }
 </script>
-{% elif doc.raw_content %}
+{% elif raw_html_view %}
 {# 폴백: 마크다운 본문(original_content)이 비어 있는 경우(예: 큰/중첩 깊은
    Confluence 문서에서 HTML→마크다운 변환 실패) 원본 HTML(raw_content)을
-   소스 그대로 표시한다. 변환 결과는 없어도 원본은 보존돼 있으므로 재처리
-   없이 내용을 확인할 수 있다. raw_content 는 Confluence storage format
-   HTML 이라 마크다운 렌더 대신 소스 텍스트로 노출한다. #}
-<article>
-    <p><small>⚠️ 변환된 본문이 비어 있어 원본 HTML을 표시합니다.</small></p>
-    <pre><code>{{ doc.raw_content }}</code></pre>
+   표시한다. raw_html_view 는 Storage Format 을 표시용 표준 HTML 로 전처리한
+   결과로, 클라이언트가 DOMPurify 로 sanitize 후 렌더(Rendered)한다. 원본
+   소스(Raw HTML) 도 토글로 함께 제공한다. #}
+<article x-data="{ view: 'rendered' }">
+    <p><small>⚠️ 마크다운 변환 본문이 비어 있어 원본 HTML을 표시합니다.</small></p>
+    <div role="group" style="margin-bottom: 1rem;">
+        <button :class="view === 'rendered' ? '' : 'outline'"
+                @click="view = 'rendered'">Rendered</button>
+        <button :class="view === 'raw' ? '' : 'outline'"
+                @click="view = 'raw'">Raw HTML</button>
+    </div>
+    <div x-show="view === 'rendered'"
+         class="markdown-body"
+         data-html
+         data-html-src="html-source-original-{{ doc.id }}"></div>
+    <div x-show="view === 'raw'">
+        <pre><code>{{ doc.raw_content }}</code></pre>
+    </div>
 </article>
+<pre id="html-source-original-{{ doc.id }}" class="html-source" hidden>{{ raw_html_view }}</pre>
+<script>
+    if (window.renderAllHtml) { window.renderAllHtml(); }
+</script>
 {% else %}
 <article>
     <pre><code>(no content)</code></pre>
