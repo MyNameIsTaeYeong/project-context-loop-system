@@ -17,6 +17,7 @@ from typing import Any
 import networkx as nx
 
 from context_loop.processor.graph_extractor import GraphData
+from context_loop.storage.entity_normalizer import normalize_entity_name
 from context_loop.storage.metadata_store import MetadataStore
 
 logger = logging.getLogger(__name__)
@@ -160,9 +161,17 @@ class GraphStore:
         for entity in graph_data.entities:
             props = {"description": entity.description} if entity.description else {}
 
-            # 기존 정규 노드 검색
+            # R3: 정규화 키 산출 — graph_store 측에서 정규화하여 metadata_store
+            # 에 전달 (책임 분리: storage 레이어는 입력 키를 그대로 신뢰). 같은
+            # 키를 신규 노드 INSERT 시에도 재사용해 머지/생성 양쪽이 일관된
+            # 정규화 정책을 따른다.
+            normalized = normalize_entity_name(entity.name)
+
+            # 기존 정규 노드 검색 (정규화 키 기반)
             existing = await self._store.find_graph_node_by_entity(
-                entity.name, entity.entity_type,
+                entity.name,
+                entity.entity_type,
+                normalized_name=normalized,
             )
 
             if existing:
@@ -190,6 +199,18 @@ class GraphStore:
                         document_ids={document_id},
                         properties=existing_props,
                     )
+                # R3 머지 로그: 표기 변형 없이 그대로 일치한 경우 'exact',
+                # 정규화 키만으로 일치한 경우 'normalized' 로 구분. 비교는
+                # canonical 노드 원본 entity_name 과 입력 entity.name 사이의
+                # 직접 동일성으로 판정 (대소문자 포함 정확히 동일).
+                method = "exact" if existing.get("entity_name") == entity.name else "normalized"
+                await self._record_merge_safely(
+                    canonical_node_id=node_id,
+                    raw_entity_name=entity.name,
+                    raw_entity_type=entity.entity_type,
+                    source_document_id=document_id,
+                    merge_method=method,
+                )
             else:
                 # 새 노드 생성 — graph_nodes INSERT 와 graph_node_documents link
                 # INSERT 를 같은 트랜잭션 / 한 번의 commit 으로 묶어, 두 INSERT
@@ -201,6 +222,7 @@ class GraphStore:
                     entity_name=entity.name,
                     entity_type=entity.entity_type,
                     properties=json.dumps(props, ensure_ascii=False),
+                    normalized_name=normalized,
                 )
                 new_count += 1
                 self._graph.add_node(
@@ -209,6 +231,14 @@ class GraphStore:
                     entity_type=entity.entity_type,
                     document_ids={document_id},
                     properties=props,
+                )
+                # R3 머지 로그: 신규 노드 생성 케이스
+                await self._record_merge_safely(
+                    canonical_node_id=node_id,
+                    raw_entity_name=entity.name,
+                    raw_entity_type=entity.entity_type,
+                    source_document_id=document_id,
+                    merge_method="new",
                 )
 
             name_to_node_id[entity.name] = node_id
@@ -264,6 +294,39 @@ class GraphStore:
             edge_count,
         )
         return {"nodes": new_count, "edges": edge_count, "merged": merged_count}
+
+    async def _record_merge_safely(
+        self,
+        *,
+        canonical_node_id: int,
+        raw_entity_name: str,
+        raw_entity_type: str,
+        source_document_id: int,
+        merge_method: str,
+        similarity_score: float | None = None,
+    ) -> None:
+        """``graph_merge_log`` INSERT — 실패 시 그래프 저장은 진행한다.
+
+        R3: 관측성 로그는 그래프 저장의 critical path 에서 실패해도 본 작업이
+        멈추면 안 된다 — exception 을 삼키고 경고만 남긴다. 머지 결정 자체는
+        이미 commit 된 상태이므로 로그 누락이 데이터 정합성을 깨지 않는다.
+        """
+        try:
+            await self._store.record_graph_merge(
+                canonical_node_id=canonical_node_id,
+                raw_entity_name=raw_entity_name,
+                raw_entity_type=raw_entity_type,
+                source_document_id=source_document_id,
+                merge_method=merge_method,
+                similarity_score=similarity_score,
+            )
+        except Exception:
+            logger.warning(
+                "graph_merge_log 기록 실패 — node_id=%d, method=%s",
+                canonical_node_id,
+                merge_method,
+                exc_info=True,
+            )
 
     async def delete_document_graph(self, document_id: int) -> None:
         """문서의 그래프 데이터를 삭제한다.
