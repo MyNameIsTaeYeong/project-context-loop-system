@@ -54,6 +54,9 @@ async def test_graph_page_renders(client):
     # 세 탭과 탐색기 스크립트가 포함된다
     assert "키워드 탐색" in resp.text
     assert "graph_explorer.js" in resp.text
+    # 정적 JS 는 캐시버스팅 버전 쿼리를 달고 로드된다 (stale graph.js 방지)
+    assert "graph.js?v=" in resp.text
+    assert "graph_explorer.js?v=" in resp.text
 
 
 @pytest.mark.asyncio

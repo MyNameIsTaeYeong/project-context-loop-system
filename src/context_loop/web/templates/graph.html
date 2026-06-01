@@ -65,6 +65,6 @@
 
 {% block scripts %}
 <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-<script src="/static/js/graph.js"></script>
-<script src="/static/js/graph_explorer.js"></script>
+<script src="/static/js/graph.js?v={{ asset_version }}"></script>
+<script src="/static/js/graph_explorer.js?v={{ asset_version }}"></script>
 {% endblock %}
