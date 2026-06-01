@@ -10,7 +10,54 @@ html_converter.html_to_markdown()의 동작을 검증한다:
 
 from __future__ import annotations
 
-from context_loop.ingestion.html_converter import html_to_markdown
+from context_loop.ingestion.html_converter import (
+    confluence_storage_to_html,
+    html_to_markdown,
+)
+
+
+# --- confluence_storage_to_html (렌더 폴백용 표준 HTML 변환) ---
+
+
+def test_storage_to_html_empty_input() -> None:
+    """빈 입력은 빈 문자열을 반환한다."""
+    assert confluence_storage_to_html("") == ""
+    assert confluence_storage_to_html("   ") == ""
+
+
+def test_storage_to_html_converts_code_macro() -> None:
+    """ac:structured-macro(code)를 표준 pre/code 로 변환한다."""
+    html = (
+        '<ac:structured-macro ac:name="code">'
+        '<ac:parameter ac:name="language">python</ac:parameter>'
+        '<ac:plain-text-body><![CDATA[print("hi")]]></ac:plain-text-body>'
+        "</ac:structured-macro>"
+    )
+    out = confluence_storage_to_html(html)
+    assert "language-python" in out
+    assert 'print("hi")' in out
+    # Confluence 네임스페이스 태그 잔재가 없어야 한다
+    assert "<ac:" not in out
+
+
+def test_storage_to_html_strips_script() -> None:
+    """script/style 태그는 제거된다 (XSS 1차 방어)."""
+    html = "<p>본문</p><script>alert(1)</script>"
+    out = confluence_storage_to_html(html)
+    assert "본문" in out
+    assert "<script>" not in out
+
+
+def test_storage_to_html_handles_deeply_nested_without_recursion_error() -> None:
+    """깊게 중첩된 HTML 도 RecursionError 없이 변환한다.
+
+    markdownify 는 동일 입력에서 RecursionError 를 내지만,
+    confluence_storage_to_html 는 BeautifulSoup 트리 순회만 사용하므로
+    안전하다 — 큰 Confluence 문서 폴백 렌더의 전제.
+    """
+    deep = "<div>" * 800 + "내용" + "</div>" * 800
+    out = confluence_storage_to_html(deep)
+    assert "내용" in out
 
 
 # --- 기본 HTML 요소 ---

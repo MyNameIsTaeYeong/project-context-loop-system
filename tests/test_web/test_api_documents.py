@@ -76,6 +76,60 @@ async def test_document_original_tab_renders_markdown_for_confluence(client, sto
 
 
 @pytest.mark.asyncio
+async def test_document_original_tab_falls_back_to_raw_content(client, stores):
+    """original_content(마크다운)가 비어 있고 raw_content(원본 HTML)가 있으면
+    원본 HTML을 렌더 가능한 표준 HTML로 전처리해 폴백 표시한다. 큰/중첩 깊은
+    Confluence 문서에서 HTML→마크다운 변환이 실패해 original_content 가 빈
+    경우의 복구 경로. 클라이언트가 DOMPurify 로 sanitize 후 렌더한다."""
+    meta_store = stores[0]
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp",
+        title="Big Doc",
+        original_content="",
+        raw_content=(
+            "<h1>원본 제목</h1>"
+            '<ac:structured-macro ac:name="code">'
+            '<ac:parameter ac:name="language">python</ac:parameter>'
+            '<ac:plain-text-body><![CDATA[print("hi")]]></ac:plain-text-body>'
+            "</ac:structured-macro>"
+        ),
+        content_hash="hraw",
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/original")
+    assert resp.status_code == 200
+    # 폴백 안내 문구 노출
+    assert "원본 HTML" in resp.text
+    # 클라이언트 HTML 렌더용 컨테이너와 소스 엘리먼트
+    assert "data-html" in resp.text
+    assert f'id="html-source-original-{doc_id}"' in resp.text
+    assert 'class="html-source"' in resp.text
+    # Confluence 매크로가 표준 HTML(code 블록)로 전처리되어 소스에 포함
+    assert "language-python" in resp.text
+    # 마크다운 렌더 컨테이너(md-source)는 없어야 한다
+    assert "md-source-original" not in resp.text
+    # 빈 본문 안내가 폴백을 가리지 않아야 한다
+    assert "(no content)" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_document_original_tab_no_content_when_both_empty(client, stores):
+    """original_content 와 raw_content 가 모두 비면 '(no content)' 를 표시한다."""
+    meta_store = stores[0]
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp",
+        title="Empty Doc",
+        original_content="",
+        raw_content=None,
+        content_hash="hempty",
+    )
+
+    resp = await client.get(f"/partials/document/{doc_id}/original")
+    assert resp.status_code == 200
+    assert "(no content)" in resp.text
+
+
+@pytest.mark.asyncio
 async def test_document_original_tab_git_code_no_markdown(client, stores):
     """git_code 소스는 코드이므로 마크다운 렌더링 컨테이너가 없어야 한다."""
     meta_store = stores[0]

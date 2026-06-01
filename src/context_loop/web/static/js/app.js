@@ -61,10 +61,37 @@ function renderAllMarkdown(root) {
     var scope = root || document;
     var targets = scope.querySelectorAll ? scope.querySelectorAll("[data-markdown]") : [];
     targets.forEach(renderMarkdownTarget);
+    renderAllHtml(scope);
+}
+
+// HTML 렌더링 — data-html 속성이 있는 엘리먼트의 원본 HTML 을 (data-html-src
+// 로 지정된 .html-source 요소에서) 읽어 DOMPurify 로 sanitize 후 삽입한다.
+// 이미 HTML 인 콘텐츠(예: 마크다운 변환 실패 시 Confluence 원본 HTML 폴백)를
+// 마크다운 파싱 없이 안전하게 렌더하는 경로.
+function renderHtmlTarget(el) {
+    if (!el || el.dataset.htmlRendered === "1") return;
+    var srcId = el.dataset.htmlSrc;
+    var srcEl = srcId ? document.getElementById(srcId) : null;
+    if (!srcEl) return;
+    var raw = srcEl.textContent || "";
+    var html = raw;
+    if (typeof window.DOMPurify !== "undefined") {
+        html = window.DOMPurify.sanitize(raw);
+    }
+    el.innerHTML = html;
+    el.dataset.htmlRendered = "1";
+}
+
+function renderAllHtml(root) {
+    var scope = root || document;
+    var targets = scope.querySelectorAll ? scope.querySelectorAll("[data-html]") : [];
+    targets.forEach(renderHtmlTarget);
 }
 
 window.renderAllMarkdown = renderAllMarkdown;
 window.renderMarkdownTarget = renderMarkdownTarget;
+window.renderAllHtml = renderAllHtml;
+window.renderHtmlTarget = renderHtmlTarget;
 
 document.addEventListener("DOMContentLoaded", function() { renderAllMarkdown(); });
 document.body.addEventListener("htmx:afterSwap", function(e) {

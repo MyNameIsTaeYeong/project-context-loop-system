@@ -21,6 +21,27 @@ logger = logging.getLogger(__name__)
 _WEB_DIR = Path(__file__).resolve().parent
 
 
+def _compute_asset_version() -> str:
+    """정적 자산(js/css)의 최신 수정 시각을 캐시버스팅 버전 문자열로 반환한다.
+
+    템플릿이 ``?v={{ asset_version }}`` 로 정적 파일을 참조하면, 파일이 바뀔
+    때마다 값이 바뀌어 브라우저가 캐시 대신 새 파일을 받는다. 산출 실패 시
+    빈 값을 반환(쿼리 없이 동작 — 기존과 동일).
+    """
+    static_dir = _WEB_DIR / "static"
+    try:
+        mtimes = [
+            p.stat().st_mtime
+            for p in static_dir.rglob("*")
+            if p.suffix in (".js", ".css")
+        ]
+        if mtimes:
+            return str(int(max(mtimes)))
+    except OSError:
+        logger.debug("asset_version 산출 실패", exc_info=True)
+    return ""
+
+
 def _configure_logging(config: Config) -> None:
     """config의 app.log_level을 context_loop 로거에 적용한다.
 
@@ -152,6 +173,9 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
     templates = Jinja2Templates(directory=_WEB_DIR / "templates")
+    # 정적 자산 캐시버스팅용 버전 — 정적 파일(js/css)의 최신 mtime 으로 산출한다.
+    # 코드 변경 시 값이 바뀌어 브라우저가 새 파일을 받는다(stale graph.js 방지).
+    templates.env.globals["asset_version"] = _compute_asset_version()
     app.state.templates = templates
 
     from context_loop.web.api.chat import router as chat_router
@@ -159,6 +183,7 @@ def create_app() -> FastAPI:
     from context_loop.web.api.confluence_mcp import router as confluence_mcp_router
     from context_loop.web.api.documents import router as documents_router
     from context_loop.web.api.git_sync import router as git_sync_router
+    from context_loop.web.api.graph import router as graph_router
     from context_loop.web.api.stats import router as stats_router
     from context_loop.web.api.upload import router as upload_router
 
@@ -168,6 +193,7 @@ def create_app() -> FastAPI:
     app.include_router(confluence_mcp_router)
     app.include_router(git_sync_router)
     app.include_router(chat_router)
+    app.include_router(graph_router)
     app.include_router(documents_router)
 
     return app
