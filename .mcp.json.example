@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "context-loop": {
+      "command": "${CONTEXT_LOOP_VENV:-.venv}/bin/context-loop",
+      "args": ["mcp", "serve"],
+      "env": {}
+    }
+  }
+}
