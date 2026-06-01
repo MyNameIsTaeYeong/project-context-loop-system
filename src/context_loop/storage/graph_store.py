@@ -399,6 +399,115 @@ class GraphStore:
             frontier = next_frontier
         return visited
 
+    def _resolve_seed_nodes(
+        self,
+        entity_name: str,
+        *,
+        embedding_fallback: list[float] | None = None,
+        embedding_fallback_threshold: float = 0.5,
+        embedding_fallback_top_k: int = 3,
+    ) -> list[int]:
+        """엔티티 이름을 시드 node_id 목록으로 해석한다 (4단계 폴백).
+
+        ``get_neighbors`` 와 ``get_connected_component`` 가 공유하는 이름→노드
+        해석 로직. 완전 일치 → 파일 범위 제거 일치 → 짧은 이름 일치 →
+        임베딩 fallback 순으로 시도한다.
+        """
+        query_lower = entity_name.lower()
+
+        # 1. 완전 일치 (기존 동작)
+        center_nodes = [
+            n for n, d in self._graph.nodes(data=True)
+            if d.get("entity_name", "").lower() == query_lower
+        ]
+
+        # 2. 파일 범위를 벗긴 부분 일치 (예: "UserService.create_user")
+        if not center_nodes:
+            center_nodes = [
+                n for n, d in self._graph.nodes(data=True)
+                if _extract_scoped_name(d.get("entity_name", "")).lower() == query_lower
+            ]
+
+        # 3. 짧은 이름 일치 (예: "create_user", "UserService")
+        if not center_nodes:
+            center_nodes = [
+                n for n, d in self._graph.nodes(data=True)
+                if _extract_short_name(d.get("entity_name", "")).lower() == query_lower
+            ]
+
+        # 4. 임베딩 fallback — 표면 매칭이 모두 실패한 경우. 질의 이름이
+        # 인덱스에 표기 차이로 존재할 때 (예: "Auth Service" ↔ "AuthService",
+        # "인증 서비스" ↔ "인증서비스") 의미 임베딩으로 가장 가까운 노드를 시드로
+        # 사용하여 검색 funnel 손실을 줄인다.
+        if not center_nodes and embedding_fallback is not None:
+            similar = self.search_entities_by_embedding(
+                embedding_fallback,
+                threshold=embedding_fallback_threshold,
+                top_k=embedding_fallback_top_k,
+            )
+            center_nodes = [s["node_id"] for s in similar if s.get("node_id") is not None]
+
+        return center_nodes
+
+    def get_connected_component(
+        self,
+        entity_name: str,
+        *,
+        embedding_fallback: list[float] | None = None,
+        embedding_fallback_threshold: float = 0.5,
+        embedding_fallback_top_k: int = 3,
+        max_nodes: int = 500,
+    ) -> list[dict[str, Any]]:
+        """엔티티에서 (방향 무시) 연결된 모든 노드를 반환한다.
+
+        ``get_neighbors`` 가 depth 제한 BFS 인 것과 달리, 시드 노드가 속한
+        연결 컴포넌트(weakly connected component) 전체를 반환한다 — "이
+        키워드와 연결된 모든 엔티티" 탐색용. 시드 이름 해석은
+        ``_resolve_seed_nodes`` 와 동일한 4단계 폴백을 쓴다.
+
+        Args:
+            entity_name: 시작 키워드/엔티티 이름.
+            embedding_fallback: 표면 매칭 실패 시 사용할 임베딩 벡터.
+            max_nodes: 반환 노드 상한 (거대 컴포넌트로 인한 과도한 페이로드
+                방지). BFS 가 이 수에 도달하면 탐색을 중단한다.
+
+        Returns:
+            연결된 노드 dict 목록 (시드 포함). 시드를 못 찾으면 빈 목록.
+        """
+        seeds = self._resolve_seed_nodes(
+            entity_name,
+            embedding_fallback=embedding_fallback,
+            embedding_fallback_threshold=embedding_fallback_threshold,
+            embedding_fallback_top_k=embedding_fallback_top_k,
+        )
+        if not seeds:
+            return []
+
+        visited: set[int] = set(seeds)
+        frontier: set[int] = set(seeds)
+        while frontier and len(visited) < max_nodes:
+            nxt: set[int] = set()
+            for n in frontier:
+                if not self._graph.has_node(n):
+                    continue
+                nxt.update(self._graph.successors(n))
+                nxt.update(self._graph.predecessors(n))
+            nxt -= visited
+            if not nxt:
+                break
+            visited.update(nxt)
+            frontier = nxt
+
+        result: list[dict[str, Any]] = []
+        for node_id in list(visited)[:max_nodes]:
+            if not self._graph.has_node(node_id):
+                continue
+            data = dict(self._graph.nodes[node_id])
+            data["id"] = node_id
+            data["is_seed"] = node_id in set(seeds)
+            result.append(data)
+        return result
+
     def get_neighbors(
         self,
         entity_name: str,
@@ -436,39 +545,12 @@ class GraphStore:
         Returns:
             관련 노드 정보 목록.
         """
-        query_lower = entity_name.lower()
-
-        # 1. 완전 일치 (기존 동작)
-        center_nodes = [
-            n for n, d in self._graph.nodes(data=True)
-            if d.get("entity_name", "").lower() == query_lower
-        ]
-
-        # 2. 파일 범위를 벗긴 부분 일치 (예: "UserService.create_user")
-        if not center_nodes:
-            center_nodes = [
-                n for n, d in self._graph.nodes(data=True)
-                if _extract_scoped_name(d.get("entity_name", "")).lower() == query_lower
-            ]
-
-        # 3. 짧은 이름 일치 (예: "create_user", "UserService")
-        if not center_nodes:
-            center_nodes = [
-                n for n, d in self._graph.nodes(data=True)
-                if _extract_short_name(d.get("entity_name", "")).lower() == query_lower
-            ]
-
-        # 4. 임베딩 fallback — 표면 매칭이 모두 실패한 경우. LLM 추측 이름이
-        # 인덱스에 표기 차이로 존재할 때 (예: "Auth Service" ↔ "AuthService",
-        # "인증 서비스" ↔ "인증서비스") 의미 임베딩으로 가장 가까운 노드를 시드로
-        # 사용하여 검색 funnel 손실을 줄인다.
-        if not center_nodes and embedding_fallback is not None:
-            similar = self.search_entities_by_embedding(
-                embedding_fallback,
-                threshold=embedding_fallback_threshold,
-                top_k=embedding_fallback_top_k,
-            )
-            center_nodes = [s["node_id"] for s in similar if s.get("node_id") is not None]
+        center_nodes = self._resolve_seed_nodes(
+            entity_name,
+            embedding_fallback=embedding_fallback,
+            embedding_fallback_threshold=embedding_fallback_threshold,
+            embedding_fallback_top_k=embedding_fallback_top_k,
+        )
 
         if not center_nodes:
             return []

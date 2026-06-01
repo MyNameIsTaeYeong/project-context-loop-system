@@ -1049,3 +1049,56 @@ async def test_cross_doc_embedding_no_duplicates(
 
     assert count == 1  # 1개 노드 → 1개 임베딩
     assert graph_store.entity_embedding_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_connected_component_returns_full_component(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """시드에서 양방향으로 연결된 모든 노드를 반환한다 (depth 무제한)."""
+    doc_id = await _create_doc(meta_store)
+    # A -> B -> C (체인). depth=1 이웃은 B 까지지만, 컴포넌트는 C 까지.
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="A", entity_type="component"),
+            Entity(name="B", entity_type="component"),
+            Entity(name="C", entity_type="component"),
+        ],
+        relations=[
+            Relation(source="A", target="B", relation_type="calls"),
+            Relation(source="B", target="C", relation_type="calls"),
+        ],
+    ))
+
+    component = graph_store.get_connected_component("A")
+    names = {n["entity_name"] for n in component}
+    assert names == {"A", "B", "C"}
+    # 시드 표시
+    seeds = [n for n in component if n.get("is_seed")]
+    assert len(seeds) == 1
+    assert seeds[0]["entity_name"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_get_connected_component_no_match(graph_store: GraphStore) -> None:
+    """일치하는 시드가 없으면 빈 목록을 반환한다."""
+    assert graph_store.get_connected_component("없는엔티티") == []
+
+
+@pytest.mark.asyncio
+async def test_get_connected_component_respects_max_nodes(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """max_nodes 상한을 넘지 않는다."""
+    doc_id = await _create_doc(meta_store)
+    rels = [
+        Relation(source="hub", target=f"n{i}", relation_type="rel")
+        for i in range(10)
+    ]
+    ents = [Entity(name="hub", entity_type="component")] + [
+        Entity(name=f"n{i}", entity_type="component") for i in range(10)
+    ]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=ents, relations=rels))
+
+    component = graph_store.get_connected_component("hub", max_nodes=5)
+    assert len(component) <= 5

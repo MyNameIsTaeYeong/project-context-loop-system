@@ -712,6 +712,93 @@ class MetadataStore:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_merged_node_groups(
+        self,
+        *,
+        min_variants: int = 2,
+    ) -> list[dict[str, Any]]:
+        """크로스-문서 병합이 일어난 노드 그룹을 집계해 반환한다 (관측·디버깅용).
+
+        ``graph_merge_log`` 의 행을 ``canonical_node_id`` 기준으로 묶어, 한
+        정규 노드로 흡수된 원본 표기(raw_entity_name)들과 머지 방식을 요약한다.
+        병합이 의미 있게 일어난 노드(서로 다른 원본 표기가 ``min_variants`` 종
+        이상이거나, 여러 문서에서 수렴한 노드)만 노출한다.
+
+        Args:
+            min_variants: 그룹으로 노출할 최소 기준 (원본 표기 종류 수 또는
+                기여 문서 수 중 큰 값). 기본 2 — 단일 문서에서 한 번만
+                등장(신규 1건)한 노드는 병합이 아니므로 제외.
+
+        Returns:
+            각 그룹 dict (variant 수 → 문서 수 내림차순 정렬):
+              - canonical_node_id: 정규 노드 ID
+              - entity_name: 정규 노드의 현재 이름 (graph_nodes 조인)
+              - entity_type: 정규 노드 타입
+              - variant_names: 흡수된 원본 표기 목록 (중복 제거, 정렬)
+              - document_ids: 기여한 문서 ID 목록 (중복 제거, 정렬)
+              - methods: 등장한 merge_method 집합 (exact/normalized/new)
+              - log_count: 이 노드에 기록된 총 로그 행 수
+        """
+        cursor = await self.db.execute(
+            """SELECT m.canonical_node_id      AS canonical_node_id,
+                      m.raw_entity_name        AS raw_entity_name,
+                      m.source_document_id     AS source_document_id,
+                      m.merge_method           AS merge_method,
+                      n.entity_name            AS entity_name,
+                      n.entity_type            AS entity_type
+               FROM graph_merge_log m
+               LEFT JOIN graph_nodes n ON n.id = m.canonical_node_id
+               ORDER BY m.canonical_node_id, m.id"""
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+        grouped: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            cid = r["canonical_node_id"]
+            g = grouped.get(cid)
+            if g is None:
+                g = {
+                    "canonical_node_id": cid,
+                    "entity_name": r.get("entity_name") or "(삭제된 노드)",
+                    "entity_type": r.get("entity_type") or "other",
+                    "variant_names": set(),
+                    "document_ids": set(),
+                    "methods": set(),
+                    "log_count": 0,
+                }
+                grouped[cid] = g
+            g["log_count"] += 1
+            if r.get("raw_entity_name"):
+                g["variant_names"].add(r["raw_entity_name"])
+            if r.get("source_document_id") is not None:
+                g["document_ids"].add(r["source_document_id"])
+            if r.get("merge_method"):
+                g["methods"].add(r["merge_method"])
+
+        result: list[dict[str, Any]] = []
+        for g in grouped.values():
+            variant_count = len(g["variant_names"])
+            doc_count = len(g["document_ids"])
+            # 병합으로 볼 수 있는 조건: 원본 표기가 2종 이상이거나
+            # 2개 이상 문서가 같은 노드로 수렴.
+            if max(variant_count, doc_count) < min_variants:
+                continue
+            result.append({
+                "canonical_node_id": g["canonical_node_id"],
+                "entity_name": g["entity_name"],
+                "entity_type": g["entity_type"],
+                "variant_names": sorted(g["variant_names"]),
+                "document_ids": sorted(g["document_ids"]),
+                "methods": sorted(g["methods"]),
+                "log_count": g["log_count"],
+            })
+
+        result.sort(
+            key=lambda x: (len(x["variant_names"]), len(x["document_ids"])),
+            reverse=True,
+        )
+        return result
+
     async def delete_graph_data_by_document(self, document_id: int) -> None:
         """문서의 그래프 엣지를 삭제하고, 노드-문서 연결을 해제한다.
 

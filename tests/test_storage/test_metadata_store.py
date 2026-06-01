@@ -507,3 +507,56 @@ async def test_get_stats(store: MetadataStore) -> None:
     assert stats["chunk_count"] == 1
     assert stats["node_count"] == 1
     assert stats["edge_count"] == 0
+
+
+async def test_get_merged_node_groups(store: MetadataStore) -> None:
+    """병합된 노드 그룹을 집계한다 — 2종 이상 표기 또는 2개 이상 문서 수렴."""
+    doc1 = await store.create_document(
+        source_type="manual", title="D1",
+        original_content="c", content_hash="h1",
+    )
+    doc2 = await store.create_document(
+        source_type="manual", title="D2",
+        original_content="c", content_hash="h2",
+    )
+    node_id = await store.create_graph_node_with_link(
+        document_id=doc1, entity_name="Gateway", entity_type="component",
+    )
+    # 같은 정규 노드로 두 표기·두 문서가 수렴한 머지 로그 기록
+    await store.record_graph_merge(
+        canonical_node_id=node_id, raw_entity_name="Gateway",
+        raw_entity_type="component", source_document_id=doc1,
+        merge_method="new",
+    )
+    await store.record_graph_merge(
+        canonical_node_id=node_id, raw_entity_name="gateway",
+        raw_entity_type="component", source_document_id=doc2,
+        merge_method="normalized",
+    )
+
+    groups = await store.get_merged_node_groups(min_variants=2)
+    assert len(groups) == 1
+    g = groups[0]
+    assert g["entity_name"] == "Gateway"
+    assert set(g["variant_names"]) == {"Gateway", "gateway"}
+    assert set(g["document_ids"]) == {doc1, doc2}
+    assert set(g["methods"]) == {"new", "normalized"}
+
+
+async def test_get_merged_node_groups_excludes_single_variant(
+    store: MetadataStore,
+) -> None:
+    """단일 표기·단일 문서(신규 1건)는 병합으로 보지 않아 제외한다."""
+    doc = await store.create_document(
+        source_type="manual", title="D",
+        original_content="c", content_hash="h",
+    )
+    node_id = await store.create_graph_node_with_link(
+        document_id=doc, entity_name="Solo", entity_type="component",
+    )
+    await store.record_graph_merge(
+        canonical_node_id=node_id, raw_entity_name="Solo",
+        raw_entity_type="component", source_document_id=doc,
+        merge_method="new",
+    )
+    assert await store.get_merged_node_groups(min_variants=2) == []

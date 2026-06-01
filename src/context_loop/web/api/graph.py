@@ -1,0 +1,183 @@
+"""그래프 탐색 페이지 및 API 엔드포인트.
+
+구축된 지식 그래프를 웹 대시보드에서 시각화·탐색한다:
+  - ``GET /graph``                  : 그래프 탐색 페이지
+  - ``GET /api/graph/full``         : 전체 그래프(노드/엣지) JSON (상한 적용)
+  - ``GET /api/graph/explore``      : 키워드 → 연결된 모든 엔티티 서브그래프
+  - ``GET /api/graph/merges``       : 병합된 노드 그룹 목록
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query, Request
+from langchain_core.embeddings import Embeddings
+
+from context_loop.storage.graph_store import GraphStore
+from context_loop.storage.metadata_store import MetadataStore
+from context_loop.web.dependencies import (
+    get_embedding_client,
+    get_graph_store,
+    get_meta_store,
+    get_templates,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# 전체 그래프 시각화 시 한 번에 그리는 노드 상한. 거대 그래프에서 브라우저
+# 렌더가 멈추는 것을 막는다. 초과 시 노드는 차수(degree) 높은 순으로 추린다.
+_FULL_GRAPH_MAX_NODES = 300
+
+
+@router.get("/graph")
+async def graph_page(request: Request):
+    """그래프 탐색 페이지."""
+    templates = get_templates(request)
+    return templates.TemplateResponse("graph.html", {"request": request})
+
+
+def _node_payload(node_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """NetworkX 노드 데이터를 vis-network 노드 dict 로 변환한다."""
+    props = data.get("properties") or {}
+    description = ""
+    if isinstance(props, dict):
+        description = str(props.get("description") or "")
+    doc_ids = data.get("document_ids")
+    doc_count = len(doc_ids) if isinstance(doc_ids, set) else 0
+    name = data.get("entity_name", str(node_id))
+    etype = data.get("entity_type", "other") or "other"
+    title = f"{name} ({etype})"
+    if description:
+        title += f"\n{description}"
+    if doc_count:
+        title += f"\n문서 {doc_count}건"
+    return {
+        "id": node_id,
+        "label": name,
+        "group": etype,
+        "title": title,
+    }
+
+
+def _edge_payload(source: int, target: int, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "from": source,
+        "to": target,
+        "label": data.get("relation_type", ""),
+    }
+
+
+@router.get("/api/graph/full")
+async def graph_full(
+    graph_store: GraphStore = Depends(get_graph_store),
+) -> dict[str, Any]:
+    """전체 그래프를 vis-network 형식으로 반환한다.
+
+    노드 수가 상한을 초과하면 차수(연결 수) 높은 노드부터 추려 반환하고,
+    그 노드들 사이의 엣지만 포함한다.
+    """
+    g = graph_store.graph
+    total_nodes = g.number_of_nodes()
+    total_edges = g.number_of_edges()
+
+    node_ids = list(g.nodes())
+    truncated = False
+    if total_nodes > _FULL_GRAPH_MAX_NODES:
+        truncated = True
+        # 차수 높은 노드 우선 (허브 중심으로 보여줌)
+        node_ids = sorted(node_ids, key=lambda n: g.degree(n), reverse=True)
+        node_ids = node_ids[:_FULL_GRAPH_MAX_NODES]
+
+    keep = set(node_ids)
+    nodes = [_node_payload(n, dict(g.nodes[n])) for n in node_ids]
+    edges = [
+        _edge_payload(u, v, data)
+        for u, v, data in g.edges(data=True)
+        if u in keep and v in keep
+    ]
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "shown_nodes": len(nodes),
+            "shown_edges": len(edges),
+            "truncated": truncated,
+        },
+    }
+
+
+@router.get("/api/graph/explore")
+async def graph_explore(
+    keyword: str = Query(..., min_length=1),
+    graph_store: GraphStore = Depends(get_graph_store),
+    embedding_client: Embeddings = Depends(get_embedding_client),
+) -> dict[str, Any]:
+    """키워드에 해당하는 엔티티부터 연결된 모든 엔티티 서브그래프를 반환한다.
+
+    표면 매칭(완전/부분/짧은 이름)이 실패하면 키워드 임베딩으로 가장 가까운
+    노드를 시드로 사용한다(엔티티 임베딩 캐시가 있을 때). 시드가 속한 연결
+    컴포넌트 전체를 반환한다.
+    """
+    # 임베딩 fallback 준비 — 캐시가 비어 있으면 1회 구축, 키워드 임베딩 계산.
+    embedding_fallback = None
+    try:
+        if graph_store.entity_embedding_count == 0 and graph_store.stats()["nodes"] > 0:
+            await graph_store.build_entity_embeddings(embedding_client)
+        if graph_store.entity_embedding_count > 0:
+            embedding_fallback = await embedding_client.aembed_query(keyword)
+    except Exception:
+        logger.warning("키워드 임베딩 fallback 준비 실패", exc_info=True)
+
+    component = graph_store.get_connected_component(
+        keyword,
+        embedding_fallback=embedding_fallback,
+    )
+    if not component:
+        return {
+            "nodes": [],
+            "edges": [],
+            "stats": {"matched": False, "shown_nodes": 0, "shown_edges": 0},
+            "keyword": keyword,
+        }
+
+    node_ids = [n["id"] for n in component]
+    keep = set(node_ids)
+    g = graph_store.graph
+    nodes = []
+    for n in component:
+        payload = _node_payload(n["id"], n)
+        if n.get("is_seed"):
+            payload["seed"] = True
+        nodes.append(payload)
+    edges = [
+        _edge_payload(u, v, data)
+        for u, v, data in g.edges(data=True)
+        if u in keep and v in keep
+    ]
+    seed_count = sum(1 for n in component if n.get("is_seed"))
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "matched": True,
+            "shown_nodes": len(nodes),
+            "shown_edges": len(edges),
+            "seed_count": seed_count,
+        },
+        "keyword": keyword,
+    }
+
+
+@router.get("/api/graph/merges")
+async def graph_merges(
+    meta_store: MetadataStore = Depends(get_meta_store),
+) -> dict[str, Any]:
+    """병합된(크로스-문서 수렴) 노드 그룹 목록을 반환한다."""
+    groups = await meta_store.get_merged_node_groups(min_variants=2)
+    return {"groups": groups, "count": len(groups)}

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}Graph - Context Loop{% endblock %}
+
+{% block content %}
+<h2>지식 그래프</h2>
+<p>구축된 그래프의 노드·엣지를 탐색합니다. 키워드로 특정 엔티티와 연결된 모든
+엔티티를 보거나, 병합된 노드를 확인할 수 있습니다.</p>
+
+<div x-data="{ tab: 'explore' }">
+    <div role="group" style="margin-bottom: 1rem;">
+        <button :class="tab === 'explore' ? '' : 'outline'"
+                @click="tab = 'explore'">키워드 탐색</button>
+        <button :class="tab === 'full' ? '' : 'outline'"
+                @click="tab = 'full'; if (window.graphLoadFull) window.graphLoadFull()">전체 그래프</button>
+        <button :class="tab === 'merges' ? '' : 'outline'"
+                @click="tab = 'merges'; if (window.graphLoadMerges) window.graphLoadMerges()">병합된 노드</button>
+    </div>
+
+    <!-- 키워드 탐색 -->
+    <section x-show="tab === 'explore'">
+        <form onsubmit="event.preventDefault(); if (window.graphExplore) window.graphExplore();">
+            <fieldset role="group">
+                <input type="search" id="graph-keyword"
+                       placeholder="엔티티 키워드 (예: 결제 시스템 아키텍처)"
+                       autocomplete="off">
+                <button type="submit">탐색</button>
+            </fieldset>
+        </form>
+        <p id="graph-explore-status" style="min-height: 1.2rem;"></p>
+        <div id="graph-explore-container"
+             style="height: 540px; border: 1px solid var(--pico-muted-border-color);
+                    border-radius: var(--pico-border-radius);"></div>
+    </section>
+
+    <!-- 전체 그래프 -->
+    <section x-show="tab === 'full'">
+        <p id="graph-full-status" style="min-height: 1.2rem;"></p>
+        <div id="graph-full-container"
+             style="height: 540px; border: 1px solid var(--pico-muted-border-color);
+                    border-radius: var(--pico-border-radius);"></div>
+    </section>
+
+    <!-- 병합된 노드 -->
+    <section x-show="tab === 'merges'">
+        <p id="graph-merges-status" style="min-height: 1.2rem;"></p>
+        <div id="graph-merges-table"></div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script src="/static/js/graph.js"></script>
+<script src="/static/js/graph_explorer.js"></script>
+{% endblock %}
