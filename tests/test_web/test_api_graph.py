@@ -157,3 +157,70 @@ async def test_graph_merges_empty_when_no_merge(client, stores):
     resp = await client.get("/api/graph/merges")
     assert resp.status_code == 200
     assert resp.json()["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_graph_explore_depth_param(client, stores):
+    """depth 파라미터로 탐색 범위를 제한할 수 있다."""
+    meta_store, _, graph_store = stores
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="Chain",
+        original_content="c", content_hash="hc",
+    )
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name=n, entity_type="component") for n in ["A", "B", "C"]],
+        relations=[
+            Relation(source="A", target="B", relation_type="r"),
+            Relation(source="B", target="C", relation_type="r"),
+        ],
+    ))
+
+    # depth=1 → A, B 만
+    resp = await client.get("/api/graph/explore", params={"keyword": "A", "depth": 1})
+    assert resp.status_code == 200
+    data = resp.json()
+    labels = {n["label"] for n in data["nodes"]}
+    assert "A" in str(labels)  # 라벨에 hop 부기가 붙을 수 있어 부분 매칭
+    assert data["stats"]["shown_nodes"] == 2
+    assert data["depth"] == 1
+    # 각 노드에 hop 이 포함된다
+    assert all("hop" in n for n in data["nodes"])
+
+    # depth 미지정 → 전체 (A, B, C)
+    resp2 = await client.get("/api/graph/explore", params={"keyword": "A"})
+    data2 = resp2.json()
+    assert data2["stats"]["shown_nodes"] == 3
+    assert data2["depth"] is None
+
+
+@pytest.mark.asyncio
+async def test_graph_node_detail(client, stores):
+    """노드 상세 — 출처 문서와 병합 내역을 반환한다."""
+    meta_store, _, graph_store = stores
+    doc1, doc2 = await _seed_graph(meta_store, graph_store)
+
+    # Gateway 노드 id 조회
+    full = (await client.get("/api/graph/full")).json()
+    gw = next(n for n in full["nodes"] if n["label"] == "Gateway")
+
+    resp = await client.get(f"/api/graph/node/{gw['id']}")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["entity_name"] == "Gateway"
+    # 두 문서에서 추출됨
+    doc_ids = {doc["document_id"] for doc in d["documents"]}
+    assert doc_ids == {doc1, doc2}
+    # 문서 제목·source_type 포함
+    assert all("title" in doc and "source_type" in doc for doc in d["documents"])
+    # 병합 내역에 흡수된 표기들이 기록됨
+    raw_names = {m["raw_entity_name"] for m in d["merges"]}
+    assert {"Gateway", "gateway"} <= raw_names
+    methods = {m["merge_method"] for m in d["merges"]}
+    assert methods  # exact/normalized/new 중
+
+
+@pytest.mark.asyncio
+async def test_graph_node_detail_not_found(client, stores):
+    """존재하지 않는 노드는 404."""
+    resp = await client.get("/api/graph/node/999999")
+    assert resp.status_code == 404

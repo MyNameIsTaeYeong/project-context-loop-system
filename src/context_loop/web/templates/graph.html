@@ -24,13 +24,27 @@
                 <input type="search" id="graph-keyword"
                        placeholder="엔티티 키워드 (예: 결제 시스템 아키텍처)"
                        autocomplete="off">
+                <input type="number" id="graph-depth" min="1" max="20"
+                       placeholder="depth (비우면 전체)"
+                       style="max-width: 12rem;" autocomplete="off">
                 <button type="submit">탐색</button>
             </fieldset>
+            <small>depth 를 비우면 연결된 모든 엔티티를 탐색합니다. 1 = 직접
+            이웃, 2 = 2-hop 까지. 노드를 클릭하면 출처 문서·병합 내역을 봅니다.</small>
         </form>
         <p id="graph-explore-status" style="min-height: 1.2rem;"></p>
-        <div id="graph-explore-container"
-             style="height: 540px; border: 1px solid var(--pico-muted-border-color);
-                    border-radius: var(--pico-border-radius);"></div>
+        <div style="display: flex; gap: 1rem; align-items: stretch;">
+            <div id="graph-explore-container"
+                 style="flex: 1; height: 540px;
+                        border: 1px solid var(--pico-muted-border-color);
+                        border-radius: var(--pico-border-radius);"></div>
+            <aside id="graph-node-detail"
+                   style="width: 320px; height: 540px; overflow-y: auto;
+                          padding: 0 1rem; border: 1px solid var(--pico-muted-border-color);
+                          border-radius: var(--pico-border-radius);">
+                <p><small>노드를 클릭하면 상세 정보가 여기에 표시됩니다.</small></p>
+            </aside>
+        </div>
     </section>
 
     <!-- 전체 그래프 -->

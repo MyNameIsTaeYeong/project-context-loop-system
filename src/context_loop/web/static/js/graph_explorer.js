@@ -23,6 +23,16 @@ function _highlightSeeds(data) {
     return data;
 }
 
+// hop 거리를 라벨에 부기 (시드=0). depth 별 위치를 시각적으로 구분.
+function _annotateHops(data) {
+    (data.nodes || []).forEach(function (n) {
+        if (typeof n.hop === "number" && !n.seed) {
+            n.label = n.label + " (" + n.hop + ")";
+        }
+    });
+    return data;
+}
+
 async function graphExplore() {
     var input = document.getElementById("graph-keyword");
     var keyword = (input && input.value || "").trim();
@@ -30,9 +40,15 @@ async function graphExplore() {
         _setStatus("graph-explore-status", "키워드를 입력하세요.");
         return;
     }
+    var depthInput = document.getElementById("graph-depth");
+    var depthRaw = (depthInput && depthInput.value || "").trim();
+    var url = "/api/graph/explore?keyword=" + encodeURIComponent(keyword);
+    if (depthRaw !== "") {
+        url += "&depth=" + encodeURIComponent(depthRaw);
+    }
     _setStatus("graph-explore-status", "탐색 중...");
     try {
-        var resp = await fetch("/api/graph/explore?keyword=" + encodeURIComponent(keyword));
+        var resp = await fetch(url);
         if (!resp.ok) {
             _setStatus("graph-explore-status", "요청 실패: " + resp.status);
             return;
@@ -45,13 +61,77 @@ async function graphExplore() {
             return;
         }
         _highlightSeeds(data);
+        _annotateHops(data);
+        var scope = depthRaw !== "" ? ("depth " + depthRaw + " 이내") : "연결 전체";
         _setStatus("graph-explore-status",
-            "'" + keyword + "' 연결 그래프 — 노드 " + data.stats.shown_nodes +
+            "'" + keyword + "' " + scope + " — 노드 " + data.stats.shown_nodes +
             "개, 엣지 " + data.stats.shown_edges + "개 (시드 " +
-            (data.stats.seed_count || 0) + "개)");
-        initGraph("graph-explore-container", data);
+            (data.stats.seed_count || 0) + "개, 최대 " +
+            (data.stats.max_hop || 0) + "-hop)");
+        initGraph("graph-explore-container", data, {
+            onNodeClick: graphShowNodeDetail,
+        });
     } catch (e) {
         _setStatus("graph-explore-status", "오류: " + e.message);
+    }
+}
+
+// 노드 클릭 → 출처 문서·병합 내역 상세 패널 렌더.
+async function graphShowNodeDetail(nodeId) {
+    var panel = document.getElementById("graph-node-detail");
+    if (!panel) return;
+    panel.innerHTML = "<p><small>불러오는 중...</small></p>";
+    try {
+        var resp = await fetch("/api/graph/node/" + encodeURIComponent(nodeId));
+        if (!resp.ok) {
+            panel.innerHTML = "<p>상세 조회 실패: " + resp.status + "</p>";
+            return;
+        }
+        var d = await resp.json();
+
+        var html = "<h4>" + _escapeHtml(d.entity_name) + "</h4>";
+        html += "<p><small>타입: " + _escapeHtml(d.entity_type) + "</small></p>";
+        if (d.description) {
+            html += "<p><small>" + _escapeHtml(d.description) + "</small></p>";
+        }
+
+        // 출처 문서
+        html += "<h5>출처 문서 (" + (d.documents || []).length + ")</h5>";
+        if ((d.documents || []).length) {
+            html += "<ul>";
+            (d.documents).forEach(function (doc) {
+                var label = _escapeHtml(doc.title);
+                if (doc.source_type) {
+                    label += " <small>[" + _escapeHtml(doc.source_type) + "]</small>";
+                }
+                html += '<li><a href="/documents/' + doc.document_id +
+                        '" target="_blank">' + label + "</a></li>";
+            });
+            html += "</ul>";
+        } else {
+            html += "<p><small>연결된 문서 없음</small></p>";
+        }
+
+        // 병합 내역
+        html += "<h5>병합 내역 (" + (d.merges || []).length + ")</h5>";
+        if ((d.merges || []).length) {
+            html += "<table><thead><tr><th>표기</th><th>방식</th><th>문서</th>" +
+                    "</tr></thead><tbody>";
+            (d.merges).forEach(function (m) {
+                html += "<tr><td>" + _escapeHtml(m.raw_entity_name) + "</td>" +
+                        "<td>" + _escapeHtml(m.merge_method) + "</td>" +
+                        "<td>#" + _escapeHtml(m.source_document_id) + "</td></tr>";
+            });
+            html += "</tbody></table>";
+            html += "<p><small>방식: exact(정확 일치) · normalized(표기 정규화 병합)" +
+                    " · new(신규 생성)</small></p>";
+        } else {
+            html += "<p><small>병합 기록 없음</small></p>";
+        }
+
+        panel.innerHTML = html;
+    } catch (e) {
+        panel.innerHTML = "<p>오류: " + _escapeHtml(e.message) + "</p>";
     }
 }
 
@@ -127,5 +207,6 @@ async function graphLoadMerges() {
 }
 
 window.graphExplore = graphExplore;
+window.graphShowNodeDetail = graphShowNodeDetail;
 window.graphLoadFull = graphLoadFull;
 window.graphLoadMerges = graphLoadMerges;

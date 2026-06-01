@@ -1102,3 +1102,50 @@ async def test_get_connected_component_respects_max_nodes(
 
     component = graph_store.get_connected_component("hub", max_nodes=5)
     assert len(component) <= 5
+
+
+@pytest.mark.asyncio
+async def test_get_connected_component_depth_limit(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """depth 를 주면 그 hop 까지만 반환하고, None 이면 전체를 반환한다."""
+    doc_id = await _create_doc(meta_store)
+    # A -> B -> C -> D 체인
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name=n, entity_type="component") for n in ["A", "B", "C", "D"]],
+        relations=[
+            Relation(source="A", target="B", relation_type="r"),
+            Relation(source="B", target="C", relation_type="r"),
+            Relation(source="C", target="D", relation_type="r"),
+        ],
+    ))
+
+    # depth=1 → A, B 만
+    d1 = graph_store.get_connected_component("A", depth=1)
+    assert {n["entity_name"] for n in d1} == {"A", "B"}
+    # depth=2 → A, B, C
+    d2 = graph_store.get_connected_component("A", depth=2)
+    assert {n["entity_name"] for n in d2} == {"A", "B", "C"}
+    # depth=None → 전체
+    full = graph_store.get_connected_component("A", depth=None)
+    assert {n["entity_name"] for n in full} == {"A", "B", "C", "D"}
+
+
+@pytest.mark.asyncio
+async def test_get_connected_component_reports_hop(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """각 노드에 시드로부터의 hop 거리가 부여된다 (시드=0)."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name=n, entity_type="component") for n in ["A", "B", "C"]],
+        relations=[
+            Relation(source="A", target="B", relation_type="r"),
+            Relation(source="B", target="C", relation_type="r"),
+        ],
+    ))
+    comp = graph_store.get_connected_component("A")
+    hop = {n["entity_name"]: n["hop"] for n in comp}
+    assert hop["A"] == 0
+    assert hop["B"] == 1
+    assert hop["C"] == 2

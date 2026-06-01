@@ -1,13 +1,14 @@
 /* Context Loop — vis.js Graph Visualization */
 
-function initGraph(containerId, data) {
+function initGraph(containerId, data, options) {
     var container = document.getElementById(containerId);
-    if (!container || !data) return;
+    if (!container || !data) return null;
+    options = options || {};
 
     var nodes = new vis.DataSet(data.nodes || []);
     var edges = new vis.DataSet(data.edges || []);
 
-    var options = {
+    var visOptions = {
         nodes: {
             shape: "dot",
             size: 20,
@@ -38,5 +39,17 @@ function initGraph(containerId, data) {
         }
     };
 
-    new vis.Network(container, { nodes: nodes, edges: edges }, options);
+    var network = new vis.Network(
+        container, { nodes: nodes, edges: edges }, visOptions,
+    );
+
+    // 노드 클릭 콜백 (선택). 클릭된 node id 를 인자로 호출한다.
+    if (typeof options.onNodeClick === "function") {
+        network.on("click", function (params) {
+            if (params.nodes && params.nodes.length) {
+                options.onNodeClick(params.nodes[0]);
+            }
+        });
+    }
+    return network;
 }

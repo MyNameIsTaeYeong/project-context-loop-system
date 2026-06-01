@@ -453,26 +453,33 @@ class GraphStore:
         self,
         entity_name: str,
         *,
+        depth: int | None = None,
         embedding_fallback: list[float] | None = None,
         embedding_fallback_threshold: float = 0.5,
         embedding_fallback_top_k: int = 3,
         max_nodes: int = 500,
     ) -> list[dict[str, Any]]:
-        """엔티티에서 (방향 무시) 연결된 모든 노드를 반환한다.
+        """엔티티에서 (방향 무시) 연결된 노드를 hop 거리와 함께 반환한다.
 
-        ``get_neighbors`` 가 depth 제한 BFS 인 것과 달리, 시드 노드가 속한
-        연결 컴포넌트(weakly connected component) 전체를 반환한다 — "이
-        키워드와 연결된 모든 엔티티" 탐색용. 시드 이름 해석은
+        ``get_neighbors`` 가 depth 제한 BFS 인 것과 달리, 기본적으로 시드
+        노드가 속한 연결 컴포넌트(weakly connected component) 전체를 반환한다
+        — "이 키워드와 연결된 모든 엔티티" 탐색용. 시드 이름 해석은
         ``_resolve_seed_nodes`` 와 동일한 4단계 폴백을 쓴다.
+
+        각 결과 노드에는 시드로부터의 최단 hop 거리(``hop``)가 부여된다 —
+        UI 가 depth 별로 노드를 구분 표시할 수 있도록.
 
         Args:
             entity_name: 시작 키워드/엔티티 이름.
+            depth: 탐색 깊이(hop). ``None`` 이면 연결된 전체를 탐색한다.
+                1 이면 직접 이웃까지, 2 면 2-hop 까지.
             embedding_fallback: 표면 매칭 실패 시 사용할 임베딩 벡터.
             max_nodes: 반환 노드 상한 (거대 컴포넌트로 인한 과도한 페이로드
                 방지). BFS 가 이 수에 도달하면 탐색을 중단한다.
 
         Returns:
-            연결된 노드 dict 목록 (시드 포함). 시드를 못 찾으면 빈 목록.
+            연결된 노드 dict 목록 (시드 포함, ``hop`` 키 포함). 시드를 못 찾으면
+            빈 목록.
         """
         seeds = self._resolve_seed_nodes(
             entity_name,
@@ -483,28 +490,36 @@ class GraphStore:
         if not seeds:
             return []
 
-        visited: set[int] = set(seeds)
+        seed_set = set(seeds)
+        # hop 거리 기록 BFS — 시드는 0. depth=None 이면 무제한.
+        hop_by_id: dict[int, int] = {s: 0 for s in seeds}
         frontier: set[int] = set(seeds)
-        while frontier and len(visited) < max_nodes:
+        current_hop = 0
+        while frontier and len(hop_by_id) < max_nodes:
+            if depth is not None and current_hop >= depth:
+                break
+            current_hop += 1
             nxt: set[int] = set()
             for n in frontier:
                 if not self._graph.has_node(n):
                     continue
                 nxt.update(self._graph.successors(n))
                 nxt.update(self._graph.predecessors(n))
-            nxt -= visited
+            nxt -= hop_by_id.keys()
             if not nxt:
                 break
-            visited.update(nxt)
+            for nid in nxt:
+                hop_by_id[nid] = current_hop
             frontier = nxt
 
         result: list[dict[str, Any]] = []
-        for node_id in list(visited)[:max_nodes]:
+        for node_id in list(hop_by_id.keys())[:max_nodes]:
             if not self._graph.has_node(node_id):
                 continue
             data = dict(self._graph.nodes[node_id])
             data["id"] = node_id
-            data["is_seed"] = node_id in set(seeds)
+            data["is_seed"] = node_id in seed_set
+            data["hop"] = hop_by_id[node_id]
             result.append(data)
         return result
 
