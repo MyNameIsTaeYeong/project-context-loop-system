@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from context_loop.eval.graph_match import aembed_with_client
 from context_loop.processor.chunker import count_tokens
 from context_loop.processor.llm_client import LLMClient, extract_json
 
@@ -1025,6 +1026,96 @@ async def filter_question(
             return FilterReport(passed=False, reason="generic")
 
     return FilterReport(passed=True)
+
+
+async def find_equivalent_documents(
+    question: str,
+    answer_content: str,
+    source_document_id: int,
+    *,
+    embedding_client: Any,
+    vector_store: Any,
+    judge: LLMClient,
+    top_m: int = 3,
+    min_similarity: float = 0.6,
+    reasoning_mode: str | None = "off",
+    seed: int | None = None,
+) -> list[int]:
+    """질문의 답을 **동등하게** 담은 다른 문서 ID 들을 코퍼스 전역에서 찾는다.
+
+    OR-동치(경우 B) 해소용. 질문은 문서 #42 에서 생성되지만, 같은 답이 #99 에도
+    있으면 검색기가 #99 를 회수해도 정답이어야 한다. uniqueness 게이트는 코퍼스
+    전역 검색이 아니라 LLM 판단 + 무관 샘플이라 진짜 동등 문서를 놓칠 수 있으므로,
+    여기서 벡터 검색 + answer-containment 로 정밀 보강한다.
+
+    절차:
+        1. 정답 청크 임베딩으로 벡터 스토어 전역 검색(over-fetch).
+        2. ``source_document_id`` 제외 + cosine 유사도 하한(``min_similarity``)
+           적용 후 문서 단위로 최고 유사도 청크만 남김.
+        3. 상위 ``top_m`` 후보 각각에 대해 ``is_answerable`` 로 "이 문맥만으로
+           질문에 답할 수 있는가"를 검증 — yes 인 문서만 동등으로 채택.
+
+    과탐(false positive) 을 피하기 위해 유사도 하한 + answer-containment 의
+    이중 조건을 쓴다. 무관·일반 문서는 유사도 하한에서 걸러진다.
+
+    Args:
+        question: 후보 질문.
+        answer_content: 정답 청크 본문(임베딩·유사도 기준).
+        source_document_id: 원 출처 문서 ID(후보에서 제외).
+        embedding_client: 임베딩 클라이언트. None 이면 빈 리스트.
+        vector_store: 벡터 스토어. None 이면 빈 리스트.
+        judge: answer-containment 검증용 Judge LLM.
+        top_m: answer-containment 검증할 최대 후보 문서 수.
+        min_similarity: 후보 cosine 유사도 하한.
+        seed: 결정성 seed(후보별 오프셋 부여).
+
+    Returns:
+        동등 정답으로 채택된 문서 ID 들의 정렬 리스트(원 출처 제외).
+    """
+    if embedding_client is None or vector_store is None or not answer_content:
+        return []
+
+    embeddings = await aembed_with_client(embedding_client, [answer_content])
+    if not embeddings or embeddings[0] is None:
+        return []
+    query_emb = list(embeddings[0])
+
+    try:
+        raw = vector_store.search(query_emb, n_results=max(top_m * 6, 12))
+    except Exception:
+        logger.warning("동치 후보 벡터 검색 실패", exc_info=True)
+        return []
+
+    # 문서 단위로 최고 유사도 청크만 남긴다(같은 문서 여러 view 중복 제거).
+    best_by_doc: dict[int, dict[str, Any]] = {}
+    for r in raw:
+        meta = r.get("metadata") or {}
+        doc_id = meta.get("document_id")
+        if doc_id is None or int(doc_id) == int(source_document_id):
+            continue
+        sim = 1.0 - float(r.get("distance", 1.0))
+        if sim < min_similarity:
+            continue
+        prev = best_by_doc.get(int(doc_id))
+        if prev is None or sim > prev["_sim"]:
+            best_by_doc[int(doc_id)] = {**r, "_sim": sim}
+
+    candidates = sorted(best_by_doc.values(), key=lambda x: -x["_sim"])[:top_m]
+
+    equivalent: list[int] = []
+    for i, cand in enumerate(candidates):
+        cand_text = cand.get("document") or ""
+        if not cand_text:
+            continue
+        cand_seed = (seed + 500 + i) if seed is not None else None
+        ok = await is_answerable(
+            question, cand_text, judge=judge,
+            reasoning_mode=reasoning_mode, seed=cand_seed,
+        )
+        if ok is True:
+            equivalent.append(int((cand.get("metadata") or {})["document_id"]))
+
+    return sorted(set(equivalent))
 
 
 # ---------------------------------------------------------------------------

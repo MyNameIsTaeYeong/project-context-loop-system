@@ -50,6 +50,13 @@ EQUIVALENCE_KEYS: tuple[str, ...] = (
     "hyde_enabled",
     # S3 N-M1 — Judge 모드가 다르면 다른 측정 지표로 비교하는 셈이라 동치 위반.
     "judge_mode",
+    # Phase 0 — 인덱스/코퍼스 앵커. 다른 코퍼스/인덱스에서 측정한 절대값을
+    # 비교하면 무의미하므로 동치성 게이트에 포함(인덱스 드리프트 차단).
+    # (그래프 전용 키 graph_match_threshold/score_relations 는 추후 그래프
+    #  신뢰화 단계에서 추가.)
+    "vector_store_sha256",
+    "corpus_sha256",
+    "graph_store_sha256",
 )
 
 

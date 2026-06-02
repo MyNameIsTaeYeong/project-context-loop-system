@@ -119,6 +119,7 @@ from context_loop.eval.synth import (  # noqa: E402
     build_korean_stopwords_from_corpus,
     build_subgraph_snippet,
     filter_question,
+    find_equivalent_documents,
     generate_cross_doc_questions,
     generate_graph_questions,
     generate_questions,
@@ -128,6 +129,7 @@ from context_loop.eval.synth import (  # noqa: E402
 )
 from context_loop.storage.graph_store import GraphStore  # noqa: E402
 from context_loop.storage.metadata_store import MetadataStore  # noqa: E402
+from context_loop.storage.vector_store import VectorStore  # noqa: E402
 
 logger = logging.getLogger("build_synthetic_gold_set")
 
@@ -440,6 +442,9 @@ async def build(
     allow_self_eval: bool = False,
     generator_temperature: float = 0.0,
     generator_seed_base: int | None = None,
+    equivalence_enabled: bool = False,
+    equivalence_top_m: int = 3,
+    equivalence_min_similarity: float = 0.6,
 ) -> GoldSet:
     """전체 파이프라인 실행.
 
@@ -538,7 +543,20 @@ async def build(
             "graph_passed": 0,
             "cross_doc_generated": 0,
             "cross_doc_passed": 0,
+            # Phase 3.5 — OR-동치 자동 검출 통계.
+            "equivalence_groups_added": 0,
+            "equivalence_member_total": 0,
+            "non_unique_recovered": 0,
         }
+
+        # Phase 3.5 — OR-동치 자동 검출용 벡터 스토어(코퍼스 전역 검색).
+        # 활성 시에만 초기화한다. apply_filter 가 꺼져 있으면 게이트 자체가 없어
+        # 동치 검출도 의미가 없으므로 비활성으로 둔다.
+        equiv_vector_store: VectorStore | None = None
+        equiv_active = equivalence_enabled and apply_filter
+        if equiv_active:
+            equiv_vector_store = VectorStore(config.data_dir)
+            equiv_vector_store.initialize()
 
         effective_concurrency = max(1, concurrency)
         sem = asyncio.Semaphore(effective_concurrency)
@@ -562,6 +580,11 @@ async def build(
             generator_seed_base=generator_seed_base,
             extra_korean_stopwords=extra_korean_stopwords,
             max_doc_tokens=max_doc_tokens,
+            equivalence_enabled=equiv_active,
+            equivalence_top_m=equivalence_top_m,
+            equivalence_min_similarity=equivalence_min_similarity,
+            vector_store=equiv_vector_store,
+            embedding_client=embedding_client,
         )
 
         # 그래프 모드 실행 — chunk 모드 이후에 머지
@@ -639,6 +662,13 @@ async def build(
             "allow_self_eval": allow_self_eval,
             "generator_temperature": generator_temperature,
             "generator_seed_base": generator_seed_base,
+            # Phase 3.5 — OR-동치 자동 검출 메타(앵커링·재현성).
+            "or_equivalence_detection": equiv_active,
+            "equivalence_top_m": equivalence_top_m if equiv_active else 0,
+            "equivalence_min_similarity": (
+                equivalence_min_similarity if equiv_active else 0.0
+            ),
+            "equivalence_embedding_model": embedding_model_id or "" if equiv_active else "",
         }
         if enable_graph_mode:
             # 그래프 매칭 재현성을 위해 임베딩 모델 ID + 기본 τ 기록
@@ -682,6 +712,11 @@ async def _process_chunk_item(
     generator_seed_base: int | None = None,
     extra_korean_stopwords: frozenset[str] | None = None,
     max_doc_tokens: int = 0,
+    equivalence_enabled: bool = False,
+    equivalence_top_m: int = 3,
+    equivalence_min_similarity: float = 0.6,
+    vector_store: Any | None = None,
+    embedding_client: Any | None = None,
 ) -> tuple[list[GoldItem], dict[str, int]]:
     """문서 1건 처리 — LLM 생성·게이트를 수행하고 (items, local_stats) 반환.
 
@@ -767,29 +802,88 @@ async def _process_chunk_item(
                 seed=judge_seed,
                 extra_korean_stopwords=extra_korean_stopwords,
             )
+            src_doc = int(chunk["document_id"])
+
+            async def _detect_equivalents() -> list[int]:
+                """OR-동치(경우 B) 후보 검출 — 비활성 시 빈 리스트."""
+                if not equivalence_enabled:
+                    return []
+                eq_seed = (
+                    (item_seed + 20000 + j) if item_seed is not None else None
+                )
+                return await find_equivalent_documents(
+                    gq.query,
+                    chunk["content"],
+                    src_doc,
+                    embedding_client=embedding_client,
+                    vector_store=vector_store,
+                    judge=judge,
+                    top_m=equivalence_top_m,
+                    min_similarity=equivalence_min_similarity,
+                    reasoning_mode=reasoning_mode,
+                    seed=eq_seed,
+                )
+
+            def _append_item(doc_ids: list[int]) -> None:
+                groups = [doc_ids] if len(doc_ids) > 1 else []
+                local_items.append(GoldItem(
+                    id="",
+                    query=gq.query,
+                    relevant_doc_ids=doc_ids,
+                    relevant_doc_groups=groups,
+                    source_type=chunk["source_type"],
+                    source_document_id=src_doc,
+                    source_text_anchor=anchor,
+                    source_section_path=chunk["title"],
+                    difficulty=gq.difficulty,
+                    synthesized=True,
+                ))
+                local_stats["passed"] = local_stats.get("passed", 0) + 1
+                if len(doc_ids) > 1:
+                    local_stats["equivalence_groups_added"] = (
+                        local_stats.get("equivalence_groups_added", 0) + 1
+                    )
+                    local_stats["equivalence_member_total"] = (
+                        local_stats.get("equivalence_member_total", 0)
+                        + len(doc_ids)
+                    )
+
             if not report.passed:
-                key = f"fail_{report.reason}" if report.reason else "fail_parse"
-                local_stats[key] = local_stats.get(key, 0) + 1
+                # 경우 B 구제: uniqueness 게이트가 'non_unique_source' 로 막은
+                # 질문이 실제로 코퍼스에 동등 문서를 가지면 폐기 대신 OR 그룹으로
+                # 기록(recall 과소평가 해소). 동등 문서가 없으면(=일반 답변, 경우
+                # A) 기존대로 폐기. 그 외 사유(leakage/demonstrative/...)는 폐기.
+                recovered: list[int] = []
+                if report.reason == "non_unique_source":
+                    recovered = await _detect_equivalents()
+                if not recovered:
+                    key = f"fail_{report.reason}" if report.reason else "fail_parse"
+                    local_stats[key] = local_stats.get(key, 0) + 1
+                    logger.info(
+                        "  q%d 탈락 — reason=%s, query=%s",
+                        j + 1, report.reason, gq.query[:80],
+                    )
+                    continue
+                _append_item(sorted({src_doc, *recovered}))
+                local_stats["non_unique_recovered"] = (
+                    local_stats.get("non_unique_recovered", 0) + 1
+                )
                 logger.info(
-                    "  q%d 탈락 — reason=%s, query=%s",
-                    j + 1, report.reason, gq.query[:80],
+                    "  q%d 구제(동치 %d) — query=%s",
+                    j + 1, len(recovered), gq.query[:80],
                 )
                 continue
 
-            local_items.append(GoldItem(
-                id="",
-                query=gq.query,
-                relevant_doc_ids=[chunk["document_id"]],
-                source_type=chunk["source_type"],
-                source_document_id=chunk["document_id"],
-                source_text_anchor=anchor,
-                source_section_path=chunk["title"],
-                difficulty=gq.difficulty,
-                synthesized=True,
-            ))
-            local_stats["passed"] = local_stats.get("passed", 0) + 1
+            # 통과 — uniqueness LLM 이 'unique' 라 판단해도 게이트는 코퍼스 전역
+            # 검색이 아니므로 진짜 동등 문서를 놓쳤을 수 있다. 한 번 더 확인하여
+            # 있으면 OR 그룹으로 기록(놓친 동등 문서 → recall 과소평가 방지).
+            equivalents = await _detect_equivalents()
+            _append_item(sorted({src_doc, *equivalents}))
             logger.info(
-                "  q%d 통과 — query=%s", j + 1, gq.query[:80],
+                "  q%d 통과%s — query=%s",
+                j + 1,
+                f"(동치 {len(equivalents)})" if equivalents else "",
+                gq.query[:80],
             )
 
         logger.info("[doc done %d/%d]", idx, total)
@@ -814,6 +908,11 @@ async def _run_chunk_mode(
     generator_seed_base: int | None = None,
     extra_korean_stopwords: frozenset[str] | None = None,
     max_doc_tokens: int = 0,
+    equivalence_enabled: bool = False,
+    equivalence_top_m: int = 3,
+    equivalence_min_similarity: float = 0.6,
+    vector_store: Any | None = None,
+    embedding_client: Any | None = None,
 ) -> int:
     """sampled 문서들을 동시 처리하고 결과를 items 에 합친다.
 
@@ -836,6 +935,11 @@ async def _run_chunk_mode(
             generator_seed_base=generator_seed_base,
             extra_korean_stopwords=extra_korean_stopwords,
             max_doc_tokens=max_doc_tokens,
+            equivalence_enabled=equivalence_enabled,
+            equivalence_top_m=equivalence_top_m,
+            equivalence_min_similarity=equivalence_min_similarity,
+            vector_store=vector_store,
+            embedding_client=embedding_client,
         )
         for idx, chunk in enumerate(sampled, start=1)
     ]
@@ -1622,6 +1726,26 @@ def main() -> None:
         help=f"평가 시 사용될 tiered matching τ 의 기본값. 골드셋 metadata 에 "
              f"기록되어 재현성을 보장한다 (기본 {DEFAULT_GRAPH_MATCH_THRESHOLD}).",
     )
+    # Phase 3.5 — OR-동치 자동 검출. 질문이 다른 문서로도 정당하게 답되는
+    # 경우(경우 B)를 폐기하지 않고 relevant_doc_groups OR 그룹으로 기록해 recall
+    # 과소평가를 막는다. 코퍼스 전역 벡터 검색 + answer-containment 검증.
+    parser.add_argument(
+        "--equivalence-detection", action="store_true",
+        help="OR-동치 자동 검출 활성화 (Phase 3.5). 통과/비유일 질문에 대해 "
+             "코퍼스 전역에서 같은 답을 담은 동등 문서를 찾아 relevant_doc_groups "
+             "에 OR 그룹으로 기록한다. recall 과소평가(가짜 false negative) 해소. "
+             "--no-filter 와 함께면 무시(게이트 없음). 빌드 비용 증가 — "
+             "--concurrency 로 상쇄.",
+    )
+    parser.add_argument(
+        "--equivalence-top-m", type=int, default=3,
+        help="동치 검출 시 answer-containment 검증할 최대 후보 문서 수 (기본 3).",
+    )
+    parser.add_argument(
+        "--equivalence-min-similarity", type=float, default=0.6,
+        help="동치 후보의 최소 cosine 유사도 하한 (기본 0.6). 무관·일반 문서 "
+             "과탐 방지.",
+    )
     # Generator/Judge 는 운영 디폴트를 config.eval.{generator,judge}.* 에 둔다.
     # 아래 CLI 인자는 일회성 실험용 override — 미지정 시 config 값 사용,
     # config 도 비어 있으면 상위 llm.* 로 폴백한다.
@@ -1752,17 +1876,23 @@ def main() -> None:
     base_seed = args.seed
 
     # 2차 — graph evidence 임베딩 계산용 클라이언트.
+    # Phase 3.5 — OR-동치 검출(--equivalence-detection)도 코퍼스 전역 벡터 검색에
+    # 임베딩 클라이언트가 필요하므로, 그래프 모드가 꺼져 있어도 빌드한다.
     embedding_client: Any | None = None
     embedding_model_id = ""
-    if args.include_graph_questions and args.embed_graph_evidence:
+    needs_embedding = (
+        (args.include_graph_questions and args.embed_graph_evidence)
+        or (args.equivalence_detection and not args.no_filter)
+    )
+    if needs_embedding:
         try:
             from context_loop.web.app import _build_embedding_client  # noqa: PLC0415
             embedding_client = _build_embedding_client(config)
             embedding_model_id = str(config.get("processor.embedding_model") or "")
         except Exception:
             logger.warning(
-                "embedding 클라이언트 빌드 실패 — graph evidence 임베딩이 "
-                "골드셋에 박히지 않습니다 (평가 시 lazy 계산됨).",
+                "embedding 클라이언트 빌드 실패 — graph evidence 임베딩 / OR-동치 "
+                "검출이 비활성화됩니다.",
                 exc_info=True,
             )
 
@@ -1811,6 +1941,9 @@ def main() -> None:
                 allow_self_eval=bool(args.allow_self_eval),
                 generator_temperature=float(args.generator_temperature),
                 generator_seed_base=args.generator_seed_base,
+                equivalence_enabled=bool(args.equivalence_detection),
+                equivalence_top_m=int(args.equivalence_top_m),
+                equivalence_min_similarity=float(args.equivalence_min_similarity),
             )
 
     asyncio.run(_run_all())

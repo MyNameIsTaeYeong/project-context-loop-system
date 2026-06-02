@@ -193,6 +193,7 @@ async def plan_graph_search(
     llm_client: LLMClient,
     *,
     query_embedding: list[float] | None = None,
+    seed: int | None = None,
 ) -> GraphSearchPlan:
     """LLM을 사용하여 그래프 탐색 계획을 생성한다.
 
@@ -204,6 +205,9 @@ async def plan_graph_search(
         graph_store: 그래프 저장소.
         llm_client: LLM 클라이언트.
         query_embedding: 쿼리 텍스트의 임베딩 벡터. None이면 전체 스키마 사용.
+        seed: LLM 호출 seed. None이면 미전달(기존 동작). 평가 재현성을 위해
+            호출부에서 쿼리 기반 결정적 seed 를 주입한다. seed 미지원 백엔드
+            (예: Anthropic)에서는 무시된다.
 
     Returns:
         그래프 탐색 계획.
@@ -222,14 +226,16 @@ async def plan_graph_search(
         # 그래프 탐색 계획 JSON 은 일반적으로 짧지만, reasoning 모델은 thinking
         # 예산을 응답 토큰으로 잡아먹어 max_tokens 가 작으면 JSON 이 잘려 파싱
         # 실패한다. 모델 한도 범위 안에서 큰 값을 두어 잘림을 방지.
-        response = await llm_client.complete(
-            prompt,
-            system=_render_system_prompt(),
-            max_tokens=32768,
-            temperature=0.0,
-            reasoning_mode="off",
-            purpose="graph_search_planner",
-        )
+        complete_kwargs: dict[str, Any] = {
+            "system": _render_system_prompt(),
+            "max_tokens": 32768,
+            "temperature": 0.0,
+            "reasoning_mode": "off",
+            "purpose": "graph_search_planner",
+        }
+        if seed is not None:
+            complete_kwargs["seed"] = int(seed)
+        response = await llm_client.complete(prompt, **complete_kwargs)
         plan_data = extract_json(response)
     except Exception:
         logger.warning("그래프 탐색 계획 생성 실패", exc_info=True)

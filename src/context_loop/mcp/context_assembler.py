@@ -389,6 +389,7 @@ async def _search_graph_with_llm(
     *,
     query_embedding: list[float] | None = None,
     embedding_client: Any = None,
+    graph_planner_seed: int | None = None,
 ) -> GraphSearchResult | None:
     """LLM 기반 플래너로 그래프를 탐색한다.
 
@@ -405,6 +406,7 @@ async def _search_graph_with_llm(
         plan = await plan_graph_search(
             query, graph_store, llm_client,
             query_embedding=query_embedding,
+            seed=graph_planner_seed,
         )
         if not plan.should_search:
             logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
@@ -435,6 +437,7 @@ async def _rerank_and_search_graph(
     rerank_top_k: int | None,
     rerank_score_threshold: float,
     include_graph: bool,
+    graph_planner_seed: int | None = None,
 ) -> tuple[list[dict[str, Any]], GraphSearchResult | None]:
     """리랭킹과 그래프 탐색을 병렬 실행한다.
 
@@ -461,6 +464,7 @@ async def _rerank_and_search_graph(
             query, graph_store, llm_client,
             query_embedding=query_embedding,
             embedding_client=embedding_client,
+            graph_planner_seed=graph_planner_seed,
         )
 
     return await asyncio.gather(_maybe_rerank(), _maybe_graph())
@@ -485,6 +489,7 @@ async def assemble_context_with_sources(
     include_source_code: bool = False,
     max_graph_docs: int = 3,
     max_graph_tokens: int = 6000,
+    graph_planner_seed: int | None = None,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -507,6 +512,10 @@ async def assemble_context_with_sources(
         rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
         include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
+        graph_planner_seed: 그래프 탐색 플래너 LLM 호출 seed. None(기본)이면
+            미전달 — 실서비스 동작은 변경되지 않는다. 평가 경로에서만 쿼리 기반
+            결정적 seed 를 주입해 그래프 탐색 계획(→ 청크 recall)의 재현성을
+            확보한다.
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -539,6 +548,7 @@ async def assemble_context_with_sources(
         rerank_top_k=rerank_top_k,
         rerank_score_threshold=rerank_score_threshold,
         include_graph=include_graph,
+        graph_planner_seed=graph_planner_seed,
     )
 
     if chunk_results:
