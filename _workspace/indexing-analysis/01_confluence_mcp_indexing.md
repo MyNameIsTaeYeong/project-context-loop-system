@@ -1,6 +1,7 @@
 # Confluence MCP 인덱싱 파이프라인 분석
 
-> 기준: 현재 HEAD (origin/main 머지 완료). 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+> 기준: 현재 HEAD. 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+> 최초 작성 2026-05-27. **검증/갱신 2026-06-02**: 2026-05-28 storage 변경(63e1fd3 D 룰 기반 entity 정규화 + graph_merge_log, 51fc495 normalized_name 인덱스 생성 순서 수정)을 §6 저장에 반영. processor 레이어(수집~그래프 추출, §1~§5)는 현재 코드와 일치함을 확인 — pipeline.py 그래프 블록(라인 399-496), save 호출(402/428/482), `_derive_storage_method`(542) 모두 변동 없음.
 
 ## 0. 진입점 & 전체 흐름
 
@@ -191,12 +192,38 @@ confluence는 세 추출 경로가 같은 `document` 노드로 GraphStore에서 
 
 ## 6. 저장
 
-(저장소 3종 모두 **git_code와 공유** — §git_code 6단계 참조. 동일 함수 사용)
+> **갱신(2026-05-28 기준).** 벡터/청크 저장은 git_code와 공유로 변동 없음. **그래프 저장 레이어는 2026-05-28에 변경됨** — 정규 병합 키가 `(LOWER(name), type)` → **룰 기반 정규화 키(`normalized_name`)** 로 교체되었고, 머지/신규 결정을 기록하는 `graph_merge_log` 관측성 로그가 도입됨. (커밋: 63e1fd3 "D 룰 기반 entity 정규화 + graph_merge_log 도입", 51fc495 "legacy DB 마이그레이션 시 normalized_name 인덱스 생성 순서 수정")
 
-- **벡터**: `vector_store.delete_by_document` → `add_chunks` (ChromaDB, cosine). confluence 메타데이터에 `view`가 body/meta/question 3종 + question 뷰에 `question_text`.
-- **SQLite 청크**: `meta_store.create_chunk`. confluence는 `embed_text`를 채우지 않음(본문 자체가 임베딩 입력, metadata_store.py:327). `section_index`는 다청크일 때 채워짐.
-- **그래프**: 세 번의 `graph_store.save_graph_data(document_id, graph_data)` 호출. `(LOWER(name), type)` 정규 병합으로 링크/본문/LLM 그래프가 같은 document 노드로 수렴(graph_store.py:160-214). 각 호출이 `{nodes, edges, merged}` 반환, pipeline이 누적.
-- **마무리**: `_derive_storage_method` → `complete_reprocessing`. 보통 hybrid (청크+그래프).
+- **벡터** (git_code와 공유): `vector_store.delete_by_document` → `add_chunks` (ChromaDB, cosine). confluence 메타데이터에 `view`가 body/meta/question 3종 + question 뷰에 `question_text`.
+- **SQLite 청크** (git_code와 공유): `meta_store.create_chunk` (metadata_store.py:383). confluence는 `embed_text`를 채우지 않음(본문 자체가 임베딩 입력, docstring metadata_store.py:398-401). `section_index`는 다청크일 때 채워짐(ExtractionUnit `section_ids`와 조인 키).
+- **그래프**: 세 번의 `graph_store.save_graph_data(document_id, graph_data)` 호출 (graph_store.py:138-296, pipeline.py:402/428/482). 각 호출이 `{nodes, edges, merged}` 반환, pipeline이 누적. 핵심 동작은 아래 **6.1 엔티티 정규화** 참조.
+- **마무리**: `_derive_storage_method` (pipeline.py:542) → `complete_reprocessing`. 보통 hybrid (청크+그래프).
+
+### 6.1 엔티티 정규화 (entity_normalizer + graph_merge_log) — **2026-05-28 변경**
+
+세 그래프 경로(5a/5b/5c)가 같은 `document` 노드로 수렴하는 메커니즘이 단순 `LOWER(name)`에서 **룰 기반 정규화 키**로 바뀌었다.
+
+**정규화 함수:** `storage/entity_normalizer.py::normalize_entity_name(name)` (라인 39). source-agnostic·deterministic. 적용 순서:
+1. Unicode NFKC 정규화 (전각/반각·호환 합자 통일).
+2. 양끝 strip.
+3. 연속 공백 → 단일 공백.
+4. **모든 공백 / `-` / `_` 제거** (빈 문자열로 join).
+5. 케이스 폴딩 (`lower`).
+- 예: `"Payment Service"` → `paymentservice`, `"결제-시스템"` → `결제시스템`, `"auth_service"` → `authservice`. `None`/빈 입력 → `""`.
+- 본 라운드 비채택: 양끝 괄호 제거(`(v2)`), 한자/일본어 변환 (false-merge 위험).
+
+**저장 흐름** (`graph_store.py::save_graph_data`, 라인 138-296):
+1. 각 entity마다 `normalized = normalize_entity_name(entity.name)` 를 graph_store가 직접 계산 (graph_store.py:168) — 책임 분리: storage 레이어(metadata_store)는 전달받은 키를 그대로 신뢰.
+2. `find_graph_node_by_entity(entity.name, entity.entity_type, normalized_name=normalized)` (graph_store.py:171, metadata_store.py:540) — 매칭 키가 `normalized_name = ? AND entity_type = ?` (metadata_store.py:563-568). 인덱스 `idx_graph_nodes_normalized(normalized_name, entity_type)`로 `LOWER()` 함수 호출 없이 인덱스 적용.
+3. **기존 노드 hit** (graph_store.py:177-213): `merged_count += 1`; description 비어있으면 보강(`update_graph_node_properties`); `add_node_document_link(node_id, document_id)`로 문서 연결; NetworkX 갱신. **머지 방식 판정** — `existing["entity_name"] == entity.name`(대소문자 포함 정확 동일)이면 `"exact"`, 아니면 `"normalized"` (graph_store.py:206).
+4. **신규 노드** (graph_store.py:214-242): `create_graph_node_with_link(... normalized_name=normalized)` (metadata_store.py:472) — `graph_nodes` INSERT + `graph_node_documents` link INSERT를 **단일 commit**으로 묶어 race window 제거. `new_count += 1`. 머지 방식 `"new"`.
+5. **머지 로그 기록** — `_record_merge_safely(...)` (graph_store.py:298) → `metadata_store.record_graph_merge(...)` (라인 651)로 entity마다 `graph_merge_log` 한 행 INSERT. **이 호출은 try/except로 감싸 실패해도 그래프 저장을 멈추지 않음** (graph_store.py:314-329) — 머지 결정은 이미 commit됨.
+
+**`graph_merge_log` 스키마** (metadata_store.py:80-89): `id, canonical_node_id, raw_entity_name, raw_entity_type, source_document_id, merge_method, similarity_score, created_at`. `merge_method ∈ {exact, normalized, new}`. D(룰 기반) 단계는 binary 매칭이므로 `similarity_score`는 항상 NULL(향후 임베딩/LLM 머지 도입 시 점수 슬롯). 인덱스 `idx_graph_merge_log_canonical(canonical_node_id)`. 조회는 `get_graph_merge_log`(라인 692)/`get_merged_node_groups`(라인 715, min_variants≥2 그룹만 노출).
+
+**마이그레이션 (51fc495 수정 포인트):** 기존 DB에 `graph_nodes.normalized_name` 컬럼 추가는 `_migrate_schema`(metadata_store.py:209-231)에서 처리. `idx_graph_nodes_normalized` 인덱스는 `_SCHEMA_SQL`에서 **빼내** ALTER로 컬럼을 추가한 *뒤* 항상 `CREATE INDEX IF NOT EXISTS`로 생성(metadata_store.py:224-227). 이유: `executescript`는 단일 트랜잭션이라, 컬럼이 아직 없는 레거시 DB에서 스키마 SQL 내 인덱스 생성이 실패하기 때문(주석 metadata_store.py:145-147). 컬럼 추가 후 `_backfill_normalized_names`(라인 233)가 `normalized_name=''`인 기존 행만 idempotent하게 백필.
+
+**3중 그래프 수렴:** 5a/5b는 `Entity(doc_title, "document")` self-entity를 emit, 5c는 `document` 타입을 LLM 어휘에 노출하지 않지만 **같은 `document_id`로 저장**되므로 `add_node_document_link`가 동일 문서의 모든 노드를 묶는다. 키 정규화가 `LOWER(name)`보다 강해져, `"Auth Service"`/`"auth-service"`/`"authservice"`가 이제 같은 노드로 병합된다(과거엔 별개 노드).
 
 ---
 
@@ -216,7 +243,8 @@ confluence는 세 추출 경로가 같은 `document` 노드로 GraphStore에서 
 | enable_llm_body_extraction | True | pipeline.py:80 | 5c 그래프(LLM) |
 | llm max_input_tokens | 200,000 | llm_body_extractor.py:88 | 5c 그래프 |
 | llm temperature/max_tokens | 0.0/32768 | llm_body_extractor.py:82-83 | 5c 그래프 |
-| 노드 병합 키 | LOWER(name)+type | metadata_store.py:455 | 6 저장 |
+| 노드 병합 키 | **normalized_name + type** (NFKC+strip+공백/-/_제거+lower) | entity_normalizer.py:39, metadata_store.py:563 | 6 저장 (2026-05-28 변경) |
+| graph_merge_log merge_method | exact / normalized / new | graph_store.py:206/241, metadata_store.py:80 | 6 저장 (2026-05-28 추가) |
 
 ## 부록 B: 데이터 모델
 
@@ -226,6 +254,8 @@ confluence는 세 추출 경로가 같은 `document` 노드로 GraphStore에서 
 - `ExtractionUnit` (extraction_unit.py:68): section_ids, section_path, body, breadcrumb
 - `Entity`/`Relation`/`GraphData` (graph_extractor.py:15/30/48)
 - `LLMBodyExtractionConfig`/`Stats` (llm_body_extractor.py:54/92)
+- `graph_nodes` 스키마 (metadata_store.py:49-56): `id, document_id, entity_name, entity_type, properties, normalized_name`(2026-05-28 추가 컬럼)
+- `graph_merge_log` 스키마 (metadata_store.py:80-89): `id, canonical_node_id, raw_entity_name, raw_entity_type, source_document_id, merge_method, similarity_score, created_at` (2026-05-28 추가 테이블)
 
 ## 검토하지 못한 영역
 
