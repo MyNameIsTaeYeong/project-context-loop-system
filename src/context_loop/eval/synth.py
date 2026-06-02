@@ -744,7 +744,7 @@ async def generate_questions(
     n: int,
     generator: LLMClient,
     reasoning_mode: str | None = "off",
-    max_tokens: int = 1024,
+    max_tokens: int = 10000,
     temperature: float = 0.0,
     seed: int | None = None,
 ) -> list[GeneratedQuestion]:
@@ -776,7 +776,7 @@ async def generate_graph_questions(
     n: int,
     generator: LLMClient,
     reasoning_mode: str | None = "off",
-    max_tokens: int = 1024,
+    max_tokens: int = 10000,
     temperature: float = 0.0,
     seed: int | None = None,
     doc_max_tokens: int = 0,
@@ -832,7 +832,7 @@ async def generate_cross_doc_questions(
     n: int,
     generator: LLMClient,
     reasoning_mode: str | None = "off",
-    max_tokens: int = 1024,
+    max_tokens: int = 10000,
     temperature: float = 0.0,
     seed: int | None = None,
 ) -> list[GeneratedGraphQuestion]:
