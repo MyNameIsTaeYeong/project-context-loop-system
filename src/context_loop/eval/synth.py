@@ -896,7 +896,7 @@ async def is_answerable(
         question=question, chunk_content=chunk_content,
     )
     call_kwargs: dict[str, Any] = {
-        "max_tokens": 64,
+        "max_tokens": 10000,
         "temperature": 0.0,
         "reasoning_mode": reasoning_mode,
         "purpose": "goldset_judge_answerable",
@@ -931,7 +931,7 @@ async def is_unique_source(
         question=question, chunk_content=chunk_content,
     )
     call_kwargs: dict[str, Any] = {
-        "max_tokens": 64,
+        "max_tokens": 10000,
         "temperature": 0.0,
         "reasoning_mode": reasoning_mode,
         "purpose": "goldset_judge_unique_source",
