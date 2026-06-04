@@ -207,13 +207,15 @@ async def test_get_neighbors_short_name_fallback(
 
 
 @pytest.mark.asyncio
-async def test_get_neighbors_exact_match_wins_over_short_name(
+async def test_get_neighbors_bridges_bare_and_fqn_nodes(
     graph_store: GraphStore, meta_store: MetadataStore,
 ) -> None:
-    """완전 일치가 있으면 짧은 이름 fallback은 사용되지 않는다.
+    """한 질의 이름이 bare 노드(문서)와 FQN 노드(코드)를 함께 시드로 잡는다.
 
-    예: "UserService" 엔티티가 있고, FQN 엔티티 "file.py::UserService"도 있을 때
-    "UserService" 질의는 정확히 "UserService" 엔티티만 반환해야 한다.
+    표면 tier 를 union 하므로, confluence 가 만든 bare ``UserService`` 노드와
+    git_code 가 만든 FQN ``other.py::UserService`` 노드가 별개로 저장돼 있어도
+    질의 "UserService" 하나로 **둘 다** 중심 노드가 되어 코드↔지식 그래프를
+    검색 시점에 잇는다 (과거에는 완전 일치에서 멈춰 bare 노드만 반환했다).
     """
     doc_id = await _create_doc(meta_store)
     data = GraphData(
@@ -226,8 +228,46 @@ async def test_get_neighbors_exact_match_wins_over_short_name(
 
     result = graph_store.get_neighbors("UserService", depth=1)
     names = {n["entity_name"] for n in result}
-    # 완전 일치 엔티티만 중심 노드가 되어야 함
-    assert names == {"UserService"}
+    assert names == {"UserService", "other.py::UserService"}
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_normalizes_spacing_and_case(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """표면 매칭이 storage 와 동일한 normalize 키로 정렬돼 공백/케이스/하이픈을 흡수한다.
+
+    "Auth Service" / "auth-service" 가 코드 FQN ``auth_service.py::AuthService``
+    의 scoped/short 이름(``AuthService``)과 정규화 후 같은 키로 매칭된다 —
+    임베딩 fallback 없이 표면 tier 에서 코드 노드에 닿는다.
+    """
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="auth_service.py::AuthService", entity_type="class")],
+        relations=[],
+    ))
+
+    for query in ("Auth Service", "auth-service", "AUTHSERVICE"):
+        result = graph_store.get_neighbors(query, depth=1)
+        names = {n["entity_name"] for n in result}
+        assert "auth_service.py::AuthService" in names, query
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_seed_count_is_capped(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """흔한 짧은 이름이 과도한 시드를 끌어오지 않도록 max_seeds 로 컷된다."""
+    doc_id = await _create_doc(meta_store)
+    # 15개 파일이 모두 같은 짧은 이름 `run` 을 가진 FQN 심볼을 정의.
+    entities = [
+        Entity(name=f"mod{i}.py::run", entity_type="function") for i in range(15)
+    ]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    # depth=1, 엣지 없음 → 도달 노드 = 시드. 기본 상한 10 으로 컷.
+    result = graph_store.get_neighbors("run", depth=1)
+    assert len(result) == 10
 
 
 @pytest.mark.asyncio
@@ -281,6 +321,35 @@ async def test_build_entity_embeddings(graph_store: GraphStore, meta_store: Meta
     count = await graph_store.build_entity_embeddings(mock_embed)
     assert count == 2
     assert graph_store.entity_embedding_count == 2
+
+
+@pytest.mark.asyncio
+async def test_build_entity_embeddings_uses_display_name_for_fqn(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """코드 FQN 노드는 파일 범위를 벗긴 표시명으로 임베딩된다 (자연어 질의와 정렬).
+
+    임베딩 입력 텍스트는 ``UserService.create`` 같은 표시명이지만, 캐시에 저장되는
+    엔티티 이름은 원본 FQN 을 유지해 다운스트림 표기를 보존한다.
+    """
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="user_service.py::UserService.create", entity_type="method"),
+            Entity(name="Auth Service", entity_type="system"),
+        ],
+        relations=[],
+    ))
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    embedded_inputs = set(mock_embed.aembed_documents.call_args.args[0])
+    # FQN 은 표시명으로, bare 이름은 그대로.
+    assert "UserService.create" in embedded_inputs
+    assert "user_service.py::UserService.create" not in embedded_inputs
+    assert "Auth Service" in embedded_inputs
 
     # 이미 캐시됨 → 다시 빌드해도 0
     count2 = await graph_store.build_entity_embeddings(mock_embed)
@@ -392,8 +461,9 @@ async def test_get_neighbors_falls_back_to_embedding_when_name_unknown(
     """R1 F-SRCH-01: 표면 매칭(exact/scoped/short)이 모두 실패해도 임베딩
     fallback 으로 시드 노드를 찾는다.
 
-    LLM 추측 entity_name 이 인덱스 표기와 공백/케이스/하이픈으로 어긋날 때
-    검색이 빈 결과가 되어 그래프 메트릭이 0 이 되는 funnel 손실을 완화.
+    정규화로도 잇지 못하는 진짜 의미 차이(예: 한국어 "인증 서비스" ↔ 영어
+    "AuthService")일 때, LLM 추측 이름이 빈 결과가 되어 그래프 메트릭이 0 이
+    되는 funnel 손실을 임베딩 fallback 으로 완화한다.
     """
     doc_id = await _create_doc(meta_store)
     await graph_store.save_graph_data(doc_id, GraphData(
@@ -404,13 +474,13 @@ async def test_get_neighbors_falls_back_to_embedding_when_name_unknown(
     mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0, 0.0]])
     await graph_store.build_entity_embeddings(mock_embed)
 
-    # 표면 매칭으로는 "Auth Service" (공백) ≠ "AuthService" → 빈 결과.
-    no_fallback = graph_store.get_neighbors("Auth Service")
+    # 표면 매칭으로는 "인증 서비스" (정규화 "인증서비스") ≠ "authservice" → 빈 결과.
+    no_fallback = graph_store.get_neighbors("인증 서비스")
     assert no_fallback == []
 
     # 같은 의미의 임베딩 fallback 을 주면 시드 노드가 잡혀 결과가 비어있지 않다.
     with_fallback = graph_store.get_neighbors(
-        "Auth Service",
+        "인증 서비스",
         embedding_fallback=[0.95, 0.1, 0.0],  # cosine ~0.96 > 0.5
     )
     assert len(with_fallback) == 1

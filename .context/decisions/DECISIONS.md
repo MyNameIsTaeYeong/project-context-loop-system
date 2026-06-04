@@ -731,3 +731,23 @@
   - 브랜치 `claude/optimize-chat-api-performance-vODmW`, 커밋 `5e9f3d9` `98a8c47` `6da5aa7` `34f9aaf` `40e6928` `e22cf26`.
 - **관련 결정**: D-021 (LLM 기반 리랭커 도입 — 본 결정으로 LLM 호출은 cross-encoder 호출로 교체. score_threshold 의 0~10 범위 컨벤션은 0~1 로 변경됨), D-022 (HyDE).
 
+## D-046: 그래프 검색 seed 해석 정규화 + tier union — 코드↔지식 그래프 브리지
+
+- **일시**: 2026-06-04
+- **맥락**: 인덱싱 그래프 풍부도 비대칭(confluence 3중 추출 vs git_code import/contains) 분석 중, 본질이 "코드 그래프에 관계가 부족"이 아니라 **"코드 그래프가 지식(문서) 그래프와 단절된 섬"**이라는 점이 드러남. 이 시스템은 코드 인텔리전스 도구가 아니라 크로스소스 지식 RAG 라, 그래프의 고유 가치는 *문서가 서술한 개념 → 구현 코드로 hop* 하는 데 있음. 그러나 코드 심볼은 FQN(`user_service.py::UserService`), confluence 엔티티는 bare name(`UserService`/`Auth Service`)이라 `normalize_entity_name` 후에도(`::`·`.` 미제거) 별개 노드 — 저장 병합·검색 seed·임베딩 어디서도 연결 안 됨. 특히 `_resolve_seed_nodes` 가 ① `.lower()` 단순 비교(공백/케이스 미흡수), ② tier 별 `if not center_nodes` 가드로 첫 매칭에서 멈춰 한 질의가 bare 노드와 FQN 노드를 동시에 못 잡았음. FQN 네이밍 자체는 동명 심볼 오병합 방지용이라 유지해야 함.
+- **결정**: 저장 그래프(FQN 정밀성)는 그대로 두고 **검색 시점 seed 해석에서만** 코드↔지식을 잇는다 (`storage/graph_store.py`).
+  1. **정규화 비교**: `_resolve_seed_nodes` 의 tier 비교 키를 `.lower()` → storage 병합과 동일한 `normalize_entity_name` 으로 교체. "Auth Service"/"AuthService"/"auth-service" 가 같은 키(`authservice`)로 정렬 → 표면 tier 에서 코드 FQN 노드의 scoped/short 이름과 매칭.
+  2. **tier union (첫 매칭에서 멈추지 않음)**: exact → scoped → short 를 우선순위 순으로 **누적 union**. 한 질의 "UserService" 가 confluence bare 노드(exact)와 코드 `*.py::UserService` FQN 노드(scoped)를 **동시에** 시드 → 양방향 BFS 가 문서측 관계(`depends_on`/`owned_by`)와 코드측 구조(`contains`/`imports`)를 함께 반환, 두 노드의 `document_ids` 합집합이 `_search_graph_sourced_chunks` 로 흘러 문서 산문 + 코드 본문이 함께 첨부됨.
+  3. **시드 상한 `max_seeds=10`**: 흔한 짧은 이름(예: "run"/"handler")이 다수 FQN 을 끌어오는 폭증을 우선순위(exact > scoped > short) 컷으로 방지.
+  4. **임베딩 표시명**: `build_entity_embeddings` 가 코드 FQN 노드를 임베딩할 때 파일 범위를 벗긴 표시명(`Class.method`)을 입력으로 사용(`_embedding_display_name`). 캐시 저장 이름은 원본 FQN 유지. query-embedding 시드 보강이 코드 노드에도 의미적으로 닿게 함.
+- **이유**:
+  - **검색측 해결이 최소 위험·최대 레버리지**: 저장측 bare-name alias 노드/병합은 공통명 오병합 허브 + 크로스문서 2-pass 가 필요해 위험·비용 큼. seed union 은 같은 retrieval 효과를 저장 마이그레이션 없이·가역적으로·결정성 유지하며 달성(D-040 철학 부합).
+  - **FQN 정밀성 보존**: 저장 노드는 그대로라 동명 심볼 오병합 위험이 재발하지 않음. 브리지는 retrieval 시점에만 일어남.
+  - **정규화 일원화**: seed 비교가 storage 병합과 같은 키를 써서 mental model 정합 — "Auth Service" 표면 매칭이 임베딩 fallback 의존 없이 동작(funnel 손실 감소).
+- **영향**:
+  - 변경: `storage/graph_store.py` (`_resolve_seed_nodes` 재작성, `_embedding_display_name` 신규, `build_entity_embeddings`), `tests/test_storage/test_graph_store.py`.
+  - 동작 변경: `get_neighbors("UserService")` 가 bare + FQN 노드를 함께 반환(과거 bare 만). 기존 테스트 `test_get_neighbors_exact_match_wins_over_short_name` → `test_get_neighbors_bridges_bare_and_fqn_nodes` 로 의미 재정의, `test_get_neighbors_falls_back_to_embedding_when_name_unknown` 의 표면-miss 케이스를 정규화로도 못 잇는 한↔영 차이로 교체. 신규 테스트 3건(정규화 매칭/시드 상한/표시명 임베딩).
+  - 검증: `test_graph_store.py` 49 passed, planner+tools 38 passed. 전체 회귀 — 본 변경으로 인한 신규 실패 0건(기존 무관 실패 27건은 origin/main 과 동일).
+  - 향후 과제(비채택): confluence 본문의 코드 심볼 참조 인식(정규식/LLM) → 엣지화, `document_sources` 실제 채우기(`add_document_source` 미호출 상태), 인덱싱측 코드↔문서 명시 링크.
+- **관련 결정**: D-040 (LLM classifier 제거 — 결정론 파이프라인. 본 결정도 검색측 결정론 유지), D-045 (검색 파이프라인 병렬화 — 같은 `context_assembler`/`graph_search_planner` 경로).
+
