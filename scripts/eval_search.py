@@ -29,6 +29,22 @@
 옵션:
 - ``--judge`` 활성화 시 별도 LLM 으로 응답 품질을 0~5 점으로 채점.
   Generator/시스템과 다른 family 의 모델 권장 (자기 평가 편향 회피).
+
+절대 점수 보고 (Phase 4/5 — 청크/문서):
+"동일 환경 A/B" 가 아니라 "절대 점수" 를 인용·게이트에 쓰려면 재현성·비편향·
+앵커링·불확실성을 모두 강제해야 한다. ``--absolute-mode`` 가 이를 검사하고,
+``--frozen-benchmark`` 가 코퍼스 드리프트를 차단한다::
+
+    # 1) 코퍼스/골드셋 동결
+    python scripts/verify_frozen_benchmark.py --benchmark eval/frozen/main --create
+
+    # 2) 절대 점수 측정 (CI 동반, 앵커 검증)
+    python scripts/eval_search.py --gold-set eval/frozen/main/gold_set.yaml \\
+        --judge --judge-seed-base 1000 --judge-n-samples 3 \\
+        --planner-seed-base 2000 --absolute-mode \\
+        --frozen-benchmark eval/frozen/main --label absolute
+
+자세한 프로토콜은 ``docs/absolute_score_protocol.md`` 참조.
 """
 
 from __future__ import annotations
@@ -51,6 +67,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from context_loop.config import Config  # noqa: E402
+from context_loop.eval.determinism import stable_seed  # noqa: E402
 from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
 from context_loop.eval.graph_match import (  # noqa: E402
     DEFAULT_GRAPH_MATCH_THRESHOLD,
@@ -60,10 +77,14 @@ from context_loop.eval.graph_match import (  # noqa: E402
     run_entity_matching,
     run_relation_matching,
 )
+from context_loop.eval.index_fingerprint import (  # noqa: E402
+    combined_index_fingerprint,
+)
 from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.metrics import (  # noqa: E402
     aggregate,
     aggregate_with_variance,
+    bootstrap_ci_mean,
     hit_at_k,
     mrr,
     ndcg_at_k,
@@ -341,6 +362,7 @@ async def evaluate_one(
     judge_mode: str = "reference-free",
     judge_seed_base: int | None = None,
     judge_n_samples: int = 1,
+    planner_seed_base: int | None = None,
     embedding_model_id: str = "",
 ) -> dict[str, Any]:
     """단일 질의에 대한 검색 + 채점.
@@ -354,6 +376,15 @@ async def evaluate_one(
     공유한다 (D-7).
     """
     start = time.perf_counter()
+    # 평가 재현성: 그래프 탐색 플래너 LLM 에 쿼리 기반 결정적 seed 를 주입한다.
+    # search_context Step 4 가 그래프 도달 문서를 추가 회수하므로, 플래너가
+    # 흔들리면 청크 recall 자체가 비결정적이 된다. planner_seed_base 가 None 이면
+    # 미전달(기존 동작 유지).
+    graph_planner_seed = (
+        stable_seed(item.query, planner_seed_base)
+        if planner_seed_base is not None
+        else None
+    )
     assembled: AssembledContext = await assemble_context_with_sources(
         item.query,
         meta_store=meta_store,
@@ -369,6 +400,7 @@ async def evaluate_one(
         rerank_top_k=rerank_top_k,
         rerank_score_threshold=rerank_score_threshold,
         hyde_enabled=hyde_enabled,
+        graph_planner_seed=graph_planner_seed,
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -512,8 +544,10 @@ async def evaluate_one(
             row["judge_parse_failed"] = False
         else:
             # S3 N-H1 — Judge 호출에도 seed 전파. item.id 기반 deterministic.
+            # 내장 hash() 는 PYTHONHASHSEED 로 프로세스마다 salt 되어 실행 간
+            # 값이 달라진다 → stable_seed(sha256) 로 프로세스 독립적 결정성 확보.
             judge_seed = (
-                judge_seed_base + (hash(item.id) % 10_000_000)
+                stable_seed(item.id, judge_seed_base)
                 if judge_seed_base is not None
                 else None
             )
@@ -692,12 +726,76 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
             writer.writerow(row_str)
 
 
+def check_absolute_mode_requirements(
+    *,
+    judge_enabled: bool,
+    judge_is_self: bool,
+    allow_self_judge: bool,
+    judge_seed_base: int | None,
+    judge_n_samples: int,
+    include_graph: bool,
+    planner_seed_base: int | None,
+    vector_store_sha256: str,
+) -> list[str]:
+    """절대 점수 보고(absolute-mode) 요건 위반 목록을 반환한다(순수 함수).
+
+    재현성(seed)·비편향(non-self Judge)·앵커링(인덱스 지문)·불확실성(n_samples)
+    네 축을 점검한다. 위반이 없으면 빈 리스트.
+    """
+    violations: list[str] = []
+    if judge_enabled and judge_is_self and not allow_self_judge:
+        violations.append("self-evaluation Judge (분리된 Judge 필요)")
+    if judge_enabled:
+        if judge_seed_base is None:
+            violations.append("--judge-seed-base 미설정 (Judge 재현성 필요)")
+        if judge_n_samples < 3:
+            violations.append(
+                f"--judge-n-samples >= 3 필요 (현재 {judge_n_samples})",
+            )
+    if include_graph and planner_seed_base is None:
+        violations.append(
+            "--planner-seed-base 미설정 (그래프 증강→청크 recall 재현성 필요)",
+        )
+    if not vector_store_sha256:
+        violations.append("인덱스 지문(vector_store_sha256) 비어 있음 (앵커링 불가)")
+    return violations
+
+
+def _chunk_metric_cis(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """청크/문서 메트릭별 95% bootstrap CI 를 per-query 값으로 계산한다.
+
+    절대 점수에 불확실성을 동반시키기 위한 용도(Phase 4). graph_* / judge 는
+    제외하고 recall/precision/hit/ndcg/mrr 계열만 처리한다. 실패 행
+    (``metric_failed``) 은 제외.
+    """
+    chunk_prefixes = ("recall@", "precision@", "hit@", "ndcg@", "mrr")
+    succ = [r for r in rows if not r.get("metric_failed")]
+    keys: set[str] = set()
+    for r in succ:
+        for k, v in r.items():
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            if k.startswith("graph_"):
+                continue
+            if any(k == p or k.startswith(p) for p in chunk_prefixes):
+                keys.add(k)
+    out: dict[str, dict[str, float]] = {}
+    for k in sorted(keys):
+        values = [
+            r[k] for r in succ
+            if isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool)
+        ]
+        out[k] = bootstrap_ci_mean(values)
+    return out
+
+
 def write_summary(
     rows: list[dict[str, Any]],
     path: Path,
     *,
     label: str,
     config_summary: dict[str, Any],
+    absolute_mode: bool = False,
 ) -> dict[str, Any]:
     """집계 요약을 JSON 으로 저장하고 반환.
 
@@ -788,6 +886,11 @@ def write_summary(
         "metrics_by_mode": metrics_by_mode,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    # Phase 4 — absolute-mode 에서는 청크 메트릭마다 95% CI 를 동반한다
+    # (절대 점수의 불확실성 보고). 그래프/모드별 CI 강제는 추후.
+    if absolute_mode:
+        out["absolute_mode"] = True
+        out["metric_ci"] = _chunk_metric_cis(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
@@ -982,6 +1085,7 @@ async def _evaluate_gold_set(
                     judge_mode=args.judge_mode,
                     judge_seed_base=args.judge_seed_base,
                     judge_n_samples=args.judge_n_samples,
+                    planner_seed_base=getattr(args, "planner_seed_base", None),
                 )
                 row["_idx"] = idx
             except Exception as exc:
@@ -1063,6 +1167,7 @@ async def _evaluate_gold_set(
     )
     summary = write_summary(
         rows, summary_path, label=label, config_summary=enriched_config,
+        absolute_mode=bool(getattr(args, "absolute_mode", False)),
     )
     print_summary(summary)
     print(f"  details : {csv_path}")
@@ -1089,6 +1194,13 @@ async def run(args: argparse.Namespace) -> int:
     vector_store.initialize()
     graph_store = GraphStore(meta_store)
     await graph_store.load_from_db()
+
+    # Phase 0 — 인덱스/코퍼스 지문. 절대 점수를 "어느 코퍼스에서 측정했는지"에
+    # 앵커링하기 위해 1회 계산하여 summary 에 기록한다. best-effort(실패 시 빈
+    # 해시).
+    index_fingerprint = await combined_index_fingerprint(
+        vector_store, graph_store, meta_store,
+    )
 
     llm_client, embedding_client, reranker_client = _build_clients(config)
 
@@ -1164,7 +1276,79 @@ async def run(args: argparse.Namespace) -> int:
         "score_relations": args.score_relations,
         # 3차 — 동시성 메타 (재현 디버그용).
         "concurrency": max(1, int(getattr(args, "concurrency", 1) or 1)),
+        # Phase 0 — 인덱스/코퍼스 앵커. 중첩 dict + compare_runs 동치성용 평탄 키.
+        "index_fingerprint": index_fingerprint,
+        "vector_store_sha256": index_fingerprint.get("vector", {}).get("sha256", ""),
+        "graph_store_sha256": index_fingerprint.get("graph", {}).get("sha256", ""),
+        "corpus_sha256": index_fingerprint.get("corpus", {}).get("sha256", ""),
+        # Phase 1 — 재현성 seed 베이스(기록·디버그용).
+        "judge_seed_base": getattr(args, "judge_seed_base", None),
+        "planner_seed_base": getattr(args, "planner_seed_base", None),
     }
+
+    # Phase 4 — 절대 점수 보고 모드 게이트. 재현성·비편향·앵커링을 강제한다.
+    if getattr(args, "absolute_mode", False):
+        violations = check_absolute_mode_requirements(
+            judge_enabled=bool(args.judge),
+            judge_is_self=judge_is_self,
+            allow_self_judge=bool(args.allow_self_judge),
+            judge_seed_base=args.judge_seed_base,
+            judge_n_samples=int(args.judge_n_samples),
+            include_graph=bool(args.include_graph),
+            planner_seed_base=args.planner_seed_base,
+            vector_store_sha256=index_fingerprint.get("vector", {}).get("sha256", ""),
+        )
+        if violations:
+            raise SystemExit(
+                "--absolute-mode 요건 위반:\n  - "
+                + "\n  - ".join(violations)
+                + "\n절대 점수를 신뢰하려면 위 요건을 충족하거나 --absolute-mode 를 "
+                  "해제하세요.",
+            )
+
+    # Phase 5 — 고정 벤치마크 앵커 검증. manifest 의 인덱스/코퍼스/골드셋 지문과
+    # 현재가 일치할 때만 anchor_verified=true. 드리프트 시 기본 거부.
+    if args.frozen_benchmark:
+        anchor_keys = (
+            "gold_set_sha256", "vector_store_sha256",
+            "corpus_sha256", "graph_store_sha256",
+        )
+        manifest_path = Path(args.frozen_benchmark) / "benchmark.manifest.json"
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except OSError as exc:
+            raise SystemExit(
+                f"--frozen-benchmark manifest 로드 실패: {manifest_path} ({exc})",
+            ) from exc
+        try:
+            cur_gold_sha = hashlib.sha256(gold_paths[0].read_bytes()).hexdigest()
+        except OSError:
+            cur_gold_sha = ""
+        current_anchor = {
+            "gold_set_sha256": cur_gold_sha,
+            "vector_store_sha256": index_fingerprint.get("vector", {}).get("sha256", ""),
+            "corpus_sha256": index_fingerprint.get("corpus", {}).get("sha256", ""),
+            "graph_store_sha256": index_fingerprint.get("graph", {}).get("sha256", ""),
+        }
+        drift = [
+            f"{k}: manifest={manifest.get(k, '')!r} != current={current_anchor[k]!r}"
+            for k in anchor_keys
+            if manifest.get(k, "") != current_anchor[k]
+        ]
+        anchor_verified = not drift
+        config_summary["frozen_benchmark"] = str(args.frozen_benchmark)
+        config_summary["anchor_verified"] = anchor_verified
+        config_summary["benchmark_manifest_sha256"] = hashlib.sha256(
+            manifest_path.read_bytes(),
+        ).hexdigest()
+        if drift and not args.allow_anchor_mismatch:
+            raise SystemExit(
+                "고정 벤치마크 드리프트 — 절대 점수 인용 불가:\n  - "
+                + "\n  - ".join(drift)
+                + "\n재인덱싱했다면 verify_frozen_benchmark.py --create 로 재동결 "
+                  "후 재캘리브레이션하거나, --allow-anchor-mismatch 로 무시하세요.",
+            )
 
     out_dir = Path(args.output_dir)
     per_run_summaries: list[dict[str, Any]] = []
@@ -1381,7 +1565,7 @@ def main() -> None:
     parser.add_argument(
         "--judge-seed-base", type=int, default=None,
         help="Judge LLM 호출 결정성 seed base (S3 N-H1). None 이면 미전달. "
-             "정수 명시 시 항목별 seed = base + hash(item.id) % 10M 으로 "
+             "정수 명시 시 항목별 seed = base + sha256(item.id) mod 10M 으로 "
              "endpoint 가 OpenAI 호환이면 결정적 응답.",
     )
     parser.add_argument(
@@ -1389,6 +1573,39 @@ def main() -> None:
         help="Judge 호출 반복 횟수 (S3 — 분산 측정). 1 이면 단일 호출, 2+ 면 "
              "seed+i 로 N회 호출 후 median 을 최종 점수, std/min/max 를 row 에 "
              "기록. 운영 안정성 진단용.",
+    )
+    # Phase 1 — 그래프 탐색 플래너 결정성(평가 재현성). search_context Step 4 가
+    # 그래프 도달 문서를 추가 회수하므로, 플래너가 흔들리면 청크 recall 도
+    # 비결정적이 된다. None 이면 미전달(기존 동작).
+    parser.add_argument(
+        "--planner-seed-base", type=int, default=None,
+        help="그래프 탐색 플래너 LLM 호출 seed base (평가 재현성). None 이면 "
+             "미전달. 정수 명시 시 쿼리별 seed = base + sha256(query) mod 10M 으로 "
+             "OpenAI 호환 endpoint 에서 그래프 탐색(→ 청크 recall) 결정성 확보. "
+             "실서비스 동작에는 영향 없음(평가 경로 전용).",
+    )
+    # Phase 4 — 절대 점수 보고 프로토콜. 재현성·비편향·앵커링·불확실성 동반을
+    # 강제하여 청크/문서 절대 점수를 신뢰 가능 수준으로 끌어올린다.
+    parser.add_argument(
+        "--absolute-mode", action="store_true",
+        help="절대 점수 보고 모드 (Phase 4). 강제 요건: --judge-seed-base 설정, "
+             "--judge-n-samples >= 3, 비-self Judge(--allow-self-judge 없이), "
+             "인덱스 지문 비어있지 않음. 충족 시 청크 메트릭마다 95%% bootstrap "
+             "CI 를 summary 에 동반. 위반 시 비정상 종료.",
+    )
+    # Phase 5 — 고정 기준 벤치마크 앵커 검증. manifest 의 인덱스/코퍼스/골드셋
+    # 지문과 현재가 일치할 때만 절대 점수가 앵커링됐다고 인정(summary 에
+    # anchor_verified 기록). 드리프트 시 기본 거부.
+    parser.add_argument(
+        "--frozen-benchmark", default="",
+        help="고정 벤치마크 디렉터리(benchmark.manifest.json 포함). 지정 시 현재 "
+             "인덱스/코퍼스/골드셋 지문이 manifest 와 일치하는지 검증하고 "
+             "summary 에 anchor_verified 를 기록. 드리프트 시 비정상 종료.",
+    )
+    parser.add_argument(
+        "--allow-anchor-mismatch", action="store_true",
+        help="--frozen-benchmark 드리프트 시에도 종료하지 않고 "
+             "anchor_verified=false 로 기록만 한다(디버그용).",
     )
     parser.add_argument(
         "--reasoning-mode", default="off",

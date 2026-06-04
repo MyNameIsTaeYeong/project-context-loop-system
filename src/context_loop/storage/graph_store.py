@@ -632,6 +632,50 @@ class GraphStore:
             "edges": self._graph.number_of_edges(),
         }
 
+    def content_fingerprint(self) -> dict[str, Any]:
+        """그래프 내용의 결정적 지문을 반환한다.
+
+        노드는 ``(entity_name, entity_type)``, 엣지는
+        ``(source_entity_name, target_entity_name, relation_type)`` 의 안정 키만
+        사용한다. node id 는 재빌드마다 달라질 수 있어 지문에 넣지 않고, 엔티티
+        이름으로 환원한다. 평가 산출물(summary/manifest)에 코퍼스 정체성을
+        앵커링하기 위한 용도로, 임베딩/properties 같은 비결정 직렬화 대상은
+        제외한다.
+
+        Returns:
+            ``{"nodes": int, "edges": int, "sha256": str}``.
+        """
+        import hashlib
+
+        node_keys = sorted(
+            (
+                str(d.get("entity_name", "")),
+                str(d.get("entity_type", "")),
+            )
+            for _, d in self._graph.nodes(data=True)
+        )
+        edge_keys = sorted(
+            (
+                str(self._graph.nodes[u].get("entity_name", "")),
+                str(self._graph.nodes[v].get("entity_name", "")),
+                str(d.get("relation_type", "")),
+            )
+            for u, v, d in self._graph.edges(data=True)
+            if self._graph.has_node(u) and self._graph.has_node(v)
+        )
+        payload = json.dumps(
+            {"nodes": node_keys, "edges": edge_keys},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return {
+            "nodes": self._graph.number_of_nodes(),
+            "edges": self._graph.number_of_edges(),
+            "sha256": digest,
+        }
+
     # --- LLM 기반 그래프 탐색 지원 ---
 
     def get_schema_summary(self, max_entities_per_type: int = 10) -> dict[str, Any]:

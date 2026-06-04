@@ -126,6 +126,59 @@ def aggregate(
     return out
 
 
+def bootstrap_ci_mean(
+    values: Iterable[float],
+    *,
+    n_resample: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 42,
+) -> dict[str, float]:
+    """단일 표본 평균의 부트스트랩 신뢰구간을 계산한다.
+
+    절대 점수에 불확실성을 동반시키기 위한 용도 — per-query 메트릭 값 리스트를
+    받아 (평균, (1-alpha) 신뢰구간 하한/상한) 을 반환한다. ``seed`` 고정으로
+    재현 가능. scipy 의존 없이 stdlib ``random`` 만 사용한다.
+
+    Args:
+        values: per-query 메트릭 값들.
+        n_resample: 부트스트랩 리샘플 횟수.
+        alpha: 유의수준(0.05 → 95% CI).
+        seed: 재현성 seed.
+
+    Returns:
+        ``{"mean", "ci_low", "ci_high", "n"}``. 값이 없으면 모두 0.0.
+    """
+    import random
+
+    vals = [
+        float(v) for v in values
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    n = len(vals)
+    if n == 0:
+        return {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.0, "n": 0}
+    mean = sum(vals) / n
+    if n == 1:
+        return {"mean": mean, "ci_low": mean, "ci_high": mean, "n": 1}
+
+    rng = random.Random(seed)
+    resample_means: list[float] = []
+    for _ in range(n_resample):
+        total = 0.0
+        for _ in range(n):
+            total += vals[rng.randrange(n)]
+        resample_means.append(total / n)
+    resample_means.sort()
+    lo_idx = max(0, int((alpha / 2.0) * n_resample))
+    hi_idx = min(n_resample - 1, int((1.0 - alpha / 2.0) * n_resample))
+    return {
+        "mean": mean,
+        "ci_low": resample_means[lo_idx],
+        "ci_high": resample_means[hi_idx],
+        "n": n,
+    }
+
+
 def aggregate_with_variance(
     per_run_summaries: list[dict[str, float]],
 ) -> dict[str, dict[str, float]]:

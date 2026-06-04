@@ -160,6 +160,48 @@ async def test_plan_graph_search_calls_llm(graph_store: GraphStore, meta_store: 
 
 
 @pytest.mark.asyncio
+async def test_plan_graph_search_forwards_seed(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """Phase 1 — seed 가 주어지면 complete() 에 그대로 전달된다(평가 재현성)."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="Gateway", entity_type="component")],
+        relations=[],
+    ))
+    plan_json = json.dumps({
+        "should_search": True, "reasoning": "x",
+        "search_steps": [{"entity_name": "Gateway", "depth": 1, "focus_relations": []}],
+    })
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=plan_json)
+
+    await plan_graph_search("질의", graph_store, mock_llm, seed=12345)
+    assert mock_llm.complete.call_args.kwargs.get("seed") == 12345
+
+
+@pytest.mark.asyncio
+async def test_plan_graph_search_no_seed_by_default(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """seed 미지정(None)이면 complete() 에 seed 가 전달되지 않는다(기존 동작)."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="Gateway", entity_type="component")],
+        relations=[],
+    ))
+    plan_json = json.dumps({
+        "should_search": True, "reasoning": "x",
+        "search_steps": [{"entity_name": "Gateway", "depth": 1, "focus_relations": []}],
+    })
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=plan_json)
+
+    await plan_graph_search("질의", graph_store, mock_llm)
+    assert "seed" not in mock_llm.complete.call_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_plan_graph_search_with_query_embedding(
     graph_store: GraphStore, meta_store: MetadataStore,
 ) -> None:
