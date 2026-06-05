@@ -23,6 +23,7 @@ from context_loop.eval.llm import (
     _parse_headers_json,
     build_eval_llm_client,
     build_llm_client,
+    detect_role_collisions,
     role_is_configured,
 )
 
@@ -526,3 +527,67 @@ def test_role_is_configured_true_with_cli_override(config: Config) -> None:
     assert role_is_configured(
         config, "judge", model_override="cli-m",
     ) is True
+
+
+# ---------------------------------------------------------------------------
+# detect_role_collisions — S1-4 (R9) 3-way 식별
+# ---------------------------------------------------------------------------
+
+
+def test_detect_role_collisions_all_default_to_system(config: Config) -> None:
+    """generator/judge 모두 미구성 → 둘 다 system 으로 폴백 → 전부 충돌."""
+    out = detect_role_collisions(config)
+    assert out["generator_eq_system"] is True
+    assert out["judge_eq_system"] is True
+    # 둘 다 system 과 같으므로 서로도 같다.
+    assert out["generator_eq_judge"] is True
+    assert out["any_collision"] is True
+
+
+def test_detect_role_collisions_judge_separated(config: Config) -> None:
+    """judge 만 분리 구성 — generator 는 여전히 system 과 동일."""
+    config.set("eval.judge.endpoint", "http://judge/v1")
+    config.set("eval.judge.model", "judge-model")
+    out = detect_role_collisions(config)
+    assert out["judge_eq_system"] is False
+    assert out["generator_eq_system"] is True  # generator 미구성 → system
+    assert out["generator_eq_judge"] is False
+    assert out["any_collision"] is True  # generator==system 이 남음
+
+
+def test_detect_role_collisions_generator_eq_judge_channel_c(config: Config) -> None:
+    """Channel C — generator 와 judge 가 같은 모델(서로는 system 과 다름)."""
+    config.set("eval.generator.endpoint", "http://shared/v1")
+    config.set("eval.generator.model", "shared-model")
+    config.set("eval.judge.endpoint", "http://shared/v1")
+    config.set("eval.judge.model", "shared-model")
+    out = detect_role_collisions(config)
+    assert out["generator_eq_system"] is False
+    assert out["judge_eq_system"] is False
+    # role_is_configured 의 2-way 검사로는 둘 다 system 과 달라 못 잡지만,
+    # 3-way 는 generator==judge 를 식별한다.
+    assert out["generator_eq_judge"] is True
+    assert out["any_collision"] is True
+
+
+def test_detect_role_collisions_fully_separated(config: Config) -> None:
+    """세 역할 모두 다른 모델 — 충돌 없음."""
+    config.set("eval.generator.endpoint", "http://gen/v1")
+    config.set("eval.generator.model", "gen-model")
+    config.set("eval.judge.endpoint", "http://judge/v1")
+    config.set("eval.judge.model", "judge-model")
+    out = detect_role_collisions(config)
+    assert out["generator_eq_system"] is False
+    assert out["judge_eq_system"] is False
+    assert out["generator_eq_judge"] is False
+    assert out["any_collision"] is False
+
+
+def test_detect_role_collisions_judge_cli_override(config: Config) -> None:
+    """judge CLI override 가 collision 판정에 반영된다."""
+    out = detect_role_collisions(
+        config,
+        judge_endpoint_override="http://cli-judge/v1",
+        judge_model_override="cli-judge-model",
+    )
+    assert out["judge_eq_system"] is False

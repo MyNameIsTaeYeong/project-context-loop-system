@@ -118,6 +118,11 @@ class MatchReport:
             T4(embedding) 매칭은 제외. surface 메트릭의 입력.
         surface_relevant_keys: 표면 tier 로 매칭에 성공한 골든 entity 의 키
             집합. (surface recall 분자.)
+        matched_retrieved_indices: 매칭에 성공한 골든들이 hit 한 **retrieved**
+            엔티티의 list 인덱스 집합 (rank-0 기준). retrieved-중심 precision
+            계산에 사용 — ``|matched ∩ {0..k-1}| / min(k, len(retrieved))``.
+        surface_matched_retrieved_indices: 표면(T1/T2/T3) tier 만으로 매칭된
+            retrieved 인덱스 집합. surface precision 의 분자.
         tier_counts: tier 별 hit 카운트.
         scores: hit 한 매칭들의 score 리스트 (평균/최소/최대 보고용).
     """
@@ -130,6 +135,8 @@ class MatchReport:
         default_factory=list,
     )
     surface_relevant_keys: set[tuple[str, str]] = field(default_factory=set)
+    matched_retrieved_indices: set[int] = field(default_factory=set)
+    surface_matched_retrieved_indices: set[int] = field(default_factory=set)
     tier_counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(MATCH_TIERS, 0))
     scores: list[float] = field(default_factory=list)
 
@@ -395,8 +402,11 @@ def run_entity_matching(
             report.scores.append(result.score)
             g_key = ((g.name or "").strip().lower(), (g.type or "").strip())
             report.relevant_keys.add(g_key)
+            # retrieved-중심 precision 용 인덱스 집계 (S1-1) — 같은 패스에서 수집.
+            report.matched_retrieved_indices.add(result.retrieved_index)
             if result.tier != "embedding":
                 report.surface_relevant_keys.add(g_key)
+                report.surface_matched_retrieved_indices.add(result.retrieved_index)
 
     # 매칭된 retrieved 키를 rank 순서로 정렬 — generic 메트릭의 입력.
     # 동일 패스에서 표면(T1/T2/T3) tier 만 따로 모아 surface 키도 채운다 —
@@ -481,6 +491,28 @@ def match_relation_tiered(
     return best
 
 
+@dataclass
+class RelationMatchReport:
+    """관계 매칭 보고 — 엔티티 :class:`MatchReport` 의 관계 버전 (S1-1).
+
+    Attributes:
+        retrieved_keys_in_rank_order: 매칭된 관계 키를 rank 순서로.
+        relevant_keys: 매칭 성공한 골든 관계 키 집합.
+        tier_counts: tier 별 hit 카운트.
+        scores: hit score 리스트.
+        matched_retrieved_indices: 매칭된 골든들이 hit 한 retrieved 관계의
+            list 인덱스 집합. retrieved-중심 relation precision 분자에 사용.
+    """
+
+    retrieved_keys_in_rank_order: list[RelKey] = field(default_factory=list)
+    relevant_keys: set[RelKey] = field(default_factory=set)
+    tier_counts: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(MATCH_TIERS, 0),
+    )
+    scores: list[float] = field(default_factory=list)
+    matched_retrieved_indices: set[int] = field(default_factory=set)
+
+
 def run_relation_matching(
     relevant: list[GraphRelationRef],
     retrieved: list[GraphRelationRef],
@@ -488,15 +520,15 @@ def run_relation_matching(
     embed_fn: EmbedFn,
     threshold: float = DEFAULT_GRAPH_MATCH_THRESHOLD,
     strict: bool = False,
-) -> tuple[list[RelKey], set[RelKey], dict[str, int], list[float]]:
-    """관계 매칭 보고. 반환은 (retrieved_keys_in_rank_order, relevant_keys, tier_counts, scores).
+) -> RelationMatchReport:
+    """관계 매칭 보고. :class:`RelationMatchReport` 반환.
 
     엔티티 매칭과 같은 list/set 패턴을 따라 ``metrics.recall_at_k`` 등에
-    바로 사용 가능하다.
+    바로 사용 가능하다. ``matched_retrieved_indices`` 는 S1-1 의 retrieved-중심
+    relation precision 계산에 쓰인다 — 엔티티와 동일하게 같은 패스에서 수집해
+    T4 추가 비용이 없다.
     """
-    tier_counts: dict[str, int] = dict.fromkeys(MATCH_TIERS, 0)
-    scores: list[float] = []
-    relevant_keys: set[RelKey] = set()
+    report = RelationMatchReport()
     hits: list[tuple[int, RelKey, MatchResult]] = []
     for gi, g in enumerate(relevant):
         result = match_relation_tiered(
@@ -505,21 +537,21 @@ def run_relation_matching(
         if result is None:
             continue
         key = _rel_key(g)
-        relevant_keys.add(key)
-        tier_counts[result.tier] = tier_counts.get(result.tier, 0) + 1
-        scores.append(result.score)
+        report.relevant_keys.add(key)
+        report.tier_counts[result.tier] = report.tier_counts.get(result.tier, 0) + 1
+        report.scores.append(result.score)
+        report.matched_retrieved_indices.add(result.retrieved_index)
         hits.append((result.retrieved_index, key, result))
         _ = gi  # 결정성 디버깅용
 
     hits.sort(key=lambda t: t[0])
     seen: set[RelKey] = set()
-    retrieved_keys: list[RelKey] = []
     for _idx, key, _res in hits:
         if key in seen:
             continue
         seen.add(key)
-        retrieved_keys.append(key)
-    return retrieved_keys, relevant_keys, tier_counts, scores
+        report.retrieved_keys_in_rank_order.append(key)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +617,7 @@ __all__ = [
     "EmbedFn",
     "MatchReport",
     "MatchResult",
+    "RelationMatchReport",
     "aembed_with_client",
     "aggregate_tier_counts",
     "build_embed_fn",
