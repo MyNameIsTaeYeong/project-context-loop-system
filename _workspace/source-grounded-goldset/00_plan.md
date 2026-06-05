@@ -113,18 +113,52 @@ class SupportingFact:
 [8] 동결 + 버전 + provenance(4모델 ID + seed) 기록
 ```
 
-## 6. 채점 변경 — 3단위 일급 (PR #78 위에 추가)
+## 6. 채점 변경 — 3단위 일급 + 두 축 분리 (PR #78 위에 추가)
 
 세 단위 모두 **원문 근거라 인덱스 독립**이고, PR #78의 **bootstrap CI**를 그대로 적용한다.
 
-- **[문서] context recall@k** — retrieved 청크/문서가 evidence_span 출처 문서를 커버하나.
-  인덱스가 그 청크를 놓쳤으면 recall 하락(인덱싱 품질 측정). 기존 chunk recall/precision 재사용.
-- **[답변] answer correctness / faithfulness** — `reference_answer` 대비(팩토이드: 정규화
-  일치 / 개방형: 분리 judge + CI). RAGAS 보완 레이어와 정렬 가능(reference 기반).
-- **[그래프] 사실 recall** — supporting_facts를 retrieved 그래프 노드에 tiered 매칭(PR #78
-  `graph_recall_surface@k` 등). 인덱스에 노드 없으면 true miss.
+**대원칙 — 두(세) 축을 뭉개지 않는다.** "검색이 *정답 대상*(문서id/엔티티)을 가져왔나"(축 A,
+retrieval-grounded)와 "결과적으로 *맞는 답*이 나왔나"(축 B, answer correctness)는 **서로 다른
+축**이며, 보조로 "답이 가져온 근거에 기반하나"(축 C, faithfulness)를 둔다. 셋이 어긋나는
+경우를 **별도 진단 신호**로 보고한다(아래 6.4). 한 숫자로 합치면 *대체 유효 출처를 부당히
+벌하거나, 근거 없이 맞은 답을 잘못 보상*한다.
+
+### 6.1 [문서] context recall — evidence 등가 그룹 + faithfulness
+- `relevant_doc_groups`(OR-group, R3 메커니즘 재사용)로 채점: evidence_span을 담은 **어느
+  문서든** 회수하면 recall=1. `expected_source_doc_ids`를 단일 id로 강제하지 않는다
+  (같은 사실이 여러 문서에 서술될 수 있으므로 — "문서 id 틀렸지만 답 맞음"의 정당 케이스).
+- **한계 명시**: 사실을 담은 모든 문서를 사전 열거할 수 없어 문서 recall은 **하한(proxy)**.
+  그래서 축 B/C를 함께 본다.
+- **faithfulness/attribution(축 C)** — 생성 답변이 *retrieved 컨텍스트*에 귀속되는지 NLI류로
+  확인. 무관 문서를 가져왔는데 답이 맞으면(파라메트릭 지식) `faithfulness=0`으로 적발 →
+  "맞지만 근거 없음"은 **검색 실패**로 드러난다. (생성 시 Judge 게이트 (b)가 파라메트릭
+  답변형 질문을 1차 차단.)
+
+### 6.2 [답변] answer correctness
+- `reference_answer` 대비(팩토이드: 정규화 일치 / 개방형: 분리 judge + CI). 축 A와 **독립** 산출.
+- RAGAS 보완 레이어와 정렬 가능(reference 기반 + faithfulness).
+
+### 6.3 [그래프] 사실 recall — 검증 동의어(surface) vs 후보(fuzzy, 검토)
+- supporting_facts를 retrieved 그래프 노드에 tiered 매칭(PR #78):
+  - **T1 exact / T3 normalize / T2(검증된 `acceptable_surface_forms`)** → `graph_recall_surface@k`
+    (결정론·신뢰). "같은 referent임이 확인된" 동의어만 T2에 들어간다(generator 자유나열 금지).
+  - **T4 임베딩(미검증 유사)** → `graph_recall@k`(fuzzy)에만 잡히고 surface엔 안 잡힘. 즉
+    "의미는 비슷한데 같은지 불확실"한 hit은 **fuzzy로 격리**되고, `graph_match_pairs`(S1-6)에
+    (정답, 반환, tier, cosine)이 기록 → **인간 검토로 진짜 동의어면 acceptable_surface_forms로
+    승격**(동의어 집합이 성장). `Token Store`처럼 관련이나 다른 엔티티가 T4를 통과하면
+    surface=0이 진실.
+- 인덱스에 해당 노드가 아예 없으면 true miss(인덱싱 품질 측정).
+
+### 6.4 ★ divergence 리포트 — 축이 어긋나는 케이스
+다음을 **별도 집계·노출**한다(품질 진단의 핵심):
+- `answer_correct=1` & `context_recall=0` → (i) faithfulness=1이면 **대체 유효 출처**(미페널티
+  검토), (ii) faithfulness=0이면 **파라메트릭으로 맞춤**(검색 실패 가림 — 경고).
+- `context_recall=1`(또는 entity hit) & `answer_correct=0` → **검색 OK·생성 실패**(생성 문제로 진단).
+- `graph` surface=0 & fuzzy=1 → **fuzzy 의존 hit**(검토 후보, 동의어 승격 대상).
+
+### 6.5 공통
 - **answerable 분모 위생** — `answerable=False`는 분모 제외 또는 별도 보고.
-- **유지**: PR #78 surface tier 분리, 그래프 CI, 비교 가드, 매칭 증거.
+- **유지**: PR #78 surface tier 분리, 그래프 CI, 비교 가드, 매칭 증거(`graph_match_pairs`).
 
 ## 7. 2-tier 골드 + "잠정→절대" 승격 (3단위 공통)
 
@@ -185,6 +219,10 @@ chunk/graph 모드와 병존. 기존 상대 A/B는 깨지 않는다. 검증·안
 5. **사실/문서 매칭**: 기존 graph_match tier·chunk recall 재사용 vs 사실 전용 매처?
 6. **답변 채점**: 팩토이드 정규화 일치 vs 개방형 judge — 어디까지 개방형 허용? (RAGAS 연계 여부)
 7. **불가능 골드 정책**: answerable=False를 분모 제외 vs 별도 "인덱싱 표적" 버킷?
+8. **faithfulness/attribution(축 C)**: 어떤 방법으로 측정? (NLI 모델 / RAGAS faithfulness /
+   분리 judge). divergence 케이스(맞지만 근거 없음)를 경고로만 vs 메트릭에 반영?
+9. **문서 OR-group 범위**: evidence 등가 문서를 어디까지 자동 열거할지(동일 fact를 담은 문서
+   탐지) — 단일 id만 vs LLM/검색으로 등가 후보 확장 vs 인간 확인 그룹만?
 
 ## 12. 참조
 
