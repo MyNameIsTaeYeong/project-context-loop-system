@@ -113,6 +113,11 @@ class MatchReport:
             키 집합 (메트릭의 relevant set).
         all_relevant_keys: **모든** 골든 entity 의 키 집합 — recall 분모
             계산에 사용. 미매칭 골든도 포함.
+        surface_retrieved_keys_in_rank_order: 표면(T1/T2/T3) tier 만으로
+            매칭된 retrieved entity 의 ``(name.lower, type)`` 키 — rank 보존.
+            T4(embedding) 매칭은 제외. surface 메트릭의 입력.
+        surface_relevant_keys: 표면 tier 로 매칭에 성공한 골든 entity 의 키
+            집합. (surface recall 분자.)
         tier_counts: tier 별 hit 카운트.
         scores: hit 한 매칭들의 score 리스트 (평균/최소/최대 보고용).
     """
@@ -121,6 +126,10 @@ class MatchReport:
     retrieved_keys_in_rank_order: list[tuple[str, str]] = field(default_factory=list)
     relevant_keys: set[tuple[str, str]] = field(default_factory=set)
     all_relevant_keys: set[tuple[str, str]] = field(default_factory=set)
+    surface_retrieved_keys_in_rank_order: list[tuple[str, str]] = field(
+        default_factory=list,
+    )
+    surface_relevant_keys: set[tuple[str, str]] = field(default_factory=set)
     tier_counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(MATCH_TIERS, 0))
     scores: list[float] = field(default_factory=list)
 
@@ -386,17 +395,24 @@ def run_entity_matching(
             report.scores.append(result.score)
             g_key = ((g.name or "").strip().lower(), (g.type or "").strip())
             report.relevant_keys.add(g_key)
+            if result.tier != "embedding":
+                report.surface_relevant_keys.add(g_key)
 
     # 매칭된 retrieved 키를 rank 순서로 정렬 — generic 메트릭의 입력.
+    # 동일 패스에서 표면(T1/T2/T3) tier 만 따로 모아 surface 키도 채운다 —
+    # T4 임베딩 매칭 비용을 추가로 들이지 않는다.
     hits.sort(key=lambda t: t[0])
     seen: set[tuple[str, str]] = set()
-    for _r_idx, g_idx, _result in hits:
+    surface_seen: set[tuple[str, str]] = set()
+    for _r_idx, g_idx, result in hits:
         g = relevant[g_idx]
         key = ((g.name or "").strip().lower(), (g.type or "").strip())
-        if key in seen:
-            continue
-        seen.add(key)
-        report.retrieved_keys_in_rank_order.append(key)
+        if key not in seen:
+            seen.add(key)
+            report.retrieved_keys_in_rank_order.append(key)
+        if result.tier != "embedding" and key not in surface_seen:
+            surface_seen.add(key)
+            report.surface_retrieved_keys_in_rank_order.append(key)
 
     return report
 

@@ -478,6 +478,28 @@ async def evaluate_one(
             entity_report.all_relevant_keys,
             top_k,
         ),
+        # R2/R3 — 표면(T1/T2/T3) tier 만으로 계산한 메트릭. 개선 판단의 1차
+        # 기준. 분모는 동일하게 all_relevant_keys (= 모든 골든) 유지.
+        # 단일 매칭 패스에서 모은 surface 키를 재사용 — T4 비용 추가 없음.
+        f"graph_recall_surface@{top_k}": recall_at_k(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        f"graph_hit_surface@{top_k}": int(hit_at_k(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        )),
+        f"graph_ndcg_surface@{top_k}": ndcg_at_k(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        "graph_mrr_surface": mrr(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+        ),
         # 2차 — tier 분포 / score 시그널.
         "graph_match_tiers": dict(entity_report.tier_counts),
         "graph_match_score_avg": entity_report.avg_score(),
@@ -762,25 +784,53 @@ def check_absolute_mode_requirements(
 
 
 def _chunk_metric_cis(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-    """청크/문서 메트릭별 95% bootstrap CI 를 per-query 값으로 계산한다.
+    """청크/문서 + 그래프 메트릭별 95% bootstrap CI 를 per-query 값으로 계산한다.
 
-    절대 점수에 불확실성을 동반시키기 위한 용도(Phase 4). graph_* / judge 는
-    제외하고 recall/precision/hit/ndcg/mrr 계열만 처리한다. 실패 행
-    (``metric_failed``) 은 제외.
+    절대 점수에 불확실성을 동반시키기 위한 용도(Phase 4). recall/precision/
+    hit/ndcg/mrr 계열(청크)과 그래프 수치형 스칼라 메트릭(``graph_recall@k``,
+    ``graph_recall_surface@k``, ``graph_hit@k``, ``graph_ndcg@k``, ``graph_mrr``
+    등)에 동일하게 bootstrap CI 를 적용한다(R1).
+
+    CI 대상에서 제외되는 그래프 키:
+      * dict 값 — ``graph_match_tiers`` / ``graph_rel_match_tiers``.
+      * bool/문자열 — ``graph_t4_disabled`` 등 (값 타입 가드로 자동 제외).
+      * score 시그널 — ``graph_match_score_*`` (메트릭이 아닌 진단치).
+
+    실패 행(``metric_failed``) 은 제외하며, 특정 키가 없는 행(예: chunk-only
+    항목의 graph 키 부재 X — 항상 채워지지만 방어적으로)은 해당 키 집계에서
+    건너뛴다(aggregate 와 동일 정책).
     """
     chunk_prefixes = ("recall@", "precision@", "hit@", "ndcg@", "mrr")
+    graph_prefixes = (
+        "graph_recall@", "graph_recall_surface@",
+        "graph_precision@",
+        "graph_hit@", "graph_hit_surface@",
+        "graph_ndcg@", "graph_ndcg_surface@",
+        "graph_mrr", "graph_mrr_surface",
+        "graph_rel_recall@", "graph_rel_precision@",
+        "graph_rel_hit@", "graph_rel_mrr",
+    )
+
+    def _is_ci_metric(key: str) -> bool:
+        # score 시그널은 메트릭이 아니므로 제외.
+        if key.startswith("graph_match_score_") or key.startswith("graph_rel_match_score_"):
+            return False
+        if any(key == p or key.startswith(p) for p in chunk_prefixes):
+            return True
+        return any(key == p or key.startswith(p) for p in graph_prefixes)
+
     succ = [r for r in rows if not r.get("metric_failed")]
     keys: set[str] = set()
     for r in succ:
         for k, v in r.items():
+            # 값 타입 가드 — dict/bool/str/None 은 CI 대상 아님.
             if not isinstance(v, (int, float)) or isinstance(v, bool):
                 continue
-            if k.startswith("graph_"):
-                continue
-            if any(k == p or k.startswith(p) for p in chunk_prefixes):
+            if _is_ci_metric(k):
                 keys.add(k)
     out: dict[str, dict[str, float]] = {}
     for k in sorted(keys):
+        # 키가 없는 행(chunk-only 등)은 건너뛴다 — aggregate 와 동일 정책.
         values = [
             r[k] for r in succ
             if isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool)
@@ -904,6 +954,8 @@ def print_summary(summary: dict[str, Any]) -> None:
     metrics = summary.get("metrics", {})
     # 보기 좋은 순서로 키 정렬 — graph_* 는 chunk 메트릭 다음에 배치
     preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+                 "graph_recall_surface@", "graph_hit_surface@",
+                 "graph_ndcg_surface@", "graph_mrr_surface",
                  "graph_recall@", "graph_precision@", "graph_hit@",
                  "graph_ndcg@", "graph_mrr",
                  "graph_match_score_", "graph_rel_recall@",
@@ -1413,12 +1465,37 @@ def _write_aggregate(
     per_metric = [s.get("metrics") or {} for s in per_run_summaries]
     variance = aggregate_with_variance(per_metric)
 
+    # R12 — A/B 비교 가드. 비교에 들어가는 run 들의 그래프 채점 기준이
+    # 서로 다르면 그래프 델타가 시스템 차이를 반영하지 못한다. 임베딩
+    # 모델 / 매칭 임계값 / 그래프 스토어 지문이 run 간에 모두 동일해야
+    # 유효 비교. 다르면 경고 + 플래그.
+    guard_keys = ("graph_match_threshold", "embedding_model", "graph_store_sha256")
+    graph_comparison_invalid = False
+    graph_comparison_mismatches: dict[str, list[Any]] = {}
+    if len(per_run_summaries) > 1:
+        for gk in guard_keys:
+            observed = [
+                (s.get("config") or {}).get(gk) for s in per_run_summaries
+            ]
+            distinct = {repr(v) for v in observed}
+            if len(distinct) > 1:
+                graph_comparison_invalid = True
+                graph_comparison_mismatches[gk] = observed
+        if graph_comparison_invalid:
+            logger.warning(
+                "그래프 비교 가드 실패 — run 간 채점 기준 불일치: %s. "
+                "그래프 델타는 시스템 차이를 반영하지 않을 수 있습니다.",
+                ", ".join(graph_comparison_mismatches.keys()),
+            )
+
     out = {
         "label": label,
         "n_gold_sets_requested": len(gold_paths),
         "n_gold_sets_evaluated": len(per_run_summaries),
         "gold_sets": [str(p) for p in gold_paths],
         "config": config_summary,
+        "graph_comparison_invalid": graph_comparison_invalid,
+        "graph_comparison_mismatches": graph_comparison_mismatches,
         "metrics": variance,
         "per_gold_set": [
             {

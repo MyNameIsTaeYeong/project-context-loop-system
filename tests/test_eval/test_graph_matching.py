@@ -448,6 +448,61 @@ def test_scenario_d_merged_node_via_embedding() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 표면(T1/T2/T3) tier 분리 — R2/R3
+# ---------------------------------------------------------------------------
+
+
+def test_surface_keys_exclude_t4_embedding_matches() -> None:
+    """T4(embedding) 매칭은 surface 키에서 제외, full 키에는 포함."""
+    golden = [
+        _ge("인증 서비스", "system"),  # T1 exact → surface
+        _ge(
+            "주문 서비스", "system",
+            description="주문 처리 마이크로서비스",
+        ),  # T4 only → full 에만
+    ]
+    retrieved = [
+        _ge("인증 서비스", "system"),
+        _ge(
+            "Order Service", "service",  # type 도 다름 → 표면 매칭 불가
+            description="Order processing microservice",
+        ),
+    ]
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    # full 메트릭: 두 골든 모두 매칭.
+    assert report.tier_counts["exact"] == 1
+    assert report.tier_counts["embedding"] == 1
+    assert len(report.retrieved_keys_in_rank_order) == 2
+    # surface 메트릭: T1 exact 만 — T4 흡수 항목 제외.
+    assert report.surface_retrieved_keys_in_rank_order == [("인증 서비스", "system")]
+    assert report.surface_relevant_keys == {("인증 서비스", "system")}
+    # 분모(all_relevant_keys)는 full/surface 공통 — 모든 골든.
+    assert report.all_relevant_keys == {
+        ("인증 서비스", "system"),
+        ("주문 서비스", "system"),
+    }
+
+
+def test_surface_keys_equal_full_when_no_t4() -> None:
+    """표면 tier 만 발동하면 surface 키 == full 키."""
+    golden = [
+        _ge("인증 서비스", "system"),       # T1
+        _ge("주문서비스", "system"),         # T3 normalize
+    ]
+    retrieved = [
+        _ge("인증 서비스", "system"),
+        _ge("주문 서비스", "system"),
+    ]
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    assert report.tier_counts["embedding"] == 0
+    assert (
+        report.surface_retrieved_keys_in_rank_order
+        == report.retrieved_keys_in_rank_order
+    )
+    assert report.surface_relevant_keys == report.relevant_keys
+
+
+# ---------------------------------------------------------------------------
 # 시나리오 E — 관계 타입 명 변경 (--score-relations)
 # ---------------------------------------------------------------------------
 
