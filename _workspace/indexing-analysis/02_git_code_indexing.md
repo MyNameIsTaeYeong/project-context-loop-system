@@ -1,6 +1,7 @@
 # Git Code 인덱싱 파이프라인 분석
 
 > 기준: 현재 HEAD (origin/main 머지 완료). 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+> 최종 검증: 2026-06-02. 1~5단계(수집~그래프추출)는 `processor/`·`ingestion/` 미변경으로 기존 서술 유효. **6단계 저장의 그래프 병합 로직은 R3(63e1fd3 / 51fc495, 2026-05-28)로 변경되어 현재 코드 기준 갱신함** — `entity_normalizer.normalize_entity_name` 정규화 키 병합 + `graph_merge_log` 관측 로그 도입.
 
 ## 0. 진입점 & 전체 흐름
 
@@ -192,13 +193,25 @@ process_document(document_id)
 
 **SQLite 청크 (`storage/metadata_store.py`):**
 - `meta_store.delete_chunks_by_document` → `meta_store.create_chunk(...)` 루프 (pipeline.py:209-221).
-- git_code는 `embed_text=meta_text`를 채운다 (라인 219) — 임베딩 입력이 본문과 다르므로 감사용 영속화 (create_chunk docstring, metadata_store.py:327). `section_index`는 None.
+- git_code는 `embed_text=meta_text`를 채운다 (라인 219) — 임베딩 입력이 본문과 다르므로 감사용 영속화 (create_chunk docstring, metadata_store.py:396-407). `section_index`는 None(AST 코드 경로에선 항상 None, metadata_store.py:406).
 
-**그래프 저장 (`storage/graph_store.py`):**
-- `graph_store.save_graph_data(document_id, graph_data)` (라인 137). SQLite `graph_nodes`/`graph_edges` + NetworkX 인메모리 그래프 동시 갱신.
-- **정규 병합** (라인 160-214): `find_graph_node_by_entity(name, type)` (metadata_store.py:447, SQL `WHERE LOWER(entity_name)=LOWER(?) AND entity_type=?`). 기존 노드 있으면 재사용+document_id 링크 추가(병합), 없으면 `create_graph_node_with_link()`로 신규(노드+문서링크 단일 트랜잭션, race 방지).
-- 엣지: `(src, tgt, relation_type, document_id)` 중복 방지(라인 227-235) 후 `create_graph_edge`.
-- 반환 `{"nodes": 신규수, "edges": 엣지수, "merged": 병합수}`.
+**그래프 저장 (`storage/graph_store.py`):** *(R3 변경 반영 — 2026-05-28 63e1fd3/51fc495)*
+- `await graph_store.save_graph_data(document_id, graph_data)` (라인 138, async). SQLite `graph_nodes`/`graph_edges` + NetworkX 인메모리 그래프 동시 갱신. pipeline 호출부: pipeline.py:225-227.
+- **정규화 키 병합** (라인 161-244): 엔티티마다 다음 순서로 처리.
+  1. `normalized = normalize_entity_name(entity.name)` (graph_store.py:168). 정규화는 **graph_store 책임** — storage(metadata_store)는 받은 키를 그대로 신뢰(책임 분리).
+  2. `await find_graph_node_by_entity(entity.name, entity.entity_type, normalized_name=normalized)` (라인 171-175 → metadata_store.py:540). 매칭 SQL이 R3에서 변경됨: 과거 `WHERE LOWER(entity_name)=LOWER(?)` → 현재 **`WHERE normalized_name = ? AND entity_type = ?`** (metadata_store.py:564-566). `idx_graph_nodes_normalized(normalized_name, entity_type)` 인덱스 활용(LOWER() 함수 제거로 인덱스 적용 가능).
+  3. **기존 노드 존재(병합)**: `node_id` 재사용 + `add_node_document_link(node_id, document_id)`. description이 비어 있으면 `update_graph_node_properties`로 보강. NetworkX `document_ids`에 document_id 추가 (라인 177-201).
+  4. **신규**: `create_graph_node_with_link(document_id, entity_name, entity_type, properties, normalized_name=normalized)` (라인 220-226 → metadata_store.py:472). `graph_nodes` INSERT(normalized_name 포함) + `graph_node_documents` link INSERT를 **단일 commit**으로 묶어 고아노드 정리 SQL과의 FK-violation race 제거.
+- **`normalize_entity_name` 규칙** (entity_normalizer.py:39): ① NFKC → ② strip → ③ 연속공백→단일공백 → ④ `[\s\-_]+` 전부 제거(빈문자 join) → ⑤ `lower()`. 결정적·idempotent·None/빈문자 안전(`""` 반환). 괄호/버전 표기(`(v2)`)는 **보존**(false-merge 회피). source-agnostic(git_code·confluence 공유).
+  - git_code 영향: 코드 심볼은 FQN(`<file>::<parent>.<name>`)을 entity_name으로 쓰므로 정규화 후에도 파일/클래스 범위가 키에 남아 동명 심볼 오병합을 막는다. 단 정규화가 구분자(`.`/`::`는 미제거, `-`/`_`/공백만 제거)·대소문자를 흡수하므로, 예컨대 `auth_service`·`AuthService`는 같은 키(`authservice`)로 수렴 → 동일 FQN을 다른 표기로 쓴 노드가 병합될 수 있음(현재 동작 그대로 기술).
+- **`graph_merge_log` 관측 로그** (R3 신규): 엔티티 처리마다 `_record_merge_safely()` (graph_store.py:298)가 `record_graph_merge()` (metadata_store.py:651) 호출로 1행 INSERT. `merge_method` 분류 — **`'exact'`**(canonical 원본 `entity_name`이 입력 `entity.name`과 정확 동일, 라인 206), **`'normalized'`**(정규화 키로만 일치=표기변형 흡수), **`'new'`**(신규 생성, 라인 236-242). `similarity_score`는 binary 매칭이라 항상 `None`. **로그 INSERT 실패는 swallow**(graph_store.py:323-329) — 그래프 저장 critical path 보호.
+- 엣지: `(src, tgt, relation_type, document_id)` 중복 방지(라인 257-265) 후 `create_graph_edge`(metadata.py). label은 `properties.label`로 직렬화(라인 267).
+- 반환 `{"nodes": 신규수, "edges": 엣지수, "merged": 병합수}` (라인 296).
+
+**스키마 / 마이그레이션 (R3):**
+- `graph_nodes.normalized_name TEXT NOT NULL DEFAULT ''` 컬럼(metadata_store.py:55). `graph_merge_log` 테이블(라인 80-89): `canonical_node_id, raw_entity_name, raw_entity_type, source_document_id, merge_method, similarity_score, created_at`.
+- 인덱스 생성 순서 수정(51fc495): `idx_graph_nodes_normalized`는 `_SCHEMA_SQL`의 executescript에서 제외하고 **`_migrate_schema`가 ALTER TABLE 이후 항상 생성**(metadata_store.py:222-227, if 블록 밖). legacy DB(R3 이전)에서 컬럼 없이 CREATE INDEX가 "no such column" 으로 실패하던 회귀 해소.
+- 백필: `_backfill_normalized_names()` (라인 233)가 `normalized_name=''` 행만 idempotent하게 채움(executemany). 신규 DB는 no-op.
 
 **문서 상태 마무리:** `_derive_storage_method(has_chunks, has_graph)` (pipeline.py:542) → `complete_reprocessing(meta_store, document_id, history_id, storage_method)` (라인 503). 예외 시 `storage_method="chunk"` + error_message 기록 (라인 531-538).
 
@@ -219,7 +232,9 @@ process_document(document_id)
 | FQN 규칙 | `<file>::<parent>.<name>` | ast_code_extractor.py:195 | 5 그래프 |
 | import label 상한 | 20 | ast_code_extractor.py:293 | 5 그래프 |
 | ChromaDB 거리 | cosine | vector_store.py:37 | 6 저장 |
-| 노드 병합 키 | LOWER(name)+type | metadata_store.py:455 | 6 저장 |
+| 노드 병합 키 (R3) | `normalized_name`+`entity_type` | metadata_store.py:564 / entity_normalizer.py:39 | 6 저장 |
+| 정규화 규칙 (R3) | NFKC→strip→공백압축→`[\s\-_]` 제거→lower | entity_normalizer.py:39 | 6 저장 |
+| merge_method | exact / normalized / new | graph_store.py:206,236 | 6 저장 |
 
 ## 부록 B: 데이터 모델
 
@@ -228,6 +243,8 @@ process_document(document_id)
 - `CodeExtraction` (ast_code_extractor.py:58): file_path, language, symbols, imports, import_symbols
 - `Chunk` (chunker.py:43): id, index, content, token_count, section_path, section_anchor, section_index
 - `Entity`/`Relation`/`GraphData` (graph_extractor.py:15/30/48)
+- `graph_nodes` (metadata_store.py:49): id, document_id, entity_name, entity_type, properties, **normalized_name**(R3)
+- `graph_merge_log` (metadata_store.py:80, R3): id, canonical_node_id, raw_entity_name, raw_entity_type, source_document_id, merge_method, similarity_score, created_at
 
 ## 검토하지 못한 영역
 
@@ -235,4 +252,5 @@ process_document(document_id)
 - `coordinator.py`가 sync→process_document를 어떻게 트리거/스케줄하는지 (sync는 documents만 저장, process_document는 별도 호출)
 - `reprocessor.py::start_reprocessing/complete_reprocessing`의 파생 데이터 삭제 범위 상세
 - `storage/cascade.py::delete_document_cascade` (purge 경로)
-- NetworkX 그래프의 고아 노드/엣지 정리 SQL의 실제 트리거 시점
+- 고아 노드/엣지 정리는 `graph_store.delete_document_graph` (graph_store.py:331) → `delete_graph_data_by_document`(SQLite)에서 트리거되며, 신규 노드 생성 시 `create_graph_node_with_link`가 노드+링크를 단일 commit으로 묶어 정리 SQL과의 FK race를 차단(metadata_store.py:481-517). 정리 SQL 자체의 다른 호출 경로(coordinator/reprocessor 동시성)는 미추적.
+- `graph_merge_log`를 소비하는 분석/대시보드 경로(get_graph_merge_log/그래프 탐색 탭, 594d27a·996cee7)는 인덱싱 범위 밖이라 미검토.

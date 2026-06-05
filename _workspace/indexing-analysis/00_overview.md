@@ -25,7 +25,7 @@
 ## 공유하는 단계/모듈 (소스 무관 동일 코드)
 
 - **4. 임베딩 클라이언트** — `processor/embedder.py`. `EndpointEmbeddingClient`(OpenAI 호환 REST, batch 100) 또는 `LocalEmbeddingClient`(sentence-transformers). 멀티뷰 패턴(body/meta + `logical_chunk_id` 공유)도 양쪽 공통.
-- **6. 저장소 3종** — `storage/vector_store.py`(ChromaDB, 컬렉션 `context_loop_chunks`, cosine), `storage/metadata_store.py`(SQLite `create_chunk`), `storage/graph_store.py`(`save_graph_data`, `(LOWER(name), type)` 정규 병합 + NetworkX).
+- **6. 저장소 3종** — `storage/vector_store.py`(ChromaDB, 컬렉션 `context_loop_chunks`, cosine), `storage/metadata_store.py`(SQLite `create_chunk`), `storage/graph_store.py`(`save_graph_data`, **정규화 키(`normalized_name` + `entity_type`) 기반 정규 병합** + `graph_merge_log` 관측 로그 + NetworkX). 2026-05-28(63e1fd3/51fc495)부터 병합 키가 `(LOWER(name), type)` → `normalize_entity_name`(NFKC→strip→공백/`-`/`_` 제거→lower) 기반으로 변경됨.
 - **그래프 데이터 모델** — `Entity`/`Relation`/`GraphData` (graph_extractor.py), 어휘 `graph_vocabulary.py`.
 - **재처리 래퍼** — `reprocessor.start_reprocessing`/`complete_reprocessing`, `_derive_storage_method`.
 - **토큰 카운팅** — `chunker.count_tokens` (tiktoken cl100k_base, 폴백 1char=1tok).
