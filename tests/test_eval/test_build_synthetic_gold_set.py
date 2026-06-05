@@ -545,6 +545,66 @@ def test_make_graph_gold_item_emits_aliases_and_description() -> None:
     assert rel.description == "결제는 결제 팀이 운영"
 
 
+def test_make_graph_gold_item_filters_alias_and_evidence_leakage() -> None:
+    """S1-2 — source_text 가 주어지면 누설 alias 드롭·누설 evidence 비움."""
+    from context_loop.eval.synth import GeneratedGraphQuestion
+
+    subgraph = {
+        "entity_name": "AuthService",
+        "entity_type": "system",
+        "entity_description": "",
+        "document_ids": [1],
+        "primary_document_id": 1,
+        "source_type": "git_code",
+        "subgraph_snippet": "class AuthService implements TokenValidator { ... }",
+    }
+    gq = GeneratedGraphQuestion(
+        query="?",
+        # 'TokenValidator' 는 청크의 다른 식별자 복붙 → 드롭.
+        # 'auth-service' 는 엔티티 이름 표기 변형 → 유지.
+        entity_aliases=["auth-service", "TokenValidator"],
+        # evidence 가 청크 식별자를 복붙 → T4 skip 위해 비워짐.
+        evidence_description="이 노드는 TokenValidator 를 직접 호출한다",
+    )
+    leak_stats: dict[str, int] = {}
+    item = builder._make_graph_gold_item(
+        subgraph, gq,
+        source_text=subgraph["subgraph_snippet"],
+        leak_stats=leak_stats,
+    )
+    entity = item.relevant_graph_entities[0]
+    assert "auth-service" in entity.aliases
+    assert "TokenValidator" not in entity.aliases
+    assert entity.description == ""  # 누설 evidence → 비움 → T4 skip
+    assert leak_stats["alias_leakage_filtered"] == 1
+    assert leak_stats["evidence_leakage_filtered"] == 1
+
+
+def test_make_graph_gold_item_no_source_text_skips_sanitation() -> None:
+    """S1-2 — source_text 미지정 시 기존 동작 보존(누설 검사 없음)."""
+    from context_loop.eval.synth import GeneratedGraphQuestion
+
+    subgraph = {
+        "entity_name": "AuthService",
+        "entity_type": "system",
+        "entity_description": "",
+        "document_ids": [1],
+        "primary_document_id": 1,
+        "source_type": "git_code",
+        "subgraph_snippet": "class AuthService implements TokenValidator { ... }",
+    }
+    gq = GeneratedGraphQuestion(
+        query="?",
+        entity_aliases=["TokenValidator"],
+        evidence_description="TokenValidator 호출",
+    )
+    item = builder._make_graph_gold_item(subgraph, gq)
+    entity = item.relevant_graph_entities[0]
+    # 후방 호환: source_text 없으면 generator 출력 그대로.
+    assert entity.aliases == ["TokenValidator"]
+    assert entity.description == "TokenValidator 호출"
+
+
 def test_make_graph_gold_item_skips_relation_when_disabled() -> None:
     """score_relations=False 면 relation 이 채워져 있어도 emit 안 함."""
     from context_loop.eval.synth import (
@@ -589,6 +649,110 @@ def test_make_graph_gold_item_falls_back_to_node_description() -> None:
         subgraph, gq, score_relations=False,
     )
     assert item.relevant_graph_entities[0].description == "노드 자체 설명"
+
+
+# ---------------------------------------------------------------------------
+# S1-3 (R6) — 그래프 소표본 경고 임계 + 카운트 메타
+# ---------------------------------------------------------------------------
+
+
+def test_graph_low_sample_threshold_constant() -> None:
+    """S1-3 — 권고 임계 상수가 존재하고 N≥150 을 반영한다."""
+    assert builder.GRAPH_LOW_SAMPLE_THRESHOLD == 150
+
+
+def test_build_graph_metadata_low_sample_and_provenance() -> None:
+    """S1-2/S1-3/S1-4 — graph metadata 헬퍼가 필수 키를 모두 채운다."""
+    from context_loop.eval.gold_set import GoldItem, GraphEntityRef
+
+    items = [
+        GoldItem(
+            id="q1", query="?", relevant_doc_ids=[1],
+            relevant_graph_entities=[GraphEntityRef(name="x", type="t")],
+        ),
+        GoldItem(
+            id="q2", query="?", relevant_doc_ids=[1, 2],
+            relevant_graph_entities=[GraphEntityRef(name="y", type="t")],
+            cross_document=True,  # 카운트 제외
+        ),
+    ]
+    stats = {"alias_leakage_filtered": 3, "evidence_leakage_filtered": 1}
+    meta = builder._build_graph_metadata(
+        items=items,
+        stats=stats,
+        embedding_model_id="bge-m3",
+        graph_match_threshold=0.65,
+        score_relations=False,
+        embed_graph_evidence=True,
+    )
+    # S1-2 — 누설 필터 카운트 노출
+    assert meta["alias_leakage_filtered"] == 3
+    assert meta["evidence_leakage_filtered"] == 1
+    # S1-3 — 소표본 경고 (1 < 150)
+    assert meta["graph_question_count"] == 1
+    assert meta["graph_low_sample_warning"] is True
+    assert meta["graph_low_sample_threshold"] == 150
+    # S1-4 — 임베딩 출처 기록 + 추출 LLM 미기록 표식
+    assert meta["graph_evidence_embedding_model"] == "bge-m3"
+    assert meta["embedding_model"] == "bge-m3"
+    assert meta["extraction_llm_provenance"] == "unrecorded"
+
+
+def test_build_graph_metadata_no_low_sample_when_enough() -> None:
+    """S1-3 — 항목 수가 임계 이상이면 경고 플래그가 False."""
+    from context_loop.eval.gold_set import GoldItem, GraphEntityRef
+
+    items = [
+        GoldItem(
+            id=f"q{i}", query="?", relevant_doc_ids=[1],
+            relevant_graph_entities=[GraphEntityRef(name=f"e{i}", type="t")],
+        )
+        for i in range(builder.GRAPH_LOW_SAMPLE_THRESHOLD)
+    ]
+    meta = builder._build_graph_metadata(
+        items=items,
+        stats={},
+        embedding_model_id="",
+        graph_match_threshold=0.65,
+        score_relations=False,
+        embed_graph_evidence=True,
+    )
+    assert meta["graph_question_count"] == builder.GRAPH_LOW_SAMPLE_THRESHOLD
+    assert meta["graph_low_sample_warning"] is False
+    # 누설 카운트 누락 시 0 기본값
+    assert meta["alias_leakage_filtered"] == 0
+    assert meta["evidence_leakage_filtered"] == 0
+
+
+def test_graph_question_count_predicate_excludes_cross_doc() -> None:
+    """S1-3 — build() 가 쓰는 그래프 항목 카운트 술어 검증.
+
+    순수 그래프(단일 엔티티) 항목만 세고, chunk-only / cross-doc 은 제외한다.
+    """
+    from context_loop.eval.gold_set import GoldItem, GraphEntityRef
+
+    chunk_only = GoldItem(id="q1", query="?", relevant_doc_ids=[1])
+    graph_a = GoldItem(
+        id="q2", query="?", relevant_doc_ids=[1],
+        relevant_graph_entities=[GraphEntityRef(name="x", type="t")],
+    )
+    graph_b = GoldItem(
+        id="q3", query="?", relevant_doc_ids=[2],
+        relevant_graph_entities=[GraphEntityRef(name="y", type="t")],
+    )
+    cross_doc = GoldItem(
+        id="q4", query="?", relevant_doc_ids=[1, 2],
+        relevant_graph_entities=[GraphEntityRef(name="z", type="t")],
+        cross_document=True,
+    )
+    items = [chunk_only, graph_a, graph_b, cross_doc]
+    # build() 내부 술어와 동일.
+    count = sum(
+        1 for it in items
+        if it.relevant_graph_entities and not it.cross_document
+    )
+    assert count == 2
+    assert (count < builder.GRAPH_LOW_SAMPLE_THRESHOLD) is True
 
 
 # ---------------------------------------------------------------------------

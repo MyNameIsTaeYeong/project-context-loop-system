@@ -22,10 +22,13 @@ from context_loop.eval.synth import (
     generate_questions,
     has_demonstrative_reference,
     has_identifier_leakage,
+    is_alias_leakage,
     make_text_anchor,
     parse_generated_graph_questions,
     parse_generated_questions,
     parse_yes_no,
+    sanitize_graph_aliases,
+    sanitize_graph_evidence,
     stratified_sample,
     truncate_to_tokens,
 )
@@ -204,6 +207,84 @@ def test_has_identifier_leakage_case_sensitive() -> None:
     question2 = "fooHandler 가 어떻게 동작?"  # 다른 케이스 → 누출 아님
     assert has_identifier_leakage(question1, chunk) is True
     assert has_identifier_leakage(question2, chunk) is False
+
+
+# ---------------------------------------------------------------------------
+# S1-2 (R5, Channel D) — alias / evidence 누설 게이트
+# ---------------------------------------------------------------------------
+
+
+def test_is_alias_leakage_allows_name_variant() -> None:
+    """정답 엔티티 이름의 표기 변형(케이스/구분자)은 누설 아님 — 과교정 방지."""
+    chunk = "class AuthService implements TokenValidator { ... }"
+    # 엔티티 이름 'AuthService' 의 표기 변형들 — 정상 alias.
+    assert is_alias_leakage("auth_service", "AuthService", chunk) is False
+    assert is_alias_leakage("Auth-Service", "AuthService", chunk) is False
+    assert is_alias_leakage("AuthService", "AuthService", chunk) is False
+
+
+def test_is_alias_leakage_drops_copied_identifier() -> None:
+    """엔티티 변형이 아니면서 청크의 다른 고유 식별자를 복붙한 alias 는 누설."""
+    chunk = "class AuthService implements TokenValidator { ... }"
+    # 'TokenValidator' 는 엔티티 이름(AuthService) 변형이 아닌 청크 내 다른 식별자.
+    assert is_alias_leakage("TokenValidator", "AuthService", chunk) is True
+
+
+def test_is_alias_leakage_empty_is_dropped() -> None:
+    """빈 alias 는 드롭 대상 (True)."""
+    assert is_alias_leakage("   ", "AuthService", "본문") is True
+
+
+def test_is_alias_leakage_drops_korean_proper_noun() -> None:
+    """청크의 한국어 고유명사를 복붙한 alias 는 누설."""
+    # 한국어 고유명사는 청크 내 1회 등장(고유명사 가능성)일 때 후보가 된다.
+    chunk = "결제정산플랫폼은 일별 정산 배치를 담당하는 모듈이다."
+    # 엔티티 이름이 영문이라 한글 고유명사는 변형이 아님 → 누설 검출.
+    leaked = is_alias_leakage("결제정산플랫폼", "SettlementPlatform", chunk)
+    assert leaked is True
+
+
+def test_sanitize_graph_aliases_keeps_clean_drops_leak() -> None:
+    """정상 변형은 유지, 누설 alias 만 드롭하고 카운트 반환."""
+    chunk = "class AuthService implements TokenValidator { ... }"
+    aliases = ["auth-service", "TokenValidator", "인증 서비스"]
+    kept, dropped = sanitize_graph_aliases(aliases, "AuthService", chunk)
+    assert "auth-service" in kept
+    assert "인증 서비스" in kept  # 청크에 없는 자연어 표기 → 통과
+    assert "TokenValidator" not in kept
+    assert dropped == 1
+
+
+def test_sanitize_graph_aliases_empty_list() -> None:
+    """빈 alias 리스트는 그대로 빈 결과·드롭 0."""
+    kept, dropped = sanitize_graph_aliases([], "AuthService", "본문")
+    assert kept == []
+    assert dropped == 0
+
+
+def test_sanitize_graph_evidence_blanks_leak() -> None:
+    """청크 식별자를 복붙한 evidence 는 비워지고 leaked=True."""
+    chunk = "class AuthService implements TokenValidator { ... }"
+    evidence = "이 노드는 TokenValidator 를 직접 호출한다"
+    sanitized, leaked = sanitize_graph_evidence(evidence, chunk)
+    assert sanitized == ""
+    assert leaked is True
+
+
+def test_sanitize_graph_evidence_keeps_paraphrase() -> None:
+    """자연어 패러프레이즈 evidence 는 유지·leaked=False."""
+    chunk = "class AuthService implements TokenValidator { ... }"
+    evidence = "사용자 인증을 담당하며 토큰 검증기를 호출하는 컴포넌트"
+    sanitized, leaked = sanitize_graph_evidence(evidence, chunk)
+    assert sanitized == evidence
+    assert leaked is False
+
+
+def test_sanitize_graph_evidence_empty_is_not_leak() -> None:
+    """빈 evidence 는 누설 아님 (보수적)."""
+    sanitized, leaked = sanitize_graph_evidence("", "본문")
+    assert sanitized == ""
+    assert leaked is False
 
 
 # ---------------------------------------------------------------------------

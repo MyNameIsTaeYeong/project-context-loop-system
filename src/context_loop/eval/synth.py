@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -583,6 +584,125 @@ def build_korean_stopwords_from_corpus(
         key=lambda x: (-x[1], x[0]),
     )[:max_stopwords]
     return frozenset(stem for stem, _ in frequent)
+
+
+# ---------------------------------------------------------------------------
+# Graph alias / evidence leakage sanitation (S1-2 — R5, Channel D)
+# ---------------------------------------------------------------------------
+
+
+def _alias_norm(text: str) -> str:
+    """alias 비교용 정규화 — graph_match._normalize 와 동일 정책.
+
+    NFKC + 소문자화 + 공백·하이픈·언더스코어·점 제거. 이 정규화 결과가
+    같으면 두 표기는 케이스/구분자 변형(= 정상 alias)으로 간주한다.
+    graph_match 측 T3 정규화와 일치시켜, 여기서 정상으로 통과시킨 alias 가
+    평가 단계에서 실제로 같은 normalize 버킷에 들어가도록 보장한다.
+    """
+    if not text:
+        return ""
+    nfkc = unicodedata.normalize("NFKC", text)
+    return _ALIAS_STRIP_RE.sub("", nfkc).lower()
+
+
+_ALIAS_STRIP_RE = re.compile(r"[\s\-_.]+")
+
+
+def is_alias_leakage(
+    alias: str,
+    entity_name: str,
+    source_text: str,
+    *,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> bool:
+    """generator 작성 alias 가 정답을 trivially 노출하는지 판정 (S1-2).
+
+    정상 alias 는 정답 엔티티 이름의 표기 변형(케이스/공백/하이픈/언더스코어)
+    이다. 이런 alias 는 ``_alias_norm`` 결과가 ``entity_name`` 과 같으므로
+    누설로 보지 않고 통과시킨다 (과교정 방지).
+
+    누설로 판정하는 경우:
+        - 엔티티 이름의 정규화 변형이 **아니면서**, 출처 청크의 고유 식별자
+          (ASCII) 또는 한국어 고유명사를 그대로 베낀 alias.
+
+    즉 "정답 노드 이름의 표기 변형"은 허용하되, "청크 본문에서 복붙한 다른
+    고유 토큰"은 드롭한다. 후자는 T2 alias 매칭을 자명 통과시키는 누설이다.
+    """
+    alias = alias.strip()
+    if not alias:
+        # 빈 alias 는 무의미 — 호출자가 드롭하도록 True 반환.
+        return True
+    # 엔티티 이름의 표기 변형이면 정상 alias.
+    if _alias_norm(alias) == _alias_norm(entity_name):
+        return False
+    # 그 외에는 청크 누설 검사를 적용 — alias 를 "질문" 자리에 넣어 재사용.
+    if has_identifier_leakage(alias, source_text):
+        return True
+    if has_korean_proper_noun_leakage(
+        alias, source_text, extra_stopwords=extra_korean_stopwords,
+    ):
+        return True
+    return False
+
+
+def sanitize_graph_aliases(
+    aliases: list[str],
+    entity_name: str,
+    source_text: str,
+    *,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> tuple[list[str], int]:
+    """alias 리스트에서 누설 alias 를 제거한다 (S1-2).
+
+    Returns:
+        ``(kept_aliases, dropped_count)`` — 누설로 드롭된 alias 수를 함께 반환해
+        호출자가 빌드 metadata 의 ``alias_leakage_filtered`` 카운트에 합산한다.
+
+    중복 정규화 변형은 1개만 유지 (예: "Auth-Service" 와 "auth_service" 가 모두
+    엔티티 이름 변형이면 둘 다 통과하지만, 동일 normalize 버킷이라 채점상 동치).
+    """
+    kept: list[str] = []
+    dropped = 0
+    for alias in aliases:
+        if is_alias_leakage(
+            alias, entity_name, source_text,
+            extra_korean_stopwords=extra_korean_stopwords,
+        ):
+            dropped += 1
+            continue
+        kept.append(alias)
+    return kept, dropped
+
+
+def sanitize_graph_evidence(
+    evidence: str,
+    source_text: str,
+    *,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> tuple[str, bool]:
+    """evidence_description 이 정답을 trivially 노출하면 비운다 (S1-2).
+
+    evidence_description 은 자연어 패러프레이즈여야 한다. 청크 본문의 고유
+    식별자/한국어 고유명사를 그대로 베낀 evidence 는 T4 임베딩 cosine 을
+    부풀린다. 누설이 검출되면 evidence 를 빈 문자열로 만들어 T4 를 skip 시킨다
+    (``_make_graph_gold_item`` 의 빈 description → 임베딩 skip 정책과 일관).
+
+    Returns:
+        ``(sanitized_evidence, leaked)`` — ``leaked`` 가 True 면 호출자가
+        ``evidence_leakage_filtered`` 카운트를 올린다.
+
+    보수적 동작: evidence 가 비어 있으면 누설 아님(빈 문자열 그대로 반환).
+    """
+    if not evidence.strip():
+        return evidence, False
+    leaked = has_identifier_leakage(evidence, source_text) or (
+        has_korean_proper_noun_leakage(
+            evidence, source_text, extra_stopwords=extra_korean_stopwords,
+        )
+    )
+    if leaked:
+        return "", True
+    return evidence, False
 
 
 # ---------------------------------------------------------------------------
