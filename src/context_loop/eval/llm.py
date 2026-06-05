@@ -248,6 +248,11 @@ def role_is_configured(
 
     자기 평가 편향 차단(--allow-self-eval/--allow-self-judge) 의 판정 기준으로
     사용된다.
+
+    Note:
+        이 함수는 role↔system 2자 비교만 한다 (Channel C 의 generator↔judge
+        식별은 잡지 못함). 세 역할(generator/judge/system) 간 식별을 한 번에
+        보려면 :func:`detect_role_collisions` 를 사용한다.
     """
     role_endpoint, role_model = _effective_role_target(
         config, role,
@@ -257,3 +262,51 @@ def role_is_configured(
     system_endpoint = str(config.get("llm.endpoint") or "")
     system_model = str(config.get("llm.model") or "")
     return (role_endpoint, role_model) != (system_endpoint, system_model)
+
+
+def detect_role_collisions(
+    config: Config,
+    *,
+    generator_endpoint_override: str = "",
+    generator_model_override: str = "",
+    judge_endpoint_override: str = "",
+    judge_model_override: str = "",
+) -> dict[str, bool]:
+    """generator / judge / system 3자의 (endpoint, model) 식별 충돌을 판정 (S1-4, R9).
+
+    ``role_is_configured`` 는 role↔system 2-way 비교만 하므로 generator 가
+    시스템 planner/HyDE LLM 과 같은 경우는 잡아도, generator==judge 처럼 두
+    평가 역할이 서로 동일 모델인 경우(Channel C)는 식별하지 못한다. 이 헬퍼는
+    세 역할의 최종 적용 (endpoint, model) 페어를 모두 비교하여 어느 쌍이라도
+    동일하면 해당 플래그를 ``True`` 로 돌려준다.
+
+    Returns:
+        ``{"generator_eq_system", "judge_eq_system", "generator_eq_judge",
+        "any_collision"}`` bool 매핑. 어느 쌍이라도 동일하면 ``any_collision``
+        이 ``True``.
+    """
+    gen_target = _effective_role_target(
+        config, "generator",
+        endpoint_override=generator_endpoint_override,
+        model_override=generator_model_override,
+    )
+    judge_target = _effective_role_target(
+        config, "judge",
+        endpoint_override=judge_endpoint_override,
+        model_override=judge_model_override,
+    )
+    system_target = (
+        str(config.get("llm.endpoint") or ""),
+        str(config.get("llm.model") or ""),
+    )
+    generator_eq_system = gen_target == system_target
+    judge_eq_system = judge_target == system_target
+    generator_eq_judge = gen_target == judge_target
+    return {
+        "generator_eq_system": generator_eq_system,
+        "judge_eq_system": judge_eq_system,
+        "generator_eq_judge": generator_eq_judge,
+        "any_collision": (
+            generator_eq_system or judge_eq_system or generator_eq_judge
+        ),
+    }

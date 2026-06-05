@@ -4,7 +4,8 @@
   (i)  요건 위반(시드/표본/비편향/앵커) 이 정확히 잡힌다.
   (ii) 모든 요건 충족 시 위반 없음.
   (iii) write_summary(absolute_mode=True) 가 청크 메트릭별 CI 를 동반한다.
-  (iv) 그래프/judge 메트릭은 CI 대상에서 제외된다.
+  (iv) 그래프 수치형 메트릭(표면 포함)은 CI 대상에 포함, judge / dict / bool
+       키는 제외된다(R1).
 """
 
 from __future__ import annotations
@@ -104,9 +105,53 @@ def test_summary_attaches_chunk_ci() -> None:
     for key in ("recall@5", "precision@5", "mrr"):
         assert set(cis[key]) >= {"mean", "ci_low", "ci_high", "n"}
         assert cis[key]["ci_low"] <= cis[key]["mean"] <= cis[key]["ci_high"]
-    # graph_* / judge 는 청크 CI 대상에서 제외.
-    assert "graph_recall@5" not in cis
+    # R1 — 그래프 수치형 메트릭도 이제 CI 포함.
+    assert "graph_recall@5" in cis
+    assert set(cis["graph_recall@5"]) >= {"mean", "ci_low", "ci_high", "n"}
+    assert (
+        cis["graph_recall@5"]["ci_low"]
+        <= cis["graph_recall@5"]["mean"]
+        <= cis["graph_recall@5"]["ci_high"]
+    )
+    # judge 점수는 메트릭이 아니므로 여전히 CI 대상에서 제외.
     assert "judge_score" not in cis
+
+
+def test_summary_ci_includes_surface_and_graph_metrics() -> None:
+    """R2/R3 — 표면 메트릭, R1 — 그래프 메트릭이 CI 대상에 포함."""
+    rows = [
+        {"id": "q1", "mode": "graph",
+         "graph_recall@5": 1.0, "graph_recall_surface@5": 1.0,
+         "graph_hit@5": 1, "graph_hit_surface@5": 1,
+         "graph_ndcg@5": 0.8, "graph_ndcg_surface@5": 0.7,
+         "graph_mrr": 1.0, "graph_mrr_surface": 1.0,
+         "graph_match_tiers": {"exact": 1, "embedding": 0},
+         "graph_match_score_avg": 1.0,
+         "graph_t4_disabled": False},
+        {"id": "q2", "mode": "graph",
+         "graph_recall@5": 0.5, "graph_recall_surface@5": 0.0,
+         "graph_hit@5": 1, "graph_hit_surface@5": 0,
+         "graph_ndcg@5": 0.4, "graph_ndcg_surface@5": 0.0,
+         "graph_mrr": 0.5, "graph_mrr_surface": 0.0,
+         "graph_match_tiers": {"exact": 0, "embedding": 1},
+         "graph_match_score_avg": 0.7,
+         "graph_t4_disabled": False},
+    ]
+    cis = eval_search._chunk_metric_cis(rows)
+    for key in (
+        "graph_recall@5", "graph_recall_surface@5",
+        "graph_hit@5", "graph_hit_surface@5",
+        "graph_ndcg@5", "graph_ndcg_surface@5",
+        "graph_mrr", "graph_mrr_surface",
+    ):
+        assert key in cis, key
+        assert set(cis[key]) >= {"mean", "ci_low", "ci_high", "n"}
+        assert cis[key]["n"] == 2
+        assert cis[key]["ci_low"] <= cis[key]["mean"] <= cis[key]["ci_high"]
+    # dict / bool / score 시그널은 CI 대상에서 제외.
+    assert "graph_match_tiers" not in cis
+    assert "graph_t4_disabled" not in cis
+    assert "graph_match_score_avg" not in cis
 
 
 def test_summary_ci_excludes_failed_rows() -> None:

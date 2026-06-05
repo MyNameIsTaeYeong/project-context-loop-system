@@ -124,6 +124,8 @@ from context_loop.eval.synth import (  # noqa: E402
     generate_graph_questions,
     generate_questions,
     make_text_anchor,
+    sanitize_graph_aliases,
+    sanitize_graph_evidence,
     stratified_sample,
     truncate_to_tokens,
 )
@@ -143,6 +145,13 @@ logger = logging.getLogger("build_synthetic_gold_set")
 # 넣으면 judge 토큰이 폭주한다(R2 일관). 앞부분 prefix 만으로도 "다른 문서로
 # 답이 되는가" 판정에 충분 — 토큰 비용을 상수로 고정한다.
 DISTRACTOR_EXCERPT_CHARS = 2000
+
+
+# S1-3 (R6 — 단일 엔티티 0/1 채점의 소표본 민감도): 그래프 entity recall 은
+# per-item 이 0/1 이라 표본이 작으면 신뢰구간이 넓어 A/B 판정력이 약하다.
+# 그래프 골드 항목 수가 이 임계 미만이면 빌드 종료 시 경고하고 metadata 에
+# ``graph_low_sample_warning`` 을 기록한다 (N≥150 권고).
+GRAPH_LOW_SAMPLE_THRESHOLD = 150
 
 
 def _distractor_excerpt(content: str) -> str:
@@ -671,12 +680,24 @@ async def build(
             "equivalence_embedding_model": embedding_model_id or "" if equiv_active else "",
         }
         if enable_graph_mode:
-            # 그래프 매칭 재현성을 위해 임베딩 모델 ID + 기본 τ 기록
-            # (2차 — 설계 §4.3).
-            metadata["embedding_model"] = embedding_model_id or ""
-            metadata["graph_match_threshold_default"] = graph_match_threshold
-            metadata["score_relations"] = score_relations
-            metadata["embed_graph_evidence"] = embed_graph_evidence
+            graph_meta = _build_graph_metadata(
+                items=items,
+                stats=stats,
+                embedding_model_id=embedding_model_id,
+                graph_match_threshold=graph_match_threshold,
+                score_relations=score_relations,
+                embed_graph_evidence=embed_graph_evidence,
+            )
+            metadata.update(graph_meta)
+            if graph_meta["graph_low_sample_warning"]:
+                logger.warning(
+                    "그래프 골드 항목 수가 %d개로 권고치 %d 미만입니다 — "
+                    "단일 엔티티 0/1 채점이라 그래프 메트릭 신뢰구간이 넓어 "
+                    "A/B 판정력이 약합니다. N≥%d 를 권장합니다.",
+                    graph_meta["graph_question_count"],
+                    GRAPH_LOW_SAMPLE_THRESHOLD,
+                    GRAPH_LOW_SAMPLE_THRESHOLD,
+                )
         if enable_cross_doc:
             # cross-doc 생성 정책 추적성 (R2 — 결정론 씨앗 + LLM 문장화).
             metadata["cross_doc_enabled"] = True
@@ -1041,6 +1062,9 @@ async def _process_subgraph_item(
             if not apply_filter:
                 local_items.append(_make_graph_gold_item(
                     sg, gq, score_relations=score_relations,
+                    source_text=sg["subgraph_snippet"],
+                    extra_korean_stopwords=extra_korean_stopwords,
+                    leak_stats=local_stats,
                 ))
                 local_stats["passed"] = local_stats.get("passed", 0) + 1
                 local_stats["graph_passed"] = local_stats.get("graph_passed", 0) + 1
@@ -1070,6 +1094,9 @@ async def _process_subgraph_item(
 
             local_items.append(_make_graph_gold_item(
                 sg, gq, score_relations=score_relations,
+                source_text=sg["subgraph_snippet"],
+                extra_korean_stopwords=extra_korean_stopwords,
+                leak_stats=local_stats,
             ))
             local_stats["passed"] = local_stats.get("passed", 0) + 1
             local_stats["graph_passed"] = local_stats.get("graph_passed", 0) + 1
@@ -1395,11 +1422,62 @@ async def _run_cross_doc_mode(
     return next_id
 
 
+def _build_graph_metadata(
+    *,
+    items: list[GoldItem],
+    stats: dict[str, int],
+    embedding_model_id: str,
+    graph_match_threshold: float,
+    score_relations: bool,
+    embed_graph_evidence: bool,
+) -> dict[str, Any]:
+    """graph 모드 빌드 metadata 섹션을 구성한다 (S1-2/S1-3/S1-4).
+
+    순수 함수 — ``build()`` 가 호출하며, 테스트가 직접 검증할 수 있게 분리했다.
+
+    포함 키:
+        - 2차 재현성: ``embedding_model`` / ``graph_match_threshold_default`` /
+          ``score_relations`` / ``embed_graph_evidence``.
+        - S1-2 (R5, Channel D — 누설 필터 카운트): ``alias_leakage_filtered`` /
+          ``evidence_leakage_filtered``. ``_process_subgraph_item`` 이 stats 에
+          누적한 값을 metadata 그래프 섹션으로 끌어올려 감사 가능하게 한다.
+        - S1-3 (R6 — 소표본 경고): ``graph_question_count`` /
+          ``graph_low_sample_warning`` / ``graph_low_sample_threshold``.
+          순수 그래프(단일 엔티티) 항목만 세고 cross-doc(doc-level AND 채점)은
+          제외한다.
+        - S1-4 (R4 감사추적): 골드 evidence 임베딩 모델 ID 를
+          ``graph_evidence_embedding_model`` 로 기록. 인덱싱(그래프 추출) LLM
+          은 골드 빌더가 알 수 없으므로 ``extraction_llm_provenance: unrecorded``
+          로 정직하게 미기록임을 명시한다.
+    """
+    graph_question_count = sum(
+        1 for it in items
+        if it.relevant_graph_entities and not it.cross_document
+    )
+    graph_low_sample_warning = graph_question_count < GRAPH_LOW_SAMPLE_THRESHOLD
+    return {
+        "embedding_model": embedding_model_id or "",
+        "graph_match_threshold_default": graph_match_threshold,
+        "score_relations": score_relations,
+        "embed_graph_evidence": embed_graph_evidence,
+        "alias_leakage_filtered": stats.get("alias_leakage_filtered", 0),
+        "evidence_leakage_filtered": stats.get("evidence_leakage_filtered", 0),
+        "graph_question_count": graph_question_count,
+        "graph_low_sample_warning": graph_low_sample_warning,
+        "graph_low_sample_threshold": GRAPH_LOW_SAMPLE_THRESHOLD,
+        "graph_evidence_embedding_model": embedding_model_id or "",
+        "extraction_llm_provenance": "unrecorded",
+    }
+
+
 def _make_graph_gold_item(
     sg: dict[str, Any],
     gq: GeneratedGraphQuestion,
     *,
     score_relations: bool = False,
+    source_text: str | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+    leak_stats: dict[str, int] | None = None,
 ) -> GoldItem:
     """그래프 질문을 GoldItem 으로 직렬화한다.
 
@@ -1418,14 +1496,46 @@ def _make_graph_gold_item(
     임베딩 cosine 이 trivially 1.0 으로 부풀려져 그래프 시스템의 표기 변형·
     패러프레이즈 강건성 측정이 무력화된다. description 이 비면 임베딩 단계
     (``_embed_graph_item_descriptions``) 가 자연 skip 한다.
+
+    S1-2 (R5, Channel D — alias/evidence 누설 게이트): generator 가 작성한
+    ``entity_aliases`` / ``evidence_description`` 이 출처 청크(``source_text``)
+    의 고유 식별자·한국어 고유명사를 그대로 베껴 T2 alias / T4 임베딩 매칭을
+    자명 통과시키는 것을 막는다. ``source_text`` 가 주어지면 누설 alias 는
+    드롭하고, 누설 evidence 는 비워 T4 를 skip 한다. 정답 엔티티 이름의 표기
+    변형(케이스/공백/하이픈/언더스코어)인 alias 는 정상으로 통과시켜 과교정을
+    피한다. 드롭/필터 수는 ``leak_stats`` 에 누적해 빌드 metadata 의
+    ``alias_leakage_filtered`` / ``evidence_leakage_filtered`` 로 노출한다.
     """
+    aliases = list(gq.entity_aliases)
     # LLM 이 자연어로 풀어쓴 evidence 만 사용. 빈 문자열이면 T4 skip (감사 H6).
     description = gq.evidence_description
+
+    if source_text is not None:
+        aliases, dropped = sanitize_graph_aliases(
+            aliases,
+            sg["entity_name"],
+            source_text,
+            extra_korean_stopwords=extra_korean_stopwords,
+        )
+        description, evid_leaked = sanitize_graph_evidence(
+            description,
+            source_text,
+            extra_korean_stopwords=extra_korean_stopwords,
+        )
+        if leak_stats is not None:
+            if dropped:
+                leak_stats["alias_leakage_filtered"] = (
+                    leak_stats.get("alias_leakage_filtered", 0) + dropped
+                )
+            if evid_leaked:
+                leak_stats["evidence_leakage_filtered"] = (
+                    leak_stats.get("evidence_leakage_filtered", 0) + 1
+                )
 
     entity_ref = GraphEntityRef(
         name=sg["entity_name"],
         type=sg["entity_type"],
-        aliases=list(gq.entity_aliases),
+        aliases=aliases,
         description=description,
         description_embedding=None,
     )
@@ -1691,7 +1801,10 @@ def main() -> None:
     parser.add_argument(
         "--n-graph-nodes", type=int, default=0,
         help="샘플링할 graph subgraph 후보 수. 0 이면 --n-chunks 와 동일 (W-8). "
-             "--include-graph-questions 가 꺼져 있으면 무시.",
+             "--include-graph-questions 가 꺼져 있으면 무시. "
+             "그래프 메트릭은 단일 엔티티 0/1 채점이라 소표본에 민감 — "
+             "A/B 판정력 확보를 위해 그래프 골드 항목 N≥150 을 권장 (S1-3). "
+             "임계 미만이면 빌드 종료 시 소표본 경고가 출력된다.",
     )
     parser.add_argument(
         "--min-graph-neighbors", type=int, default=1,

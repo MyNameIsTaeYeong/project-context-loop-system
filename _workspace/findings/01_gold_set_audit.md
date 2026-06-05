@@ -1,318 +1,289 @@
-# Gold-Set Auditor — 합성 골드셋 생성 신뢰성 재감사 (S0/S1 패치 후)
+# Gold-Set Auditor — 합성 골드셋 생성 신뢰성 감사 (그래프 측정 한정)
 
 ## 한줄 판정
-
-**MEDIUM 위험** — 운영 의사결정용 절대 메트릭의 단독 발표는 여전히 권장하지 않으나, S0/S1 패치(P1·P3·P4·P7·P10·P11) 로 이전 감사의 **Critical 1건 + High 4건이 실질적으로 해소**되었다. 자기 평가 편향은 CLI 옵트인 없이는 차단되며(P1+P3), 한국어 누설·그래프 trivial 매칭·`--no-filter` 오염도 결정론적 또는 경로 분리로 막혔다. 잔여 위험은 (1) Judge reasoning 미요구, (2) 정적 distractor pool, (3) 그래프 τ=0.78 캘리브레이션 부재, (4) LLM seed 미전달의 4건. 시스템 내부 회귀 테스트(A vs B) 와 함께 골드셋 metadata 의 `self_evaluation_warning=false` 가 확인된 경우 운영 메트릭 보조 근거로 사용 가능. 단독 인용은 여전히 금지.
+**HIGH 위험 (그래프 entity 측정 경로는 CRITICAL 요소 포함).** 이 골드셋으로 산출한
+그래프 메트릭(특히 entity recall@k)은 **검색 품질이 아니라 "검색기가 인덱스 노드를
+그대로 회수했는가"를 측정**한다. 절대값(예: "graph recall 0.82")을 운영 품질 지표나
+SLA 로 보고하면 안 된다. A/B 개선 판단은 **조건부로만** 가능하다(아래 결론 참조).
 
 ## 검토 범위
-
-| 파일 | 패치 전 줄 수 | 패치 후 줄 수 | 주요 진입점 |
-| --- | --- | --- | --- |
-| `_workspace/source/build_synthetic_gold_set.py` | 1197 | **1330** | `main()` → `build()` → `_run_chunk_mode()` / `_run_graph_mode()` |
-| `_workspace/source/synth.py` | 673 | **835** | `generate_questions()`, `filter_question()`, `is_unique_source()` (NEW), `has_korean_proper_noun_leakage()` (NEW), `stratified_sample()` |
-| `_workspace/source/llm.py` | 226 | **259** | `build_eval_llm_client()`, `role_is_configured()`, `_effective_role_target()` (NEW) |
-| `_workspace/source/graph_match.py` | 548 | **569** | `match_entity_tiered()` (T1~T4), `build_embed_fn()` (T4 skip 메타 부착) |
-
-증가된 줄 수: +470 (≈16% 증가). 신규 헬퍼 함수 7개 추가.
-
----
+- `_workspace/source/build_synthetic_gold_set.py` (1953줄) — 그래프 진입점:
+  `load_candidate_subgraphs` (203), `load_cross_doc_seeds` (325), `build` (408),
+  `_process_subgraph_item` (~977), `_run_graph_mode` (1084),
+  `_process_cross_doc_item` (~1220), `_run_cross_doc_mode` (1310),
+  `_make_graph_gold_item` (1398), `_make_cross_doc_gold_item` (1461),
+  `_embed_graph_item_descriptions` (1496), `main` (1615).
+- `_workspace/source/synth.py` (1169줄) — `GRAPH_GENERATE_PROMPT_TEMPLATE` (163),
+  `CROSS_DOC_GENERATE_PROMPT_TEMPLATE` (222), `generate_graph_questions` (773),
+  `generate_cross_doc_questions` (829), `filter_question` (945),
+  `has_identifier_leakage` (412), `has_korean_proper_noun_leakage` (518),
+  `stratified_sample` (1126).
+- `_workspace/source/llm.py` (259줄) — `build_eval_llm_client` (123),
+  `role_is_configured` (235), `_effective_role_target` (209).
+- `_workspace/source/graph_match.py` (580줄) — `match_entity_tiered` (251),
+  `run_entity_matching` (341), `DEFAULT_GRAPH_MATCH_THRESHOLD` (33).
+- `_workspace/source/gold_set.py` (328줄) — `GraphEntityRef` (54), `GoldItem` (162).
+- 교차참조: `_workspace/source/eval_search.py` `run_entity_matching` 호출부 (429).
 
 ## 핵심 발견 (위험 등급순)
 
-### [HIGH] 정적 distractor pool — 청크별 동일 distractor 2개로 (d2) 게이트가 형식화될 위험 (이전과 동일, 잔여)
+### [CRITICAL] C1. 그래프 entity 정답이 평가 대상 인덱스 노드에서 직접 유래 → self-fitting
+- 증거:
+  - 골드 엔티티 name/type 출처: `_make_graph_gold_item` 가 `sg["entity_name"]` /
+    `sg["entity_type"]` 를 그대로 정답으로 박는다 — build_synthetic_gold_set.py:1426-1427.
+  - 그 `sg` 의 name/type 은 인덱싱된 graph_node 에서 직접 읽는다 —
+    `load_candidate_subgraphs` build_synthetic_gold_set.py:237 (`node.get("entity_name")`),
+    :240 (`entity_type`).
+  - 평가 시 retrieved entity 도 **같은 인덱스**에서 나온다 —
+    eval_search.py:431 `list(assembled.retrieved_graph_entities)`.
+  - T1 exact 매칭은 `(name.lower, type)` 동등 비교 — graph_match.py:276-280.
+- 영향: gold name/type 과 retrieved name/type 이 **동일 인덱스의 동일 문자열**이므로,
+  검색기가 해당 노드를 회수만 하면 T1 이 trivially 1.0 으로 hit 한다. 측정되는 것은
+  "표기 변형·동의어·의미 매칭에 대한 그래프 시스템의 강건성"이 아니라 "planner/retriever
+  가 그 노드를 결과에 포함시켰는가"이다. 인덱싱 파이프라인이 동일하면 표면 일치는 항상
+  자명하게 성립한다 — 골드셋 생성 방식 자체를 측정하는 순환.
+- 권고:
+  1. metadata 와 평가 요약에 **tier 분해 강제 노출**(T1/T2/T3/T4 hit 비율). T1 비중이
+     높으면 "표면 일치 측정"임을 명시. (현재 graph_match.py:385 에서 tier_counts 는
+     집계되나, 골드셋 신뢰도 경고로 연결되지 않음.)
+  2. graph 모드 골드셋에 **type-변형 hold-out** 을 의도적으로 주입(예: gold type 을
+     인덱스와 다르게 일반화하여 T4 embedding 경로 강제). 현재 `_make_graph_gold_item`
+     은 type 을 인덱스 그대로 복사하므로 T4 의 type-agnostic 설계(graph_match.py:8,305)가
+     실측에서 발동되지 않는다.
+  3. 최소한 self-fitting 위험을 metadata 에 `graph_gold_from_index: true` 같은 플래그로
+     기록하고 eval 단계에서 "graph entity recall 은 self-fitting 위험 있음" 경고를 띄울 것.
 
-- **증거**:
-  - `build_synthetic_gold_set.py:401-404` — `distractor_pool` 을 한 번만 `rng.shuffle()`, 모든 청크가 같은 풀 사용.
-  - `build_synthetic_gold_set.py:552-558` — 청크별로 `same_type_distractors = [c for c in distractor_pool if c["source_type"] == chunk["source_type"]][:n_distractors]`. 같은 source_type 내 첫 N=2개. **모든 청크가 같은 distractor 쌍**.
-  - `synth.py:778-782` (d2 게이트) — `for distractor in distractors: if is_answerable(...): generic`.
-- **이전 등급**: HIGH (H2 의 일부)
-- **패치 적용**: 부분적. P4 가 (d1) `is_unique_source` 를 추가해 distractor 의존도를 줄였으나, (d2) distractor 다양성 자체는 미패치.
-- **현재 등급**: HIGH (영향 축소 — P4 로 1차 검증선이 LLM 으로 분리됨)
-- **잔여 영향**: 첫 distractor 가 우연히 정답 청크와 가까운 주제(같은 가이드 문서의 다른 청크)면 모든 청크에서 일괄 generic 판정 → 표본 다양성 손실. 반대로 거리가 멀면 (d2) 가 형식적이 된다. (d1) 가 추가됐기에 self-bias 위험은 분산됐으나, (d2) 자체의 정보 가치는 여전히 낮다.
-- **권고**:
-  1. `build_synthetic_gold_set.py:552-558` — 청크별로 `rng.sample(distractor_pool_same_type, k=n_distractors)` 로 매번 다시 추출 (rng 시드 결정성 유지).
-  2. 또는 청크 BM25 거리 기준으로 "중간 거리" distractor 를 청크별 선별.
+### [CRITICAL] C2. generator≠judge 분리는 강제되지만, generator≠"평가 대상 인덱싱 LLM" 분리는 전무
+- 증거:
+  - generator/judge 가 system LLM 과 같으면 빌드 차단 — main() build_synthetic_gold_set.py:1828-1835
+    (`parser.error(...)`), 판정은 `role_is_configured` llm.py:235-259.
+  - 그러나 그래프 **노드/엣지 추출 LLM**(인덱싱 시점)이 generator 와 다른지에 대한 검사·
+    기록은 어디에도 없다. 골드 name/type 은 인덱싱 LLM 산출물(C1)이고, 질문/aliases/
+    description 은 generator 산출물이다. 둘이 같은 모델/패밀리면 어휘 선택이 상관되어
+    aliases·evidence_description 이 인덱싱 표현과 동조한다.
+  - metadata 에 인덱싱(추출) LLM ID 가 기록되지 않는다 — build_synthetic_gold_set.py:655-684
+    는 generator/judge/embedding 모델만 기록.
+- 영향: generator/judge 분리 게이트는 "질문 생성과 품질 판정의 자기평가 편향"만 막는다.
+  그래프 측정의 진짜 누설 축(인덱싱 표현 == 정답 표현)은 분리 강제 대상 밖이다.
+  분리를 다 지켜도 self-fitting(C1)은 그대로 남는다.
+- 권고:
+  1. 골드셋 metadata 에 graph 추출 LLM(model/endpoint) 을 기록하고, generator 와 동일
+     family 면 경고를 띄울 것(build_synthetic_gold_set.py:673-679 블록에 추가).
+  2. README/docstring 이 아니라 코드가 "graph 모드에서 추출 LLM ID 미기록 시 graph 메트릭
+     신뢰도 저하" 를 stats/metadata 에 남기도록 할 것.
 
----
+### [HIGH] H1. 단일 엔티티 gold(W-3)로 per-item recall 이 0/1 — 채점 해상도·소표본 민감도
+- 증거:
+  - `_make_graph_gold_item` 가 핵심 노드 **1개만** `relevant_graph_entities` 로 기록 —
+    build_synthetic_gold_set.py:1406-1407 주석("핵심 노드 1개만 기록 ... 이웃 포함 시
+    채점 후해짐"), :1425-1431, :1451.
+  - 따라서 per-item entity recall 분모는 항상 1 — graph_match.py:370-373
+    (`all_relevant_keys` 에 골든 키 1개), 결과적으로 item recall ∈ {0, 1}.
+- 영향: 항목당 신호가 1비트라 채점 해상도가 낮다. 집계 recall 은 곧 hit한 항목 비율이며,
+  소표본에서 분산이 크다. 기본 그래프 노드 수는 `--n-graph-nodes or --n-chunks`
+  (build_synthetic_gold_set.py:1864)로 작게 설정되기 쉽다. N=20~30 수준이면 표준오차가
+  ±0.09~0.11 수준이라 A/B 간 5%p 개선을 통계적으로 분리하기 어렵다.
+- 권고:
+  1. graph 항목 N **≥ 150~200** 권고(0/1 채점에서 ±0.05 SE 목표 시 binomial 기준 약 100,
+     계층화 손실 감안 150+). metadata 의 `stats.graph_passed` 를 표본수로 노출하고, 임계
+     미만이면 eval 단계에서 "graph recall 신뢰구간 넓음" 경고.
+  2. relation 채점(`--score-relations`, build_synthetic_gold_set.py:1434-1441)을 기본
+     활성화하거나, 1-hop 이웃 일부를 보조 정답으로 추가해 항목당 신호를 늘리는 옵션 제공.
 
-### [HIGH] Judge reasoning 미요구 — yes/no 1토큰 응답으로 self-bias 검증 불가 (이전과 동일, 잔여)
+### [HIGH] H2. generator 작성 aliases/description 의 정답 누설 → T2/T4 trivial 통과
+- 증거:
+  - aliases 는 generator LLM 이 작성하고 골드에 그대로 박힌다 —
+    `_make_graph_gold_item` build_synthetic_gold_set.py:1428 (`aliases=list(gq.entity_aliases)`),
+    파싱 synth.py:683-690.
+  - 프롬프트가 aliases 를 "위 엔티티 정보에서 자연스럽게 떠오르는 동의어"로 요구 —
+    synth.py:198-199. 즉 generator 가 인덱스 표기를 보고 그 변형을 적는다.
+  - T2 alias 매칭은 retrieved name 이 alias 집합에 들어가면 hit(score 1.0) — graph_match.py:286-294.
+  - description(T4 소스)도 generator 가 작성 — synth.py:196-197, 골드 박기 :1423,1429.
+- 영향: generator 가 "인덱스에 존재할 법한 표기"를 alias 로 적으면, retrieval 이 그
+  표기로 노드를 반환했을 때 T2 가 자명 통과한다. evidence_description 역시 인덱스
+  description/snippet 을 보고 쓰므로 T4 cosine 이 부풀려질 수 있다. 즉 강건성 tier
+  (T2/T4)가 "생성기가 정답 변형을 미리 적어둔 덕"에 통과 → 강건성 과대평가.
+- 완화 요소(부분): description 을 graph_store 원본으로 폴백하지 **않음** —
+  build_synthetic_gold_set.py:1415-1423(빈 evidence 면 T4 skip). 이는 T4 자명 1.0 을
+  일부 막는 양심적 설계. 그러나 generator 가 evidence 를 채우면 누설 가능성은 남는다.
+- 권고:
+  1. `filter_question` 의 결정론 누설 게이트(synth.py:988,994)를 **aliases/evidence 텍스트에도**
+     적용. 현재는 `gq.query` 만 검사(build_synthetic_gold_set.py:1053-1061) — aliases/description
+     은 누설 검사 없이 골드에 박힌다.
+  2. T2 alias 채점을 별도 tier 로 분리 보고하고, alias hit 비율이 높으면 "generator-supplied
+     alias 의존" 경고. graph_match.py:124 tier_counts 에 이미 alias 카운트 존재 — 노출만 하면 됨.
 
-- **증거**:
-  - `synth.py:677-684` `is_answerable()` — `max_tokens=64`, `temperature=0.0`, reasoning 없이 yes/no.
-  - `synth.py:706-713` `is_unique_source()` (P4 신규) — 같은 패턴 (max_tokens=64, yes/no).
-  - `synth.py:578-596` `parse_yes_no()` — `<think>` 태그는 처리하나 reasoning_mode 가 off 면 모델이 reasoning 을 생성하지 않음.
-- **이전 등급**: HIGH (H2 의 일부)
-- **패치 적용**: **미패치**. P4 가 프롬프트만 분리했고 reasoning 요구는 도입 안 함.
-- **현재 등급**: HIGH (영향 축소 — P4 가 두 게이트의 의미를 분리해 self-bias 가 한쪽으로만 작용)
-- **잔여 영향**: Judge 가 명확하지 않은 케이스에 yes/no 한쪽으로 치우쳐 판정해도 reasoning 부재로 검증 불가. 자기 평가 편향 차단(P1)은 분리 강제만 다루지 Judge 판단 품질은 별개.
-- **권고**:
-  1. `is_answerable` / `is_unique_source` 에 `reasoning_mode="on"` 옵션 추가 → endpoint 가 `<think>...</think>` 출력 후 결론 도출.
-  2. 또는 두 게이트의 출력 포맷을 `{"reasoning": "...", "answer": "yes/no"}` JSON 으로 변경. `extract_json` 헬퍼 기 사용.
+### [HIGH] H3. 표준 graph 모드는 단일 노드 질문이라 cross-source 브리지를 자극 못함
+- 증거:
+  - `GRAPH_GENERATE_PROMPT_TEMPLATE` 는 "이 엔티티 또는 관계에서 답을 찾을 수 있는" 질문을
+    요구 — synth.py:175-176. 정답도 단일 엔티티(H1). 한 노드만 회수하면 만점.
+  - 프롬프트가 오히려 "관계의 다른 엔티티 이름까지 줄줄 나열하지 말 것" 으로 다중 엔티티
+    브리지를 **억제** — synth.py:183-184.
+- 영향: confluence 이름→코드 FQN 같은 cross-source 브리지(서로 다른 source_type 노드를
+  잇는 추론)를 측정하지 못한다. graph 시스템의 핵심 가치(여러 출처 연결)에 대한 측정
+  민감도가 표준 graph 모드에는 부재.
+- 완화: cross-doc 모드(`_make_cross_doc_gold_item` build_synthetic_gold_set.py:1461,
+  `relevant_doc_groups=[[src],[tgt]]` AND :1479, `cross_document=True` :1480)가 이 공백을
+  의도적으로 메운다. 두 문서를 모두 봐야 답 가능한 AND 채점이라 브리지를 자극한다.
+- 권고:
+  1. graph 시스템 A/B 판정 시 **cross-doc 모드를 필수 동반**(`--enable-cross-doc`).
+     표준 graph 단독 메트릭은 브리지 능력에 무감하므로 단독 사용 금지.
+  2. cross-doc seeds 가 5개 미만이면 generic gate skip 경고(build_synthetic_gold_set.py:1348-1352)
+     가 뜨는데, 이 경우 표본 자체가 빈약하므로 cross-doc 메트릭도 보고에서 제외할 것.
 
----
+### [MEDIUM] M1. cross-doc gold 엔티티는 description/embedding 부재 → T1/T2 만으로 채점
+- 증거: `_make_cross_doc_gold_item` 의 GraphEntityRef 두 개 모두 description/embedding 없음 —
+  build_synthetic_gold_set.py:1481-1487 (source 엔티티만 aliases, target 은 name/type 뿐).
+  T4 는 description 없으면 name fallback(graph_match.py:310)이나 type-agnostic 의미 매칭
+  강건성은 사실상 측정 안 됨.
+- 영향: cross-doc 채점은 인덱스 표기 정확 일치(T1)에 더 강하게 의존 — self-fitting(C1)이
+  cross-doc 에도 전이. 브리지 발동(H3 완화)은 doc_group AND 채점이 담당하나 entity tier
+  강건성은 약함.
+- 권고: cross-doc 에서도 generator evidence_description 을 두 엔티티에 채워 T4 를 활성화하거나,
+  cross-doc 의 entity-tier 메트릭은 보고에서 doc-level AND 메트릭과 분리할 것.
 
-### [HIGH] 그래프 매칭 τ=0.78 캘리브레이션 근거 부재 (이전과 동일, 잔여 — S2 P15 로 이연)
+### [MEDIUM] M2. 그래프 매칭 임계값 변경(0.78→0.65)이 경험적 검증 없이 적용
+- 증거: `DEFAULT_GRAPH_MATCH_THRESHOLD = 0.65`, docstring 이 "이전 0.78 은 너무 보수적",
+  "골드셋 신뢰성에 영향이 큰 변경이므로 별도 validation 권장" 이라고 스스로 미검증을 인정 —
+  graph_match.py:33-40. metadata 에 기록은 됨(build_synthetic_gold_set.py:677).
+- 영향: T4 cosine 하한이 낮아지면 의미적으로 느슨한 매칭이 hit 처리되어 recall 이 구조적으로
+  상향. 0.65 의 근거가 추측에 가까워 절대값 신뢰도 저하. 단 metadata 기록으로 재현성은 확보.
+- 권고: 라벨링된 hold-out 으로 τ-sweep(0.6~0.85) precision/recall 곡선 산출 후 임계값 고정.
+  그 전까지 graph 메트릭 절대값은 τ 가정에 종속됨을 보고서에 명시.
 
-- **증거**:
-  - `graph_match.py:33-34` — `DEFAULT_GRAPH_MATCH_THRESHOLD = 0.78` + 주석 `"설계 §2.2 결정값."` 그대로.
-  - `graph_match.py:299-322` — T4 가 `description` cosine 만으로 매칭(type-agnostic). 정상 paraphrase 도 false miss / 무관 서비스 description 유사도도 false hit 가능.
-- **이전 등급**: HIGH (H4)
-- **패치 적용**: **미패치**. 패치 SUMMARY 에 따르면 S2 P15 작업으로 이연. 단, P10 으로 trivial 매칭 경로는 차단(아래 별개 항목).
-- **현재 등급**: HIGH (변화 없음)
-- **잔여 영향**: T4 hit 의 score 분포가 임계값 부근에 몰리면 메트릭이 임계값 1%p 변동에 민감해진다. 빌드자(metadata 의 `graph_match_threshold_default`) 와 평가자 τ 가 다르면 silent 메트릭 불일치.
-- **권고**:
-  1. `scripts/calibrate_graph_match.py` 신규 작성 — alias 쌍 vs 무관 쌍의 description cosine 분포에서 F1 최적점 산출.
-  2. 평가 측에서 `metadata.graph_match_threshold_default` 와 CLI `--threshold` 불일치 시 경고/에러.
+### [MEDIUM] M3. 그래프 노드 샘플링은 source_type 만 균등화 — degree/representativeness 편향
+- 증거:
+  - `stratified_sample(..., key="source_type")` — build_synthetic_gold_set.py:1128-1130.
+    토픽/노드 차수(degree)/길이/난이도 균등화 없음.
+  - 후보 필터는 1-hop 이웃 ≥ min_neighbors 만 요구 — load_candidate_subgraphs:264-267,
+    그 외 degree 분포 보정 없음. min_neighbors 기본 1(build_synthetic_gold_set.py:428).
+- 영향: hub 노드(고차수)가 distractor·정답 모두에서 과대표집될 수 있고, leaf/희소 노드의
+  검색 난이도는 측정에서 누락. source_type 균등화만으로는 그래프 구조 편향을 못 잡음.
+- 완화: 샘플링은 rng 셔플 후 round-robin 으로 결정론적·재현 가능(synth.py:1150-1168,
+  seed 전파 build_synthetic_gold_set.py:1901). 편향은 있으나 재현은 됨.
+- 권고: degree 분위수(예: 저/중/고차수)를 2차 stratify 키로 추가하거나, 최소한 metadata 에
+  샘플 degree 분포를 기록해 대표성 진단을 가능케 할 것.
 
----
+### [LOW] L1. 결정성: 샘플링은 결정적이나 LLM 결정성은 best-effort
+- 증거: `--seed` 는 샘플링/distractor 셔플만 결정(rng, build_synthetic_gold_set.py:1901,
+  synth.py:1150). LLM seed 는 별도 `--generator-seed-base`(기본 None → seed 미전달,
+  build_synthetic_gold_set.py:1782-1789)이고 subgraph 별 `seed_base + idx`
+  (build_synthetic_gold_set.py:1005), judge 는 `sg_seed + 10000 + j`(:1050-1051),
+  distractor 는 `seed + 100 + i`(synth.py:1020) 로 충돌 회피. temperature 기본 0.0
+  (synth.py:780). docstring 이 OpenAI/vLLM 만 실효, Anthropic 무시라고 명시(:1787-1788).
+- 영향: `--generator-seed-base` 미지정이 기본이라 동일 seed 라도 LLM 응답이 비결정적일
+  수 있다 → 골드셋 재생성 시 항목이 달라질 수 있음. 다중 골드셋은 `base_seed+i-1`
+  (build_synthetic_gold_set.py:1901)로 충분히 분리.
+- 권고: graph A/B 비교용 골드셋은 `--generator-seed-base` 명시 + OpenAI 호환 endpoint
+  사용을 운영 절차로 강제. metadata 에 seed_base 기록은 이미 됨(:664).
 
-### [MEDIUM] LLM seed 미전달 — `--seed` 가 샘플링만 결정. 같은 seed 라도 골드셋 내용이 흔들림 (이전과 동일, 잔여 — S2 P13 로 이연)
+### [LOW] L2. Judge 게이트는 그래프 질문에 적용되나 snippet 기준이라 누설 검출 범위 제한
+- 증거: graph 질문도 `filter_question` 4단계 게이트 통과(build_synthetic_gold_set.py:1053-1061),
+  입력 source_chunk = `sg["subgraph_snippet"]`(:1054). 게이트는 (a)답가능성
+  (b1)ASCII누설 (b2)한국어누설 (c)지시대명사 (d1)유일성 (d2)distractor — synth.py:957-1028.
+  단, 프롬프트가 "엔티티 이름은 그대로 써도 된다"(synth.py:183)고 허용하므로 entity-name
+  자체의 어휘 중첩은 게이트가 의도적으로 통과시킴.
+- 영향: 게이트는 reasoning 없이 yes/no 만 받는다(synth.py:139-140,156-159, parse_yes_no
+  :715) — 판정 근거 미기록. entity-name 중첩 허용은 self-fitting(C1)을 게이트가 막지
+  못하는 구조적 이유. 통과율(stats)은 metadata 에 기록되나(:654) 그래프 게이트 효과성
+  (통과율 분포)이 별도 노출되지 않음.
+- 권고: graph_passed/graph_generated 비율을 metadata 에 명시(이미 _stats 에 있음 —
+  build_synthetic_gold_set.py:1017,1046)하고, 95%+ 또는 50% 미만이면 게이트 형식성/과엄격
+  경고. judge 에 reasoning 요구는 비용 대비 효익 낮으므로 선택.
 
-- **증거**:
-  - `synth.py:614-621` `generator.complete()` 호출 — `temperature=0.7`, seed 인자 없음.
-  - `synth.py:677-684` Judge 호출도 동일.
-  - `build_synthetic_gold_set.py:372` `rng = random.Random(seed)` — Python random 만.
-  - `llm.py` 전체 — seed 키 검색 hit 없음.
-- **이전 등급**: MEDIUM
-- **패치 적용**: **미패치** (S2 P13). 패치 SUMMARY 에 명시.
-- **현재 등급**: MEDIUM (변화 없음)
-- **잔여 영향**: 같은 `--seed 42` 두 번 빌드 → 골드셋 항목이 미세하게 달라짐. CI 회귀 테스트의 diff 가 항상 dirty. `metadata.seed=42` 가 재현성 환상을 만든다.
-- **권고**:
-  1. `LLMClient.complete()` 시그니처에 `seed=` 추가, OpenAI/vLLM endpoint 에 전달.
-  2. `metadata.llm_seed_supported`, `metadata.generator_temperature`, `metadata.judge_temperature` 키 추가 — 결정성 보장 여부 자기 선언.
-
----
-
-### [MEDIUM] 샘플링이 source_type 한 차원만 — 길이/난이도/degree 편향 (이전과 동일, 잔여)
-
-- **증거**:
-  - `build_synthetic_gold_set.py:392-394` — `stratified_sample(candidates, n_total=n_chunks, key="source_type", rng=rng)`. **단일 키**.
-  - `synth.py:792-834` `stratified_sample()` — group key 별 round-robin. 그룹 자체는 1차원.
-  - 길이 필터(`build_synthetic_gold_set.py:1111-1117`) — `[min_chars=200, max_chars=8000]` 외 균등화 없음.
-  - 그래프 노드 `min_graph_neighbors >= 1` (`:1134`) 만 — degree 편향 미고려.
-- **이전 등급**: MEDIUM
-- **패치 적용**: **미패치**.
-- **현재 등급**: MEDIUM (변화 없음)
-- **잔여 영향**: 단일 source_type 빌드 시 stratification 효과 무력. 짧은/긴 청크, hub/leaf 노드가 같은 가중치로 샘플링 — 길이·degree 의 영향을 측정 못함.
-- **권고**: 이전 감사의 권고 그대로 유지 (`len_bucket` 추가 stratification 키, degree 버킷).
-
----
-
-### [LOW→MEDIUM] 메타데이터 chunk fingerprint 부재 — 인덱스 변경 후 stale 검증 불가 (이전과 동일, 잔여)
-
-- **증거**:
-  - `build_synthetic_gold_set.py:470-495` metadata dict — 8개 신규 키(P1) 가 추가됐지만 청크 hash/fingerprint 는 없음.
-- **이전 등급**: LOW
-- **패치 적용**: **부분적**. P8(별도 워크트리, `eval_search.py`) 으로 골드셋 전체 sha256 은 기록되나 청크 단위 hash 는 미적용.
-- **현재 등급**: LOW (변화 없음 — 골드셋 전체 fingerprint 는 P8 로 도입)
-- **잔여 영향**: 인덱싱 측 chunk_size 변경 시 같은 `source_document_id` 라도 본문 달라짐. anchor (앞 200자) 만으로는 검증 불완전.
-- **권고**: `GoldItem.source_content_hash` 필드 추가.
-
----
-
-### [LOW] 인덱싱-생성 LLM 동일 가능성 (이전과 동일, 잔여)
-
-- **증거**:
-  - `build_synthetic_gold_set.py` graph mode 의 `load_candidate_subgraphs()` 가 graph_store 에서 인덱싱 시 추출된 entity 를 그대로 읽음.
-  - Generator/Judge 가 system LLM 으로 fall-through 시 (이제 `--allow-self-eval` 강제) 인덱싱 LLM 과 같을 수 있음.
-- **이전 등급**: LOW
-- **패치 적용**: 간접. P1 으로 `--allow-self-eval` 옵트인 시에만 fall-through 가능 + metadata 에 self-eval 표시. 그러나 인덱싱 LLM ID 와 비교 로직은 없음.
-- **현재 등급**: LOW (변화 없음)
-- **잔여 영향**: 사용자가 `--allow-self-eval` 명시한 경우 인덱싱·생성 LLM 동일성 위험이 표면화됨.
-- **권고**: `metadata.indexing_llm_models` 키 추가 — `processing_history` 에서 사용된 LLM ID 들의 set.
-
----
-
-### 신규 도입된 위험 (패치 트레이드오프)
-
-#### [LOW] (d1) `is_unique_source` 추가로 인한 LLM 호출 증가 — 빌드 시간 +20~30%
-
-- **증거**:
-  - `synth.py:716-784` `filter_question()` — (a) `is_answerable` + (d1) `is_unique_source` + (d2) `is_answerable` × N_distractor = **2 + N** 회 호출. 이전: 1 + N.
-- **영향**: 청크당 LLM 호출 1회 증가. `concurrency` 로 완화 가능. 새로운 누락 모드 없음 — `parse_error` 처리 경로 동일.
-- **권고**: 운영 사용자에게 사전 공지 (패치 SUMMARY 에 이미 명시).
-
-#### [LOW] (d1) `is_unique_source` 와 (d2) 의 의미 중복 가능성
-
-- **증거**: (d1) "유일한 정답 출처인지" — 일반 위키/매뉴얼로도 답할 수 있다면 no. (d2) "무관 청크로도 답할 수 있는가" — yes 면 generic. **두 게이트 모두 "정답 청크 외 출처가 있는지" 를 다른 각도로 검증**.
-- **영향**: (d1) 통과 + (d2) 탈락 의 비중이 stats 에서 보고되어야 게이트 단계간 정보 가치를 모니터링 가능. 현재는 `fail_non_unique_source` vs `fail_generic` 카운트가 분리되어 있어 사후 분석 가능 (`build_synthetic_gold_set.py:407-420` stats dict).
-- **권고**: 운영 후 N회 빌드의 `fail_non_unique_source` 대비 `fail_generic` 분포를 확인. (d2) 가 거의 0 이면 (d1) 으로 충분 — (d2) 비활성화 옵션 검토.
-
-#### [LOW] P10 의 description fallback 제거로 그래프 recall 감소 가능
-
-- **증거**: `build_synthetic_gold_set.py:906` — LLM 이 evidence_description 빈 응답이면 description 도 빈 문자열. `graph_match.py:300-301` 에서 T4 skip.
-- **영향**: 의도된 보수적 측정. trivial 1.0 hit 제거로 metric 절대값이 낮아질 수 있으나, 회귀 테스트(A vs B) 비교에는 영향 없음.
-- **권고**: 평가 측에서 `description` 비율을 stats 로 보고 (eval-script-patcher 영역, P12 일부).
-
----
-
-## 차원별 상세 점검
+## 차원별 상세 점검 (그래프 맥락)
 
 ### 1. 샘플링 편향
+`stratified_sample` 은 source_type 만 균등화(build_synthetic_gold_set.py:1129,
+synth.py:1126-1168). degree/토픽/길이/난이도 미고려 → hub 편향 가능(M3). 한 노드 N개
+질문의 다양성 강제 메커니즘은 없음 — temperature 0.0 기본이라 오히려 N개가 유사해질 수
+있음(synth.py:780, L1). cross-doc seeds 는 disjoint-doc 엣지에서 결정론적 추출
+(build_synthetic_gold_set.py:344-358, 정렬 :390-396)로 재현성은 좋음. **판정: MEDIUM (M3).**
 
-- **변화 없음** (S0/S1 범위 밖). `stratified_sample` 의 stratification 키는 여전히 `source_type` 단일.
-- 그래프 노드의 `min_graph_neighbors >= 1` 만 적용, degree 균등화 없음.
-- **판정**: MEDIUM (변화 없음)
+### 2. 역방향 생성의 정답 누설 (그래프 self-fitting)
+가장 심각. 골드 name/type 이 평가 인덱스 노드에서 직접 유래(C1, build_synthetic_gold_set.py:1426-1427
+← load:237,240) → T1 자명 통과(graph_match.py:276-280). generator aliases/description 도
+인덱스 표기 동조(H2). 누설 방지 장치: query 에 대해서만 결정론 누설 게이트
+(synth.py:988,994), description 의 graph_store 폴백 금지(build_synthetic_gold_set.py:1415-1423).
+그러나 aliases/evidence 텍스트에는 누설 게이트 미적용(H2). **판정: CRITICAL (C1+H2).**
 
-### 2. 역방향 생성의 정답 누설 (★ 가장 중요)
+### 3. Judge 게이트 효과성
+4단계: 답가능성(LLM)/누설(결정론 ASCII+한국어)/지시대명사(결정론)/유일성+distractor(LLM)
+— synth.py:957-1028. graph 질문에 적용됨(build_synthetic_gold_set.py:1053). 게이트는
+self-fitting 을 검출하지 못함 — entity-name 중첩을 프롬프트가 허용(synth.py:183)하고
+게이트 입력이 snippet 이라 인덱스-유래 정답 표기를 누설로 보지 않음(L2). 통과율 가시화 부족.
+**판정: MEDIUM (L2) — 게이트 자체는 동작하나 그래프 누설 축을 못 막음.**
 
-- **P7 검증 (한글 누설)**:
-  - `synth.py:364-368` `_KOREAN_NOUN_RE = re.compile(r"[가-힣]{4,}")` — 4자 이상 연속 한글 매칭.
-  - `synth.py:370-379` `_KOREAN_COMMON_NOUNS` — 흔한 어휘 화이트리스트("프로젝트", "데이터베이스" 등 화이트리스트 보강).
-  - `synth.py:382-385` `_KOREAN_JOSA_RE` — 한국어 조사 정규식 — 토큰 stem 추출.
-  - `synth.py:403-428` `extract_korean_proper_noun_candidates()` — 4자 이상 + 조사 stripping + 빈도 ≤ max_freq(=1) + stopword 제외.
-  - `synth.py:431-448` `has_korean_proper_noun_leakage()` — stem substring 매칭 (조사 변화에 강건).
-  - `synth.py:758-759` `filter_question()` 의 (b2) 단계로 통합.
-- **P10 검증 (그래프 evidence DB fallback 제거)**:
-  - `build_synthetic_gold_set.py:906` — `description = gq.evidence_description` (이전: `gq.evidence_description or str(sg.get("entity_description") or "")`). DB 폴백 제거 확인.
-  - `graph_match.py:300-301` — `if not golden.description: return None` — T4 자동 skip 검증.
-- **검출 범위 확인**: 한국어 사내 도메인(팀명·시스템명) → P7 게이트로 잡힘. 그래프 trivial 매칭 → P10 으로 차단.
-- **잔여**: 영문/숫자 합성어, 2~3자 한글 고유명사("AWS", "QA팀") 는 `_IDENT_RE` 의 4자 이상 + `_KOREAN_NOUN_RE` 의 4자 이상 컷오프로 미커버. 그러나 짧은 토큰은 위양성 비용이 크므로 길이 컷오프는 합리적.
-- **판정**: HIGH → **MEDIUM** (P7+P10 으로 주요 누설 경로 차단. 잔여 미커버 영역은 비주류 케이스)
-
-### 3. Judge 4단계 게이트 효과성
-
-- **P4 검증 (GENERIC 프롬프트 분리)**:
-  - `synth.py:142-158` `GENERIC_PROMPT_TEMPLATE` — "유일한 정답 출처인지" 묻는 새 프롬프트.
-  - `synth.py:129-139` `ANSWERABLE_PROMPT_TEMPLATE` — "답할 수 있는가" 묻는 기존 프롬프트. **두 프롬프트가 명확히 다른 의미**.
-  - `synth.py:687-713` `is_unique_source()` 헬퍼 — `GENERIC_PROMPT_TEMPLATE` 사용, `purpose="goldset_judge_unique_source"`.
-  - `synth.py:770-776` `filter_question()` 의 (d1) — `is_unique_source` 호출 → `non_unique_source` 사유로 탈락.
-  - `synth.py:778-782` (d2) — distractor 보조 검증으로 남음.
-- **게이트 단계 (5단계)**: (a) answerable → (b1) leakage → (b2) korean_leakage → (c) demonstrative → (d1) unique_source → (d2) generic.
-- **잔여**: Judge reasoning 미요구 (max_tokens=64, yes/no 1단어) — 자기 친화 bias 가 여전히 작용 가능. P4 가 의미 분리로 영향을 분산했지만 근본 해결은 아님.
-- **판정**: HIGH → **MEDIUM** (P4 로 (a)·(d1) 의미 분리, self-bias 한쪽 게이트 통과만으로는 충분치 않게 됨)
-
-### 4. Generator/Judge 분리 강제성 ★
-
-- **P1 검증 (self-eval 차단)**:
-  - `build_synthetic_gold_set.py:1099-1105` — `--allow-self-eval` CLI 플래그 신규.
-  - `build_synthetic_gold_set.py:1209-1218` — `role_is_configured()` 양쪽 체크.
-  - `build_synthetic_gold_set.py:1219-1226` — `self_evaluation_warning and not args.allow_self_eval` 시 `parser.error()` 종료 (exit code 2).
-  - `build_synthetic_gold_set.py:1227-1232` — 옵트인 시에만 warning 후 진행.
-- **P3 검증 (role_is_configured 보강)**:
-  - `llm.py:209-232` `_effective_role_target()` 신규 — CLI/eval/{role}/llm 폴백 체인 재현.
-  - `llm.py:235-259` `role_is_configured()` — 단순 endpoint/model 채워짐 검사가 아닌 `(role_endpoint, role_model) != (system_endpoint, system_model)` 비교. **같은 endpoint+model 명시도 False 반환**.
-- **P1 메타데이터 검증 (8개 신규 키)**:
-  - `build_synthetic_gold_set.py:480-487` — `generator_model`, `generator_endpoint`, `judge_model`, `judge_endpoint`, `generator_configured_separately`, `judge_configured_separately`, `self_evaluation_warning`, `allow_self_eval` 8개 키 모두 기록.
-  - `build_synthetic_gold_set.py:1234-1247` — `_resolve_eval_role_identity()` 로 effective model/endpoint 해석.
-  - `build_synthetic_gold_set.py:1316-1323` `build()` 호출부에 8개 키 전달.
-- **잔여**: 사용자가 `--allow-self-eval` 명시한 경우 fall-through 가능 — 의도적. metadata `self_evaluation_warning=true` 로 사후 추적 가능.
-- **판정**: CRITICAL → **LOW** (자기 평가 편향 차단 + 메타데이터 추적성 + endpoint+model 동일성 검사 모두 도입)
+### 4. Generator/Judge 분리 강제성
+강제됨: 둘 다 system LLM 과 같으면 `parser.error` 차단(build_synthetic_gold_set.py:1828-1835),
+`role_is_configured` 가 effective (endpoint,model) 비교로 실질 동일까지 탐지(llm.py:242-259).
+`--allow-self-eval` 시 metadata 기록(:661-662) + 경고(:1836-1841). 그러나 그래프 측정의
+핵심 누설원인 **인덱싱 LLM ↔ generator 분리**는 강제·기록 대상 밖(C2). **판정: CRITICAL (C2)
+— 일반 분리는 우수하나 그래프 맥락의 진짜 축이 누락.**
 
 ### 5. 결정성 / 재현성
+샘플링/셔플 결정적(seed, build_synthetic_gold_set.py:1901). LLM 은 seed_base 옵션이며
+기본 미전달 → best-effort(L1, synth.py:756-758 docstring). seed 충돌 회피 오프셋 체계 존재
+(generator idx, judge +10000, distractor +100). 다중 골드셋 seed 분리 양호(:1901).
+temperature/seed call_kwargs 통일(synth.py:761-768,817-824,898-906). **판정: LOW (L1).**
 
-- **변화 없음** (S0/S1 범위 밖, S2 P13 로 이연).
-- Python `random.Random(seed)` 만 시드, LLM seed 미전달, temperature 비기록.
-- **판정**: MEDIUM (변화 없음)
-
-### 6. 그래프 질문
-
-- **P10 검증**: 위 차원 2 와 핵심 발견 [HIGH→해소→LOW] 항목 참고.
-- **τ=0.78 캘리브레이션**: 잔여 (S2 P15).
-- **alias 채점**: Generator 가 채운 aliases (`synth.py:545-553` 파싱) — 인덱싱 LLM 의 aliases 와 매칭. 두 LLM 이 같으면 self-loop 위험 — `--allow-self-eval` 차단으로 부분 완화.
-- **T4 description 매칭**: P10 으로 LLM 이 빈 evidence 출력 시 T4 skip. trivial 매칭 경로 차단.
-- **신규 graph_t4_disabled 표기 (P12 — graph_match.py)**:
-  - `graph_match.py:158-181` `build_embed_fn()` 반환 함수에 `t4_disabled`, `skip_count` 속성 부착. 평가 시 T4 skip 여부 명시 추적.
-- **판정**: HIGH → **MEDIUM** (P10 으로 trivial 매칭 차단, P12 로 T4 skip 표면화. τ 캘리브레이션은 잔여)
+### 6. 그래프 질문 / 매칭
+τ=0.65 미검증 변경(M2, graph_match.py:33-40), metadata 기록은 됨(:677). T2 alias 채점이
+generator 작성 alias 에 의존(H2). T4 type-agnostic 설계(graph_match.py:8,305)는 골드 type 이
+인덱스와 동일해 실측 미발동(C1 권고2). 추출 LLM == generator 여부 미기록(C2).
+**판정: HIGH (H2) + MEDIUM (M2).**
 
 ### 7. 메타데이터 / 추적성
-
-- **P1 검증 (8개 신규 메타 키)**: 차원 4 참고.
-- **P11 검증 (`--no-filter` 출력 분리)**:
-  - `build_synthetic_gold_set.py:991-1006` `_unfiltered_output_path()` — `.UNFILTERED` 접미사 강제. 이중 접미사 방지.
-  - `build_synthetic_gold_set.py:1258-1266` `main()` 에서 `args.no_filter` 시 경로 강제 변환 + stderr 경고.
-  - `_numbered_output_path` 와 호환: `gold_set.UNFILTERED.yaml` → `gold_set.UNFILTERED_001.yaml`.
-- **추가 (P8, 별도 워크트리)**: 골드셋 전체 sha256 (`eval_search.py` 측). `compare_runs.py` 신규로 동치성 검증.
-- **잔여 누락**:
-  - 청크별 content_hash (LOW)
-  - 인덱싱 LLM ID (LOW — `--allow-self-eval` 케이스 대비)
-  - `llm_seed_supported`, `temperature` (재현성 — S2 P13)
-- **판정**: MEDIUM → **LOW** (P1 + P11 + P8 으로 핵심 추적성 확보)
-
----
+양호한 부분: generator/judge model·endpoint, seed, seed_base, temperature, embedding_model,
+graph_match_threshold_default, score_relations, self_evaluation_warning 기록
+(build_synthetic_gold_set.py:645-684). `--no-filter` 는 `.UNFILTERED` 경로 강제(:1547-1562).
+부족한 부분: (a) graph 추출 LLM ID 미기록(C2), (b) graph gold 가 인덱스 유래라는
+self-fitting 플래그 부재(C1), (c) chunk fingerprint/노드 fingerprint 미기록 — 동일 인덱스에서
+생성됐는지 검증 불가. eval 단계 self-evaluation 경고 노출은 self_evaluation_warning 플래그로
+가능하나 graph self-fitting 경고는 없음. **판정: MEDIUM.**
 
 ## 종합 위험 매트릭스
-
-| 차원 | 패치 전 등급 | 패치 후 등급 | 핵심 변화 |
-| --- | --- | --- | --- |
-| 1. 샘플링 편향 | MEDIUM | MEDIUM | 변화 없음 — source_type 단일 stratification 유지 |
-| 2. 역방향 생성 정답 누설 | HIGH | **MEDIUM** | P7 (한글) + P10 (그래프 trivial) 으로 주요 경로 차단 |
-| 3. Judge 게이트 효과성 | HIGH | **MEDIUM** | P4 로 (a)·(d1) 의미 분리, self-bias 한쪽으로만 작용. Judge reasoning 미요구 잔여 |
-| 4. Generator/Judge 분리 강제 | **CRITICAL** | **LOW** | P1+P3 으로 차단 + 8개 메타키 기록 + 동일 endpoint/model 검사 |
-| 5. 결정성/재현성 | MEDIUM | MEDIUM | 변화 없음 (S2 P13 이연) |
-| 6. 그래프 질문 | HIGH | **MEDIUM** | P10 으로 trivial 매칭 차단. τ 캘리브레이션 잔여 |
-| 7. 메타데이터/추적성 | MEDIUM | **LOW** | P1 + P11 + (P8 별도) 으로 핵심 추적성 확보 |
-
----
-
-## 이전 감사 대비 변화 (Before/After)
-
-| 항목 | 이전 등급 | 패치 인용 | 코드 검증 | 현재 등급 | 잔여 위험 |
-| --- | --- | --- | --- | --- | --- |
-| Self-eval fall-through 차단 | **CRITICAL** | P1: `parser.error()` + `--allow-self-eval` | `build_synthetic_gold_set.py:1220-1226` `parser.error()` 강제 종료 확인 | **LOW** | 옵트인 시 fall-through 가능 (의도) — metadata 로 추적 |
-| 메타데이터 모델 ID 기록 | (CRITICAL 일부) | P1: 8개 신규 키 | `build_synthetic_gold_set.py:480-487` 8키 모두 기록 확인 | **LOW** | 인덱싱 LLM ID 미포함 |
-| `role_is_configured` 보강 | (CRITICAL 일부) | P3: endpoint+model 동일성 검사 | `llm.py:235-259` `_effective_role_target` 추가, `(role_endpoint, role_model) != (system...)` 비교 | **LOW** | 없음 |
-| 한국어 누설 검출 | **HIGH** | P7: `has_korean_proper_noun_leakage` + 조사 stripping | `synth.py:364-448` 신규 함수 + (b2) 단계 통합 (`:758`) | **MEDIUM** | 2~3자 한글 미커버 (길이 컷오프 트레이드오프) |
-| GENERIC 프롬프트 분리 | **HIGH** | P4: `is_unique_source` + `non_unique_source` reason | `synth.py:142-158` 새 프롬프트, `:687-713` 새 함수, `:770-776` (d1) 추가 | **MEDIUM** | Judge reasoning 미요구 |
-| 그래프 evidence DB fallback | **HIGH** | P10: `description = gq.evidence_description` (fallback 제거) | `build_synthetic_gold_set.py:906` 단일 표현식 확인. T4 자동 skip (`graph_match.py:300-301`) | **MEDIUM** | description 누락률 평가 측 보고 필요 (eval-script-patcher 영역) |
-| `--no-filter` 출력 분리 | **HIGH** | P11: `.UNFILTERED` 접미사 강제 | `build_synthetic_gold_set.py:991-1006` 헬퍼 + `:1258-1266` 호출 | **LOW** | `_numbered_output_path` 호환 확인됨 |
-| 그래프 τ=0.78 캘리브레이션 | **HIGH** | (S2 P15 이연) | `graph_match.py:33-34` 변경 없음 | **HIGH** | S2 작업 대기 |
-| Judge reasoning 미요구 | **HIGH** | 미패치 | `synth.py:677-684`, `:706-713` max_tokens=64 yes/no 유지 | **HIGH** | S2 권고 |
-| 정적 distractor pool | (HIGH 일부) | 미패치 | `build_synthetic_gold_set.py:401-404` 한 번만 shuffle. `:552-558` 첫 N개 | **HIGH** | S2 권고 |
-| 길이/난이도/degree 편향 | **MEDIUM** | 미패치 | 변화 없음 | **MEDIUM** | S2 권고 |
-| LLM seed 미전달 | **MEDIUM** | (S2 P13 이연) | `llm.py` seed 키 없음 | **MEDIUM** | S2 작업 대기 |
-| concurrency id 비결정성 | **MEDIUM** | 부분 (gather 순서 결정적, LLM 응답만 흔들림) | `build_synthetic_gold_set.py:649-664` gather + idx 순 id 부여 | **MEDIUM** | LLM seed 와 함께 처리 |
-| chunk fingerprint 부재 | **LOW** | (P8 골드셋 전체 sha256 만) | 청크 단위 hash 미적용 | **LOW** | S2/S3 권고 |
-| 인덱싱·생성 LLM 동일 | **LOW** | 간접 (P1 옵트인 차단) | `--allow-self-eval` 명시 시에만 가능 | **LOW** | 변화 없음 |
-
-**신규 도입된 위험 (패치 트레이드오프):**
-
-| 항목 | 등급 | 영향 |
+| 차원 | 위험 등급 | 핵심 이슈 |
 | --- | --- | --- |
-| (d1) `is_unique_source` LLM 호출 증가 (+20~30% 빌드 시간) | **LOW** | 운영 사용자 사전 공지 필요 |
-| (d1)/(d2) 의미 중복 가능성 | **LOW** | stats 분포 모니터링으로 충분 |
-| P10 description fallback 제거로 graph recall 절대값 감소 | **LOW** | 의도된 보수적 측정 — 회귀 비교는 영향 없음 |
-
----
+| 1. 샘플링 | MEDIUM | source_type만 균등화, degree/hub 편향(M3); 질문 다양성 강제 없음 |
+| 2. 정답 누설(self-fitting) | CRITICAL | gold name/type 이 인덱스 노드 직접 유래 → T1 자명(C1); alias/evidence 누설(H2) |
+| 3. Judge 게이트 | MEDIUM | 4단계 적용되나 entity-name 중첩 허용·snippet 기준이라 누설 미검출(L2) |
+| 4. Gen/Judge 분리 | CRITICAL | 일반 분리는 강제·기록 우수하나 인덱싱 LLM↔generator 분리 누락(C2) |
+| 5. 결정성/재현성 | LOW | 샘플링 결정적, LLM seed best-effort·기본 미전달(L1) |
+| 6. 그래프 매칭 | HIGH | τ=0.65 미검증(M2); T2/T4 가 generator 작성물 의존(H2) |
+| 7. 메타데이터/추적성 | MEDIUM | 추출 LLM·self-fitting·fingerprint 미기록(C2/C1) |
+| (위협3) 단일엔티티 0/1 | HIGH | per-item recall 해상도 1비트, 소표본 민감(H1) |
+| (위협5) 브리지 미자극 | HIGH | 표준 graph 단일노드라 cross-source 무감, cross-doc 동반 필요(H3) |
 
 ## 운영 권고
 
-### 사용 가능 범위 (이전 대비 확대)
+### 이 골드셋으로 만든 그래프 메트릭을 A/B 개선 판단에 쓸 수 있는가?
+**조건부 YES — 단, 다음을 모두 지킬 때에 한해 "상대 비교"로만.**
+- 양 arm 이 **동일 인덱스/동일 추출 LLM** 위에서 평가될 것. 그러면 self-fitting(C1) 편향이
+  양쪽에 동일하게 작용하므로 *상대 차이*는 retriever/planner 변경 효과로 해석 가능.
+  (인덱싱 자체를 바꾸는 A/B 는 self-fitting 편향이 비대칭이 되어 **사용 금지**.)
+- graph entity 메트릭은 **tier 분해(T1/T2/T3/T4)와 함께** 봐야 한다. T1 변화만으로 개선을
+  주장하면 표면 회수율 변화일 뿐 의미 매칭 개선이 아니다.
+- graph 항목 N ≥ 150 (H1) + cross-doc 모드 동반(H3) + τ 고정·기록(M2).
 
-- **이전과 동일**: 시스템 내부 회귀 테스트 (A vs B), chunk-only 모드 difficulty=easy 정성 리뷰.
-- **확대 (조건부)**: 운영 메트릭의 **보조 근거**. 단, 다음 조건 모두 충족 시:
-  1. 골드셋 metadata 의 `self_evaluation_warning == false` (Generator/Judge 가 별도 LLM 으로 분리).
-  2. `filter_applied == true` (파일명에 `.UNFILTERED` 없음).
-  3. `compare_runs.py` 의 `gold_set_sha256` 동치성 확인됨.
-  4. 그래프 메트릭은 `graph_t4_disabled == false` 확인.
+### 사용 가능 범위
+- 동일 인덱스 위 retriever/planner/rerank 파라미터의 **상대 A/B** (방향성 판단).
+- cross-doc 모드의 doc-level AND recall — 브리지 능력의 상대 비교(C1 영향 적음, doc_id 기반).
 
-### 사용 금지 범위 (이전과 동일)
+### 사용 금지 범위
+- graph entity recall **절대값**을 품질 지표·SLA·외부 보고로 사용 (self-fitting C1로 부풀려짐).
+- 인덱싱/추출 파이프라인을 바꾸는 A/B 의 graph entity 메트릭 비교 (편향 비대칭).
+- N<100 graph 항목에서의 5%p 미만 차이 판정 (0/1 채점 분산, H1).
+- 표준 graph 모드 단독으로 cross-source 브리지 능력 주장 (H3).
 
-- **단독 절대 메트릭 발표** ("우리 검색 정확도 X%") — Judge reasoning 부재 + τ 캘리브레이션 부재로 절대값 신뢰도 부족. 회귀 비교 또는 보조 근거로만.
-- **외부 벤치마크/경쟁 분석** — 자기 평가 편향 차단(P1) 적용했더라도 LLM seed 미전달로 재현성이 보장되지 않아 외부 검증 불가.
-- **`--no-filter` 생성 골드셋의 운영 사용** — P11 으로 파일명 분리됐으나 `metadata.filter_applied=False` 명시 확인 필요.
-- **`--allow-self-eval` 명시 빌드의 운영 사용** — metadata `self_evaluation_warning=true` 시 회귀 테스트 외 용도 금지.
-
-### 보완 작업 우선순위 (이전 보고서 대비 재정렬)
-
-1. **[즉시]** Judge reasoning 도입 — `is_answerable` / `is_unique_source` 에 `reasoning_mode="on"` 또는 JSON 출력. (잔여 HIGH)
-2. **[즉시]** Distractor pool 청크별 dynamic 추출 — `build_synthetic_gold_set.py:552` `rng.sample(...)` 패턴. (잔여 HIGH)
-3. **[1주 내]** S2 P15 — 그래프 τ 캘리브레이션 스크립트. (잔여 HIGH)
-4. **[1주 내]** S2 P13 — LLM endpoint seed 전달 인프라. (잔여 MEDIUM)
-5. **[2주 내]** stratified_sample 다중 키 (`source_type`, `len_bucket`, degree). (잔여 MEDIUM)
-6. **[1개월 내]** 청크 단위 content_hash + 인덱싱 LLM ID metadata. (잔여 LOW)
-7. **[1개월 내]** (d1)/(d2) 통과율 분포 모니터링 → 필요 시 (d2) 비활성화 옵션. (트레이드오프 검토)
-
----
-
-## 신뢰도 등급 변화 요약
-
-| 등급 | 패치 전 (이전 감사) | 패치 후 (현 감사) |
-| --- | --- | --- |
-| Critical | 1 | 0 |
-| High | 4 | 3 (Judge reasoning, distractor pool, τ 캘리브레이션) |
-| Medium | 3 | 3 (샘플링, 재현성, distractor 의미 중복 신규 LOW) |
-| Low | 2 | 4 (메타데이터 미세 누락 + 신규 트레이드오프 3건) |
-| **전체** | **HIGH 위험** | **MEDIUM 위험** |
-
-S0/S1 12건 패치 중 본 감사 범위(P1·P3·P4·P7·P10·P11) 6건이 모두 코드에서 실제로 적용·동작함을 확인. 자기 평가 편향(Critical 1건) + 정답 누설 방어 부재(High 2건) + Judge 게이트 우회 가능성(High 1건의 일부) 가 해소되어 **운영 의사결정용 보조 근거로 조건부 사용 가능** 수준에 도달. 단독 절대 메트릭 발표는 여전히 제한.
+### 보완 작업 (우선순위 순)
+1. **(C1/C2)** metadata 에 graph 추출 LLM ID + `graph_gold_from_index` 플래그 + 노드
+   fingerprint 기록, eval 요약에 self-fitting 경고 노출. (build_synthetic_gold_set.py:673-679)
+2. **(C1)** tier 분해(T1~T4 hit 비율)를 eval 기본 출력으로 승격, T1 편중 경고.
+   (graph_match.py:385 tier_counts 활용)
+3. **(H2)** `filter_question` 의 결정론 누설 게이트를 aliases/evidence_description 텍스트에도
+   적용. (build_synthetic_gold_set.py:1053-1061 직전에 누설 검사 추가)
+4. **(H1)** graph 항목 N≥150 운영 가이드 + 표본수 임계 미만 시 신뢰구간 경고.
+5. **(H3)** graph A/B 시 `--enable-cross-doc` 필수화, cross-doc seeds<5 시 보고 제외.
+6. **(M2)** τ-sweep validation 후 임계값 고정·근거 문서화. (graph_match.py:33)
+7. **(M3)** degree 분위수 2차 stratify + 샘플 degree 분포 metadata 기록.

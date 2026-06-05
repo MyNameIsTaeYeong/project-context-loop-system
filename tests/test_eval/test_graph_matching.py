@@ -448,6 +448,128 @@ def test_scenario_d_merged_node_via_embedding() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 표면(T1/T2/T3) tier 분리 — R2/R3
+# ---------------------------------------------------------------------------
+
+
+def test_surface_keys_exclude_t4_embedding_matches() -> None:
+    """T4(embedding) 매칭은 surface 키에서 제외, full 키에는 포함."""
+    golden = [
+        _ge("인증 서비스", "system"),  # T1 exact → surface
+        _ge(
+            "주문 서비스", "system",
+            description="주문 처리 마이크로서비스",
+        ),  # T4 only → full 에만
+    ]
+    retrieved = [
+        _ge("인증 서비스", "system"),
+        _ge(
+            "Order Service", "service",  # type 도 다름 → 표면 매칭 불가
+            description="Order processing microservice",
+        ),
+    ]
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    # full 메트릭: 두 골든 모두 매칭.
+    assert report.tier_counts["exact"] == 1
+    assert report.tier_counts["embedding"] == 1
+    assert len(report.retrieved_keys_in_rank_order) == 2
+    # surface 메트릭: T1 exact 만 — T4 흡수 항목 제외.
+    assert report.surface_retrieved_keys_in_rank_order == [("인증 서비스", "system")]
+    assert report.surface_relevant_keys == {("인증 서비스", "system")}
+    # 분모(all_relevant_keys)는 full/surface 공통 — 모든 골든.
+    assert report.all_relevant_keys == {
+        ("인증 서비스", "system"),
+        ("주문 서비스", "system"),
+    }
+
+
+def test_surface_keys_equal_full_when_no_t4() -> None:
+    """표면 tier 만 발동하면 surface 키 == full 키."""
+    golden = [
+        _ge("인증 서비스", "system"),       # T1
+        _ge("주문서비스", "system"),         # T3 normalize
+    ]
+    retrieved = [
+        _ge("인증 서비스", "system"),
+        _ge("주문 서비스", "system"),
+    ]
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    assert report.tier_counts["embedding"] == 0
+    assert (
+        report.surface_retrieved_keys_in_rank_order
+        == report.retrieved_keys_in_rank_order
+    )
+    assert report.surface_relevant_keys == report.relevant_keys
+
+
+# ---------------------------------------------------------------------------
+# S1-1 (R7) — retrieved-중심 precision 의 matched_retrieved_indices
+# ---------------------------------------------------------------------------
+
+
+def test_matched_retrieved_indices_track_hit_ranks() -> None:
+    """매칭된 retrieved 의 list 인덱스가 집합으로 수집된다 (precision 분자)."""
+    golden = [
+        _ge("인증 서비스", "system"),  # retrieved[1] 과 매칭
+        _ge("주문 서비스", "system"),  # retrieved[2] 와 매칭
+    ]
+    retrieved = [
+        _ge("결제 서비스", "system"),  # false-positive — 어떤 골든과도 매칭 X
+        _ge("인증 서비스", "system"),
+        _ge("주문 서비스", "system"),
+    ]
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    # 인덱스 0(결제)은 미매칭 → 분자에서 빠짐. 1,2 만 매칭.
+    assert report.matched_retrieved_indices == {1, 2}
+    # 표면 tier 만(전부 T1)이므로 surface 도 동일.
+    assert report.surface_matched_retrieved_indices == {1, 2}
+
+
+def test_precision_penalizes_false_positive_via_retrieved_indices() -> None:
+    """S1-1 재정의의 핵심 — false-positive 가 retrieved-중심 precision 을 끌어내린다.
+
+    골든 1개가 retrieved 3개 중 1개와만 매칭되면, 나머지 2개는 분자에서 빠진다.
+    이전(분모=k 고정 + 분자=매칭 골든 수) 정의로는 precision 이 1/k 였지만,
+    retrieved-중심에서는 1/min(k, len(retrieved)) = 1/3 으로 false-positive 의
+    패널티가 명시적으로 분모에 남는다.
+    """
+    golden = [_ge("인증 서비스", "system")]
+    retrieved = [
+        _ge("인증 서비스", "system"),  # idx 0 — 매칭
+        _ge("결제 서비스", "system"),  # idx 1 — false-positive
+        _ge("배송 서비스", "system"),  # idx 2 — false-positive
+    ]
+    report = run_entity_matching(golden, retrieved, embed_fn=_embed)
+    top_k = 5
+    denom = min(top_k, len(retrieved))  # = 3
+    topk_idx = set(range(denom))
+    precision = len(report.matched_retrieved_indices & topk_idx) / denom
+    assert precision == 1 / 3  # false-positive 2개가 분모에 남음
+    # 매칭은 1개뿐.
+    assert report.matched_retrieved_indices == {0}
+
+
+def test_relation_matched_retrieved_indices() -> None:
+    """관계 매칭도 retrieved 인덱스를 수집해 retrieved-중심 precision 을 지원."""
+    golden = [GraphRelationRef(
+        source_name="A", target_name="B", relation_type="depends_on",
+    )]
+    retrieved = [
+        GraphRelationRef(
+            source_name="X", target_name="Y", relation_type="calls",
+        ),  # idx 0 — false-positive
+        GraphRelationRef(
+            source_name="A", target_name="B", relation_type="depends_on",
+        ),  # idx 1 — 매칭
+    ]
+    rel_report = run_relation_matching(golden, retrieved, embed_fn=_embed)
+    assert rel_report.matched_retrieved_indices == {1}
+    denom = min(5, len(retrieved))
+    precision = len(rel_report.matched_retrieved_indices & set(range(denom))) / denom
+    assert precision == 1 / 2
+
+
+# ---------------------------------------------------------------------------
 # 시나리오 E — 관계 타입 명 변경 (--score-relations)
 # ---------------------------------------------------------------------------
 
@@ -466,12 +588,12 @@ def test_scenario_e_relation_type_renamed_absorbed_by_t4() -> None:
         relation_type="requires",  # 타입 명 변경
         description="결제 서비스는 주문 서비스를 필요로 한다",
     )]
-    retrieved_keys, _relevant_keys, tier_counts, scores = run_relation_matching(
+    rel_report = run_relation_matching(
         golden, retrieved, embed_fn=_embed,
     )
-    assert tier_counts["embedding"] == 1
-    assert len(retrieved_keys) == 1
-    assert scores[0] >= DEFAULT_GRAPH_MATCH_THRESHOLD
+    assert rel_report.tier_counts["embedding"] == 1
+    assert len(rel_report.retrieved_keys_in_rank_order) == 1
+    assert rel_report.scores[0] >= DEFAULT_GRAPH_MATCH_THRESHOLD
 
 
 def test_scenario_e_relation_exact_match_hits_t1() -> None:
@@ -481,11 +603,11 @@ def test_scenario_e_relation_exact_match_hits_t1() -> None:
     retrieved = [GraphRelationRef(
         source_name="A", target_name="B", relation_type="depends_on",
     )]
-    _, _, tier_counts, scores = run_relation_matching(
+    rel_report = run_relation_matching(
         golden, retrieved, embed_fn=_embed,
     )
-    assert tier_counts["exact"] == 1
-    assert scores == [1.0]
+    assert rel_report.tier_counts["exact"] == 1
+    assert rel_report.scores == [1.0]
 
 
 def test_relation_strict_skips_embedding() -> None:
@@ -498,11 +620,11 @@ def test_relation_strict_skips_embedding() -> None:
         source_name="A", target_name="B", relation_type="requires",
         description="설명",
     )]
-    rks, _, tcs, _ = run_relation_matching(
+    rel_report = run_relation_matching(
         golden, retrieved, embed_fn=_embed, strict=True,
     )
-    assert rks == []
-    assert all(c == 0 for c in tcs.values())
+    assert rel_report.retrieved_keys_in_rank_order == []
+    assert all(c == 0 for c in rel_report.tier_counts.values())
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,7 @@ from context_loop.eval.gold_set import GoldItem, load_gold_set  # noqa: E402
 from context_loop.eval.graph_match import (  # noqa: E402
     DEFAULT_GRAPH_MATCH_THRESHOLD,
     EmbedFn,
+    MatchReport,
     aggregate_tier_counts,
     build_embed_fn,
     run_entity_matching,
@@ -80,7 +81,11 @@ from context_loop.eval.graph_match import (  # noqa: E402
 from context_loop.eval.index_fingerprint import (  # noqa: E402
     combined_index_fingerprint,
 )
-from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
+from context_loop.eval.llm import (  # noqa: E402
+    build_eval_llm_client,
+    detect_role_collisions,
+    role_is_configured,
+)
 from context_loop.eval.metrics import (  # noqa: E402
     aggregate,
     aggregate_with_variance,
@@ -336,6 +341,30 @@ async def judge_answer(
 # ---------------------------------------------------------------------------
 
 
+def _build_match_pairs(
+    relevant: list[Any],
+    report: MatchReport,
+) -> list[dict[str, Any]]:
+    """매칭된 골든 엔티티별 per-pair 증거를 JSON 직렬화 가능한 list 로 만든다 (S1-6).
+
+    ``report.results`` 는 ``relevant`` 와 같은 인덱스 정렬이며, 각 항목이 None 이
+    아니면 해당 골든이 어떤 retrieved(``retrieved_index``)와 어떤 tier/score 로
+    매칭됐는지를 담는다. T4 false-positive 사후 spot-check 의 추적 단서.
+    """
+    pairs: list[dict[str, Any]] = []
+    for g, result in zip(relevant, report.results):
+        if result is None:
+            continue
+        pairs.append({
+            "golden_name": getattr(g, "name", "") or "",
+            "golden_type": getattr(g, "type", "") or "",
+            "retrieved_index": result.retrieved_index,
+            "tier": result.tier,
+            "score": result.score,
+        })
+    return pairs
+
+
 async def evaluate_one(
     item: GoldItem,
     *,
@@ -426,13 +455,36 @@ async def evaluate_one(
 
     # graph-level 채점 — 4-tier cascade (exact → alias → normalize → embedding).
     # 임베딩 단계의 비용 통제는 외부 주입된 LRU 캐시 embed_fn 으로 흡수.
+    retrieved_graph_entities = list(assembled.retrieved_graph_entities)
     entity_report = run_entity_matching(
         item.relevant_graph_entities,
-        list(assembled.retrieved_graph_entities),
+        retrieved_graph_entities,
         embed_fn=embed_fn,
         threshold=graph_match_threshold,
         strict=graph_match_strict,
     )
+    # S1-1 (R7) — retrieved-중심 graph precision.
+    # 기존 graph_precision@k 는 분모를 top_k 상수로 고정하고 분자에 매칭된
+    # 골든 수를 써서 false-positive(매칭 안 된 retrieved)에 패널티가 0 이었다.
+    # 재정의: 분자 = top-k retrieved 중 relevant(=어떤 골든과 매칭된) 인덱스 수,
+    # 분모 = min(top_k, len(retrieved)). 이제 매칭 안 된 retrieved 가 분모에는
+    # 남고 분자에서는 빠지므로 false-positive 가 precision 을 끌어내린다.
+    # retrieved 리스트는 run_entity_matching 에 넘긴 것과 동일 순서(rank)이며
+    # MatchResult.retrieved_index 가 이 리스트의 인덱스를 그대로 가리킨다.
+    n_graph_retrieved = len(retrieved_graph_entities)
+    graph_prec_denom = min(top_k, n_graph_retrieved)
+    if graph_prec_denom > 0:
+        topk_idx = set(range(graph_prec_denom))
+        graph_precision_value = (
+            len(entity_report.matched_retrieved_indices & topk_idx) / graph_prec_denom
+        )
+        graph_precision_surface_value = (
+            len(entity_report.surface_matched_retrieved_indices & topk_idx)
+            / graph_prec_denom
+        )
+    else:
+        graph_precision_value = 0.0
+        graph_precision_surface_value = 0.0
 
     row: dict[str, Any] = {
         "id": item.id,
@@ -459,11 +511,9 @@ async def evaluate_one(
             entity_report.all_relevant_keys,
             top_k,
         ),
-        f"graph_precision@{top_k}": precision_at_k(
-            entity_report.retrieved_keys_in_rank_order,
-            entity_report.all_relevant_keys,
-            top_k,
-        ),
+        # S1-1 — retrieved-중심 precision (위에서 계산). false-positive 패널티 有.
+        f"graph_precision@{top_k}": graph_precision_value,
+        f"graph_precision_surface@{top_k}": graph_precision_surface_value,
         f"graph_hit@{top_k}": int(hit_at_k(
             entity_report.retrieved_keys_in_rank_order,
             entity_report.all_relevant_keys,
@@ -478,8 +528,35 @@ async def evaluate_one(
             entity_report.all_relevant_keys,
             top_k,
         ),
+        # R2/R3 — 표면(T1/T2/T3) tier 만으로 계산한 메트릭. 개선 판단의 1차
+        # 기준. 분모는 동일하게 all_relevant_keys (= 모든 골든) 유지.
+        # 단일 매칭 패스에서 모은 surface 키를 재사용 — T4 비용 추가 없음.
+        f"graph_recall_surface@{top_k}": recall_at_k(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        f"graph_hit_surface@{top_k}": int(hit_at_k(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        )),
+        f"graph_ndcg_surface@{top_k}": ndcg_at_k(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+            top_k,
+        ),
+        "graph_mrr_surface": mrr(
+            entity_report.surface_retrieved_keys_in_rank_order,
+            entity_report.all_relevant_keys,
+        ),
         # 2차 — tier 분포 / score 시그널.
         "graph_match_tiers": dict(entity_report.tier_counts),
+        # S1-6 (R2) — per-pair 매칭 증거. T4 false-positive 사후 spot-check 용.
+        # CI/aggregate 대상 아님(list 값이라 _is_ci_metric/aggregate 에서 자연 제외).
+        "graph_match_pairs": _build_match_pairs(
+            item.relevant_graph_entities, entity_report,
+        ),
         "graph_match_score_avg": entity_report.avg_score(),
         "graph_match_score_min": entity_report.min_score(),
         "graph_match_score_max": entity_report.max_score(),
@@ -487,15 +564,17 @@ async def evaluate_one(
     }
 
     if score_relations and item.relevant_graph_relations:
-        rel_retrieved_keys, rel_relevant_keys, rel_tier_counts, rel_scores = (
-            run_relation_matching(
-                item.relevant_graph_relations,
-                list(assembled.retrieved_graph_relations),
-                embed_fn=embed_fn,
-                threshold=graph_match_threshold,
-                strict=graph_match_strict,
-            )
+        retrieved_graph_relations = list(assembled.retrieved_graph_relations)
+        rel_report = run_relation_matching(
+            item.relevant_graph_relations,
+            retrieved_graph_relations,
+            embed_fn=embed_fn,
+            threshold=graph_match_threshold,
+            strict=graph_match_strict,
         )
+        rel_retrieved_keys = rel_report.retrieved_keys_in_rank_order
+        rel_tier_counts = rel_report.tier_counts
+        rel_scores = rel_report.scores
         # all_relevant 는 골든 관계 전체.
         all_rel_keys: set[tuple[str, str, str]] = {
             (
@@ -508,9 +587,20 @@ async def evaluate_one(
         row[f"graph_rel_recall@{top_k}"] = recall_at_k(
             rel_retrieved_keys, all_rel_keys, top_k,
         )
-        row[f"graph_rel_precision@{top_k}"] = precision_at_k(
-            rel_retrieved_keys, all_rel_keys, top_k,
-        )
+        # S1-1 (R7) — 관계도 엔티티와 동일한 retrieved-중심 precision 으로 보정.
+        # 기존 precision_at_k 는 분모를 top_k 상수로 고정해 false-positive 패널티가
+        # 0 이었다. 재정의: 분자 = top-k retrieved 관계 중 relevant 인덱스 수,
+        # 분모 = min(top_k, len(retrieved relations)).
+        n_rel_retrieved = len(retrieved_graph_relations)
+        rel_prec_denom = min(top_k, n_rel_retrieved)
+        if rel_prec_denom > 0:
+            rel_topk_idx = set(range(rel_prec_denom))
+            row[f"graph_rel_precision@{top_k}"] = (
+                len(rel_report.matched_retrieved_indices & rel_topk_idx)
+                / rel_prec_denom
+            )
+        else:
+            row[f"graph_rel_precision@{top_k}"] = 0.0
         row[f"graph_rel_hit@{top_k}"] = int(hit_at_k(
             rel_retrieved_keys, all_rel_keys, top_k,
         ))
@@ -520,8 +610,6 @@ async def evaluate_one(
             row["graph_rel_match_score_avg"] = sum(rel_scores) / len(rel_scores)
             row["graph_rel_match_score_min"] = min(rel_scores)
             row["graph_rel_match_score_max"] = max(rel_scores)
-        # 사용 의도 유지 — relevant 키 변수 (디버그 후속용).
-        _ = rel_relevant_keys
 
     # 정답 청크 본문 조회 방식은 judge 채점 여부와 무관하게 row 에 기록 —
     # source 미해상도(fallback/empty) 의 빈도를 추적하기 위함.
@@ -645,6 +733,39 @@ def _classify_mode(item: GoldItem) -> str:
     return "chunk"
 
 
+def _failed_metric_keys(top_k: int, *, has_graph: bool) -> dict[str, Any]:
+    """실패(검색 예외) 질의의 row 에 명시할 표준 메트릭 None 키를 만든다 (S1-5, R11).
+
+    aggregate/CI 가 None 값을 자동 스킵하므로, 실패 질의는 평균에서 빠지되
+    "키 자체가 없어 무성 제외"되는 것을 방지한다 — 키는 존재하되 값이 None.
+
+    chunk 메트릭은 항상 채운다. ``has_graph`` (= ``relevant_graph_entities``
+    보유 질의) 일 때만 수치 graph 메트릭도 None 으로 명시한다. graph 정답이
+    없는 chunk-only 질의에는 graph 키를 넣지 않는다(_classify_mode 분류 존중).
+    """
+    keys: dict[str, Any] = {
+        f"recall@{top_k}": None,
+        f"precision@{top_k}": None,
+        f"hit@{top_k}": None,
+        f"ndcg@{top_k}": None,
+        "mrr": None,
+    }
+    if has_graph:
+        keys.update({
+            f"graph_recall@{top_k}": None,
+            f"graph_recall_surface@{top_k}": None,
+            f"graph_precision@{top_k}": None,
+            f"graph_precision_surface@{top_k}": None,
+            f"graph_hit@{top_k}": None,
+            f"graph_hit_surface@{top_k}": None,
+            f"graph_ndcg@{top_k}": None,
+            f"graph_ndcg_surface@{top_k}": None,
+            "graph_mrr": None,
+            "graph_mrr_surface": None,
+        })
+    return keys
+
+
 def _normalize_for_anchor(text: str) -> str:
     """source_text_anchor 비교용 정규화 — 연속 whitespace 단일 공백."""
     return " ".join(text.split())
@@ -762,25 +883,53 @@ def check_absolute_mode_requirements(
 
 
 def _chunk_metric_cis(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-    """청크/문서 메트릭별 95% bootstrap CI 를 per-query 값으로 계산한다.
+    """청크/문서 + 그래프 메트릭별 95% bootstrap CI 를 per-query 값으로 계산한다.
 
-    절대 점수에 불확실성을 동반시키기 위한 용도(Phase 4). graph_* / judge 는
-    제외하고 recall/precision/hit/ndcg/mrr 계열만 처리한다. 실패 행
-    (``metric_failed``) 은 제외.
+    절대 점수에 불확실성을 동반시키기 위한 용도(Phase 4). recall/precision/
+    hit/ndcg/mrr 계열(청크)과 그래프 수치형 스칼라 메트릭(``graph_recall@k``,
+    ``graph_recall_surface@k``, ``graph_hit@k``, ``graph_ndcg@k``, ``graph_mrr``
+    등)에 동일하게 bootstrap CI 를 적용한다(R1).
+
+    CI 대상에서 제외되는 그래프 키:
+      * dict 값 — ``graph_match_tiers`` / ``graph_rel_match_tiers``.
+      * bool/문자열 — ``graph_t4_disabled`` 등 (값 타입 가드로 자동 제외).
+      * score 시그널 — ``graph_match_score_*`` (메트릭이 아닌 진단치).
+
+    실패 행(``metric_failed``) 은 제외하며, 특정 키가 없는 행(예: chunk-only
+    항목의 graph 키 부재 X — 항상 채워지지만 방어적으로)은 해당 키 집계에서
+    건너뛴다(aggregate 와 동일 정책).
     """
     chunk_prefixes = ("recall@", "precision@", "hit@", "ndcg@", "mrr")
+    graph_prefixes = (
+        "graph_recall@", "graph_recall_surface@",
+        "graph_precision@", "graph_precision_surface@",
+        "graph_hit@", "graph_hit_surface@",
+        "graph_ndcg@", "graph_ndcg_surface@",
+        "graph_mrr", "graph_mrr_surface",
+        "graph_rel_recall@", "graph_rel_precision@",
+        "graph_rel_hit@", "graph_rel_mrr",
+    )
+
+    def _is_ci_metric(key: str) -> bool:
+        # score 시그널은 메트릭이 아니므로 제외.
+        if key.startswith("graph_match_score_") or key.startswith("graph_rel_match_score_"):
+            return False
+        if any(key == p or key.startswith(p) for p in chunk_prefixes):
+            return True
+        return any(key == p or key.startswith(p) for p in graph_prefixes)
+
     succ = [r for r in rows if not r.get("metric_failed")]
     keys: set[str] = set()
     for r in succ:
         for k, v in r.items():
+            # 값 타입 가드 — dict/bool/str/None 은 CI 대상 아님.
             if not isinstance(v, (int, float)) or isinstance(v, bool):
                 continue
-            if k.startswith("graph_"):
-                continue
-            if any(k == p or k.startswith(p) for p in chunk_prefixes):
+            if _is_ci_metric(k):
                 keys.add(k)
     out: dict[str, dict[str, float]] = {}
     for k in sorted(keys):
+        # 키가 없는 행(chunk-only 등)은 건너뛴다 — aggregate 와 동일 정책.
         values = [
             r[k] for r in succ
             if isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool)
@@ -904,6 +1053,9 @@ def print_summary(summary: dict[str, Any]) -> None:
     metrics = summary.get("metrics", {})
     # 보기 좋은 순서로 키 정렬 — graph_* 는 chunk 메트릭 다음에 배치
     preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+                 "graph_recall_surface@", "graph_precision_surface@",
+                 "graph_hit_surface@",
+                 "graph_ndcg_surface@", "graph_mrr_surface",
                  "graph_recall@", "graph_precision@", "graph_hit@",
                  "graph_ndcg@", "graph_mrr",
                  "graph_match_score_", "graph_rel_recall@",
@@ -1094,15 +1246,16 @@ async def _evaluate_gold_set(
                 row = {
                     "id": item.id,
                     "query": item.query,
+                    "mode": _classify_mode(item),
                     "error": str(exc),
                     "metric_failed": True,
                     "_idx": idx,
                     # 표준 메트릭 키를 None 으로 명시 — aggregate 가 자동 스킵.
-                    f"recall@{top_k}": None,
-                    f"precision@{top_k}": None,
-                    f"hit@{top_k}": None,
-                    f"ndcg@{top_k}": None,
-                    "mrr": None,
+                    # graph 정답 보유 질의는 graph_* 키도 None 명시(S1-5, R11).
+                    **_failed_metric_keys(
+                        top_k,
+                        has_graph=bool(item.relevant_graph_entities),
+                    ),
                 }
             completed += 1
             logger.info(
@@ -1124,16 +1277,14 @@ async def _evaluate_gold_set(
                 "예외가 _process_item 밖으로 새어 나옴: idx=%d, exc=%s", idx, r,
             )
             top_k = args.top_k
+            # item 을 복구할 수 없는 방어 경로 — graph 여부 미상이므로 chunk
+            # 키만 명시(_failed_metric_keys has_graph=False).
             rows.append({
                 "id": f"_idx{idx}",
                 "error": str(r),
                 "metric_failed": True,
                 "_idx": idx,
-                f"recall@{top_k}": None,
-                f"precision@{top_k}": None,
-                f"hit@{top_k}": None,
-                f"ndcg@{top_k}": None,
-                "mrr": None,
+                **_failed_metric_keys(top_k, has_graph=False),
             })
         else:
             rows.append(r)
@@ -1255,6 +1406,22 @@ async def run(args: argparse.Namespace) -> int:
     rerank_score_threshold = float(config.get("search.reranker_score_threshold", 0.0))
 
     embedding_model_id = str(config.get("processor.embedding_model") or "")
+    # S1-4 (R9) — generator/judge/system 3자 식별 충돌을 1회 판정해 요약에 기록.
+    # eval_search 는 generator CLI override 가 없으므로 config.eval.generator.* 를
+    # 그대로 사용한다(judge 는 CLI override 반영).
+    role_collisions = detect_role_collisions(
+        config,
+        judge_endpoint_override=args.judge_endpoint,
+        judge_model_override=args.judge_model,
+    )
+    if role_collisions["any_collision"]:
+        logger.warning(
+            "역할 식별 충돌 감지 — generator==system:%s judge==system:%s "
+            "generator==judge:%s (self-evaluation 편향 가능, summary 에 기록)",
+            role_collisions["generator_eq_system"],
+            role_collisions["judge_eq_system"],
+            role_collisions["generator_eq_judge"],
+        )
     config_summary = {
         "top_k": args.top_k,
         "max_chunks": args.max_chunks,
@@ -1270,6 +1437,10 @@ async def run(args: argparse.Namespace) -> int:
         # Self-evaluation 추적 — judge fall-through 시 메트릭이 편향됨을 명시.
         "judge_is_self": judge_is_self,
         "allow_self_judge": bool(args.allow_self_judge),
+        # S1-4 (R9) — generator/judge/system 3자 식별 충돌. role_is_configured 의
+        # 2-way 검사로는 못 잡는 Channel C(generator==judge, generator==system)
+        # 까지 한 번에 식별하여 self-evaluation 편향을 추적에 남긴다.
+        "role_collisions": role_collisions,
         # 2차 — graph 매칭 정책 / 재현성용 메타.
         "graph_match_threshold": args.graph_match_threshold,
         "graph_match_strict": args.graph_match_strict,
@@ -1413,12 +1584,37 @@ def _write_aggregate(
     per_metric = [s.get("metrics") or {} for s in per_run_summaries]
     variance = aggregate_with_variance(per_metric)
 
+    # R12 — A/B 비교 가드. 비교에 들어가는 run 들의 그래프 채점 기준이
+    # 서로 다르면 그래프 델타가 시스템 차이를 반영하지 못한다. 임베딩
+    # 모델 / 매칭 임계값 / 그래프 스토어 지문이 run 간에 모두 동일해야
+    # 유효 비교. 다르면 경고 + 플래그.
+    guard_keys = ("graph_match_threshold", "embedding_model", "graph_store_sha256")
+    graph_comparison_invalid = False
+    graph_comparison_mismatches: dict[str, list[Any]] = {}
+    if len(per_run_summaries) > 1:
+        for gk in guard_keys:
+            observed = [
+                (s.get("config") or {}).get(gk) for s in per_run_summaries
+            ]
+            distinct = {repr(v) for v in observed}
+            if len(distinct) > 1:
+                graph_comparison_invalid = True
+                graph_comparison_mismatches[gk] = observed
+        if graph_comparison_invalid:
+            logger.warning(
+                "그래프 비교 가드 실패 — run 간 채점 기준 불일치: %s. "
+                "그래프 델타는 시스템 차이를 반영하지 않을 수 있습니다.",
+                ", ".join(graph_comparison_mismatches.keys()),
+            )
+
     out = {
         "label": label,
         "n_gold_sets_requested": len(gold_paths),
         "n_gold_sets_evaluated": len(per_run_summaries),
         "gold_sets": [str(p) for p in gold_paths],
         "config": config_summary,
+        "graph_comparison_invalid": graph_comparison_invalid,
+        "graph_comparison_mismatches": graph_comparison_mismatches,
         "metrics": variance,
         "per_gold_set": [
             {
