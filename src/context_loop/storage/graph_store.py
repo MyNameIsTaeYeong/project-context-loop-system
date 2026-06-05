@@ -65,6 +65,19 @@ def _extract_scoped_name(entity_name: str) -> str:
     return entity_name.split("::", 1)[1]
 
 
+def _embedding_display_name(entity_name: str) -> str:
+    """엔티티 임베딩 입력용 표시명.
+
+    코드 심볼 FQN(``file.py::Class.method``)은 파일 범위를 벗긴 부분
+    (``Class.method``)을 임베딩해, 자연어/문서 질의 임베딩과의 의미 거리를
+    줄인다 — query-embedding 시드 보강이 코드 노드에도 닿게 하여 코드↔지식
+    브리지를 의미 차원에서 보강한다. FQN 이 아니면 이름 그대로.
+    """
+    if "::" not in entity_name:
+        return entity_name
+    return _extract_scoped_name(entity_name)
+
+
 class GraphStore:
     """NetworkX + SQLite 기반 그래프 저장소.
 
@@ -406,39 +419,45 @@ class GraphStore:
         embedding_fallback: list[float] | None = None,
         embedding_fallback_threshold: float = 0.5,
         embedding_fallback_top_k: int = 3,
+        max_seeds: int = 10,
     ) -> list[int]:
-        """엔티티 이름을 시드 node_id 목록으로 해석한다 (4단계 폴백).
+        """엔티티 이름을 시드 node_id 목록으로 해석한다 (표면 union + 임베딩 폴백).
 
         ``get_neighbors`` 와 ``get_connected_component`` 가 공유하는 이름→노드
-        해석 로직. 완전 일치 → 파일 범위 제거 일치 → 짧은 이름 일치 →
-        임베딩 fallback 순으로 시도한다.
+        해석 로직. 완전 일치 → 파일 범위 제거 일치 → 짧은 이름 일치 순으로
+        **누적 union** 한 뒤(첫 매칭에서 멈추지 않음), 모두 비면 임베딩 fallback.
+
+        표면 tier 를 union 하므로 한 질의 이름이 confluence bare 노드(완전 일치)와
+        코드 FQN 노드(scoped/short 일치)를 **동시에** 시드로 잡아, 별개로 저장된
+        코드 그래프와 지식(문서) 그래프를 검색 시점에 잇는다. 비교 키는 storage
+        병합과 동일한 ``normalize_entity_name`` 으로 정렬하여 "Auth Service" ↔
+        "AuthService" ↔ "auth-service" 같은 공백/케이스/구분자 차이를 흡수한다.
+        흔한 짧은 이름이 과도한 시드를 끌어오는 것을 막기 위해 우선순위
+        (exact > scoped > short) 순으로 ``max_seeds`` 까지만 채택한다.
         """
-        query_lower = entity_name.lower()
+        query_key = normalize_entity_name(entity_name)
 
-        # 1. 완전 일치 (기존 동작)
-        center_nodes = [
-            n for n, d in self._graph.nodes(data=True)
-            if d.get("entity_name", "").lower() == query_lower
-        ]
+        seen: set[int] = set()
+        ordered: list[int] = []
 
-        # 2. 파일 범위를 벗긴 부분 일치 (예: "UserService.create_user")
-        if not center_nodes:
-            center_nodes = [
-                n for n, d in self._graph.nodes(data=True)
-                if _extract_scoped_name(d.get("entity_name", "")).lower() == query_lower
-            ]
+        def _collect(key_fn: Any) -> None:
+            for n, d in self._graph.nodes(data=True):
+                if n in seen:
+                    continue
+                if normalize_entity_name(key_fn(d.get("entity_name", ""))) == query_key:
+                    seen.add(n)
+                    ordered.append(n)
 
-        # 3. 짧은 이름 일치 (예: "create_user", "UserService")
-        if not center_nodes:
-            center_nodes = [
-                n for n, d in self._graph.nodes(data=True)
-                if _extract_short_name(d.get("entity_name", "")).lower() == query_lower
-            ]
+        if query_key:
+            _collect(lambda name: name)        # 1. 완전 일치
+            _collect(_extract_scoped_name)     # 2. 파일 범위 제거 일치
+            _collect(_extract_short_name)      # 3. 짧은 이름 일치
+
+        center_nodes = ordered[:max_seeds]
 
         # 4. 임베딩 fallback — 표면 매칭이 모두 실패한 경우. 질의 이름이
-        # 인덱스에 표기 차이로 존재할 때 (예: "Auth Service" ↔ "AuthService",
-        # "인증 서비스" ↔ "인증서비스") 의미 임베딩으로 가장 가까운 노드를 시드로
-        # 사용하여 검색 funnel 손실을 줄인다.
+        # 인덱스에 표기 차이로 존재할 때 (예: "인증 서비스" ↔ "인증서비스")
+        # 의미 임베딩으로 가장 가까운 노드를 시드로 사용하여 funnel 손실을 줄인다.
         if not center_nodes and embedding_fallback is not None:
             similar = self.search_entities_by_embedding(
                 embedding_fallback,
@@ -887,9 +906,11 @@ class GraphStore:
         if not missing:
             return 0
 
-        names = [name for _, name in missing]
+        # 임베딩 입력은 표시명(코드 FQN 은 파일 범위 제거)을 쓰되, 캐시에 저장하는
+        # 이름은 원본 entity_name 으로 유지해 다운스트림 표기는 그대로 보존한다.
+        embed_inputs = [_embedding_display_name(name) for _, name in missing]
         try:
-            embeddings = await embedding_client.aembed_documents(names)
+            embeddings = await embedding_client.aembed_documents(embed_inputs)
         except Exception:
             logger.warning("엔티티 임베딩 생성 실패", exc_info=True)
             return 0
