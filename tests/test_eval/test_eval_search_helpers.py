@@ -14,6 +14,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT / "src"))
@@ -136,3 +138,189 @@ def test_match_pairs_not_a_ci_metric() -> None:
     assert "graph_match_pairs" not in cis
     # 수치 graph 메트릭은 CI 에 포함.
     assert "graph_recall@5" in cis
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P4) — 측정 단위 일급화 + answerable 위생
+# ---------------------------------------------------------------------------
+
+
+def _gold_item(**kw):  # type: ignore[no-untyped-def]
+    from context_loop.eval.gold_set import GoldItem
+    base = {"id": "q1", "query": "?"}
+    base.update(kw)
+    return GoldItem(**base)
+
+
+def test_serves_unit_explicit_measurement_units() -> None:
+    item = _gold_item(measurement_units=["doc", "graph"])
+    assert eval_search._serves_unit(item, "doc") is True
+    assert eval_search._serves_unit(item, "graph") is True
+    assert eval_search._serves_unit(item, "answer") is False
+
+
+def test_serves_unit_legacy_inference() -> None:
+    """measurement_units 가 비면 정답키 보유로 단위를 추론한다."""
+    item = _gold_item(relevant_doc_ids=[1])
+    assert eval_search._serves_unit(item, "doc") is True
+    assert eval_search._serves_unit(item, "graph") is False
+    item2 = _gold_item(relevant_doc_ids=[], reference_answer="답")
+    assert eval_search._serves_unit(item2, "answer") is True
+    assert eval_search._serves_unit(item2, "doc") is False
+
+
+def test_write_summary_answerable_hygiene(tmp_path: Path) -> None:
+    """answerable=False 행은 메트릭 평균 분모에서 제외되고 별도 보고된다."""
+    rows = [
+        {"id": "a", "mode": "chunk", "recall@5": 1.0,
+         "measurement_units": ["doc"], "answerable": True},
+        {"id": "b", "mode": "chunk", "recall@5": 1.0,
+         "measurement_units": ["doc"], "answerable": True},
+        # 회수 불가 표적 — recall 0 이지만 분모에서 제외돼야 함
+        {"id": "c", "mode": "chunk", "recall@5": 0.0,
+         "measurement_units": ["doc"], "answerable": False},
+    ]
+    out = eval_search.write_summary(
+        rows, tmp_path / "s.summary.json",
+        label="t", config_summary={},
+    )
+    # answerable=2개만 평균 → recall 1.0 (c 의 0.0 제외)
+    assert out["metrics"]["recall@5"] == 1.0
+    assert out["n_unanswerable"] == 1
+    assert out["unanswerable_ids"] == ["c"]
+    assert out["measurement_unit_coverage"]["doc"] == 3
+
+
+def test_write_summary_legacy_rows_unchanged(tmp_path: Path) -> None:
+    """answerable/measurement_units 없는 레거시 행은 전부 분모에 포함(무변경)."""
+    rows = [
+        {"id": "a", "mode": "chunk", "recall@5": 1.0},
+        {"id": "b", "mode": "chunk", "recall@5": 0.0},
+    ]
+    out = eval_search.write_summary(
+        rows, tmp_path / "s.summary.json",
+        label="t", config_summary={},
+    )
+    assert out["metrics"]["recall@5"] == 0.5  # 둘 다 포함
+    assert out["n_unanswerable"] == 0
+    assert out["measurement_unit_coverage"] == {"doc": 0, "answer": 0, "graph": 0}
+
+
+def test_context_recall_is_ci_metric() -> None:
+    """context_recall@k 가 bootstrap CI 대상에 포함된다."""
+    rows = [
+        {"context_recall@5": 1.0}, {"context_recall@5": 0.0},
+        {"context_recall@5": 1.0}, {"context_recall@5": 1.0},
+    ]
+    cis = eval_search._chunk_metric_cis(rows)
+    assert "context_recall@5" in cis
+    assert "mean" in cis["context_recall@5"]
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P4-answer) — 답변 단위 채점 + divergence
+# ---------------------------------------------------------------------------
+
+
+class _StubLLM:
+    def __init__(self, responses):  # type: ignore[no-untyped-def]
+        self._responses = list(responses)
+        self.calls = []  # type: ignore[var-annotated]
+
+    async def complete(self, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls.append({"prompt": prompt, **kwargs})
+        return self._responses.pop(0) if self._responses else ""
+
+
+def test_normalize_answer_strips_punct_and_case() -> None:
+    assert eval_search._normalize_answer('  "100만원."  ') == "100만원"
+    assert eval_search._normalize_answer("Token Validator") == "token validator"
+
+
+def test_factoid_match_exact_and_contains() -> None:
+    assert eval_search.factoid_match("100만원", "약 100만원 입니다") is True
+    assert eval_search.factoid_match("Token Validator", "token validator") is True
+    assert eval_search.factoid_match("100만원", "50만원") is False
+    assert eval_search.factoid_match("", "무엇") is False
+
+
+@pytest.mark.asyncio
+async def test_score_answer_correctness_factoid_no_llm() -> None:
+    """팩토이드 일치는 LLM 호출 없이 1.0."""
+    judge = _StubLLM([])
+    score, method, _ = await eval_search.score_answer_correctness(
+        "q", "100만원", "정답은 100만원이다", judge=judge,
+    )
+    assert score == 1.0
+    assert method == "factoid"
+    assert judge.calls == []  # judge 미호출
+
+
+@pytest.mark.asyncio
+async def test_score_answer_correctness_judge_path() -> None:
+    """팩토이드 불일치 → judge 0~5 → 0..1 정규화."""
+    judge = _StubLLM(['{"score": 4, "reason": "대체로 맞음"}'])
+    score, method, reason = await eval_search.score_answer_correctness(
+        "q", "토큰 검증 모듈에 의존", "인증은 검증기에 기댄다", judge=judge,
+    )
+    assert score == 0.8
+    assert method == "judge"
+    assert reason == "대체로 맞음"
+
+
+@pytest.mark.asyncio
+async def test_score_answer_correctness_parse_error() -> None:
+    judge = _StubLLM(["깨진 응답"])
+    score, method, _ = await eval_search.score_answer_correctness(
+        "q", "기준", "전혀 다른 답", judge=judge,
+    )
+    assert score == -1.0
+    assert method == "parse_error"
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_from_context_uses_system_llm() -> None:
+    llm = _StubLLM(["Token Validator에 의존한다."])
+    out = await eval_search.generate_answer_from_context(
+        "질문", "검색 컨텍스트 본문", answer_llm=llm,
+    )
+    assert out == "Token Validator에 의존한다."
+    assert llm.calls[0]["purpose"] == "goldset_answer_gen"
+    assert "검색 컨텍스트 본문" in llm.calls[0]["prompt"]
+
+
+def test_divergence_label_axes() -> None:
+    # 답 맞음 + 검색 실패 → answer_without_context
+    assert eval_search._divergence_label(0.0, 1) == "answer_without_context"
+    # 검색 OK + 답 실패 → context_without_answer
+    assert eval_search._divergence_label(1.0, 0) == "context_without_answer"
+    # 두 축 일치 → 빈 라벨
+    assert eval_search._divergence_label(1.0, 1) == ""
+    assert eval_search._divergence_label(0.0, 0) == ""
+    # 판정 불가
+    assert eval_search._divergence_label(None, 1) == ""
+    assert eval_search._divergence_label(0.0, None) == ""
+
+
+def test_write_summary_answer_and_divergence_report(tmp_path: Path) -> None:
+    rows = [
+        {"id": "a", "mode": "chunk", "answer_correct": 1, "answer_correctness": 1.0,
+         "measurement_units": ["doc", "answer"], "answerable": True,
+         "divergence": "answer_without_context"},
+        {"id": "b", "mode": "chunk", "answer_correct": 0, "answer_correctness": 0.2,
+         "measurement_units": ["doc", "answer"], "answerable": True,
+         "divergence": "context_without_answer"},
+        {"id": "c", "mode": "chunk", "answer_correct": 1, "answer_correctness": 0.8,
+         "measurement_units": ["doc", "answer"], "answerable": True},
+        {"id": "d", "mode": "chunk", "answer_parse_failed": True,
+         "measurement_units": ["answer"], "answerable": True},
+    ]
+    out = eval_search.write_summary(
+        rows, tmp_path / "s.summary.json", label="t", config_summary={},
+    )
+    # answer_correct 평균 = (1+0+1)/3
+    assert abs(out["metrics"]["answer_correct"] - (2 / 3)) < 1e-9
+    assert out["n_answer_scored"] == 3
+    assert out["n_answer_parse_failed"] == 1
+    assert out["divergence_counts"]["answer_without_context"] == 1
+    assert out["divergence_counts"]["context_without_answer"] == 1

@@ -13,19 +13,29 @@ import pytest
 
 from context_loop.eval.synth import (
     GRAPH_GENERATE_PROMPT_TEMPLATE,
+    ExtractedFact,
+    SourceGroundedQuestion,
     build_subgraph_snippet,
+    derive_acceptable_surface_forms,
+    evidence_span_in_source,
     extract_unique_tokens,
+    extract_verifiable_facts,
     filter_question,
+    filter_source_grounded_question,
     format_edges_for_prompt,
     generate_cross_doc_questions,
     generate_graph_questions,
     generate_questions,
+    generate_sg_question,
     has_demonstrative_reference,
     has_identifier_leakage,
+    infer_measurement_units,
     is_alias_leakage,
     make_text_anchor,
+    parse_extracted_facts,
     parse_generated_graph_questions,
     parse_generated_questions,
+    parse_source_grounded_question,
     parse_yes_no,
     sanitize_graph_aliases,
     sanitize_graph_evidence,
@@ -958,3 +968,267 @@ async def test_generate_cross_doc_questions_prompt() -> None:
     assert "두 문서" in prompt
     # purpose 라벨이 cross-doc 전용
     assert stub.calls[0]["purpose"] == "goldset_generate_cross_doc"
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P1) — 사실 추출 + evidence_span substring 검증
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_span_in_source_exact() -> None:
+    src = "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
+    assert evidence_span_in_source("Token Validator에 의존한다.", src) is True
+
+
+def test_evidence_span_in_source_whitespace_normalized() -> None:
+    """줄바꿈·들여쓰기 차이는 흡수하되 단어 변경은 잡는다."""
+    src = "Auth Service가\n   결제 인증을  처리한다."
+    assert evidence_span_in_source("Auth Service가 결제 인증을 처리한다.", src) is True
+
+
+def test_evidence_span_in_source_paraphrase_rejected() -> None:
+    """패러프레이즈(단어 변경)는 원문에 없으므로 거부된다."""
+    src = "Auth Service가 Token Validator에 의존한다."
+    assert evidence_span_in_source("인증 서비스는 토큰 검증기에 의존한다.", src) is False
+
+
+def test_evidence_span_in_source_empty_is_false() -> None:
+    assert evidence_span_in_source("", "원문") is False
+    assert evidence_span_in_source("   ", "원문") is False
+
+
+def test_parse_extracted_facts_valid() -> None:
+    text = """
+    [
+      {"entity": "Auth Service", "entity_type": "system",
+       "relation": "depends_on", "target": "Token Validator",
+       "evidence_span": "Auth Service가 Token Validator에 의존한다."}
+    ]
+    """
+    facts = parse_extracted_facts(text)
+    assert len(facts) == 1
+    assert facts[0].entity == "Auth Service"
+    assert facts[0].relation == "depends_on"
+    assert facts[0].target == "Token Validator"
+
+
+def test_parse_extracted_facts_skips_missing_entity_or_span() -> None:
+    text = """
+    [
+      {"entity": "", "evidence_span": "근거"},
+      {"entity": "X", "evidence_span": ""},
+      {"entity": "Y", "evidence_span": "원문 근거 문장"}
+    ]
+    """
+    facts = parse_extracted_facts(text)
+    assert len(facts) == 1
+    assert facts[0].entity == "Y"
+
+
+def test_parse_extracted_facts_parse_error_returns_empty() -> None:
+    assert parse_extracted_facts("not json at all") == []
+
+
+@pytest.mark.asyncio
+async def test_extract_verifiable_facts_validates_and_rejects() -> None:
+    """원문에 존재하는 span 은 통과, 없는 span(환각) 은 폐기된다."""
+    source = "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
+    response = (
+        '[{"entity": "Auth Service", "entity_type": "system",'
+        ' "relation": "depends_on", "target": "Token Validator",'
+        ' "evidence_span": "Token Validator에 의존한다."},'
+        ' {"entity": "Ghost", "entity_type": "system",'
+        ' "evidence_span": "원문에 없는 지어낸 문장이다."}]'
+    )
+    stub = StubLLM([response])
+    facts, stats = await extract_verifiable_facts(
+        source, extraction_llm=stub, n=5, source_doc_id=12,  # type: ignore[arg-type]
+    )
+    assert len(facts) == 1
+    assert facts[0].entity == "Auth Service"
+    assert facts[0].source_doc_id == 12  # 검증 통과 사실에 doc id 박힘
+    assert stats == {
+        "facts_extracted": 2,
+        "facts_evidence_validated": 1,
+        "facts_evidence_rejected": 1,
+    }
+    # 원문이 프롬프트에 들어갔는지
+    assert source in stub.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_extract_verifiable_facts_empty_response() -> None:
+    stub = StubLLM([""])
+    facts, stats = await extract_verifiable_facts(
+        "원문", extraction_llm=stub, n=3,  # type: ignore[arg-type]
+    )
+    assert facts == []
+    assert stats["facts_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_extract_verifiable_facts_passes_seed_and_purpose() -> None:
+    stub = StubLLM(['[{"entity": "X", "evidence_span": "원문 근거"}]'])
+    await extract_verifiable_facts(
+        "원문 근거 문장", extraction_llm=stub, n=1, seed=7,  # type: ignore[arg-type]
+    )
+    assert stub.calls[0]["seed"] == 7
+    assert stub.calls[0]["purpose"] == "goldset_extract_facts"
+
+
+def test_extracted_fact_defaults() -> None:
+    f = ExtractedFact(entity="X")
+    assert f.entity_type == ""
+    assert f.relation == ""
+    assert f.source_doc_id is None
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P2) — 질문/기준답 합성 + 단위 태깅 + judge 게이트
+# ---------------------------------------------------------------------------
+
+
+def test_parse_source_grounded_question_object() -> None:
+    text = (
+        '{"q": "결제 인증 서비스는 어떤 검증 모듈에 의존하나요?",'
+        ' "reference_answer": "Token Validator에 의존한다.",'
+        ' "difficulty": "medium", "acceptable_surface_forms": ["인증 서비스"]}'
+    )
+    sgq = parse_source_grounded_question(text)
+    assert sgq is not None
+    assert sgq.query.startswith("결제 인증")
+    assert sgq.reference_answer == "Token Validator에 의존한다."
+    assert sgq.difficulty == "medium"
+    assert sgq.acceptable_surface_forms == ["인증 서비스"]
+
+
+def test_parse_source_grounded_question_array_takes_first() -> None:
+    sgq = parse_source_grounded_question('[{"q": "질문", "reference_answer": "답"}]')
+    assert sgq is not None
+    assert sgq.query == "질문"
+
+
+def test_parse_source_grounded_question_empty_query_none() -> None:
+    assert parse_source_grounded_question('{"q": "", "reference_answer": "답"}') is None
+    assert parse_source_grounded_question("not json") is None
+
+
+def test_infer_measurement_units_attribute_fact() -> None:
+    """relation/target 없는 속성 사실 → doc + answer (graph 없음)."""
+    f = ExtractedFact(entity="X", evidence_span="근거")
+    assert infer_measurement_units(f) == ["doc", "answer"]
+
+
+def test_infer_measurement_units_relation_fact() -> None:
+    """relation+target 있는 사실 → doc + answer + graph."""
+    f = ExtractedFact(entity="A", relation="depends_on", target="B", evidence_span="근거")
+    assert infer_measurement_units(f) == ["doc", "answer", "graph"]
+
+
+def test_derive_acceptable_surface_forms_drops_leakage() -> None:
+    """원문 고유 식별자 복붙 동의어는 드롭, 이름 변형은 통과."""
+    source = "class AuthService implements TokenValidator { ... }"
+    forms = derive_acceptable_surface_forms(
+        "AuthService",
+        ["auth_service", "TokenValidator"],  # 1째는 이름 변형(통과), 2째는 누설
+        source,
+    )
+    assert "auth_service" in forms
+    assert "TokenValidator" not in forms
+
+
+def test_derive_acceptable_surface_forms_dedup() -> None:
+    forms = derive_acceptable_surface_forms(
+        "결제 서비스", ["결제서비스", "결제서비스"], "원문 본문",
+    )
+    assert forms.count("결제서비스") == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_sg_question_parses_and_sanitizes() -> None:
+    source = "class AuthService implements TokenValidator { 결제 인증 처리 }"
+    fact = ExtractedFact(
+        entity="AuthService", entity_type="system",
+        relation="depends_on", target="TokenValidator",
+        evidence_span="class AuthService implements TokenValidator",
+        source_doc_id=12,
+    )
+    response = (
+        '{"q": "결제 인증을 처리하는 서비스는 어떤 검증 모듈에 의존하나요?",'
+        ' "reference_answer": "토큰 검증 모듈에 의존한다.", "difficulty": "medium",'
+        ' "acceptable_surface_forms": ["auth_service", "TokenValidator"]}'
+    )
+    stub = StubLLM([response])
+    sgq = await generate_sg_question(
+        fact, generator=stub, source_text=source,  # type: ignore[arg-type]
+    )
+    assert sgq is not None
+    # 누설 동의어(TokenValidator)는 제거, 이름 변형(auth_service)은 유지
+    assert "TokenValidator" not in sgq.acceptable_surface_forms
+    assert "auth_service" in sgq.acceptable_surface_forms
+    # 프롬프트에 관계가 들어갔는지
+    assert "depends_on" in stub.calls[0]["prompt"]
+    assert stub.calls[0]["purpose"] == "goldset_generate_sg"
+
+
+@pytest.mark.asyncio
+async def test_generate_sg_question_parse_failure_returns_none() -> None:
+    stub = StubLLM(["완전히 깨진 응답"])
+    sgq = await generate_sg_question(
+        ExtractedFact(entity="X", evidence_span="근거"),
+        generator=stub,  # type: ignore[arg-type]
+    )
+    assert sgq is None
+
+
+@pytest.mark.asyncio
+async def test_filter_source_grounded_question_rejects_missing_evidence() -> None:
+    """evidence_span 이 원문에 없으면 LLM 호출 없이 evidence_missing 으로 탈락."""
+    fact = ExtractedFact(entity="X", evidence_span="원문에 없는 지어낸 근거")
+    judge = StubLLM([])  # 호출되면 빈 응답 → 만약 진행되면 parse_error
+    report = await filter_source_grounded_question(
+        question="질문", fact=fact, source_text="전혀 다른 원문",
+        distractors=[], judge=judge,  # type: ignore[arg-type]
+    )
+    assert report.passed is False
+    assert report.reason == "evidence_missing"
+    assert judge.calls == []  # LLM 호출 전에 차단
+
+
+@pytest.mark.asyncio
+async def test_filter_source_grounded_question_passes_clean() -> None:
+    source = "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
+    fact = ExtractedFact(
+        entity="Auth Service", relation="depends_on", target="Token Validator",
+        evidence_span="Token Validator에 의존한다.",
+    )
+    judge = StubLLM([
+        "yes",  # answerable (evidence_span 근거)
+        "yes",  # unique source
+        "no",   # distractor 답 못 함
+    ])
+    report = await filter_source_grounded_question(
+        question="결제 인증을 처리하는 서비스가 의존하는 검증 모듈은?",
+        fact=fact, source_text=source, distractors=["무관 본문"],
+        judge=judge,  # type: ignore[arg-type]
+    )
+    assert report.passed is True
+
+
+@pytest.mark.asyncio
+async def test_filter_source_grounded_question_not_answerable() -> None:
+    source = "Auth Service가 Token Validator에 의존한다."
+    fact = ExtractedFact(entity="Auth Service", evidence_span="Token Validator에 의존한다.")
+    judge = StubLLM(["no"])  # answerable=no
+    report = await filter_source_grounded_question(
+        question="무관한 질문", fact=fact, source_text=source,
+        distractors=[], judge=judge,  # type: ignore[arg-type]
+    )
+    assert report.passed is False
+    assert report.reason == "not_answerable"
+
+
+def test_source_grounded_question_defaults() -> None:
+    sgq = SourceGroundedQuestion(query="q")
+    assert sgq.reference_answer == ""
+    assert sgq.acceptable_surface_forms == []

@@ -188,6 +188,15 @@ eval:
   # reasoning_profiles 는 모델 family 별로 페이로드 형식이 다르므로 (Qwen3 의
   # enable_thinking vs DeepSeek 의 thinking 등), generator/judge 가 system 과
   # 다른 family 라면 여기서 별도 매핑을 정의하는 것이 안전하다.
+  # source-grounded 골드 (PR #79) 는 모델 4중 분리를 권장한다:
+  #   추출(extraction) ≠ 시스템(llm.* — 인덱싱/planner/HyDE) ≠ judge, + 임베딩 분리.
+  # 각 키가 비면 상위 llm.* / processor.embedding_* 로 폴백한다 (= 충돌로 판정됨).
+  extraction:                      # 원문에서 검증가능 사실 추출 (evidence_span)
+    endpoint: ""                   # 인덱싱·시스템 모델과 다른 모델 권장
+    model: ""
+    api_key: ""
+    headers: {}
+    reasoning_profiles: {}
   generator:                       # 골드셋 질의 합성
     endpoint: ""                   # 예: "http://strong-model:8080/v1"
     model: ""                      # 예: "gpt-4o" 또는 "claude-sonnet-4"
@@ -200,6 +209,10 @@ eval:
     api_key: ""
     headers: {}
     reasoning_profiles: {}         # generator 와 다른 family 라면 별도 매핑
+  embedding:                       # 평가용 임베딩 (인덱싱 임베딩과 분리 시 self-fitting 완화)
+    provider: ""                   # 비면 processor.embedding_provider 로 폴백
+    model: ""                      # 비면 processor.embedding_model 로 폴백
+    endpoint: ""                   # 비면 processor.embedding_endpoint 로 폴백
 
 storage:
   vector_db: "chromadb"

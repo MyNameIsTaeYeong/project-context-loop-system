@@ -107,22 +107,33 @@ from context_loop.eval.gold_set import (  # noqa: E402
     GoldSet,
     GraphEntityRef,
     GraphRelationRef,
+    SupportingFact,
     save_gold_set,
 )
 from context_loop.eval.graph_match import (  # noqa: E402
     DEFAULT_GRAPH_MATCH_THRESHOLD,
     aembed_with_client,
 )
-from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
+from context_loop.eval.llm import (  # noqa: E402
+    build_eval_llm_client,
+    detect_role_collisions,
+    role_is_configured,
+)
 from context_loop.eval.synth import (  # noqa: E402
+    ExtractedFact,
     GeneratedGraphQuestion,
+    SourceGroundedQuestion,
     build_korean_stopwords_from_corpus,
     build_subgraph_snippet,
+    extract_verifiable_facts,
     filter_question,
+    filter_source_grounded_question,
     find_equivalent_documents,
     generate_cross_doc_questions,
     generate_graph_questions,
     generate_questions,
+    generate_sg_question,
+    infer_measurement_units,
     make_text_anchor,
     sanitize_graph_aliases,
     sanitize_graph_evidence,
@@ -454,6 +465,12 @@ async def build(
     equivalence_enabled: bool = False,
     equivalence_top_m: int = 3,
     equivalence_min_similarity: float = 0.6,
+    enable_source_grounded: bool = False,
+    extraction: LLMClient | None = None,
+    facts_per_doc: int = 5,
+    extraction_model: str = "",
+    extraction_endpoint: str = "",
+    extraction_configured_separately: bool = False,
 ) -> GoldSet:
     """전체 파이프라인 실행.
 
@@ -570,31 +587,68 @@ async def build(
         effective_concurrency = max(1, concurrency)
         sem = asyncio.Semaphore(effective_concurrency)
 
-        # next_id 는 chunk 모드 → graph 모드로 연속 부여한다 (D-3).
+        # next_id 는 1차 모드 → graph 모드로 연속 부여한다 (D-3).
+        # source-grounded 모드는 chunk 모드를 대체한다(같은 원문 코퍼스에 대한
+        # 대안 생성 전략 — 인덱스→골드 역생성 vs 원문→골드 evidence 고정).
         next_id = 1
-        next_id = await _run_chunk_mode(
-            sampled=sampled,
-            distractor_pool=distractor_pool,
-            generator=generator,
-            judge=judge,
-            questions_per_chunk=questions_per_chunk,
-            n_distractors=n_distractors,
-            reasoning_mode=reasoning_mode,
-            apply_filter=apply_filter,
-            sem=sem,
-            items=items,
-            stats=stats,
-            next_id=next_id,
-            generator_temperature=generator_temperature,
-            generator_seed_base=generator_seed_base,
-            extra_korean_stopwords=extra_korean_stopwords,
-            max_doc_tokens=max_doc_tokens,
-            equivalence_enabled=equiv_active,
-            equivalence_top_m=equivalence_top_m,
-            equivalence_min_similarity=equivalence_min_similarity,
-            vector_store=equiv_vector_store,
-            embedding_client=embedding_client,
-        )
+        if enable_source_grounded:
+            if extraction is None:
+                raise RuntimeError(
+                    "source-grounded 모드에는 extraction LLM 이 필요합니다 "
+                    "(build_eval_llm_client(config, 'extraction')).",
+                )
+            provenance_base = {
+                "extraction_model": extraction_model,
+                "extraction_endpoint": extraction_endpoint,
+                "generator_model": generator_model,
+                "judge_model": judge_model,
+                "embedding_model": embedding_model_id,
+            }
+            next_id = await _run_source_grounded_mode(
+                sampled=sampled,
+                distractor_pool=distractor_pool,
+                extraction=extraction,
+                generator=generator,
+                judge=judge,
+                facts_per_doc=facts_per_doc,
+                n_distractors=n_distractors,
+                reasoning_mode=reasoning_mode,
+                apply_filter=apply_filter,
+                sem=sem,
+                items=items,
+                stats=stats,
+                next_id=next_id,
+                score_relations=score_relations,
+                generator_temperature=generator_temperature,
+                generator_seed_base=generator_seed_base,
+                extra_korean_stopwords=extra_korean_stopwords,
+                max_doc_tokens=max_doc_tokens,
+                provenance_base=provenance_base,
+            )
+        else:
+            next_id = await _run_chunk_mode(
+                sampled=sampled,
+                distractor_pool=distractor_pool,
+                generator=generator,
+                judge=judge,
+                questions_per_chunk=questions_per_chunk,
+                n_distractors=n_distractors,
+                reasoning_mode=reasoning_mode,
+                apply_filter=apply_filter,
+                sem=sem,
+                items=items,
+                stats=stats,
+                next_id=next_id,
+                generator_temperature=generator_temperature,
+                generator_seed_base=generator_seed_base,
+                extra_korean_stopwords=extra_korean_stopwords,
+                max_doc_tokens=max_doc_tokens,
+                equivalence_enabled=equiv_active,
+                equivalence_top_m=equivalence_top_m,
+                equivalence_min_similarity=equivalence_min_similarity,
+                vector_store=equiv_vector_store,
+                embedding_client=embedding_client,
+            )
 
         # 그래프 모드 실행 — chunk 모드 이후에 머지
         if enable_graph_mode and graph_store is not None:
@@ -645,7 +699,7 @@ async def build(
                 extra_korean_stopwords=extra_korean_stopwords,
             )
 
-        generation_modes = ["chunk"]
+        generation_modes = ["source_grounded"] if enable_source_grounded else ["chunk"]
         if enable_graph_mode:
             generation_modes.append("graph")
         if enable_cross_doc:
@@ -703,6 +757,17 @@ async def build(
             metadata["cross_doc_enabled"] = True
             metadata["cross_doc_max_seeds"] = cross_doc_max_seeds
             metadata["cross_doc_generation"] = "deterministic_seed+llm_phrasing"
+
+        if enable_source_grounded:
+            # PR #79 — source-grounded 추적성 + 4중 모델 분리 기록.
+            metadata["source_grounded"] = True
+            metadata["facts_per_doc"] = facts_per_doc
+            metadata["extraction_model"] = extraction_model
+            metadata["extraction_endpoint"] = extraction_endpoint
+            metadata["extraction_configured_separately"] = (
+                extraction_configured_separately
+            )
+            metadata["measurement_unit_coverage"] = _measurement_unit_coverage(items)
 
         gold = GoldSet(version=1, items=items, metadata=metadata)
         save_gold_set(gold, output_path)
@@ -987,6 +1052,208 @@ def _merge_stats(target: dict[str, int], local: dict[str, int]) -> None:
     """LocalStats dict 를 main stats 에 더한다 (동적 키 포함)."""
     for k, v in local.items():
         target[k] = target.get(k, 0) + v
+
+
+def _measurement_unit_coverage(items: list[GoldItem]) -> dict[str, int]:
+    """골드 항목들의 측정 단위 커버리지 (doc/answer/graph) 집계 (PR #79)."""
+    return {
+        unit: sum(1 for it in items if unit in it.measurement_units)
+        for unit in ("doc", "answer", "graph")
+    }
+
+
+async def _process_source_grounded_item(
+    idx: int,
+    doc: dict[str, Any],
+    *,
+    distractor_pool: list[dict[str, Any]],
+    extraction: LLMClient,
+    generator: LLMClient,
+    judge: LLMClient,
+    facts_per_doc: int,
+    n_distractors: int,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    sem: asyncio.Semaphore,
+    total: int,
+    score_relations: bool = False,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+    max_doc_tokens: int = 0,
+    provenance_base: dict[str, Any] | None = None,
+) -> tuple[list[GoldItem], dict[str, int]]:
+    """원문 문서 1건을 source-grounded 경로로 처리 (PR #79 통합 배선).
+
+    파이프라인(계획서 §5): 원문 → 사실 추출(evidence_span 검증) → 사실별 질문+
+    기준답 합성 → judge 게이트 → doc/answer/graph 통합 GoldItem 조립.
+    ``id`` 는 호출자가 idx 순으로 부여한다(다른 모드와 동일 규약).
+    """
+    async with sem:
+        doc_id = int(doc["document_id"])
+        logger.info(
+            "[sg doc start %d/%d] doc=%d, source_type=%s",
+            idx, total, doc_id, doc["source_type"],
+        )
+        local_items: list[GoldItem] = []
+        local_stats: dict[str, int] = {}
+        item_seed = (
+            generator_seed_base + doc_id
+            if generator_seed_base is not None
+            else None
+        )
+
+        facts, fstats = await extract_verifiable_facts(
+            doc["content"],
+            extraction_llm=extraction,
+            n=facts_per_doc,
+            source_doc_id=doc_id,
+            reasoning_mode=reasoning_mode,
+            temperature=generator_temperature,
+            seed=item_seed,
+            doc_max_tokens=max_doc_tokens,
+        )
+        local_stats["sg_facts_extracted"] = fstats.get("facts_extracted", 0)
+        local_stats["sg_facts_validated"] = fstats.get("facts_evidence_validated", 0)
+        local_stats["sg_facts_rejected"] = fstats.get("facts_evidence_rejected", 0)
+
+        if not facts:
+            logger.info("[sg doc done %d/%d] (검증 사실 0)", idx, total)
+            return local_items, local_stats
+
+        # distractor 는 같은 source_type 우선 (chunk 모드와 동일 정책).
+        same_type = [
+            c for c in distractor_pool if c["source_type"] == doc["source_type"]
+        ][:n_distractors]
+        if len(same_type) < n_distractors:
+            fill = [c for c in distractor_pool if c not in same_type]
+            same_type += fill[: n_distractors - len(same_type)]
+        distractor_excerpts = [_distractor_excerpt(d["content"]) for d in same_type]
+
+        for j, fact in enumerate(facts):
+            gen_seed = (item_seed + 10000 + j) if item_seed is not None else None
+            sgq = await generate_sg_question(
+                fact,
+                generator=generator,
+                source_text=doc["content"],
+                reasoning_mode=reasoning_mode,
+                temperature=generator_temperature,
+                seed=gen_seed,
+                extra_korean_stopwords=extra_korean_stopwords,
+            )
+            local_stats["sg_generated"] = local_stats.get("sg_generated", 0) + 1
+            if sgq is None:
+                local_stats["fail_parse"] = local_stats.get("fail_parse", 0) + 1
+                continue
+
+            if apply_filter:
+                judge_seed = (
+                    (item_seed + 20000 + j) if item_seed is not None else None
+                )
+                report = await filter_source_grounded_question(
+                    sgq.query, fact, doc["content"], distractor_excerpts,
+                    judge=judge, reasoning_mode=reasoning_mode, seed=judge_seed,
+                    extra_korean_stopwords=extra_korean_stopwords,
+                )
+                if not report.passed:
+                    key = f"fail_{report.reason}" if report.reason else "fail_parse"
+                    local_stats[key] = local_stats.get(key, 0) + 1
+                    logger.info(
+                        "  fact%d 탈락 — reason=%s, query=%s",
+                        j + 1, report.reason, sgq.query[:80],
+                    )
+                    continue
+
+            provenance = dict(provenance_base or {})
+            provenance["seed"] = item_seed
+            item = build_source_grounded_gold_item(
+                sgq, [fact],
+                source_type=doc["source_type"],
+                source_text=doc["content"],
+                score_relations=score_relations,
+                provenance=provenance,
+            )
+            item.source_section_path = doc.get("title", "")
+            local_items.append(item)
+            local_stats["sg_passed"] = local_stats.get("sg_passed", 0) + 1
+            logger.info(
+                "  fact%d 통과 — units=%s, query=%s",
+                j + 1, item.measurement_units, sgq.query[:60],
+            )
+
+        logger.info(
+            "[sg doc done %d/%d] passed=%d", idx, total,
+            local_stats.get("sg_passed", 0),
+        )
+        return local_items, local_stats
+
+
+async def _run_source_grounded_mode(
+    *,
+    sampled: list[dict[str, Any]],
+    distractor_pool: list[dict[str, Any]],
+    extraction: LLMClient,
+    generator: LLMClient,
+    judge: LLMClient,
+    facts_per_doc: int,
+    n_distractors: int,
+    reasoning_mode: str | None,
+    apply_filter: bool,
+    sem: asyncio.Semaphore,
+    items: list[GoldItem],
+    stats: dict[str, int],
+    next_id: int,
+    score_relations: bool = False,
+    generator_temperature: float = 0.0,
+    generator_seed_base: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+    max_doc_tokens: int = 0,
+    provenance_base: dict[str, Any] | None = None,
+) -> int:
+    """원문 문서들을 source-grounded 경로로 동시 처리하고 items 에 합친다.
+
+    Returns: 다음 idx 에 사용될 ``next_id``.
+    """
+    total = len(sampled)
+    tasks = [
+        _process_source_grounded_item(
+            idx, doc,
+            distractor_pool=distractor_pool,
+            extraction=extraction,
+            generator=generator,
+            judge=judge,
+            facts_per_doc=facts_per_doc,
+            n_distractors=n_distractors,
+            reasoning_mode=reasoning_mode,
+            apply_filter=apply_filter,
+            sem=sem,
+            total=total,
+            score_relations=score_relations,
+            generator_temperature=generator_temperature,
+            generator_seed_base=generator_seed_base,
+            extra_korean_stopwords=extra_korean_stopwords,
+            max_doc_tokens=max_doc_tokens,
+            provenance_base=provenance_base,
+        )
+        for idx, doc in enumerate(sampled, start=1)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for idx, r in enumerate(results, start=1):
+        if isinstance(r, BaseException):
+            logger.exception(
+                "[sg fail %d/%d] %s", idx, total, r,
+                exc_info=r if isinstance(r, Exception) else None,
+            )
+            stats["fail_runtime"] = stats.get("fail_runtime", 0) + 1
+            continue
+        local_items, local_stats = r
+        for item in local_items:
+            item.id = f"q{next_id:04d}"
+            items.append(item)
+            next_id += 1
+        _merge_stats(stats, local_stats)
+    return next_id
 
 
 async def _process_subgraph_item(
@@ -1470,6 +1737,109 @@ def _build_graph_metadata(
     }
 
 
+def _fact_to_supporting_fact(
+    fact: ExtractedFact,
+    *,
+    acceptable_surface_forms: list[str] | None = None,
+) -> SupportingFact:
+    """``ExtractedFact`` (synth 합성 레이어) 를 ``SupportingFact`` (골드 스키마) 로 매핑.
+
+    PR #79 P2 — synth.py 가 gold_set 스키마에 의존하지 않도록 분리해 둔 두 타입
+    사이의 경계 변환. ``acceptable_surface_forms`` 는 누설 게이트를 통과한 검증
+    동의어만 들어온다 (호출자가 ``derive_acceptable_surface_forms`` 로 정제).
+    """
+    return SupportingFact(
+        entity=fact.entity,
+        entity_type=fact.entity_type,
+        relation=fact.relation,
+        target=fact.target,
+        evidence_span=fact.evidence_span,
+        source_doc_id=fact.source_doc_id,
+        acceptable_surface_forms=list(acceptable_surface_forms or []),
+    )
+
+
+def build_source_grounded_gold_item(
+    sgq: SourceGroundedQuestion,
+    facts: list[ExtractedFact],
+    *,
+    source_type: str = "",
+    source_text: str = "",
+    score_relations: bool = False,
+    provenance: dict[str, Any] | None = None,
+) -> GoldItem:
+    """SG 질문 + 근거 사실들을 통합 ``GoldItem`` 으로 조립한다 (PR #79 P2).
+
+    한 원천 사실(들)이 ``measurement_units`` 에 따라 doc/answer/graph 세 단위를
+    동시에 서빙하도록 정답키를 파생한다 (계획서 §4):
+    - **doc**: ``relevant_doc_ids`` ← 사실들의 ``source_doc_id`` (중복 제거·정렬).
+    - **answer**: ``reference_answer`` ← ``sgq.reference_answer``.
+    - **graph**: ``relevant_graph_entities`` / (옵션)``relevant_graph_relations``
+      ← relation+target 을 가진 사실에서 파생.
+
+    ``sgq.acceptable_surface_forms`` 는 주체 엔티티(facts[0]) 의 검증 동의어로
+    붙인다. ``id`` 는 placeholder ``""`` — 호출 루프가 idx 순으로 부여한다
+    (graph/chunk 모드와 동일 규약).
+    """
+    primary = facts[0] if facts else None
+    supporting: list[SupportingFact] = []
+    for i, f in enumerate(facts):
+        forms = sgq.acceptable_surface_forms if i == 0 else []
+        supporting.append(_fact_to_supporting_fact(f, acceptable_surface_forms=forms))
+
+    # doc 단위 — evidence_span 출처 문서들.
+    doc_ids = sorted({
+        f.source_doc_id for f in facts if f.source_doc_id is not None
+    })
+
+    # measurement_units — 사실별 단위의 합집합 (순서 doc<answer<graph 유지).
+    unit_set: set[str] = set()
+    for f in facts:
+        unit_set.update(infer_measurement_units(f))
+    units = [u for u in ("doc", "answer", "graph") if u in unit_set]
+
+    # graph 단위 — relation+target 사실에서 엔티티/관계 파생.
+    graph_entities: list[GraphEntityRef] = []
+    graph_relations: list[GraphRelationRef] = []
+    if "graph" in units:
+        seen_entities: set[tuple[str, str]] = set()
+        for i, f in enumerate(facts):
+            if not (f.relation and f.target):
+                continue
+            key = (f.entity.lower(), f.entity_type)
+            if key not in seen_entities:
+                seen_entities.add(key)
+                graph_entities.append(GraphEntityRef(
+                    name=f.entity,
+                    type=f.entity_type,
+                    aliases=list(sgq.acceptable_surface_forms) if i == 0 else [],
+                ))
+            if score_relations:
+                graph_relations.append(GraphRelationRef(
+                    source_name=f.entity,
+                    target_name=f.target,
+                    relation_type=f.relation,
+                ))
+
+    return GoldItem(
+        id="",
+        query=sgq.query,
+        relevant_doc_ids=doc_ids,
+        relevant_doc_groups=[[d] for d in doc_ids],
+        relevant_graph_entities=graph_entities,
+        relevant_graph_relations=graph_relations,
+        source_type=source_type,
+        source_document_id=(primary.source_doc_id if primary else None),
+        source_text_anchor=(make_text_anchor(source_text) if source_text else None),
+        difficulty=sgq.difficulty,
+        synthesized=True,
+        reference_answer=sgq.reference_answer,
+        supporting_facts=supporting,
+        measurement_units=units,
+        provenance=dict(provenance or {}),
+    )
+
+
 def _make_graph_gold_item(
     sg: dict[str, Any],
     gq: GeneratedGraphQuestion,
@@ -1879,6 +2249,28 @@ def main() -> None:
              "그것도 비면 llm.headers.",
     )
 
+    # PR #79 — source-grounded 모드 (원문→골드 evidence 고정, 3단위 동시 서빙).
+    parser.add_argument(
+        "--source-grounded", action="store_true",
+        help="원문에서 검증가능 사실(evidence_span)을 추출해 doc/answer/graph "
+             "3단위를 동시 서빙하는 통합 골드를 생성한다 (chunk 역생성 모드 대체). "
+             "추출 LLM(--extraction-* / config.eval.extraction)이 인덱싱·시스템 "
+             "모델과 분리되어야 한다(self-fitting 차단).",
+    )
+    parser.add_argument(
+        "--facts-per-doc", type=int, default=5,
+        help="--source-grounded 모드에서 문서당 추출할 검증가능 사실 수 상한 "
+             "(기본 5). 각 사실이 질문 1개로 합성된다.",
+    )
+    parser.add_argument("--extraction-endpoint", default="")
+    parser.add_argument("--extraction-model", default="")
+    parser.add_argument("--extraction-api-key", default="")
+    parser.add_argument(
+        "--extraction-headers", default="",
+        help="Extraction 헤더 JSON. 미지정 시 config.eval.extraction.headers, "
+             "그것도 비면 llm.headers.",
+    )
+
     # 3차 — 항목 단위 병렬 처리 (R1).
     parser.add_argument(
         "--concurrency", type=int, default=1,
@@ -1967,6 +2359,51 @@ def main() -> None:
             model_override=args.judge_model,
         )
     )
+
+    # PR #79 — source-grounded 모드의 추출 LLM (4중 분리: 추출 ≠ 시스템(인덱싱) ≠
+    # generator ≠ judge). 추출이 system 과 같으면 정답이 인덱싱과 같은 모델에서
+    # 유래 → self-fitting. --allow-self-eval 없이는 차단한다.
+    extraction: LLMClient | None = None
+    extraction_configured = False
+    effective_extraction_model = ""
+    effective_extraction_endpoint = ""
+    if args.source_grounded:
+        extraction = build_eval_llm_client(
+            config, "extraction",
+            endpoint_override=args.extraction_endpoint,
+            model_override=args.extraction_model,
+            api_key_override=args.extraction_api_key,
+            headers_override_json=args.extraction_headers,
+        )
+        collisions = detect_role_collisions(
+            config,
+            extraction_endpoint_override=args.extraction_endpoint,
+            extraction_model_override=args.extraction_model,
+            generator_endpoint_override=args.generator_endpoint,
+            generator_model_override=args.generator_model,
+            judge_endpoint_override=args.judge_endpoint,
+            judge_model_override=args.judge_model,
+        )
+        extraction_configured = not collisions["extraction_eq_system"]
+        if collisions["extraction_eq_system"] and not args.allow_self_eval:
+            parser.error(
+                "source-grounded: 추출 LLM 이 system LLM (llm.* — 인덱싱/시스템) 과 "
+                "동일합니다. 정답이 인덱싱과 같은 모델에서 유래하면 self-fitting "
+                "위험이 있습니다. config.eval.extraction 또는 --extraction-* 로 분리 "
+                "모델을 지정하거나, 의도적이면 --allow-self-eval 을 명시하세요.",
+            )
+        if collisions["extraction_eq_generator"]:
+            logger.warning(
+                "source-grounded: 추출 LLM 과 generator 가 동일 모델입니다 — 사실 "
+                "추출과 질문 합성이 같은 모델이라 편향 가능. 분리 권장.",
+            )
+        effective_extraction_model, effective_extraction_endpoint = (
+            _resolve_eval_role_identity(
+                config, "extraction",
+                endpoint_override=args.extraction_endpoint,
+                model_override=args.extraction_model,
+            )
+        )
 
     source_types = [s.strip() for s in args.source_types.split(",") if s.strip()] or None
 
@@ -2057,6 +2494,12 @@ def main() -> None:
                 equivalence_enabled=bool(args.equivalence_detection),
                 equivalence_top_m=int(args.equivalence_top_m),
                 equivalence_min_similarity=float(args.equivalence_min_similarity),
+                enable_source_grounded=bool(args.source_grounded),
+                extraction=extraction,
+                facts_per_doc=int(args.facts_per_doc),
+                extraction_model=effective_extraction_model,
+                extraction_endpoint=effective_extraction_endpoint,
+                extraction_configured_separately=bool(extraction_configured),
             )
 
     asyncio.run(_run_all())

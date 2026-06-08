@@ -1137,3 +1137,252 @@ def test_merge_stats_empty_local_noop() -> None:
     target: dict[str, int] = {"generated": 5}
     builder._merge_stats(target, {})
     assert target == {"generated": 5}
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P2) — ExtractedFact → SupportingFact → GoldItem 조립
+# ---------------------------------------------------------------------------
+
+
+def test_fact_to_supporting_fact_maps_fields() -> None:
+    from context_loop.eval.synth import ExtractedFact
+
+    fact = ExtractedFact(
+        entity="Auth Service", entity_type="system",
+        relation="depends_on", target="Token Validator",
+        evidence_span="Auth Service가 Token Validator에 의존한다.",
+        source_doc_id=12,
+    )
+    sf = builder._fact_to_supporting_fact(fact, acceptable_surface_forms=["인증 서비스"])
+    assert sf.entity == "Auth Service"
+    assert sf.relation == "depends_on"
+    assert sf.target == "Token Validator"
+    assert sf.source_doc_id == 12
+    assert sf.acceptable_surface_forms == ["인증 서비스"]
+
+
+def test_build_source_grounded_gold_item_three_units() -> None:
+    """relation 사실 → doc+answer+graph 3단위 동시 서빙."""
+    from context_loop.eval.synth import ExtractedFact, SourceGroundedQuestion
+
+    fact = ExtractedFact(
+        entity="Auth Service", entity_type="system",
+        relation="depends_on", target="Token Validator",
+        evidence_span="Auth Service가 Token Validator에 의존한다.",
+        source_doc_id=12,
+    )
+    sgq = SourceGroundedQuestion(
+        query="결제 인증을 처리하는 서비스가 의존하는 검증 모듈은?",
+        reference_answer="Token Validator에 의존한다.",
+        difficulty="medium",
+        acceptable_surface_forms=["인증 서비스"],
+    )
+    item = builder.build_source_grounded_gold_item(
+        sgq, [fact], source_type="confluence_mcp",
+        source_text="Auth Service가 Token Validator에 의존한다.",
+        score_relations=True,
+        provenance={"extraction_model": "m-a", "seed": 7},
+    )
+    assert item.id == ""  # placeholder — 호출 루프가 부여
+    assert item.measurement_units == ["doc", "answer", "graph"]
+    assert item.relevant_doc_ids == [12]
+    assert item.relevant_doc_groups == [[12]]
+    assert item.reference_answer == "Token Validator에 의존한다."
+    assert len(item.supporting_facts) == 1
+    assert item.relevant_graph_entities[0].name == "Auth Service"
+    assert item.relevant_graph_entities[0].aliases == ["인증 서비스"]
+    assert item.relevant_graph_relations[0].relation_type == "depends_on"
+    assert item.provenance["seed"] == 7
+    assert item.synthesized is True
+
+
+def test_build_source_grounded_gold_item_attribute_fact_no_graph() -> None:
+    """relation 없는 속성 사실 → doc+answer 만 (graph 엔티티/관계 없음)."""
+    from context_loop.eval.synth import ExtractedFact, SourceGroundedQuestion
+
+    fact = ExtractedFact(
+        entity="결제 한도", entity_type="concept",
+        evidence_span="결제 한도는 일 100만원이다.", source_doc_id=5,
+    )
+    sgq = SourceGroundedQuestion(query="일일 결제 한도는?", reference_answer="100만원")
+    item = builder.build_source_grounded_gold_item(sgq, [fact])
+    assert item.measurement_units == ["doc", "answer"]
+    assert item.relevant_graph_entities == []
+    assert item.relevant_graph_relations == []
+    assert item.relevant_doc_ids == [5]
+
+
+def test_build_source_grounded_gold_item_roundtrip_serializable() -> None:
+    """조립된 GoldItem 이 to_dict/from_dict round-trip 된다 (P0 스키마 호환)."""
+    from context_loop.eval.gold_set import GoldItem
+    from context_loop.eval.synth import ExtractedFact, SourceGroundedQuestion
+
+    fact = ExtractedFact(
+        entity="A", relation="calls", target="B",
+        evidence_span="A는 B를 호출한다.", source_doc_id=3,
+    )
+    sgq = SourceGroundedQuestion(query="q", reference_answer="a")
+    item = builder.build_source_grounded_gold_item(
+        sgq, [fact], source_type="git_code", score_relations=True,
+    )
+    restored = GoldItem.from_dict(item.to_dict())
+    assert restored.measurement_units == ["doc", "answer", "graph"]
+    assert restored.supporting_facts[0].evidence_span == "A는 B를 호출한다."
+    assert restored.reference_answer == "a"
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 통합 배선) — _process_source_grounded_item E2E
+# ---------------------------------------------------------------------------
+
+
+class _RoleStub:
+    """역할별 응답 큐를 가진 LLM 스텁 (extraction/generator/judge 각각)."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict] = []  # type: ignore[type-arg]
+
+    async def complete(self, prompt: str, **kwargs) -> str:  # type: ignore[no-untyped-def]
+        self.calls.append({"prompt": prompt, **kwargs})
+        return self._responses.pop(0) if self._responses else ""
+
+
+def _sg_doc() -> dict:  # type: ignore[type-arg]
+    return {
+        "document_id": 12,
+        "source_type": "confluence_mcp",
+        "content": "Auth Service가 Token Validator에 의존한다. 추가 본문 내용.",
+        "title": "인증 설계",
+        "url": "",
+    }
+
+
+@_pytest.mark.asyncio
+async def test_process_source_grounded_item_full_pass() -> None:
+    """원문→추출→합성→judge 통과→3단위 GoldItem 1개 생성."""
+    import asyncio as _asyncio
+
+    extraction = _RoleStub([
+        '[{"entity": "Auth Service", "entity_type": "system",'
+        ' "relation": "depends_on", "target": "Token Validator",'
+        ' "evidence_span": "Auth Service가 Token Validator에 의존한다."}]'
+    ])
+    generator = _RoleStub([
+        '{"q": "결제 인증을 처리하는 모듈이 의존하는 검증 구성요소는?",'
+        ' "reference_answer": "토큰 검증 구성요소에 의존한다.",'
+        ' "difficulty": "medium", "acceptable_surface_forms": []}'
+    ])
+    # filter: is_answerable=yes, is_unique_source=yes, distractor is_answerable=no
+    judge = _RoleStub(["yes", "yes", "no"])
+
+    items, stats = await builder._process_source_grounded_item(
+        1, _sg_doc(),
+        distractor_pool=[{
+            "document_id": 99, "source_type": "confluence_mcp",
+            "content": "전혀 무관한 다른 문서 본문.", "title": "", "url": "",
+        }],
+        extraction=extraction,  # type: ignore[arg-type]
+        generator=generator,  # type: ignore[arg-type]
+        judge=judge,  # type: ignore[arg-type]
+        facts_per_doc=5,
+        n_distractors=1,
+        reasoning_mode="off",
+        apply_filter=True,
+        sem=_asyncio.Semaphore(1),
+        total=1,
+        score_relations=True,
+        provenance_base={"extraction_model": "m-ext", "generator_model": "m-gen"},
+    )
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.measurement_units == ["doc", "answer", "graph"]
+    assert item.relevant_doc_ids == [12]
+    assert item.reference_answer == "토큰 검증 구성요소에 의존한다."
+    assert item.supporting_facts[0].evidence_span == "Auth Service가 Token Validator에 의존한다."
+    assert item.relevant_graph_relations[0].relation_type == "depends_on"
+    assert item.provenance["extraction_model"] == "m-ext"
+    assert item.source_section_path == "인증 설계"
+    assert stats["sg_facts_validated"] == 1
+    assert stats["sg_passed"] == 1
+
+
+@_pytest.mark.asyncio
+async def test_process_source_grounded_item_hallucinated_evidence_dropped() -> None:
+    """evidence_span 이 원문에 없으면 추출 단계에서 폐기 → 항목 0."""
+    import asyncio as _asyncio
+
+    extraction = _RoleStub([
+        '[{"entity": "Ghost", "entity_type": "system",'
+        ' "evidence_span": "원문에 존재하지 않는 지어낸 문장이다."}]'
+    ])
+    generator = _RoleStub([])  # 호출되면 안 됨
+    judge = _RoleStub([])
+
+    items, stats = await builder._process_source_grounded_item(
+        1, _sg_doc(),
+        distractor_pool=[],
+        extraction=extraction,  # type: ignore[arg-type]
+        generator=generator,  # type: ignore[arg-type]
+        judge=judge,  # type: ignore[arg-type]
+        facts_per_doc=5,
+        n_distractors=0,
+        reasoning_mode="off",
+        apply_filter=True,
+        sem=_asyncio.Semaphore(1),
+        total=1,
+    )
+
+    assert items == []
+    assert stats["sg_facts_extracted"] == 1
+    assert stats["sg_facts_validated"] == 0
+    assert stats["sg_facts_rejected"] == 1
+    assert generator.calls == []  # 사실 0 → generator 미호출
+
+
+@_pytest.mark.asyncio
+async def test_process_source_grounded_item_no_filter_skips_judge() -> None:
+    """apply_filter=False → judge 미호출, 바로 조립."""
+    import asyncio as _asyncio
+
+    extraction = _RoleStub([
+        '[{"entity": "Auth Service", "entity_type": "system",'
+        ' "evidence_span": "추가 본문 내용."}]'
+    ])
+    generator = _RoleStub([
+        '{"q": "인증 모듈의 부가 동작은?", "reference_answer": "부가 본문 참조",'
+        ' "difficulty": "easy"}'
+    ])
+    judge = _RoleStub([])
+
+    items, stats = await builder._process_source_grounded_item(
+        1, _sg_doc(),
+        distractor_pool=[],
+        extraction=extraction,  # type: ignore[arg-type]
+        generator=generator,  # type: ignore[arg-type]
+        judge=judge,  # type: ignore[arg-type]
+        facts_per_doc=5,
+        n_distractors=0,
+        reasoning_mode="off",
+        apply_filter=False,
+        sem=_asyncio.Semaphore(1),
+        total=1,
+    )
+
+    assert len(items) == 1
+    # relation 없는 속성 사실 → doc + answer 만
+    assert items[0].measurement_units == ["doc", "answer"]
+    assert judge.calls == []  # filter off → judge 미호출
+    assert stats["sg_passed"] == 1
+
+
+def test_measurement_unit_coverage_helper() -> None:
+    from context_loop.eval.gold_set import GoldItem
+
+    items = [
+        GoldItem(id="a", query="?", measurement_units=["doc", "answer", "graph"]),
+        GoldItem(id="b", query="?", measurement_units=["doc", "answer"]),
+    ]
+    cov = builder._measurement_unit_coverage(items)
+    assert cov == {"doc": 2, "answer": 2, "graph": 1}

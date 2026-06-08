@@ -22,7 +22,7 @@ from typing import Any, Literal
 from context_loop.config import Config
 from context_loop.processor.llm_client import LLMClient
 
-EvalRole = Literal["generator", "judge"]
+EvalRole = Literal["extraction", "generator", "judge"]
 
 
 def _parse_headers_json(headers_json: str) -> dict[str, str]:
@@ -141,7 +141,7 @@ def build_eval_llm_client(
 
     Args:
         config: 애플리케이션 Config.
-        role: ``"generator"`` 또는 ``"judge"``.
+        role: ``"extraction"`` / ``"generator"`` / ``"judge"``.
         endpoint_override: CLI ``--{role}-endpoint``.
         model_override: CLI ``--{role}-model``.
         api_key_override: CLI ``--{role}-api-key``.
@@ -153,7 +153,7 @@ def build_eval_llm_client(
     Raises:
         ValueError: ``role`` 이 알 수 없는 값이거나 헤더 JSON 파싱 실패.
     """
-    if role not in ("generator", "judge"):
+    if role not in ("extraction", "generator", "judge"):
         raise ValueError(f"알 수 없는 role: {role}")
 
     role_path = f"eval.{role}"
@@ -232,6 +232,46 @@ def _effective_role_target(
     return str(endpoint), str(model)
 
 
+def _effective_embedding_target(
+    config: Config,
+    *,
+    provider_override: str = "",
+    model_override: str = "",
+    endpoint_override: str = "",
+) -> tuple[str, str, str]:
+    """평가용 임베딩의 실제 적용될 ``(provider, model, endpoint)`` 을 계산.
+
+    우선순위: CLI override > ``config.eval.embedding.*`` > ``config.processor.embedding_*``.
+    eval 전용 임베딩이 비면 인덱싱 임베딩(``processor.embedding_*``) 으로 폴백한다 →
+    :func:`detect_role_collisions` 에서 인덱스와 동일 판정(self-fitting 위험).
+    """
+    provider = (
+        provider_override
+        or (config.get("eval.embedding.provider") or "")
+        or (config.get("processor.embedding_provider") or "")
+    )
+    model = (
+        model_override
+        or (config.get("eval.embedding.model") or "")
+        or (config.get("processor.embedding_model") or "")
+    )
+    endpoint = (
+        endpoint_override
+        or (config.get("eval.embedding.endpoint") or "")
+        or (config.get("processor.embedding_endpoint") or "")
+    )
+    return str(provider), str(model), str(endpoint)
+
+
+def _index_embedding_target(config: Config) -> tuple[str, str, str]:
+    """인덱싱에 사용된 임베딩 ``(provider, model, endpoint)``."""
+    return (
+        str(config.get("processor.embedding_provider") or ""),
+        str(config.get("processor.embedding_model") or ""),
+        str(config.get("processor.embedding_endpoint") or ""),
+    )
+
+
 def role_is_configured(
     config: Config,
     role: EvalRole,
@@ -267,24 +307,46 @@ def role_is_configured(
 def detect_role_collisions(
     config: Config,
     *,
+    extraction_endpoint_override: str = "",
+    extraction_model_override: str = "",
     generator_endpoint_override: str = "",
     generator_model_override: str = "",
     judge_endpoint_override: str = "",
     judge_model_override: str = "",
+    eval_embedding_provider_override: str = "",
+    eval_embedding_model_override: str = "",
+    eval_embedding_endpoint_override: str = "",
 ) -> dict[str, bool]:
-    """generator / judge / system 3자의 (endpoint, model) 식별 충돌을 판정 (S1-4, R9).
+    """역할 간 (endpoint, model) 식별 충돌을 판정 (S1-4 R9 → PR #79 4중 확장).
 
     ``role_is_configured`` 는 role↔system 2-way 비교만 하므로 generator 가
     시스템 planner/HyDE LLM 과 같은 경우는 잡아도, generator==judge 처럼 두
     평가 역할이 서로 동일 모델인 경우(Channel C)는 식별하지 못한다. 이 헬퍼는
-    세 역할의 최종 적용 (endpoint, model) 페어를 모두 비교하여 어느 쌍이라도
+    역할들의 최종 적용 (endpoint, model) 페어를 모두 비교하여 어느 쌍이라도
     동일하면 해당 플래그를 ``True`` 로 돌려준다.
 
+    PR #79 — source-grounded 골드는 **모델 4중 분리** (추출 ≠ 시스템(인덱싱/
+    planner/HyDE) ≠ judge, + 임베딩 분리) 를 요구한다. 기존 3-way (generator/
+    judge/system) 위에 ``extraction`` 역할과 임베딩 충돌을 **추가만** 한다.
+
+    하위호환: 기존 키 ``generator_eq_system`` / ``judge_eq_system`` /
+    ``generator_eq_judge`` / ``any_collision`` 의 의미는 **그대로** 유지된다
+    (``any_collision`` 은 여전히 3-way 만 집계). 4중·임베딩까지 본 종합 판정은
+    신규 키 ``any_collision_full`` 을 본다.
+
     Returns:
-        ``{"generator_eq_system", "judge_eq_system", "generator_eq_judge",
-        "any_collision"}`` bool 매핑. 어느 쌍이라도 동일하면 ``any_collision``
-        이 ``True``.
+        bool 매핑. 기존 4키 + 신규:
+        ``extraction_eq_system`` / ``extraction_eq_generator`` /
+        ``extraction_eq_judge`` / ``embedding_eq_index`` / ``any_collision_full``.
+        ``extraction`` 미구성 시 system 으로 폴백 → ``extraction_eq_system`` 기본
+        ``True``. eval 임베딩 미구성 시 인덱싱 임베딩으로 폴백 →
+        ``embedding_eq_index`` 기본 ``True``.
     """
+    extraction_target = _effective_role_target(
+        config, "extraction",
+        endpoint_override=extraction_endpoint_override,
+        model_override=extraction_model_override,
+    )
     gen_target = _effective_role_target(
         config, "generator",
         endpoint_override=generator_endpoint_override,
@@ -299,14 +361,38 @@ def detect_role_collisions(
         str(config.get("llm.endpoint") or ""),
         str(config.get("llm.model") or ""),
     )
+    eval_embedding = _effective_embedding_target(
+        config,
+        provider_override=eval_embedding_provider_override,
+        model_override=eval_embedding_model_override,
+        endpoint_override=eval_embedding_endpoint_override,
+    )
+    index_embedding = _index_embedding_target(config)
+
     generator_eq_system = gen_target == system_target
     judge_eq_system = judge_target == system_target
     generator_eq_judge = gen_target == judge_target
+    extraction_eq_system = extraction_target == system_target
+    extraction_eq_generator = extraction_target == gen_target
+    extraction_eq_judge = extraction_target == judge_target
+    embedding_eq_index = eval_embedding == index_embedding
+
+    any_collision = generator_eq_system or judge_eq_system or generator_eq_judge
+    any_collision_full = (
+        any_collision
+        or extraction_eq_system
+        or extraction_eq_generator
+        or extraction_eq_judge
+        or embedding_eq_index
+    )
     return {
         "generator_eq_system": generator_eq_system,
         "judge_eq_system": judge_eq_system,
         "generator_eq_judge": generator_eq_judge,
-        "any_collision": (
-            generator_eq_system or judge_eq_system or generator_eq_judge
-        ),
+        "extraction_eq_system": extraction_eq_system,
+        "extraction_eq_generator": extraction_eq_generator,
+        "extraction_eq_judge": extraction_eq_judge,
+        "embedding_eq_index": embedding_eq_index,
+        "any_collision": any_collision,
+        "any_collision_full": any_collision_full,
     }

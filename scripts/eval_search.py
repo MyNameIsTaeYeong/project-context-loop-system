@@ -208,6 +208,48 @@ JUDGE_MODES = ("reference-free", "overlap", "entailment")
 """Judge 모드 식별자. CLI ``--judge-mode`` 인자로 선택."""
 
 
+# source-grounded (PR #79 P4-answer) — 답변 단위 채점.
+# 시스템 LLM(평가 대상 RAG 생성기)이 검색 컨텍스트로만 답을 생성하고, 분리된
+# judge 가 reference_answer 대비 정확성을 채점한다 (생성≠채점 모델 분리).
+ANSWER_GEN_PROMPT = """\
+질문: {query}
+
+검색된 컨텍스트:
+---
+{retrieved_context}
+---
+
+위 컨텍스트에 **명시적으로 포함된 정보만** 사용해 질문에 한국어로 간결히 답하라.
+컨텍스트에 답이 없으면 정확히 "정보 없음" 이라고만 답하라 (학습 지식 사용 금지).
+설명 없이 답만 출력하라.
+"""
+
+
+JUDGE_PROMPT_ANSWER_CORRECTNESS = """\
+질문: {query}
+
+기준 정답(reference):
+---
+{reference_answer}
+---
+
+평가 대상 답변(시스템 생성):
+---
+{generated_answer}
+---
+
+생성된 답변이 기준 정답과 **사실적으로 일치/충실**한지 0~5점으로 평가하라.
+표현이 달라도 핵심 사실이 맞으면 고득점, 사실이 틀리거나 무관하면 0점.
+- 5: 기준 정답의 핵심 사실을 정확히 담음 (표현 차이 무관)
+- 3: 부분적으로만 맞음
+- 0: 틀리거나 무관 ("정보 없음" 포함)
+
+JSON 으로만 출력::
+
+  {{"score": 0~5 정수, "reason": "한 줄 설명"}}
+"""
+
+
 async def _judge_answer_single(
     query: str,
     source_chunk: str,
@@ -337,6 +379,125 @@ async def judge_answer(
 
 
 # ---------------------------------------------------------------------------
+# source-grounded (PR #79 P4-answer) — 답변 단위 채점
+# ---------------------------------------------------------------------------
+
+
+def _normalize_answer(text: str) -> str:
+    """답변 비교용 정규화 — 소문자·whitespace 단일화·둘러싼 따옴표/문장부호 제거."""
+    t = " ".join((text or "").split()).strip().lower()
+    return t.strip("\"'`.,!?()[]{}·:;")
+
+
+def factoid_match(reference: str, generated: str) -> bool:
+    """팩토이드 결정론 일치 — 정규화 후 완전 일치 또는 기준답이 생성답에 포함.
+
+    짧은 사실형 정답("100만원" 등)의 LLM 호출 없는 1차 채점. 패러프레이즈·개방형
+    답변은 여기서 잡히지 않고 judge 로 넘어간다(보수적: false negative 는 judge 가
+    구제, false positive 는 기준답이 생성답의 substring 일 때만 — 사실 포함 신호).
+    """
+    r = _normalize_answer(reference)
+    g = _normalize_answer(generated)
+    if not r or not g:
+        return False
+    return r == g or r in g
+
+
+async def generate_answer_from_context(
+    query: str,
+    retrieved_context: str,
+    *,
+    answer_llm: LLMClient,
+    reasoning_mode: str | None = "off",
+    seed: int | None = None,
+    max_tokens: int = 512,
+) -> str:
+    """시스템 LLM(평가 대상 RAG 생성기)이 검색 컨텍스트로만 답을 생성한다.
+
+    생성 모델은 시스템(``llm.*``), 채점 모델은 judge — 생성≠채점 분리(계획서 §2).
+    """
+    prompt = ANSWER_GEN_PROMPT.format(
+        query=query, retrieved_context=retrieved_context[:6000],
+    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_answer_gen",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await answer_llm.complete(prompt, **call_kwargs)
+    return (text or "").strip()
+
+
+async def score_answer_correctness(
+    query: str,
+    reference_answer: str,
+    generated_answer: str,
+    *,
+    judge: LLMClient,
+    reasoning_mode: str | None = "off",
+    seed: int | None = None,
+) -> tuple[float, str, str]:
+    """생성 답변을 reference_answer 대비 채점한다 (계획서 §6.2).
+
+    1차 팩토이드 결정론 일치(:func:`factoid_match`) → 통과 시 1.0(LLM 호출 없음).
+    아니면 분리된 judge 로 0~5 채점 후 0..1 로 정규화.
+
+    Returns:
+        ``(correctness, method, reason)`` — ``correctness`` 는 0..1 또는 파싱 실패
+        시 -1.0. ``method`` 는 ``"factoid"`` / ``"judge"`` / ``"parse_error"``.
+    """
+    if factoid_match(reference_answer, generated_answer):
+        return 1.0, "factoid", ""
+    prompt = JUDGE_PROMPT_ANSWER_CORRECTNESS.format(
+        query=query,
+        reference_answer=reference_answer[:2000],
+        generated_answer=generated_answer[:2000],
+    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": 256,
+        "temperature": 0.0,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_judge_answer_correctness",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await judge.complete(prompt, **call_kwargs)
+    try:
+        data = extract_json(text)
+    except ValueError:
+        return -1.0, "parse_error", "parse_error"
+    if not isinstance(data, dict) or not isinstance(data.get("score"), (int, float)):
+        return -1.0, "parse_error", "parse_error"
+    score = max(0, min(5, int(data["score"])))
+    reason = str(data.get("reason") or "").strip()
+    return score / 5.0, "judge", reason
+
+
+def _divergence_label(
+    context_recall: float | None,
+    answer_correct: int | None,
+) -> str:
+    """축 A(검색)·축 B(답변)가 어긋나는 케이스를 라벨링한다 (계획서 §6.4).
+
+    - ``answer_without_context``: 답은 맞는데 정답 문서 회수 실패 (파라메트릭 또는
+      대체 출처 — faithfulness 로 추가 분해는 후속, §11-8).
+    - ``context_without_answer``: 검색은 OK인데 답 생성 실패 (생성 문제).
+    - ``""``: 두 축 일치(둘 다 성공/둘 다 실패) 또는 판정 불가(None).
+    """
+    if context_recall is None or answer_correct is None:
+        return ""
+    ctx_ok = context_recall > 0
+    if answer_correct == 1 and not ctx_ok:
+        return "answer_without_context"
+    if answer_correct == 0 and ctx_ok:
+        return "context_without_answer"
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Single query evaluation
 # ---------------------------------------------------------------------------
 
@@ -393,6 +554,9 @@ async def evaluate_one(
     judge_n_samples: int = 1,
     planner_seed_base: int | None = None,
     embedding_model_id: str = "",
+    answer_llm: LLMClient | None = None,
+    score_answer: bool = False,
+    answer_correct_threshold: float = 0.6,
 ) -> dict[str, Any]:
     """단일 질의에 대한 검색 + 채점.
 
@@ -563,6 +727,17 @@ async def evaluate_one(
         "elapsed_ms": elapsed_ms,
     }
 
+    # source-grounded (PR #79 P4) — 측정 단위 일급화. measurement_units 가 명시된
+    # 항목(source-grounded)에만 단위 메타·doc 단위 first-class 메트릭을 붙인다.
+    # 레거시 골드(빈 measurement_units)는 출력 무변경(기존 recall@k 그대로).
+    if item.measurement_units:
+        row["measurement_units"] = list(item.measurement_units)
+        row["answerable"] = item.answerable
+        # [doc] context recall — evidence_span 출처 문서를 회수했나. R3 동치
+        # 그룹 채점(recall@k)을 그대로 doc 단위 정답으로 재사용한다(계획서 §6.1).
+        if "doc" in item.measurement_units:
+            row[f"context_recall@{top_k}"] = row[f"recall@{top_k}"]
+
     if score_relations and item.relevant_graph_relations:
         retrieved_graph_relations = list(assembled.retrieved_graph_relations)
         rel_report = run_relation_matching(
@@ -667,6 +842,55 @@ async def evaluate_one(
             row["judge_n_samples"] = int(judge_stats.get("n_samples") or 0)
             row["judge_n_parse_failed"] = int(judge_stats.get("n_parse_failed") or 0)
 
+    # source-grounded (PR #79 P4-answer) — 답변 단위 채점 (계획서 §6.2).
+    # 시스템 LLM 이 검색 컨텍스트로 답을 생성 → 분리된 judge 가 reference_answer
+    # 대비 채점. answerable=False(회수 불가 표적)·answer 단위 미서빙·reference 부재·
+    # 클라이언트 부재 시 skip. 검색(축 A)과 독립 산출 후 divergence(§6.4) 기록.
+    if (
+        score_answer
+        and answer_llm is not None
+        and judge is not None
+        and item.answerable
+        and item.reference_answer
+        and _serves_unit(item, "answer")
+    ):
+        answer_gen_seed = (
+            stable_seed("answergen:" + item.id, judge_seed_base)
+            if judge_seed_base is not None
+            else None
+        )
+        generated = await generate_answer_from_context(
+            item.query, assembled.context_text,
+            answer_llm=answer_llm, reasoning_mode=reasoning_mode,
+            seed=answer_gen_seed,
+        )
+        ans_seed = (
+            stable_seed("answerjudge:" + item.id, judge_seed_base)
+            if judge_seed_base is not None
+            else None
+        )
+        correctness, method, ans_reason = await score_answer_correctness(
+            item.query, item.reference_answer, generated,
+            judge=judge, reasoning_mode=reasoning_mode, seed=ans_seed,
+        )
+        row["generated_answer"] = generated
+        row["answer_score_method"] = method
+        if correctness < 0:
+            # judge parse 실패 — 평균에서 분리 (None → aggregate 자동 스킵).
+            row["answer_correctness"] = None
+            row["answer_correct"] = None
+            row["answer_parse_failed"] = True
+        else:
+            answer_correct = int(correctness >= answer_correct_threshold)
+            row["answer_correctness"] = correctness
+            row["answer_correct"] = answer_correct
+            row["answer_reason"] = ans_reason
+            # divergence (§6.4) — 축 A(context recall) vs 축 B(answer correctness).
+            cr = row.get(f"context_recall@{top_k}")
+            divergence = _divergence_label(cr, answer_correct)
+            if divergence:
+                row["divergence"] = divergence
+
     # P12 — embed_fn 이 T4 단계 skip 을 한 번이라도 했는지 row 에 기록.
     t4_disabled = bool(getattr(embed_fn, "t4_disabled", False))
     if t4_disabled:
@@ -731,6 +955,24 @@ def _classify_mode(item: GoldItem) -> str:
     if has_graph:
         return "graph"
     return "chunk"
+
+
+def _serves_unit(item: GoldItem, unit: str) -> bool:
+    """item 이 주어진 측정 단위(doc/answer/graph)를 서빙하는지 (PR #79 P4).
+
+    ``measurement_units`` 가 명시되면(source-grounded) 그대로 따른다. 비어 있으면
+    (레거시 골드) 정답키 보유로 추론한다: doc←relevant_doc_ids,
+    graph←relevant_graph_entities, answer←reference_answer.
+    """
+    if item.measurement_units:
+        return unit in item.measurement_units
+    if unit == "doc":
+        return bool(item.relevant_doc_ids)
+    if unit == "graph":
+        return bool(item.relevant_graph_entities)
+    if unit == "answer":
+        return bool(item.reference_answer)
+    return False
 
 
 def _failed_metric_keys(top_k: int, *, has_graph: bool) -> dict[str, Any]:
@@ -899,7 +1141,11 @@ def _chunk_metric_cis(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]
     항목의 graph 키 부재 X — 항상 채워지지만 방어적으로)은 해당 키 집계에서
     건너뛴다(aggregate 와 동일 정책).
     """
-    chunk_prefixes = ("recall@", "precision@", "hit@", "ndcg@", "mrr")
+    chunk_prefixes = (
+        "recall@", "precision@", "hit@", "ndcg@", "mrr",
+        "context_recall@",  # source-grounded doc 단위 (PR #79 P4)
+        "answer_correct",   # answer 단위: answer_correct / answer_correctness (P4-answer)
+    )
     graph_prefixes = (
         "graph_recall@", "graph_recall_surface@",
         "graph_precision@", "graph_precision_surface@",
@@ -957,12 +1203,17 @@ def write_summary(
     별도로 누적 합산하여 보고한다.
     """
     excluded = {"source_document_id"}
-    summary = aggregate(rows, exclude=excluded)
+    # source-grounded (PR #79 P4) — answerable 분모 위생(계획서 §6.5). 완벽한
+    # 시스템도 회수 불가한 표적(answerable=False)은 메트릭 평균/CI 분모에서
+    # 제외하고 별도 버킷으로 보고한다. answerable 은 기본 True 이고 레거시 골드는
+    # 이 키가 없어 r.get(..., True)=True → 기존 골드셋 집계는 무변경.
+    answerable_rows = [r for r in rows if r.get("answerable", True)]
+    summary = aggregate(answerable_rows, exclude=excluded)
 
     rows_by_mode: dict[str, list[dict[str, Any]]] = {
         "chunk": [], "graph": [], "hybrid": [], "cross_doc": [],
     }
-    for r in rows:
+    for r in answerable_rows:
         mode = r.get("mode")
         if mode in rows_by_mode:
             rows_by_mode[mode].append(r)
@@ -1018,12 +1269,39 @@ def write_summary(
     graph_t4_skip_count = sum(1 for r in rows if r.get("graph_t4_disabled"))
     graph_t4_disabled_any = graph_t4_skip_count > 0
 
+    # source-grounded (PR #79 P4) — answerable 위생 + 측정 단위 커버리지 보고.
+    n_unanswerable = sum(1 for r in rows if not r.get("answerable", True))
+    unanswerable_ids = [r.get("id") for r in rows if not r.get("answerable", True)]
+    measurement_unit_coverage = {
+        unit: sum(1 for r in rows if unit in (r.get("measurement_units") or []))
+        for unit in ("doc", "answer", "graph")
+    }
+
+    # P4-answer — 답변 단위 채점 통계 + divergence(§6.4) 분포.
+    n_answer_scored = sum(
+        1 for r in rows
+        if isinstance(r.get("answer_correct"), int)
+        and not isinstance(r.get("answer_correct"), bool)
+    )
+    n_answer_parse_failed = sum(1 for r in rows if r.get("answer_parse_failed"))
+    divergence_counts = Counter(
+        r.get("divergence") for r in rows if r.get("divergence")
+    )
+
     out = {
         "label": label,
         "n_queries": n_total,
         "n_failed": n_failed,
         "n_successful": n_successful,
         "failure_rate": failure_rate,
+        # answerable=False(인덱싱 표적)는 메트릭 분모에서 제외 — 별도 보고.
+        "n_unanswerable": n_unanswerable,
+        "unanswerable_ids": unanswerable_ids,
+        "measurement_unit_coverage": measurement_unit_coverage,
+        # P4-answer — 답변 단위 채점·divergence 통계.
+        "n_answer_scored": n_answer_scored,
+        "n_answer_parse_failed": n_answer_parse_failed,
+        "divergence_counts": dict(divergence_counts),
         "judge_score_parse_failures": judge_parse_failures,
         "judge_score_success_count": judge_success_count,
         "judge_skip_count": judge_skipped,
@@ -1039,7 +1317,8 @@ def write_summary(
     # (절대 점수의 불확실성 보고). 그래프/모드별 CI 강제는 추후.
     if absolute_mode:
         out["absolute_mode"] = True
-        out["metric_ci"] = _chunk_metric_cis(rows)
+        # CI 도 answerable 분모 위생을 따른다(metric 평균과 동일 모집단).
+        out["metric_ci"] = _chunk_metric_cis(answerable_rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
@@ -1052,7 +1331,9 @@ def print_summary(summary: dict[str, Any]) -> None:
     print("=" * 60)
     metrics = summary.get("metrics", {})
     # 보기 좋은 순서로 키 정렬 — graph_* 는 chunk 메트릭 다음에 배치
-    preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+    preferred = ["context_recall@",
+                 "answer_correct", "answer_correctness",
+                 "recall@", "precision@", "hit@", "ndcg@", "mrr",
                  "graph_recall_surface@", "graph_precision_surface@",
                  "graph_hit_surface@",
                  "graph_ndcg_surface@", "graph_mrr_surface",
@@ -1238,6 +1519,13 @@ async def _evaluate_gold_set(
                     judge_seed_base=args.judge_seed_base,
                     judge_n_samples=args.judge_n_samples,
                     planner_seed_base=getattr(args, "planner_seed_base", None),
+                    answer_llm=(
+                        llm_client if getattr(args, "score_answer", False) else None
+                    ),
+                    score_answer=getattr(args, "score_answer", False),
+                    answer_correct_threshold=getattr(
+                        args, "answer_correct_threshold", 0.6,
+                    ),
                 )
                 row["_idx"] = idx
             except Exception as exc:
@@ -1257,6 +1545,13 @@ async def _evaluate_gold_set(
                         has_graph=bool(item.relevant_graph_entities),
                     ),
                 }
+                # source-grounded 항목은 단위 메타·doc 키도 None 으로 명시
+                # (answerable 위생 필터·CI 가 일관되게 처리하도록).
+                if item.measurement_units:
+                    row["measurement_units"] = list(item.measurement_units)
+                    row["answerable"] = item.answerable
+                    if "doc" in item.measurement_units:
+                        row[f"context_recall@{top_k}"] = None
             completed += 1
             logger.info(
                 "[%s done %d/%d] (completed=%d) q=%s",
@@ -1445,6 +1740,9 @@ async def run(args: argparse.Namespace) -> int:
         "graph_match_threshold": args.graph_match_threshold,
         "graph_match_strict": args.graph_match_strict,
         "score_relations": args.score_relations,
+        # PR #79 P4-answer — 답변 단위 채점 플래그.
+        "score_answer": getattr(args, "score_answer", False),
+        "answer_correct_threshold": getattr(args, "answer_correct_threshold", 0.6),
         # 3차 — 동시성 메타 (재현 디버그용).
         "concurrency": max(1, int(getattr(args, "concurrency", 1) or 1)),
         # Phase 0 — 인덱스/코퍼스 앵커. 중첩 dict + compare_runs 동치성용 평탄 키.
@@ -1769,6 +2067,19 @@ def main() -> None:
         help="Judge 호출 반복 횟수 (S3 — 분산 측정). 1 이면 단일 호출, 2+ 면 "
              "seed+i 로 N회 호출 후 median 을 최종 점수, std/min/max 를 row 에 "
              "기록. 운영 안정성 진단용.",
+    )
+    # PR #79 P4-answer — 답변 단위 채점 (source-grounded reference_answer 대비).
+    parser.add_argument(
+        "--score-answer", action="store_true",
+        help="답변 단위 채점 (계획서 §6.2). 시스템 LLM 이 검색 컨텍스트로 답을 "
+             "생성하고 분리된 judge 가 reference_answer 대비 정확성을 0~1 로 "
+             "채점. reference_answer 를 가진 source-grounded 항목에만 적용. "
+             "--judge 와 함께 써야 함(채점 모델 필요).",
+    )
+    parser.add_argument(
+        "--answer-correct-threshold", type=float, default=0.6,
+        help="answer_correctness(0~1)를 이진 answer_correct 로 변환하는 임계값 "
+             "(기본 0.6). divergence(§6.4) 판정에 사용.",
     )
     # Phase 1 — 그래프 탐색 플래너 결정성(평가 재현성). search_context Step 4 가
     # 그래프 도달 문서를 추가 회수하므로, 플래너가 흔들리면 청크 recall 도
