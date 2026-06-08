@@ -563,6 +563,17 @@ async def evaluate_one(
         "elapsed_ms": elapsed_ms,
     }
 
+    # source-grounded (PR #79 P4) — 측정 단위 일급화. measurement_units 가 명시된
+    # 항목(source-grounded)에만 단위 메타·doc 단위 first-class 메트릭을 붙인다.
+    # 레거시 골드(빈 measurement_units)는 출력 무변경(기존 recall@k 그대로).
+    if item.measurement_units:
+        row["measurement_units"] = list(item.measurement_units)
+        row["answerable"] = item.answerable
+        # [doc] context recall — evidence_span 출처 문서를 회수했나. R3 동치
+        # 그룹 채점(recall@k)을 그대로 doc 단위 정답으로 재사용한다(계획서 §6.1).
+        if "doc" in item.measurement_units:
+            row[f"context_recall@{top_k}"] = row[f"recall@{top_k}"]
+
     if score_relations and item.relevant_graph_relations:
         retrieved_graph_relations = list(assembled.retrieved_graph_relations)
         rel_report = run_relation_matching(
@@ -733,6 +744,24 @@ def _classify_mode(item: GoldItem) -> str:
     return "chunk"
 
 
+def _serves_unit(item: GoldItem, unit: str) -> bool:
+    """item 이 주어진 측정 단위(doc/answer/graph)를 서빙하는지 (PR #79 P4).
+
+    ``measurement_units`` 가 명시되면(source-grounded) 그대로 따른다. 비어 있으면
+    (레거시 골드) 정답키 보유로 추론한다: doc←relevant_doc_ids,
+    graph←relevant_graph_entities, answer←reference_answer.
+    """
+    if item.measurement_units:
+        return unit in item.measurement_units
+    if unit == "doc":
+        return bool(item.relevant_doc_ids)
+    if unit == "graph":
+        return bool(item.relevant_graph_entities)
+    if unit == "answer":
+        return bool(item.reference_answer)
+    return False
+
+
 def _failed_metric_keys(top_k: int, *, has_graph: bool) -> dict[str, Any]:
     """실패(검색 예외) 질의의 row 에 명시할 표준 메트릭 None 키를 만든다 (S1-5, R11).
 
@@ -899,7 +928,10 @@ def _chunk_metric_cis(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]
     항목의 graph 키 부재 X — 항상 채워지지만 방어적으로)은 해당 키 집계에서
     건너뛴다(aggregate 와 동일 정책).
     """
-    chunk_prefixes = ("recall@", "precision@", "hit@", "ndcg@", "mrr")
+    chunk_prefixes = (
+        "recall@", "precision@", "hit@", "ndcg@", "mrr",
+        "context_recall@",  # source-grounded doc 단위 (PR #79 P4)
+    )
     graph_prefixes = (
         "graph_recall@", "graph_recall_surface@",
         "graph_precision@", "graph_precision_surface@",
@@ -957,12 +989,17 @@ def write_summary(
     별도로 누적 합산하여 보고한다.
     """
     excluded = {"source_document_id"}
-    summary = aggregate(rows, exclude=excluded)
+    # source-grounded (PR #79 P4) — answerable 분모 위생(계획서 §6.5). 완벽한
+    # 시스템도 회수 불가한 표적(answerable=False)은 메트릭 평균/CI 분모에서
+    # 제외하고 별도 버킷으로 보고한다. answerable 은 기본 True 이고 레거시 골드는
+    # 이 키가 없어 r.get(..., True)=True → 기존 골드셋 집계는 무변경.
+    answerable_rows = [r for r in rows if r.get("answerable", True)]
+    summary = aggregate(answerable_rows, exclude=excluded)
 
     rows_by_mode: dict[str, list[dict[str, Any]]] = {
         "chunk": [], "graph": [], "hybrid": [], "cross_doc": [],
     }
-    for r in rows:
+    for r in answerable_rows:
         mode = r.get("mode")
         if mode in rows_by_mode:
             rows_by_mode[mode].append(r)
@@ -1018,12 +1055,24 @@ def write_summary(
     graph_t4_skip_count = sum(1 for r in rows if r.get("graph_t4_disabled"))
     graph_t4_disabled_any = graph_t4_skip_count > 0
 
+    # source-grounded (PR #79 P4) — answerable 위생 + 측정 단위 커버리지 보고.
+    n_unanswerable = sum(1 for r in rows if not r.get("answerable", True))
+    unanswerable_ids = [r.get("id") for r in rows if not r.get("answerable", True)]
+    measurement_unit_coverage = {
+        unit: sum(1 for r in rows if unit in (r.get("measurement_units") or []))
+        for unit in ("doc", "answer", "graph")
+    }
+
     out = {
         "label": label,
         "n_queries": n_total,
         "n_failed": n_failed,
         "n_successful": n_successful,
         "failure_rate": failure_rate,
+        # answerable=False(인덱싱 표적)는 메트릭 분모에서 제외 — 별도 보고.
+        "n_unanswerable": n_unanswerable,
+        "unanswerable_ids": unanswerable_ids,
+        "measurement_unit_coverage": measurement_unit_coverage,
         "judge_score_parse_failures": judge_parse_failures,
         "judge_score_success_count": judge_success_count,
         "judge_skip_count": judge_skipped,
@@ -1039,7 +1088,8 @@ def write_summary(
     # (절대 점수의 불확실성 보고). 그래프/모드별 CI 강제는 추후.
     if absolute_mode:
         out["absolute_mode"] = True
-        out["metric_ci"] = _chunk_metric_cis(rows)
+        # CI 도 answerable 분모 위생을 따른다(metric 평균과 동일 모집단).
+        out["metric_ci"] = _chunk_metric_cis(answerable_rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
@@ -1052,7 +1102,8 @@ def print_summary(summary: dict[str, Any]) -> None:
     print("=" * 60)
     metrics = summary.get("metrics", {})
     # 보기 좋은 순서로 키 정렬 — graph_* 는 chunk 메트릭 다음에 배치
-    preferred = ["recall@", "precision@", "hit@", "ndcg@", "mrr",
+    preferred = ["context_recall@",
+                 "recall@", "precision@", "hit@", "ndcg@", "mrr",
                  "graph_recall_surface@", "graph_precision_surface@",
                  "graph_hit_surface@",
                  "graph_ndcg_surface@", "graph_mrr_surface",
@@ -1257,6 +1308,13 @@ async def _evaluate_gold_set(
                         has_graph=bool(item.relevant_graph_entities),
                     ),
                 }
+                # source-grounded 항목은 단위 메타·doc 키도 None 으로 명시
+                # (answerable 위생 필터·CI 가 일관되게 처리하도록).
+                if item.measurement_units:
+                    row["measurement_units"] = list(item.measurement_units)
+                    row["answerable"] = item.answerable
+                    if "doc" in item.measurement_units:
+                        row[f"context_recall@{top_k}"] = None
             completed += 1
             logger.info(
                 "[%s done %d/%d] (completed=%d) q=%s",

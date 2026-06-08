@@ -136,3 +136,80 @@ def test_match_pairs_not_a_ci_metric() -> None:
     assert "graph_match_pairs" not in cis
     # 수치 graph 메트릭은 CI 에 포함.
     assert "graph_recall@5" in cis
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P4) — 측정 단위 일급화 + answerable 위생
+# ---------------------------------------------------------------------------
+
+
+def _gold_item(**kw):  # type: ignore[no-untyped-def]
+    from context_loop.eval.gold_set import GoldItem
+    base = {"id": "q1", "query": "?"}
+    base.update(kw)
+    return GoldItem(**base)
+
+
+def test_serves_unit_explicit_measurement_units() -> None:
+    item = _gold_item(measurement_units=["doc", "graph"])
+    assert eval_search._serves_unit(item, "doc") is True
+    assert eval_search._serves_unit(item, "graph") is True
+    assert eval_search._serves_unit(item, "answer") is False
+
+
+def test_serves_unit_legacy_inference() -> None:
+    """measurement_units 가 비면 정답키 보유로 단위를 추론한다."""
+    item = _gold_item(relevant_doc_ids=[1])
+    assert eval_search._serves_unit(item, "doc") is True
+    assert eval_search._serves_unit(item, "graph") is False
+    item2 = _gold_item(relevant_doc_ids=[], reference_answer="답")
+    assert eval_search._serves_unit(item2, "answer") is True
+    assert eval_search._serves_unit(item2, "doc") is False
+
+
+def test_write_summary_answerable_hygiene(tmp_path: Path) -> None:
+    """answerable=False 행은 메트릭 평균 분모에서 제외되고 별도 보고된다."""
+    rows = [
+        {"id": "a", "mode": "chunk", "recall@5": 1.0,
+         "measurement_units": ["doc"], "answerable": True},
+        {"id": "b", "mode": "chunk", "recall@5": 1.0,
+         "measurement_units": ["doc"], "answerable": True},
+        # 회수 불가 표적 — recall 0 이지만 분모에서 제외돼야 함
+        {"id": "c", "mode": "chunk", "recall@5": 0.0,
+         "measurement_units": ["doc"], "answerable": False},
+    ]
+    out = eval_search.write_summary(
+        rows, tmp_path / "s.summary.json",
+        label="t", config_summary={},
+    )
+    # answerable=2개만 평균 → recall 1.0 (c 의 0.0 제외)
+    assert out["metrics"]["recall@5"] == 1.0
+    assert out["n_unanswerable"] == 1
+    assert out["unanswerable_ids"] == ["c"]
+    assert out["measurement_unit_coverage"]["doc"] == 3
+
+
+def test_write_summary_legacy_rows_unchanged(tmp_path: Path) -> None:
+    """answerable/measurement_units 없는 레거시 행은 전부 분모에 포함(무변경)."""
+    rows = [
+        {"id": "a", "mode": "chunk", "recall@5": 1.0},
+        {"id": "b", "mode": "chunk", "recall@5": 0.0},
+    ]
+    out = eval_search.write_summary(
+        rows, tmp_path / "s.summary.json",
+        label="t", config_summary={},
+    )
+    assert out["metrics"]["recall@5"] == 0.5  # 둘 다 포함
+    assert out["n_unanswerable"] == 0
+    assert out["measurement_unit_coverage"] == {"doc": 0, "answer": 0, "graph": 0}
+
+
+def test_context_recall_is_ci_metric() -> None:
+    """context_recall@k 가 bootstrap CI 대상에 포함된다."""
+    rows = [
+        {"context_recall@5": 1.0}, {"context_recall@5": 0.0},
+        {"context_recall@5": 1.0}, {"context_recall@5": 1.0},
+    ]
+    cis = eval_search._chunk_metric_cis(rows)
+    assert "context_recall@5" in cis
+    assert "mean" in cis["context_recall@5"]
