@@ -591,3 +591,98 @@ def test_detect_role_collisions_judge_cli_override(config: Config) -> None:
         judge_model_override="cli-judge-model",
     )
     assert out["judge_eq_system"] is False
+
+
+# ---------------------------------------------------------------------------
+# detect_role_collisions — PR #79 4중 확장 (extraction + embedding)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_role_collisions_legacy_keys_unchanged(config: Config) -> None:
+    """기존 3-way 키와 any_collision 의미는 그대로 유지된다 (하위호환)."""
+    config.set("eval.generator.endpoint", "http://gen/v1")
+    config.set("eval.generator.model", "gen-model")
+    config.set("eval.judge.endpoint", "http://judge/v1")
+    config.set("eval.judge.model", "judge-model")
+    out = detect_role_collisions(config)
+    # generator/judge/system 모두 분리 → 3-way 충돌 없음
+    assert out["generator_eq_system"] is False
+    assert out["judge_eq_system"] is False
+    assert out["generator_eq_judge"] is False
+    assert out["any_collision"] is False
+
+
+def test_detect_role_collisions_extraction_defaults_to_system(config: Config) -> None:
+    """extraction 미구성 → system 폴백 → extraction_eq_system True."""
+    out = detect_role_collisions(config)
+    assert out["extraction_eq_system"] is True
+    # 임베딩도 eval 전용 미구성 → 인덱싱 임베딩 폴백 → 충돌
+    assert out["embedding_eq_index"] is True
+    assert out["any_collision_full"] is True
+
+
+def test_detect_role_collisions_full_separation_4way(config: Config) -> None:
+    """추출/generator/judge/system 4중 + 임베딩까지 모두 분리 → 충돌 0."""
+    config.set("processor.embedding_provider", "endpoint")
+    config.set("processor.embedding_model", "index-embed")
+    config.set("processor.embedding_endpoint", "http://index-embed/v1")
+    config.set("eval.extraction.endpoint", "http://extract/v1")
+    config.set("eval.extraction.model", "extract-model")
+    config.set("eval.generator.endpoint", "http://gen/v1")
+    config.set("eval.generator.model", "gen-model")
+    config.set("eval.judge.endpoint", "http://judge/v1")
+    config.set("eval.judge.model", "judge-model")
+    config.set("eval.embedding.provider", "endpoint")
+    config.set("eval.embedding.model", "eval-embed")
+    config.set("eval.embedding.endpoint", "http://eval-embed/v1")
+    out = detect_role_collisions(config)
+    assert out["extraction_eq_system"] is False
+    assert out["extraction_eq_generator"] is False
+    assert out["extraction_eq_judge"] is False
+    assert out["embedding_eq_index"] is False
+    assert out["any_collision"] is False
+    assert out["any_collision_full"] is False
+
+
+def test_detect_role_collisions_extraction_eq_generator(config: Config) -> None:
+    """추출 LLM 과 generator 가 같은 모델이면 extraction_eq_generator True."""
+    config.set("eval.extraction.endpoint", "http://shared/v1")
+    config.set("eval.extraction.model", "shared-model")
+    config.set("eval.generator.endpoint", "http://shared/v1")
+    config.set("eval.generator.model", "shared-model")
+    config.set("eval.judge.endpoint", "http://judge/v1")
+    config.set("eval.judge.model", "judge-model")
+    out = detect_role_collisions(config)
+    assert out["extraction_eq_generator"] is True
+    assert out["any_collision_full"] is True
+
+
+def test_detect_role_collisions_embedding_separated_only(config: Config) -> None:
+    """eval 임베딩만 인덱싱과 분리되면 embedding_eq_index False."""
+    config.set("processor.embedding_model", "index-embed")
+    config.set("eval.embedding.model", "eval-embed")
+    out = detect_role_collisions(config)
+    assert out["embedding_eq_index"] is False
+
+
+def test_detect_role_collisions_extraction_cli_override(config: Config) -> None:
+    """extraction CLI override 가 collision 판정에 반영된다."""
+    out = detect_role_collisions(
+        config,
+        extraction_endpoint_override="http://cli-extract/v1",
+        extraction_model_override="cli-extract-model",
+    )
+    assert out["extraction_eq_system"] is False
+
+
+def test_build_eval_llm_client_supports_extraction_role(
+    config: Config, stub_web_app: MagicMock,
+) -> None:
+    """extraction role 도 build_eval_llm_client 로 빌드된다."""
+    config.set("eval.extraction.endpoint", "http://extract/v1")
+    config.set("eval.extraction.model", "extract-model")
+    captured, fake = _capture_builder()
+    stub_web_app.side_effect = fake
+    build_eval_llm_client(config, "extraction")
+    assert captured[0]["endpoint"] == "http://extract/v1"
+    assert captured[0]["model"] == "extract-model"

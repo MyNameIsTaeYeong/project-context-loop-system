@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from context_loop.eval.gold_set import (
+    MEASUREMENT_UNITS,
     GoldItem,
     GoldSet,
     GraphEntityRef,
     GraphRelationRef,
+    SupportingFact,
     load_gold_set,
     save_gold_set,
 )
@@ -429,3 +431,93 @@ def test_gold_item_backward_compat_with_extended_yaml(tmp_path: Path) -> None:
     assert loaded.metadata["embedding_model"] == "text-embedding-3-small"
     # 변수 의도 유지
     _ = save_loaded
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P0) — SupportingFact + 신규 GoldItem 필드
+# ---------------------------------------------------------------------------
+
+
+def test_supporting_fact_to_from_dict_roundtrip() -> None:
+    fact = SupportingFact(
+        entity="Auth Service",
+        entity_type="system",
+        relation="depends_on",
+        target="Token Validator",
+        evidence_span="Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다.",
+        source_doc_id=12,
+        acceptable_surface_forms=["인증 서비스", "AuthService"],
+    )
+    restored = SupportingFact.from_dict(fact.to_dict())
+    assert restored == fact
+
+
+def test_supporting_fact_minimal_omits_empty_keys() -> None:
+    fact = SupportingFact(entity="X")
+    d = fact.to_dict()
+    assert d == {"entity": "X"}
+    assert SupportingFact.from_dict(d) == fact
+
+
+def test_gold_item_source_grounded_roundtrip() -> None:
+    item = GoldItem(
+        id="sg1",
+        query="Auth Service는 무엇에 의존하나요?",
+        relevant_doc_ids=[12],
+        reference_answer="Auth Service는 Token Validator에 의존한다.",
+        supporting_facts=[
+            SupportingFact(
+                entity="Auth Service",
+                entity_type="system",
+                relation="depends_on",
+                target="Token Validator",
+                evidence_span="Auth Service ... Token Validator에 의존한다.",
+                source_doc_id=12,
+            ),
+        ],
+        answerable=True,
+        measurement_units=["doc", "answer", "graph"],
+        provenance={"extraction_model": "model-a", "judge_model": "model-b", "seed": 7},
+    )
+    restored = GoldItem.from_dict(item.to_dict())
+    assert restored.reference_answer == item.reference_answer
+    assert restored.supporting_facts == item.supporting_facts
+    assert restored.answerable is True
+    assert restored.measurement_units == ["doc", "answer", "graph"]
+    assert restored.provenance["seed"] == 7
+
+
+def test_gold_item_answerable_false_emitted_and_loaded(tmp_path: Path) -> None:
+    """answerable=False (인덱싱 표적) 는 emit 되고 round-trip 된다."""
+    item = GoldItem(id="x", query="q", relevant_doc_ids=[1], answerable=False)
+    assert item.to_dict()["answerable"] is False
+    restored = GoldItem.from_dict(item.to_dict())
+    assert restored.answerable is False
+
+
+def test_gold_item_answerable_default_true_not_emitted() -> None:
+    """기본 answerable=True 는 emit 되지 않는다 (스키마 잡음 억제)."""
+    item = GoldItem(id="x", query="q", relevant_doc_ids=[1])
+    assert "answerable" not in item.to_dict()
+
+
+def test_gold_item_unknown_measurement_units_dropped() -> None:
+    """알 수 없는 측정 단위는 조용히 버린다 (스키마 위생)."""
+    item = GoldItem.from_dict({
+        "id": "x",
+        "query": "q",
+        "relevant_doc_ids": [1],
+        "measurement_units": ["doc", "bogus", "graph", "doc"],
+    })
+    assert item.measurement_units == ["doc", "graph"]  # bogus 제거 + 중복 제거
+    assert set(item.measurement_units) <= MEASUREMENT_UNITS
+
+
+def test_gold_item_legacy_without_source_grounded_fields_loads() -> None:
+    """source-grounded 필드 없는 옛 YAML 도 기본값으로 로드된다 (하위호환)."""
+    item = GoldItem.from_dict({"id": "old", "query": "q", "relevant_doc_ids": [1]})
+    assert item.reference_answer == ""
+    assert item.supporting_facts == []
+    assert item.answerable is True
+    assert item.measurement_units == []
+    assert item.provenance == {}
