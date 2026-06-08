@@ -36,6 +36,10 @@ from context_loop.eval.human_anchor import (  # noqa: E402
     generator_precision,
     import_review_csv,
 )
+from context_loop.eval.promotion import (  # noqa: E402
+    build_promotion_report,
+    render_promotion_report,
+)
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -80,6 +84,29 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_promote(args: argparse.Namespace) -> int:
+    gold = load_gold_set(Path(args.gold))
+    verdicts = import_review_csv(Path(args.review)) if args.review else {}
+    precision = generator_precision(gold, verdicts)
+    with open(args.eval_summary, encoding="utf-8") as f:
+        eval_summary = json.load(f)
+    report = build_promotion_report(
+        eval_summary=eval_summary,
+        precision=precision,
+        gold_metadata=gold.metadata or {},
+        min_precision_labeled=args.min_precision_labeled,
+        min_eval_n=args.min_eval_n,
+    )
+    print(render_promotion_report(report))
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f"\n승격 보고 저장 — {out_path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -104,6 +131,32 @@ def main() -> int:
         "--out", default="", help="정밀도 보고 JSON 출력 경로 (선택).",
     )
     p_score.set_defaults(func=_cmd_score)
+
+    p_prom = sub.add_parser(
+        "promote",
+        help="eval 요약 + 인간 정밀도 + provenance → 단위별 잠정/절대 승격 보고",
+    )
+    p_prom.add_argument("--gold", required=True, help="골드셋 YAML 경로")
+    p_prom.add_argument(
+        "--eval-summary", required=True,
+        help="eval_search 의 *.summary.json 경로 (--absolute-mode 권장 — CI 포함)",
+    )
+    p_prom.add_argument(
+        "--review", default="",
+        help="채워진 리뷰 CSV (선택). 없으면 인간 정밀도 미반영 → 잠정.",
+    )
+    p_prom.add_argument(
+        "--min-precision-labeled", type=int, default=20,
+        help="단위 절대 승격에 필요한 최소 인간 라벨 수 (기본 20).",
+    )
+    p_prom.add_argument(
+        "--min-eval-n", type=int, default=30,
+        help="절대 승격에 필요한 최소 eval 성공 질의 수 (기본 30).",
+    )
+    p_prom.add_argument(
+        "--out", default="", help="승격 보고 JSON 출력 경로 (선택).",
+    )
+    p_prom.set_defaults(func=_cmd_promote)
 
     args = parser.parse_args()
     return int(args.func(args))
