@@ -14,6 +14,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT / "src"))
@@ -213,3 +215,112 @@ def test_context_recall_is_ci_metric() -> None:
     cis = eval_search._chunk_metric_cis(rows)
     assert "context_recall@5" in cis
     assert "mean" in cis["context_recall@5"]
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P4-answer) — 답변 단위 채점 + divergence
+# ---------------------------------------------------------------------------
+
+
+class _StubLLM:
+    def __init__(self, responses):  # type: ignore[no-untyped-def]
+        self._responses = list(responses)
+        self.calls = []  # type: ignore[var-annotated]
+
+    async def complete(self, prompt, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls.append({"prompt": prompt, **kwargs})
+        return self._responses.pop(0) if self._responses else ""
+
+
+def test_normalize_answer_strips_punct_and_case() -> None:
+    assert eval_search._normalize_answer('  "100만원."  ') == "100만원"
+    assert eval_search._normalize_answer("Token Validator") == "token validator"
+
+
+def test_factoid_match_exact_and_contains() -> None:
+    assert eval_search.factoid_match("100만원", "약 100만원 입니다") is True
+    assert eval_search.factoid_match("Token Validator", "token validator") is True
+    assert eval_search.factoid_match("100만원", "50만원") is False
+    assert eval_search.factoid_match("", "무엇") is False
+
+
+@pytest.mark.asyncio
+async def test_score_answer_correctness_factoid_no_llm() -> None:
+    """팩토이드 일치는 LLM 호출 없이 1.0."""
+    judge = _StubLLM([])
+    score, method, _ = await eval_search.score_answer_correctness(
+        "q", "100만원", "정답은 100만원이다", judge=judge,
+    )
+    assert score == 1.0
+    assert method == "factoid"
+    assert judge.calls == []  # judge 미호출
+
+
+@pytest.mark.asyncio
+async def test_score_answer_correctness_judge_path() -> None:
+    """팩토이드 불일치 → judge 0~5 → 0..1 정규화."""
+    judge = _StubLLM(['{"score": 4, "reason": "대체로 맞음"}'])
+    score, method, reason = await eval_search.score_answer_correctness(
+        "q", "토큰 검증 모듈에 의존", "인증은 검증기에 기댄다", judge=judge,
+    )
+    assert score == 0.8
+    assert method == "judge"
+    assert reason == "대체로 맞음"
+
+
+@pytest.mark.asyncio
+async def test_score_answer_correctness_parse_error() -> None:
+    judge = _StubLLM(["깨진 응답"])
+    score, method, _ = await eval_search.score_answer_correctness(
+        "q", "기준", "전혀 다른 답", judge=judge,
+    )
+    assert score == -1.0
+    assert method == "parse_error"
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_from_context_uses_system_llm() -> None:
+    llm = _StubLLM(["Token Validator에 의존한다."])
+    out = await eval_search.generate_answer_from_context(
+        "질문", "검색 컨텍스트 본문", answer_llm=llm,
+    )
+    assert out == "Token Validator에 의존한다."
+    assert llm.calls[0]["purpose"] == "goldset_answer_gen"
+    assert "검색 컨텍스트 본문" in llm.calls[0]["prompt"]
+
+
+def test_divergence_label_axes() -> None:
+    # 답 맞음 + 검색 실패 → answer_without_context
+    assert eval_search._divergence_label(0.0, 1) == "answer_without_context"
+    # 검색 OK + 답 실패 → context_without_answer
+    assert eval_search._divergence_label(1.0, 0) == "context_without_answer"
+    # 두 축 일치 → 빈 라벨
+    assert eval_search._divergence_label(1.0, 1) == ""
+    assert eval_search._divergence_label(0.0, 0) == ""
+    # 판정 불가
+    assert eval_search._divergence_label(None, 1) == ""
+    assert eval_search._divergence_label(0.0, None) == ""
+
+
+def test_write_summary_answer_and_divergence_report(tmp_path: Path) -> None:
+    rows = [
+        {"id": "a", "mode": "chunk", "answer_correct": 1, "answer_correctness": 1.0,
+         "measurement_units": ["doc", "answer"], "answerable": True,
+         "divergence": "answer_without_context"},
+        {"id": "b", "mode": "chunk", "answer_correct": 0, "answer_correctness": 0.2,
+         "measurement_units": ["doc", "answer"], "answerable": True,
+         "divergence": "context_without_answer"},
+        {"id": "c", "mode": "chunk", "answer_correct": 1, "answer_correctness": 0.8,
+         "measurement_units": ["doc", "answer"], "answerable": True},
+        {"id": "d", "mode": "chunk", "answer_parse_failed": True,
+         "measurement_units": ["answer"], "answerable": True},
+    ]
+    out = eval_search.write_summary(
+        rows, tmp_path / "s.summary.json", label="t", config_summary={},
+    )
+    # answer_correct 평균 = (1+0+1)/3
+    assert abs(out["metrics"]["answer_correct"] - (2 / 3)) < 1e-9
+    assert out["n_answer_scored"] == 3
+    assert out["n_answer_parse_failed"] == 1
+    assert out["divergence_counts"]["answer_without_context"] == 1
+    assert out["divergence_counts"]["context_without_answer"] == 1
