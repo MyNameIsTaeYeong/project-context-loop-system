@@ -71,6 +71,27 @@ class GeneratedGraphQuestion:
 
 
 @dataclass
+class ExtractedFact:
+    """원문에서 추출된 검증가능 사실 (source-grounded, PR #79 P1).
+
+    추출 LLM 출력의 합성 레이어 타입 — ``gold_set.SupportingFact`` 스키마와
+    독립이다 (synth.py 가 gold_set 에 의존하지 않도록; ``generate_graph_questions``
+    가 ``GraphEntityRef`` 대신 ``GeneratedGraphQuestion`` 을 돌려주는 것과 동일
+    패턴). 빌드 스크립트(P2)가 이를 ``SupportingFact`` 로 매핑한다.
+
+    ``evidence_span`` 은 원문 verbatim 인용이며, :func:`extract_verifiable_facts`
+    가 :func:`evidence_span_in_source` 로 원문 존재를 검증한 것만 통과시킨다.
+    """
+
+    entity: str
+    entity_type: str = ""
+    relation: str = ""
+    target: str = ""
+    evidence_span: str = ""
+    source_doc_id: int | None = None
+
+
+@dataclass
 class FilterReport:
     """품질 게이트 통과/탈락 사유 리포트."""
 
@@ -273,6 +294,48 @@ GRAPH_SNIPPET_MAX_CHARS = 8000
 
 # source_text_anchor 의 표준 prefix 길이.
 ANCHOR_MAX_CHARS = 200
+
+
+# source-grounded (PR #79 P1) — 원문에서 검증가능 사실(SupportingFact 원천) 추출.
+# 핵심: ``evidence_span`` 은 원문에서 **그대로 복사한 verbatim 인용** 이어야 한다.
+# 패러프레이즈/요약 금지 — 이후 substring 검증(``evidence_span_in_source``)으로
+# 원문에 실제 존재하지 않는 span 을 가진 사실은 환각으로 폐기한다.
+EXTRACT_FACTS_PROMPT_TEMPLATE = """\
+다음은 사내 문서 또는 코드의 원문이다:
+
+---
+{document_text}
+---
+
+이 원문이 **실제로 명시하는** 검증가능한 사실을 최대 {n}개 추출해라.
+각 사실은 원문만으로 확인 가능해야 하며, 외부 지식·추측·요약을 섞지 마라.
+
+각 사실에 대해 다음을 채워라:
+- ``entity``: 사실의 주체 (시스템/모듈/팀/개념 등의 이름).
+- ``entity_type``: 주체의 종류 (예: system, module, team, concept, function).
+- ``relation``: (선택) 주체가 대상과 맺는 관계 (예: depends_on, owns, calls,
+  validates). 단순 속성 사실이면 빈 문자열.
+- ``target``: (선택) 관계의 대상 엔티티 이름. relation 이 있을 때만.
+- ``evidence_span``: **원문에서 그대로 복사한** 한 문장(또는 구절). 위 사실이
+  원문의 어디에 쓰여 있는지를 보이는 verbatim 인용. 절대 바꿔 쓰지 마라 —
+  원문의 글자 그대로여야 한다 (substring 검증을 통과해야 함).
+
+원칙:
+- 원문에 없는 사실을 지어내지 마라.
+- ``evidence_span`` 은 반드시 원문에 글자 그대로 존재해야 한다 (패러프레이즈 금지).
+- 관계가 분명하지 않으면 ``relation``/``target`` 을 비우고 속성 사실로 남겨라.
+
+JSON 배열로만 출력해라 (다른 설명 금지, 예시는 형태만):
+[
+  {{
+    "entity": "Auth Service",
+    "entity_type": "system",
+    "relation": "depends_on",
+    "target": "Token Validator",
+    "evidence_span": "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
+  }}
+]
+"""
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -832,6 +895,54 @@ def parse_generated_graph_questions(text: str) -> list[GeneratedGraphQuestion]:
     return out
 
 
+def evidence_span_in_source(span: str, source_text: str) -> bool:
+    """``span`` 이 ``source_text`` 안에 실제로 존재하는지 검증 (PR #79 P1).
+
+    환각 차단의 핵심 게이트 — 추출 LLM 이 만들어낸 ``evidence_span`` 이 원문에
+    글자 그대로 없으면 그 사실은 폐기된다. 비교는 whitespace 정규화 후 수행해
+    줄바꿈/들여쓰기 차이로 인한 false negative 만 흡수하고, 실제 단어/문자
+    변경(패러프레이즈)은 그대로 잡는다.
+
+    빈 span 은 근거 부재이므로 False (검증 실패) 로 본다.
+    """
+    if not span or not span.strip():
+        return False
+    norm_span = _normalize_whitespace(span)
+    norm_source = _normalize_whitespace(source_text)
+    return norm_span in norm_source
+
+
+def parse_extracted_facts(text: str) -> list[ExtractedFact]:
+    """추출 LLM 응답에서 ``ExtractedFact`` 리스트를 파싱한다 (PR #79 P1).
+
+    파싱 실패 시 빈 리스트. ``entity`` 와 ``evidence_span`` 이 모두 비어 있지
+    않은 항목만 채택한다 (근거 없는 사실은 P1 단계에서 무의미).
+    """
+    try:
+        data = extract_json(text)
+    except ValueError:
+        logger.warning("사실 추출 응답 파싱 실패: %s", text[:200])
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[ExtractedFact] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        entity = str(item.get("entity") or "").strip()
+        span = str(item.get("evidence_span") or "").strip()
+        if not entity or not span:
+            continue
+        out.append(ExtractedFact(
+            entity=entity,
+            entity_type=str(item.get("entity_type") or "").strip(),
+            relation=str(item.get("relation") or "").strip(),
+            target=str(item.get("target") or "").strip(),
+            evidence_span=span,
+        ))
+    return out
+
+
 def parse_yes_no(text: str) -> bool | None:
     """"yes"/"no" 한 단어 응답을 bool 로 파싱.
 
@@ -888,6 +999,79 @@ async def generate_questions(
         call_kwargs["seed"] = int(seed)
     text = await generator.complete(prompt, **call_kwargs)
     return parse_generated_questions(text)
+
+
+async def extract_verifiable_facts(
+    document_text: str,
+    *,
+    extraction_llm: LLMClient,
+    n: int = 5,
+    source_doc_id: int | None = None,
+    reasoning_mode: str | None = "off",
+    max_tokens: int = 10000,
+    temperature: float = 0.0,
+    seed: int | None = None,
+    doc_max_tokens: int = 0,
+) -> tuple[list[ExtractedFact], dict[str, int]]:
+    """원문에서 검증가능 사실을 추출한다 (source-grounded, PR #79 P1).
+
+    골드 생성의 방향을 *인덱스→골드* 에서 *원문→골드* 로 뒤집는 1단계. 추출
+    LLM(인덱싱/시스템 모델과 분리 권장 — ``detect_role_collisions`` 의
+    ``extraction`` 역할)에 원문을 보여주고 ``ExtractedFact`` 들을 받은 뒤,
+    **각 ``evidence_span`` 이 원문에 실제 존재하는지 substring 검증**
+    (:func:`evidence_span_in_source`)을 통과한 사실만 돌려준다 (환각 차단).
+
+    Args:
+        document_text: 원문 본문 (``documents.original_content`` 또는 섹션).
+        extraction_llm: 추출 LLM. ``build_eval_llm_client(config, "extraction")``
+            로 빌드한 클라이언트를 주입한다 (config-driven, 테스트는 mock).
+        n: 추출 요청 사실 수 상한.
+        source_doc_id: 추출 대상 문서 ID. 결과 ``ExtractedFact.source_doc_id`` 에
+            박혀 doc 단위 정답키(SupportingFact.source_doc_id) 파생에 쓰인다.
+        reasoning_mode: 추론 프로파일 (다른 생성 함수와 일관).
+        max_tokens: 응답 최대 토큰.
+        temperature: 샘플링 온도 (기본 0.0, 재현성 우선).
+        seed: 결정성용 seed (endpoint 지원 시 전달).
+        doc_max_tokens: 원문 토큰 한도. 초과 시 앞부분 truncate (0=무제한). 단,
+            substring 검증은 **truncate 된 텍스트 기준** 으로 수행해 LLM 이 못 본
+            뒷부분을 근거로 한 사실이 통과하지 않게 한다.
+
+    Returns:
+        ``(facts, stats)`` — 검증 통과 ``ExtractedFact`` 리스트와 통계 dict
+        (``facts_extracted`` / ``facts_evidence_validated`` /
+        ``facts_evidence_rejected``).
+    """
+    source_text, _ = truncate_to_tokens(document_text, doc_max_tokens)
+    prompt = EXTRACT_FACTS_PROMPT_TEMPLATE.format(document_text=source_text, n=n)
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_extract_facts",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await extraction_llm.complete(prompt, **call_kwargs)
+    raw_facts = parse_extracted_facts(text)
+
+    validated: list[ExtractedFact] = []
+    rejected = 0
+    for fact in raw_facts:
+        if evidence_span_in_source(fact.evidence_span, source_text):
+            fact.source_doc_id = source_doc_id
+            validated.append(fact)
+        else:
+            rejected += 1
+            logger.debug(
+                "evidence_span 원문 부재로 폐기 (doc=%s): %.80s",
+                source_doc_id, fact.evidence_span,
+            )
+    stats = {
+        "facts_extracted": len(raw_facts),
+        "facts_evidence_validated": len(validated),
+        "facts_evidence_rejected": rejected,
+    }
+    return validated, stats
 
 
 async def generate_graph_questions(

@@ -13,8 +13,11 @@ import pytest
 
 from context_loop.eval.synth import (
     GRAPH_GENERATE_PROMPT_TEMPLATE,
+    ExtractedFact,
     build_subgraph_snippet,
+    evidence_span_in_source,
     extract_unique_tokens,
+    extract_verifiable_facts,
     filter_question,
     format_edges_for_prompt,
     generate_cross_doc_questions,
@@ -24,6 +27,7 @@ from context_loop.eval.synth import (
     has_identifier_leakage,
     is_alias_leakage,
     make_text_anchor,
+    parse_extracted_facts,
     parse_generated_graph_questions,
     parse_generated_questions,
     parse_yes_no,
@@ -958,3 +962,116 @@ async def test_generate_cross_doc_questions_prompt() -> None:
     assert "두 문서" in prompt
     # purpose 라벨이 cross-doc 전용
     assert stub.calls[0]["purpose"] == "goldset_generate_cross_doc"
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P1) — 사실 추출 + evidence_span substring 검증
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_span_in_source_exact() -> None:
+    src = "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
+    assert evidence_span_in_source("Token Validator에 의존한다.", src) is True
+
+
+def test_evidence_span_in_source_whitespace_normalized() -> None:
+    """줄바꿈·들여쓰기 차이는 흡수하되 단어 변경은 잡는다."""
+    src = "Auth Service가\n   결제 인증을  처리한다."
+    assert evidence_span_in_source("Auth Service가 결제 인증을 처리한다.", src) is True
+
+
+def test_evidence_span_in_source_paraphrase_rejected() -> None:
+    """패러프레이즈(단어 변경)는 원문에 없으므로 거부된다."""
+    src = "Auth Service가 Token Validator에 의존한다."
+    assert evidence_span_in_source("인증 서비스는 토큰 검증기에 의존한다.", src) is False
+
+
+def test_evidence_span_in_source_empty_is_false() -> None:
+    assert evidence_span_in_source("", "원문") is False
+    assert evidence_span_in_source("   ", "원문") is False
+
+
+def test_parse_extracted_facts_valid() -> None:
+    text = """
+    [
+      {"entity": "Auth Service", "entity_type": "system",
+       "relation": "depends_on", "target": "Token Validator",
+       "evidence_span": "Auth Service가 Token Validator에 의존한다."}
+    ]
+    """
+    facts = parse_extracted_facts(text)
+    assert len(facts) == 1
+    assert facts[0].entity == "Auth Service"
+    assert facts[0].relation == "depends_on"
+    assert facts[0].target == "Token Validator"
+
+
+def test_parse_extracted_facts_skips_missing_entity_or_span() -> None:
+    text = """
+    [
+      {"entity": "", "evidence_span": "근거"},
+      {"entity": "X", "evidence_span": ""},
+      {"entity": "Y", "evidence_span": "원문 근거 문장"}
+    ]
+    """
+    facts = parse_extracted_facts(text)
+    assert len(facts) == 1
+    assert facts[0].entity == "Y"
+
+
+def test_parse_extracted_facts_parse_error_returns_empty() -> None:
+    assert parse_extracted_facts("not json at all") == []
+
+
+@pytest.mark.asyncio
+async def test_extract_verifiable_facts_validates_and_rejects() -> None:
+    """원문에 존재하는 span 은 통과, 없는 span(환각) 은 폐기된다."""
+    source = "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
+    response = (
+        '[{"entity": "Auth Service", "entity_type": "system",'
+        ' "relation": "depends_on", "target": "Token Validator",'
+        ' "evidence_span": "Token Validator에 의존한다."},'
+        ' {"entity": "Ghost", "entity_type": "system",'
+        ' "evidence_span": "원문에 없는 지어낸 문장이다."}]'
+    )
+    stub = StubLLM([response])
+    facts, stats = await extract_verifiable_facts(
+        source, extraction_llm=stub, n=5, source_doc_id=12,  # type: ignore[arg-type]
+    )
+    assert len(facts) == 1
+    assert facts[0].entity == "Auth Service"
+    assert facts[0].source_doc_id == 12  # 검증 통과 사실에 doc id 박힘
+    assert stats == {
+        "facts_extracted": 2,
+        "facts_evidence_validated": 1,
+        "facts_evidence_rejected": 1,
+    }
+    # 원문이 프롬프트에 들어갔는지
+    assert source in stub.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_extract_verifiable_facts_empty_response() -> None:
+    stub = StubLLM([""])
+    facts, stats = await extract_verifiable_facts(
+        "원문", extraction_llm=stub, n=3,  # type: ignore[arg-type]
+    )
+    assert facts == []
+    assert stats["facts_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_extract_verifiable_facts_passes_seed_and_purpose() -> None:
+    stub = StubLLM(['[{"entity": "X", "evidence_span": "원문 근거"}]'])
+    await extract_verifiable_facts(
+        "원문 근거 문장", extraction_llm=stub, n=1, seed=7,  # type: ignore[arg-type]
+    )
+    assert stub.calls[0]["seed"] == 7
+    assert stub.calls[0]["purpose"] == "goldset_extract_facts"
+
+
+def test_extracted_fact_defaults() -> None:
+    f = ExtractedFact(entity="X")
+    assert f.entity_type == ""
+    assert f.relation == ""
+    assert f.source_doc_id is None
