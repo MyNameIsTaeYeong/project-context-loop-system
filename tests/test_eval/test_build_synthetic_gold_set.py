@@ -1137,3 +1137,95 @@ def test_merge_stats_empty_local_noop() -> None:
     target: dict[str, int] = {"generated": 5}
     builder._merge_stats(target, {})
     assert target == {"generated": 5}
+
+
+# ---------------------------------------------------------------------------
+# source-grounded (PR #79 P2) — ExtractedFact → SupportingFact → GoldItem 조립
+# ---------------------------------------------------------------------------
+
+
+def test_fact_to_supporting_fact_maps_fields() -> None:
+    from context_loop.eval.synth import ExtractedFact
+
+    fact = ExtractedFact(
+        entity="Auth Service", entity_type="system",
+        relation="depends_on", target="Token Validator",
+        evidence_span="Auth Service가 Token Validator에 의존한다.",
+        source_doc_id=12,
+    )
+    sf = builder._fact_to_supporting_fact(fact, acceptable_surface_forms=["인증 서비스"])
+    assert sf.entity == "Auth Service"
+    assert sf.relation == "depends_on"
+    assert sf.target == "Token Validator"
+    assert sf.source_doc_id == 12
+    assert sf.acceptable_surface_forms == ["인증 서비스"]
+
+
+def test_build_source_grounded_gold_item_three_units() -> None:
+    """relation 사실 → doc+answer+graph 3단위 동시 서빙."""
+    from context_loop.eval.synth import ExtractedFact, SourceGroundedQuestion
+
+    fact = ExtractedFact(
+        entity="Auth Service", entity_type="system",
+        relation="depends_on", target="Token Validator",
+        evidence_span="Auth Service가 Token Validator에 의존한다.",
+        source_doc_id=12,
+    )
+    sgq = SourceGroundedQuestion(
+        query="결제 인증을 처리하는 서비스가 의존하는 검증 모듈은?",
+        reference_answer="Token Validator에 의존한다.",
+        difficulty="medium",
+        acceptable_surface_forms=["인증 서비스"],
+    )
+    item = builder.build_source_grounded_gold_item(
+        sgq, [fact], source_type="confluence_mcp",
+        source_text="Auth Service가 Token Validator에 의존한다.",
+        score_relations=True,
+        provenance={"extraction_model": "m-a", "seed": 7},
+    )
+    assert item.id == ""  # placeholder — 호출 루프가 부여
+    assert item.measurement_units == ["doc", "answer", "graph"]
+    assert item.relevant_doc_ids == [12]
+    assert item.relevant_doc_groups == [[12]]
+    assert item.reference_answer == "Token Validator에 의존한다."
+    assert len(item.supporting_facts) == 1
+    assert item.relevant_graph_entities[0].name == "Auth Service"
+    assert item.relevant_graph_entities[0].aliases == ["인증 서비스"]
+    assert item.relevant_graph_relations[0].relation_type == "depends_on"
+    assert item.provenance["seed"] == 7
+    assert item.synthesized is True
+
+
+def test_build_source_grounded_gold_item_attribute_fact_no_graph() -> None:
+    """relation 없는 속성 사실 → doc+answer 만 (graph 엔티티/관계 없음)."""
+    from context_loop.eval.synth import ExtractedFact, SourceGroundedQuestion
+
+    fact = ExtractedFact(
+        entity="결제 한도", entity_type="concept",
+        evidence_span="결제 한도는 일 100만원이다.", source_doc_id=5,
+    )
+    sgq = SourceGroundedQuestion(query="일일 결제 한도는?", reference_answer="100만원")
+    item = builder.build_source_grounded_gold_item(sgq, [fact])
+    assert item.measurement_units == ["doc", "answer"]
+    assert item.relevant_graph_entities == []
+    assert item.relevant_graph_relations == []
+    assert item.relevant_doc_ids == [5]
+
+
+def test_build_source_grounded_gold_item_roundtrip_serializable() -> None:
+    """조립된 GoldItem 이 to_dict/from_dict round-trip 된다 (P0 스키마 호환)."""
+    from context_loop.eval.gold_set import GoldItem
+    from context_loop.eval.synth import ExtractedFact, SourceGroundedQuestion
+
+    fact = ExtractedFact(
+        entity="A", relation="calls", target="B",
+        evidence_span="A는 B를 호출한다.", source_doc_id=3,
+    )
+    sgq = SourceGroundedQuestion(query="q", reference_answer="a")
+    item = builder.build_source_grounded_gold_item(
+        sgq, [fact], source_type="git_code", score_relations=True,
+    )
+    restored = GoldItem.from_dict(item.to_dict())
+    assert restored.measurement_units == ["doc", "answer", "graph"]
+    assert restored.supporting_facts[0].evidence_span == "A는 B를 호출한다."
+    assert restored.reference_answer == "a"

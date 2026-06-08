@@ -107,6 +107,7 @@ from context_loop.eval.gold_set import (  # noqa: E402
     GoldSet,
     GraphEntityRef,
     GraphRelationRef,
+    SupportingFact,
     save_gold_set,
 )
 from context_loop.eval.graph_match import (  # noqa: E402
@@ -115,7 +116,9 @@ from context_loop.eval.graph_match import (  # noqa: E402
 )
 from context_loop.eval.llm import build_eval_llm_client, role_is_configured  # noqa: E402
 from context_loop.eval.synth import (  # noqa: E402
+    ExtractedFact,
     GeneratedGraphQuestion,
+    SourceGroundedQuestion,
     build_korean_stopwords_from_corpus,
     build_subgraph_snippet,
     filter_question,
@@ -123,6 +126,7 @@ from context_loop.eval.synth import (  # noqa: E402
     generate_cross_doc_questions,
     generate_graph_questions,
     generate_questions,
+    infer_measurement_units,
     make_text_anchor,
     sanitize_graph_aliases,
     sanitize_graph_evidence,
@@ -1468,6 +1472,109 @@ def _build_graph_metadata(
         "graph_evidence_embedding_model": embedding_model_id or "",
         "extraction_llm_provenance": "unrecorded",
     }
+
+
+def _fact_to_supporting_fact(
+    fact: ExtractedFact,
+    *,
+    acceptable_surface_forms: list[str] | None = None,
+) -> SupportingFact:
+    """``ExtractedFact`` (synth 합성 레이어) 를 ``SupportingFact`` (골드 스키마) 로 매핑.
+
+    PR #79 P2 — synth.py 가 gold_set 스키마에 의존하지 않도록 분리해 둔 두 타입
+    사이의 경계 변환. ``acceptable_surface_forms`` 는 누설 게이트를 통과한 검증
+    동의어만 들어온다 (호출자가 ``derive_acceptable_surface_forms`` 로 정제).
+    """
+    return SupportingFact(
+        entity=fact.entity,
+        entity_type=fact.entity_type,
+        relation=fact.relation,
+        target=fact.target,
+        evidence_span=fact.evidence_span,
+        source_doc_id=fact.source_doc_id,
+        acceptable_surface_forms=list(acceptable_surface_forms or []),
+    )
+
+
+def build_source_grounded_gold_item(
+    sgq: SourceGroundedQuestion,
+    facts: list[ExtractedFact],
+    *,
+    source_type: str = "",
+    source_text: str = "",
+    score_relations: bool = False,
+    provenance: dict[str, Any] | None = None,
+) -> GoldItem:
+    """SG 질문 + 근거 사실들을 통합 ``GoldItem`` 으로 조립한다 (PR #79 P2).
+
+    한 원천 사실(들)이 ``measurement_units`` 에 따라 doc/answer/graph 세 단위를
+    동시에 서빙하도록 정답키를 파생한다 (계획서 §4):
+    - **doc**: ``relevant_doc_ids`` ← 사실들의 ``source_doc_id`` (중복 제거·정렬).
+    - **answer**: ``reference_answer`` ← ``sgq.reference_answer``.
+    - **graph**: ``relevant_graph_entities`` / (옵션)``relevant_graph_relations``
+      ← relation+target 을 가진 사실에서 파생.
+
+    ``sgq.acceptable_surface_forms`` 는 주체 엔티티(facts[0]) 의 검증 동의어로
+    붙인다. ``id`` 는 placeholder ``""`` — 호출 루프가 idx 순으로 부여한다
+    (graph/chunk 모드와 동일 규약).
+    """
+    primary = facts[0] if facts else None
+    supporting: list[SupportingFact] = []
+    for i, f in enumerate(facts):
+        forms = sgq.acceptable_surface_forms if i == 0 else []
+        supporting.append(_fact_to_supporting_fact(f, acceptable_surface_forms=forms))
+
+    # doc 단위 — evidence_span 출처 문서들.
+    doc_ids = sorted({
+        f.source_doc_id for f in facts if f.source_doc_id is not None
+    })
+
+    # measurement_units — 사실별 단위의 합집합 (순서 doc<answer<graph 유지).
+    unit_set: set[str] = set()
+    for f in facts:
+        unit_set.update(infer_measurement_units(f))
+    units = [u for u in ("doc", "answer", "graph") if u in unit_set]
+
+    # graph 단위 — relation+target 사실에서 엔티티/관계 파생.
+    graph_entities: list[GraphEntityRef] = []
+    graph_relations: list[GraphRelationRef] = []
+    if "graph" in units:
+        seen_entities: set[tuple[str, str]] = set()
+        for i, f in enumerate(facts):
+            if not (f.relation and f.target):
+                continue
+            key = (f.entity.lower(), f.entity_type)
+            if key not in seen_entities:
+                seen_entities.add(key)
+                graph_entities.append(GraphEntityRef(
+                    name=f.entity,
+                    type=f.entity_type,
+                    aliases=list(sgq.acceptable_surface_forms) if i == 0 else [],
+                ))
+            if score_relations:
+                graph_relations.append(GraphRelationRef(
+                    source_name=f.entity,
+                    target_name=f.target,
+                    relation_type=f.relation,
+                ))
+
+    return GoldItem(
+        id="",
+        query=sgq.query,
+        relevant_doc_ids=doc_ids,
+        relevant_doc_groups=[[d] for d in doc_ids],
+        relevant_graph_entities=graph_entities,
+        relevant_graph_relations=graph_relations,
+        source_type=source_type,
+        source_document_id=(primary.source_doc_id if primary else None),
+        source_text_anchor=(make_text_anchor(source_text) if source_text else None),
+        difficulty=sgq.difficulty,
+        synthesized=True,
+        reference_answer=sgq.reference_answer,
+        supporting_facts=supporting,
+        measurement_units=units,
+        provenance=dict(provenance or {}),
+    )
 
 
 def _make_graph_gold_item(

@@ -92,6 +92,22 @@ class ExtractedFact:
 
 
 @dataclass
+class SourceGroundedQuestion:
+    """원문 사실로부터 합성된 질문 + 기준답 (source-grounded, PR #79 P2).
+
+    ``ExtractedFact`` 하나로부터 생성된다. ``query`` 는 그 사실로만 답 가능해야
+    하고, ``reference_answer`` 는 ``evidence_span`` 근거에 충실한 기준답이다
+    (answer 단위 채점의 정답키). ``acceptable_surface_forms`` 는 generator 가
+    제안한 동의어 중 누설 게이트(``sanitize_graph_aliases``)를 통과한 것만 담는다.
+    """
+
+    query: str
+    reference_answer: str = ""
+    difficulty: str = ""
+    acceptable_surface_forms: list[str] = field(default_factory=list)
+
+
+@dataclass
 class FilterReport:
     """품질 게이트 통과/탈락 사유 리포트."""
 
@@ -335,6 +351,40 @@ JSON 배열로만 출력해라 (다른 설명 금지, 예시는 형태만):
     "evidence_span": "Auth Service가 결제 인증을 처리하며 Token Validator에 의존한다."
   }}
 ]
+"""
+
+
+# source-grounded (PR #79 P2) — 추출된 사실 1개로부터 질문 + 기준답 합성.
+# 질문은 그 사실로만 답 가능해야 하고(검색·답변 단위의 표적), reference_answer 는
+# evidence_span 근거에 충실해야 한다. 식별자 복붙 금지(검색 trivial recall 차단).
+SG_QUESTION_PROMPT_TEMPLATE = """\
+다음은 원문에서 추출된 검증된 사실 하나다:
+
+- 주체: {entity} ({entity_type})
+- 관계: {relation_line}
+- 원문 근거(evidence_span): "{evidence_span}"
+
+이 사실로 **그리고 이 사실로만** 답할 수 있는 한국어 질문 1개와, 그 질문의
+기준답(reference_answer)을 작성해라.
+
+원칙:
+- 질문은 **검색창에 단독으로 입력해도 의미가 통해야** 한다 (사용자는 원문을
+  보지 않는다).
+- 식별자(함수명/클래스명/페이지명/고유명사)를 그대로 베끼지 말고 의미로 풀어써라.
+  ✗ 나쁜 예: "Auth Service는 무엇에 의존하나요?" (이름 복붙)
+  ○ 좋은 예: "결제 인증을 처리하는 서비스는 어떤 검증 모듈에 의존하나요?"
+- **지시대명사·포인터 표현 금지** ("이 사실/위 관계/this entity" 등).
+- ``reference_answer`` 는 원문 근거에 충실한 1~2 문장. 외부 지식·추측 금지.
+- ``acceptable_surface_forms``: 주체 ``{entity}`` 와 **동일 대상**임이 분명한 다른
+  표기만 (확신 없으면 빈 배열). 추측·관련어 나열 금지.
+
+JSON 객체 하나로만 출력해라 (다른 설명 금지, 예시는 형태만):
+{{
+  "q": "질문 본문",
+  "reference_answer": "원문 근거에 충실한 기준답",
+  "difficulty": "medium",
+  "acceptable_surface_forms": ["인증 서비스"]
+}}
 """
 
 
@@ -943,6 +993,81 @@ def parse_extracted_facts(text: str) -> list[ExtractedFact]:
     return out
 
 
+def parse_source_grounded_question(text: str) -> SourceGroundedQuestion | None:
+    """SG 질문 합성 응답(단일 JSON 객체)을 파싱한다 (PR #79 P2).
+
+    배열로 와도 첫 항목을 채택한다 (LLM 변형 대응). ``q``/``query`` 가 비면
+    ``None`` (호출부 게이트). ``difficulty`` 는 화이트리스트 외 값이면 빈 문자열.
+    """
+    try:
+        data = extract_json(text)
+    except ValueError:
+        logger.warning("SG 질문 응답 파싱 실패: %s", text[:200])
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return None
+    q = str(data.get("q") or data.get("query") or "").strip()
+    if not q:
+        return None
+    diff = str(data.get("difficulty") or "").strip().lower()
+    if diff not in ("easy", "medium", "hard"):
+        diff = ""
+    raw_forms = data.get("acceptable_surface_forms") or []
+    forms: list[str] = []
+    if isinstance(raw_forms, list):
+        for f in raw_forms:
+            if isinstance(f, str) and f.strip():
+                forms.append(f.strip())
+    return SourceGroundedQuestion(
+        query=q,
+        reference_answer=str(data.get("reference_answer") or "").strip(),
+        difficulty=diff,
+        acceptable_surface_forms=forms,
+    )
+
+
+def infer_measurement_units(fact: ExtractedFact) -> list[str]:
+    """한 사실이 서빙하는 측정 단위를 결정론적으로 판정한다 (PR #79 P2).
+
+    - ``doc``: 항상 (evidence_span 출처 문서를 회수했나 = context recall).
+    - ``answer``: 항상 (reference_answer 채점).
+    - ``graph``: ``relation`` + ``target`` 이 모두 있을 때만 (트리플 회수 채점).
+    """
+    units = ["doc", "answer"]
+    if fact.relation and fact.target:
+        units.append("graph")
+    return units
+
+
+def derive_acceptable_surface_forms(
+    entity: str,
+    proposed: list[str],
+    source_text: str,
+    *,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> list[str]:
+    """generator 가 제안한 동의어를 누설 게이트로 정제한다 (PR #79 P2).
+
+    ``sanitize_graph_aliases`` (S1-2) 를 재사용해, 원문의 고유 식별자/한국어
+    고유명사를 그대로 베껴 T2 surface 매칭을 자명 통과시키는 누설 동의어를
+    드롭한다. 엔티티 이름의 표기 변형(케이스/구분자)은 정상 통과(과교정 방지).
+    중복은 순서 보존 제거한다.
+    """
+    kept, _dropped = sanitize_graph_aliases(
+        proposed, entity, source_text,
+        extra_korean_stopwords=extra_korean_stopwords,
+    )
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in kept:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
 def parse_yes_no(text: str) -> bool | None:
     """"yes"/"no" 한 단어 응답을 bool 로 파싱.
 
@@ -1072,6 +1197,58 @@ async def extract_verifiable_facts(
         "facts_evidence_rejected": rejected,
     }
     return validated, stats
+
+
+async def generate_sg_question(
+    fact: ExtractedFact,
+    *,
+    generator: LLMClient,
+    source_text: str = "",
+    reasoning_mode: str | None = "off",
+    max_tokens: int = 10000,
+    temperature: float = 0.0,
+    seed: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> SourceGroundedQuestion | None:
+    """추출된 사실 1개에서 질문 + reference_answer 를 합성한다 (PR #79 P2).
+
+    ``acceptable_surface_forms`` 는 generator 제안을 ``source_text`` 기준 누설
+    게이트(:func:`derive_acceptable_surface_forms`)로 정제해 채운다 —
+    ``source_text`` 가 비면 정제 없이 generator 제안을 그대로 둔다(상위 호출이
+    원문을 넘기는 것을 권장).
+
+    Returns:
+        ``SourceGroundedQuestion`` 또는 파싱 실패 시 ``None``.
+    """
+    relation_line = (
+        f"{fact.entity} --[{fact.relation}]--> {fact.target}"
+        if fact.relation and fact.target
+        else "(단순 속성 사실 — 관계 없음)"
+    )
+    prompt = SG_QUESTION_PROMPT_TEMPLATE.format(
+        entity=fact.entity,
+        entity_type=fact.entity_type or "(타입 없음)",
+        relation_line=relation_line,
+        evidence_span=fact.evidence_span,
+    )
+    call_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "reasoning_mode": reasoning_mode,
+        "purpose": "goldset_generate_sg",
+    }
+    if seed is not None:
+        call_kwargs["seed"] = int(seed)
+    text = await generator.complete(prompt, **call_kwargs)
+    sgq = parse_source_grounded_question(text)
+    if sgq is None:
+        return None
+    if source_text and sgq.acceptable_surface_forms:
+        sgq.acceptable_surface_forms = derive_acceptable_surface_forms(
+            fact.entity, sgq.acceptable_surface_forms, source_text,
+            extra_korean_stopwords=extra_korean_stopwords,
+        )
+    return sgq
 
 
 async def generate_graph_questions(
@@ -1329,6 +1506,71 @@ async def filter_question(
         if ans is True:
             return FilterReport(passed=False, reason="generic")
 
+    return FilterReport(passed=True)
+
+
+async def filter_source_grounded_question(
+    question: str,
+    fact: ExtractedFact,
+    source_text: str,
+    distractors: list[str],
+    *,
+    judge: LLMClient,
+    reasoning_mode: str | None = "off",
+    seed: int | None = None,
+    extra_korean_stopwords: frozenset[str] | None = None,
+) -> FilterReport:
+    """source-grounded 질문 품질 게이트 (PR #79 P2 — 계획서 §5 [4]).
+
+    기존 :func:`filter_question` 위에 **evidence 존재 게이트**를 얹는다:
+
+    - (c-pre) ``evidence_span`` 이 원문(``source_text``)에 실제 존재? 아니면
+      ``evidence_missing`` 으로 탈락 (환각 사실에서 나온 질문 차단).
+    - (a) 원문 근거(``evidence_span``)로 답 가능? — ``is_answerable``
+    - (b) 식별자/한국어 누설·지시대명사 — 결정론 (source_chunk=원문 기준)
+    - (d) 무관 청크/일반지식으론 불가? — ``is_unique_source`` + distractor
+
+    답변 가능성 게이트의 ``source_chunk`` 는 사실의 근거인 ``evidence_span`` 을
+    쓴다 (그 사실로만 답 가능한지 검증). 누설 게이트는 원문 전체(``source_text``)
+    기준으로 본다 (원문의 어떤 고유명사든 복붙 차단).
+    """
+    if not evidence_span_in_source(fact.evidence_span, source_text):
+        return FilterReport(passed=False, reason="evidence_missing")
+    # 답변 가능성은 evidence_span 근거로, 누설은 원문 전체로 — 두 게이트의
+    # source_chunk 분리. filter_question 은 단일 source_chunk 를 받으므로,
+    # 답변 가능성(evidence_span)과 누설(원문) 게이트를 직접 조합한다.
+    ans = await is_answerable(
+        question, fact.evidence_span, judge=judge,
+        reasoning_mode=reasoning_mode, seed=seed,
+    )
+    if ans is None:
+        return FilterReport(passed=False, reason="parse_error")
+    if not ans:
+        return FilterReport(passed=False, reason="not_answerable")
+    if has_identifier_leakage(question, source_text):
+        return FilterReport(passed=False, reason="leakage")
+    if has_korean_proper_noun_leakage(
+        question, source_text, extra_stopwords=extra_korean_stopwords,
+    ):
+        return FilterReport(passed=False, reason="korean_leakage")
+    if has_demonstrative_reference(question):
+        return FilterReport(passed=False, reason="demonstrative")
+    unique = await is_unique_source(
+        question, fact.evidence_span, judge=judge,
+        reasoning_mode=reasoning_mode, seed=seed,
+    )
+    if unique is None:
+        return FilterReport(passed=False, reason="parse_error")
+    if not unique:
+        return FilterReport(passed=False, reason="non_unique_source")
+    for i, distractor in enumerate(distractors):
+        d_seed = (seed + 100 + i) if seed is not None else None
+        d_ans = await is_answerable(
+            question, distractor, judge=judge,
+            reasoning_mode=reasoning_mode, seed=d_seed,
+        )
+        if d_ans is True:
+            return FilterReport(passed=False, reason="generic")
     return FilterReport(passed=True)
 
 
