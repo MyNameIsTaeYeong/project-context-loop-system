@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from context_loop.mcp.context_assembler import (
+    _apply_parent_documents,
     _fetch_and_format_source_code,
     _format_graph_chunk_results,
     _search_chunks,
@@ -17,6 +18,7 @@ from context_loop.mcp.context_assembler import (
     assemble_context,
     assemble_context_with_sources,
 )
+from context_loop.processor.chunker import count_tokens
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
@@ -1126,3 +1128,301 @@ async def test_with_sources_graph_doc_gets_real_similarity(stores) -> None:
     )
     graph_source = next(s for s in ctx.sources if s.document_id == doc_graph)
     assert graph_source.similarity > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Parent-document retrieval (섹션 폴백 청크 → 문서 전문 치환)
+# ---------------------------------------------------------------------------
+
+
+async def _create_fallback_doc(
+    meta_store,
+    vector_store,
+    *,
+    title: str,
+    content_hash: str,
+    embedding: list[float],
+    source_type: str = "confluence_mcp",
+    original_content: str | None = None,
+    view: str = "body",
+    question_text: str = "",
+) -> int:
+    """섹션 폴백(다청크) 문서 + 적중용 벡터 엔트리 1건을 생성한다."""
+    original = original_content if original_content is not None else (
+        f"# {title}\n\n섹션1 본문\n\n# 두번째 섹션\n\n섹션2 본문 전체 맥락"
+    )
+    doc_id = await meta_store.create_document(
+        source_type=source_type, title=title,
+        original_content=original, content_hash=content_hash,
+    )
+    await meta_store.create_chunk(
+        chunk_id=f"{content_hash}-0", document_id=doc_id, chunk_index=0,
+        content="섹션1 본문", token_count=10, section_path=title,
+    )
+    await meta_store.create_chunk(
+        chunk_id=f"{content_hash}-1", document_id=doc_id, chunk_index=1,
+        content="섹션2 본문 전체 맥락", token_count=10, section_path="두번째 섹션",
+    )
+    meta = {
+        "document_id": doc_id, "logical_chunk_id": f"{content_hash}-0",
+        "section_path": title, "view": view,
+    }
+    if question_text:
+        meta["question_text"] = question_text
+    vector_store.add_chunks(
+        chunk_ids=[f"{content_hash}-0#{view}"],
+        embeddings=[embedding],
+        documents=["섹션1 본문"],
+        metadatas=[meta],
+    )
+    return doc_id
+
+
+@pytest.mark.asyncio
+async def test_apply_parent_documents_substitutes_multichunk_doc(stores) -> None:
+    """다청크(섹션 폴백) 문서의 적중 청크가 원문 전문으로 치환된다."""
+    meta_store, vector_store, _ = stores
+    doc_id = await _create_fallback_doc(
+        meta_store, vector_store, title="PDoc", content_hash="pd1",
+        embedding=[0.9, 0.1],
+    )
+    results = [{"metadata": {"document_id": doc_id, "section_path": "PDoc"},
+                "document": "섹션1 본문"}]
+    substituted: set[int] = set()
+
+    consumed = await _apply_parent_documents(
+        results, meta_store,
+        max_doc_tokens=32000, remaining_budget=96000,
+        substituted_doc_ids=substituted,
+    )
+    assert results[0]["parent_document"] is True
+    assert "섹션2 본문 전체 맥락" in results[0]["document"]
+    assert consumed > 0
+    assert substituted == {doc_id}
+
+
+@pytest.mark.asyncio
+async def test_apply_parent_documents_skips_single_chunk_doc(stores) -> None:
+    """1청크 문서(섹션 폴백 없음)는 이미 전문이므로 치환하지 않는다."""
+    meta_store, vector_store, _ = stores
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp", title="Small",
+        original_content="작은 문서 전문", content_hash="pd2",
+    )
+    await meta_store.create_chunk(
+        chunk_id="pd2-0", document_id=doc_id, chunk_index=0,
+        content="작은 문서 전문", token_count=5,
+    )
+    results = [{"metadata": {"document_id": doc_id}, "document": "작은 문서 전문"}]
+
+    consumed = await _apply_parent_documents(
+        results, meta_store,
+        max_doc_tokens=32000, remaining_budget=96000,
+        substituted_doc_ids=set(),
+    )
+    assert consumed == 0
+    assert "parent_document" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_apply_parent_documents_respects_doc_limit(stores) -> None:
+    """전문이 문서당 한도를 넘으면 기존 섹션 청크를 유지한다."""
+    meta_store, vector_store, _ = stores
+    doc_id = await _create_fallback_doc(
+        meta_store, vector_store, title="BigDoc", content_hash="pd3",
+        embedding=[0.9, 0.1],
+    )
+    results = [{"metadata": {"document_id": doc_id}, "document": "섹션1 본문"}]
+
+    consumed = await _apply_parent_documents(
+        results, meta_store,
+        max_doc_tokens=1, remaining_budget=96000,
+        substituted_doc_ids=set(),
+    )
+    assert consumed == 0
+    assert results[0]["document"] == "섹션1 본문"
+    assert "parent_document" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_apply_parent_documents_respects_total_budget(stores) -> None:
+    """총합 예산이 소진되면 후순위 문서는 치환되지 않는다."""
+    meta_store, vector_store, _ = stores
+    doc_a = await _create_fallback_doc(
+        meta_store, vector_store, title="DocA", content_hash="pd4a",
+        embedding=[0.9, 0.1],
+    )
+    doc_b = await _create_fallback_doc(
+        meta_store, vector_store, title="DocB", content_hash="pd4b",
+        embedding=[0.8, 0.2],
+    )
+    doc_a_row = await meta_store.get_document(doc_a)
+    budget = count_tokens(doc_a_row["original_content"])  # 첫 문서만큼만
+
+    results = [
+        {"metadata": {"document_id": doc_a}, "document": "섹션1 본문"},
+        {"metadata": {"document_id": doc_b}, "document": "섹션1 본문"},
+    ]
+    consumed = await _apply_parent_documents(
+        results, meta_store,
+        max_doc_tokens=32000, remaining_budget=budget,
+        substituted_doc_ids=set(),
+    )
+    assert consumed == budget
+    assert results[0].get("parent_document") is True
+    assert "parent_document" not in results[1]
+
+
+@pytest.mark.asyncio
+async def test_apply_parent_documents_skips_git_code(stores) -> None:
+    """git_code 소스는 치환 대상에서 제외된다 (소스 첨부 경로와 중복 방지)."""
+    meta_store, vector_store, _ = stores
+    doc_id = await _create_fallback_doc(
+        meta_store, vector_store, title="code.py", content_hash="pd5",
+        embedding=[0.9, 0.1], source_type="git_code",
+    )
+    results = [{"metadata": {"document_id": doc_id}, "document": "섹션1 본문"}]
+
+    consumed = await _apply_parent_documents(
+        results, meta_store,
+        max_doc_tokens=32000, remaining_budget=96000,
+        substituted_doc_ids=set(),
+    )
+    assert consumed == 0
+    assert "parent_document" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_apply_parent_documents_skips_empty_original(stores) -> None:
+    """original_content 가 비어 있으면 치환하지 않는다."""
+    meta_store, vector_store, _ = stores
+    doc_id = await _create_fallback_doc(
+        meta_store, vector_store, title="Empty", content_hash="pd6",
+        embedding=[0.9, 0.1], original_content="",
+    )
+    results = [{"metadata": {"document_id": doc_id}, "document": "섹션1 본문"}]
+
+    consumed = await _apply_parent_documents(
+        results, meta_store,
+        max_doc_tokens=32000, remaining_budget=96000,
+        substituted_doc_ids=set(),
+    )
+    assert consumed == 0
+    assert "parent_document" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_parent_doc_enabled(stores) -> None:
+    """parent_doc_enabled=True 면 섹션 청크 대신 전문 + '전문 첨부' 라벨이 출력된다."""
+    meta_store, vector_store, graph_store = stores
+    await _create_fallback_doc(
+        meta_store, vector_store, title="PDoc", content_hash="pd7",
+        embedding=[0.9, 0.1],
+    )
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    result = await assemble_context(
+        query="섹션1", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client,
+        include_graph=False, parent_doc_enabled=True,
+    )
+    assert "전문 첨부" in result
+    assert "매칭 섹션: PDoc" in result
+    assert "섹션2 본문 전체 맥락" in result  # 전문에만 있는 텍스트
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_parent_doc_default_off(stores) -> None:
+    """파라미터 미전달(기본 off) 시 기존 섹션 청크 출력이 유지된다."""
+    meta_store, vector_store, graph_store = stores
+    await _create_fallback_doc(
+        meta_store, vector_store, title="PDoc", content_hash="pd8",
+        embedding=[0.9, 0.1],
+    )
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    result = await assemble_context(
+        query="섹션1", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client,
+        include_graph=False,
+    )
+    assert "전문 첨부" not in result
+    assert "섹션2 본문 전체 맥락" not in result
+    assert "섹션1 본문" in result
+
+
+@pytest.mark.asyncio
+async def test_with_sources_parent_doc_flag(stores) -> None:
+    """with_sources 경로에서 Source.full_document 와 전문 라벨이 노출된다."""
+    meta_store, vector_store, graph_store = stores
+    doc_id = await _create_fallback_doc(
+        meta_store, vector_store, title="PDoc", content_hash="pd9",
+        embedding=[0.9, 0.1],
+    )
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    ctx = await assemble_context_with_sources(
+        query="섹션1", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client,
+        include_graph=False, parent_doc_enabled=True,
+    )
+    assert "(전문 첨부, 매칭 섹션: PDoc)" in ctx.context_text
+    assert "섹션2 본문 전체 맥락" in ctx.context_text
+    source = next(s for s in ctx.sources if s.document_id == doc_id)
+    assert source.full_document is True
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_parent_doc_on_graph_sourced(stores) -> None:
+    """그래프 경로로 도달한 다청크 문서도 전문으로 치환된다."""
+    meta_store, vector_store, graph_store = stores
+    doc_vec = await meta_store.create_document(
+        source_type="manual", title="VecDoc", original_content="c", content_hash="pd10v",
+    )
+    vector_store.add_chunks(
+        chunk_ids=["pd10v#body"], embeddings=[[0.9, 0.1]], documents=["벡터 본문"],
+        metadatas=[{"document_id": doc_vec, "logical_chunk_id": "pd10v", "view": "body"}],
+    )
+    doc_graph = await _create_fallback_doc(
+        meta_store, vector_store, title="GraphDoc", content_hash="pd10g",
+        embedding=[0.1, 0.9],
+    )
+    await graph_store.save_graph_data(doc_graph, GraphData(
+        entities=[Entity(name="PEnt", entity_type="service")], relations=[],
+    ))
+
+    embed_client = _make_embedding_client([0.9, 0.1])
+    llm = _make_llm_client({
+        "should_search": True, "reasoning": "x",
+        "search_steps": [{"entity_name": "PEnt", "depth": 1, "focus_relations": []}],
+    })
+
+    result = await assemble_context(
+        query="PEnt", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client, llm_client=llm,
+        include_graph=True, similarity_threshold=0.5, max_graph_docs=3,
+        parent_doc_enabled=True,
+    )
+    assert "## 그래프 연결 문서" in result
+    assert "전문 첨부" in result
+    assert "섹션2 본문 전체 맥락" in result
+
+
+@pytest.mark.asyncio
+async def test_parent_doc_question_view_hit(stores) -> None:
+    """question view 적중도 동일하게 치환되며 매칭 질문 라벨은 유지된다."""
+    meta_store, vector_store, graph_store = stores
+    await _create_fallback_doc(
+        meta_store, vector_store, title="QDoc", content_hash="pd11",
+        embedding=[0.9, 0.1], view="question", question_text="QDoc 의 동작은?",
+    )
+    embed_client = _make_embedding_client([0.9, 0.1])
+
+    result = await assemble_context(
+        query="동작", meta_store=meta_store, vector_store=vector_store,
+        graph_store=graph_store, embedding_client=embed_client,
+        include_graph=False, parent_doc_enabled=True,
+    )
+    assert "전문 첨부" in result
+    assert "매칭 질문: QDoc 의 동작은?" in result
+    assert "섹션2 본문 전체 맥락" in result
