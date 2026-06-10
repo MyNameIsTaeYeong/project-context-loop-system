@@ -38,6 +38,8 @@ class Source:
     document_id: int
     title: str
     similarity: float = 0.0
+    # parent-document retrieval 로 섹션 청크 대신 문서 전문이 첨부되었는지 여부.
+    full_document: bool = False
 
 
 @dataclass
@@ -74,6 +76,9 @@ async def assemble_context(
     include_source_code: bool = False,
     max_graph_docs: int = 3,
     max_graph_tokens: int = 6000,
+    parent_doc_enabled: bool = False,
+    parent_doc_max_doc_tokens: int = 32000,
+    parent_doc_total_tokens: int = 96000,
 ) -> str:
     """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
 
@@ -96,11 +101,17 @@ async def assemble_context(
         rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
         include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
+        parent_doc_enabled: 섹션 폴백 청크 적중 시 문서 전문 치환
+            (parent-document retrieval) 여부.
+        parent_doc_max_doc_tokens: 전문 치환의 문서당 토큰 한도.
+        parent_doc_total_tokens: 전문 치환 총합 토큰 예산 (벡터+그래프 합산).
 
     Returns:
         조립된 컨텍스트 텍스트.
     """
     sections: list[str] = []
+    parent_doc_budget = parent_doc_total_tokens
+    parent_substituted: set[int] = set()
 
     # 쿼리 임베딩 생성 (HyDE 활성화 시 가상 문서 임베딩과 평균)
     if hyde_enabled and llm_client:
@@ -129,6 +140,13 @@ async def assemble_context(
     )
 
     if chunk_results:
+        if parent_doc_enabled:
+            parent_doc_budget -= await _apply_parent_documents(
+                chunk_results, meta_store,
+                max_doc_tokens=parent_doc_max_doc_tokens,
+                remaining_budget=parent_doc_budget,
+                substituted_doc_ids=parent_substituted,
+            )
         chunk_section = _format_chunk_results(chunk_results, meta_store)
         sections.append(await chunk_section)
 
@@ -142,6 +160,13 @@ async def assemble_context(
             max_graph_tokens=max_graph_tokens,
         )
         if graph_chunks:
+            if parent_doc_enabled:
+                parent_doc_budget -= await _apply_parent_documents(
+                    graph_chunks, meta_store,
+                    max_doc_tokens=parent_doc_max_doc_tokens,
+                    remaining_budget=parent_doc_budget,
+                    substituted_doc_ids=parent_substituted,
+                )
             sections.append(
                 await _format_graph_chunk_results(graph_chunks, meta_store)
             )
@@ -257,7 +282,12 @@ async def _format_chunk_results(
         question_text = meta.get("question_text", "")
 
         header = f"\n### [{title}] (유사도: {1 - distance:.2f})"
-        if section_path:
+        if r.get("parent_document"):
+            label = "전문 첨부"
+            if section_path:
+                label += f" (매칭 섹션: {section_path})"
+            header += f"\n_{label}_"
+        elif section_path:
             header += f"\n_섹션: {section_path}_"
         if view == "question" and question_text:
             header += f"\n_매칭 질문: {question_text}_"
@@ -265,6 +295,89 @@ async def _format_chunk_results(
         lines.append(content)
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Parent-document retrieval (적중 섹션 → 문서 전문 치환)
+# ---------------------------------------------------------------------------
+#
+# doc-level 청킹은 문서가 max_embedding_tokens 를 초과하면 섹션 단위로 폴백
+# 분할한다. 검색이 그런 섹션 청크를 적중하면 LLM 에게 문서의 일부만 전달되어
+# 답변 컨텍스트가 부족해진다. 이 헬퍼는 적중 청크가 섹션 폴백 청크인 문서에
+# 한해 결과의 ``document`` 를 ``documents.original_content`` 전문으로 치환한다.
+# 임베딩/검색 단위는 그대로 두고 답변 컨텍스트만 확장하는 것이 목적.
+
+# parent-document 치환에서 제외할 소스 타입. git_code 는 심볼 단위 청킹이라
+# "섹션 폴백" 개념이 다르고, 원본 소스 첨부는 include_source_code 경로
+# (_fetch_and_format_source_code) 가 이미 담당하므로 중복을 피한다.
+_PARENT_DOC_EXCLUDED_SOURCES = frozenset({"git_code"})
+
+
+async def _apply_parent_documents(
+    results: list[dict[str, Any]],
+    meta_store: MetadataStore,
+    *,
+    max_doc_tokens: int,
+    remaining_budget: int,
+    substituted_doc_ids: set[int],
+) -> int:
+    """섹션 폴백 청크 적중 문서의 본문을 원문 전문으로 치환한다.
+
+    결과 dict 를 in-place 변형한다: ``document`` 를 전문으로 바꾸고
+    ``parent_document=True`` 마커를 추가한다. ``metadata.section_path`` 는
+    보존되어 포맷터가 "매칭 섹션" 라벨로 노출한다 (provenance 유지).
+
+    치환 조건 (하나라도 어긋나면 기존 섹션 청크 유지 — 안전 폴백):
+      1. 문서가 존재하고 source_type 이 제외 목록에 없음
+      2. ``original_content`` 가 비어있지 않음
+      3. 문서의 청크가 2개 이상 (= 섹션 폴백 발생; 1청크면 이미 전문)
+      4. 전문 토큰이 ``max_doc_tokens`` 이하
+      5. 전문 토큰이 ``remaining_budget`` 이하
+
+    Args:
+        results: 검색 결과 리스트 (벡터 또는 그래프 첨부).
+        meta_store: 메타데이터 저장소.
+        max_doc_tokens: 문서당 전문 토큰 한도.
+        remaining_budget: 전문 첨부 총합 잔여 예산.
+        substituted_doc_ids: 이미 전문으로 치환된 문서 ID (호출 간 공유 —
+            벡터/그래프 결과 사이의 중복 치환 방지).
+
+    Returns:
+        이번 호출에서 소비한 토큰 수 (호출측이 잔여 예산에서 차감).
+    """
+    consumed = 0
+    for r in results:
+        meta = r.get("metadata") or {}
+        doc_id = meta.get("document_id")
+        if not doc_id or doc_id in substituted_doc_ids:
+            continue
+        try:
+            doc = await meta_store.get_document(doc_id)
+            if not doc:
+                continue
+            if doc.get("source_type") in _PARENT_DOC_EXCLUDED_SOURCES:
+                continue
+            original_content = doc.get("original_content") or ""
+            if not original_content.strip():
+                continue
+            chunk_rows = await meta_store.get_chunks_by_document(doc_id)
+            if len(chunk_rows) <= 1:
+                continue  # 섹션 폴백 없음 — 적중 청크가 이미 문서 전문
+            doc_tokens = count_tokens(original_content)
+            if doc_tokens > max_doc_tokens:
+                continue
+            if doc_tokens > remaining_budget - consumed:
+                continue
+            r["document"] = original_content
+            r["parent_document"] = True
+            substituted_doc_ids.add(doc_id)
+            consumed += doc_tokens
+        except Exception:
+            logger.warning(
+                "parent-document 치환 실패 | document_id=%s", doc_id,
+                exc_info=True,
+            )
+    return consumed
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +487,12 @@ async def _format_graph_chunk_results(
         section_path = meta.get("section_path", "")
 
         header = f"\n### [{title}] (그래프 경로로 도달)"
-        if section_path:
+        if r.get("parent_document"):
+            label = "전문 첨부"
+            if section_path:
+                label += f" (매칭 섹션: {section_path})"
+            header += f"\n_{label}_"
+        elif section_path:
             header += f"\n_섹션: {section_path}_"
         lines.append(header)
         lines.append(content)
@@ -489,6 +607,9 @@ async def assemble_context_with_sources(
     include_source_code: bool = False,
     max_graph_docs: int = 3,
     max_graph_tokens: int = 6000,
+    parent_doc_enabled: bool = False,
+    parent_doc_max_doc_tokens: int = 32000,
+    parent_doc_total_tokens: int = 96000,
     graph_planner_seed: int | None = None,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
@@ -512,6 +633,10 @@ async def assemble_context_with_sources(
         rerank_score_threshold: 리랭크 점수 최소값 (모델 의존, 보통 0~1).
         hyde_enabled: HyDE (Hypothetical Document Embedding) 사용 여부.
         include_source_code: code_doc/code_summary의 원본 git_code 소스를 첨부할지 여부.
+        parent_doc_enabled: 섹션 폴백 청크 적중 시 문서 전문 치환
+            (parent-document retrieval) 여부.
+        parent_doc_max_doc_tokens: 전문 치환의 문서당 토큰 한도.
+        parent_doc_total_tokens: 전문 치환 총합 토큰 예산 (벡터+그래프 합산).
         graph_planner_seed: 그래프 탐색 플래너 LLM 호출 seed. None(기본)이면
             미전달 — 실서비스 동작은 변경되지 않는다. 평가 경로에서만 쿼리 기반
             결정적 seed 를 주입해 그래프 탐색 계획(→ 청크 recall)의 재현성을
@@ -523,6 +648,8 @@ async def assemble_context_with_sources(
     sections: list[str] = []
     sources: list[Source] = []
     doc_cache: dict[int, dict[str, Any]] = {}
+    parent_doc_budget = parent_doc_total_tokens
+    parent_substituted: set[int] = set()
 
     # 쿼리 임베딩 생성 (HyDE 활성화 시 가상 문서 임베딩과 평균)
     if hyde_enabled and llm_client:
@@ -552,6 +679,13 @@ async def assemble_context_with_sources(
     )
 
     if chunk_results:
+        if parent_doc_enabled:
+            parent_doc_budget -= await _apply_parent_documents(
+                chunk_results, meta_store,
+                max_doc_tokens=parent_doc_max_doc_tokens,
+                remaining_budget=parent_doc_budget,
+                substituted_doc_ids=parent_substituted,
+            )
         lines = []
         for r in chunk_results:
             meta = r.get("metadata") or {}
@@ -565,15 +699,24 @@ async def assemble_context_with_sources(
             section_path = meta.get("section_path", "")
             view = meta.get("view", "")
             question_text = meta.get("question_text", "")
+            is_parent_doc = bool(r.get("parent_document"))
 
             source_label = f"[출처: {title}]"
-            if section_path:
+            if is_parent_doc:
+                source_label += " (전문 첨부"
+                if section_path:
+                    source_label += f", 매칭 섹션: {section_path}"
+                source_label += ")"
+            elif section_path:
                 source_label += f" (섹션: {section_path})"
             if view == "question" and question_text:
                 source_label += f" (매칭 질문: {question_text})"
             lines.append(f"{source_label}\n{r.get('document', '')}")
             if doc_id and doc_id not in {s.document_id for s in sources}:
-                sources.append(Source(document_id=doc_id, title=title, similarity=similarity))
+                sources.append(Source(
+                    document_id=doc_id, title=title, similarity=similarity,
+                    full_document=is_parent_doc,
+                ))
         sections.append("\n\n".join(lines))
 
     # 3. 그래프 탐색 결과 처리 — 엔티티/관계 요약 + 연결 문서 본문 첨부 (설계 A)
@@ -588,7 +731,15 @@ async def assemble_context_with_sources(
             max_graph_tokens=max_graph_tokens,
         )
         fetched_sim: dict[int, float] = {}
+        fetched_parent: set[int] = set()
         if graph_chunks:
+            if parent_doc_enabled:
+                parent_doc_budget -= await _apply_parent_documents(
+                    graph_chunks, meta_store,
+                    max_doc_tokens=parent_doc_max_doc_tokens,
+                    remaining_budget=parent_doc_budget,
+                    substituted_doc_ids=parent_substituted,
+                )
             sections.append(
                 await _format_graph_chunk_results(graph_chunks, meta_store)
             )
@@ -596,6 +747,8 @@ async def assemble_context_with_sources(
                 did = (r.get("metadata") or {}).get("document_id")
                 if did is not None:
                     fetched_sim[did] = 1 - r.get("distance", 1.0)
+                    if r.get("parent_document"):
+                        fetched_parent.add(did)
 
         # 그래프 탐색 결과에서 출처 추출 — 본문이 실제로 컨텍스트에 첨부된
         # 문서만 포함한다. graph_result.document_ids 전체(탐색된 모든 노드의
@@ -613,6 +766,7 @@ async def assemble_context_with_sources(
                 sources.append(Source(
                     document_id=doc_id, title=title,
                     similarity=similarity,
+                    full_document=doc_id in fetched_parent,
                 ))
 
     # Phase 9.7: 원본 소스 코드 첨부

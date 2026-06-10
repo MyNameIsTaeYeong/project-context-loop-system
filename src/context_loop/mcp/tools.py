@@ -63,6 +63,15 @@ def register_tools(mcp: FastMCP) -> None:
             hyde_enabled=_config.get("search.hyde_enabled", False) if _config else False,
             max_graph_docs=_config.get("mcp.max_graph_context_docs", 3) if _config else 3,
             max_graph_tokens=_config.get("mcp.max_graph_context_tokens", 6000) if _config else 6000,
+            parent_doc_enabled=(
+                _config.get("mcp.parent_document_enabled", False) if _config else False
+            ),
+            parent_doc_max_doc_tokens=(
+                _config.get("mcp.parent_document_max_doc_tokens", 32000) if _config else 32000
+            ),
+            parent_doc_total_tokens=(
+                _config.get("mcp.parent_document_total_tokens", 96000) if _config else 96000
+            ),
         )
 
     @mcp.tool()
