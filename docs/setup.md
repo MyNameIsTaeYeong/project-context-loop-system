@@ -138,6 +138,68 @@ claude mcp add --scope project context-loop -- /절대경로/.venv/bin/context-l
 (`search_context`, `list_documents`, `get_document`, `get_graph_context`)이
 보이면 연결 완료다.
 
+### 6.3 opencode에 연동
+
+opencode는 stdio(`local`)·HTTP/SSE(`remote`) MCP 서버를 모두 지원한다.
+로컬 코딩 에이전트로 쓰는 경우 stdio 방식이 가장 간단하다 — opencode가
+`context-loop mcp serve` 프로세스를 직접 띄운다.
+
+프로젝트 루트의 `opencode.json.example`을 `opencode.json`으로 복사한다.
+
+```bash
+cp opencode.json.example opencode.json
+```
+
+`opencode.json` 내용(stdio / local 방식):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "context-loop": {
+      "type": "local",
+      "command": [".venv/bin/context-loop", "mcp", "serve"],
+      "enabled": true,
+      "environment": {}
+    }
+  }
+}
+```
+
+> `command`는 셸을 거치지 않고 그대로 실행되므로 `${VAR}` 같은 셸 확장은
+> 동작하지 않는다. opencode를 이 저장소 루트가 아닌 다른 디렉터리에서 실행하거나
+> 모든 프로젝트에서 전역으로 쓰려면 **절대경로**로 지정한다.
+> 예: `["/절대경로/project-context-loop-system/.venv/bin/context-loop", "mcp", "serve"]`
+
+**적용 범위 선택**
+
+- **이 저장소 안에서만**: 위처럼 저장소 루트에 `opencode.json`을 둔다
+  (커밋하면 팀이 공유, 상대경로 `.venv/bin/...` 사용 가능).
+- **모든 프로젝트에서 전역**: `~/.config/opencode/opencode.json`에 동일한 `mcp`
+  블록을 두되 `command`는 위의 **절대경로**로 적는다.
+
+**원격/팀 공유(SSE) 방식**
+
+다른 머신·팀과 공유하려면 서버를 SSE로 띄우고(`context-loop mcp serve --transport sse --port 3001`)
+opencode는 `remote`로 연결한다.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "context-loop": {
+      "type": "remote",
+      "url": "http://localhost:3001/sse",
+      "enabled": true
+    }
+  }
+}
+```
+
+opencode 실행 후 도구 목록에 `context-loop`의 4종
+(`search_context`, `list_documents`, `get_document`, `get_graph_context`)이
+보이면 연결 완료다.
+
 ## 현재 구현 상태
 
 | Phase | 내용 | 상태 |
