@@ -214,12 +214,18 @@ mcp:
   sse_port: 3001
   max_context_chunks: 10
   include_graph_by_default: true
-  # R3 — 인덱싱을 문서 단위로 전환하면서 검색 결과가 청크가 아닌 문서 단위로
-  # dedup 된다. 한 결과의 본문 평균이 5K 토큰 안팎이므로 4096 기본은
-  # max_context_chunks 와 곱해 즉시 충돌. 256K LLM 가정 하에 32K 로 상향.
-  context_max_tokens: 32768
   # 그래프 탐색이 도달했지만 벡터 검색이 못 찾은 문서의 본문을 컨텍스트에
   # 첨부할 때의 상한 (설계 A). 청크가 문서 단위라 무거우므로 개수와 토큰을
   # 함께 가드한다. 0 이면 그래프 연결 문서 첨부 off (= 엔티티/관계 텍스트만).
   max_graph_context_docs: 3
   max_graph_context_tokens: 6000
+  # Parent-document retrieval — 벡터/그래프 적중 청크가 섹션 폴백 청크
+  # (문서가 max_embedding_tokens 초과로 섹션 분할된 경우)인 문서는 해당
+  # 섹션 대신 documents.original_content 전문을 컨텍스트에 첨부한다.
+  # 예산(문서당/총합)을 초과하는 문서는 기존 섹션 청크를 유지한다 (안전 폴백).
+  # 예산 산정 (256K LLM 전제): 일반 청크 최악치 10×8K=80K + 전문 96K
+  # + 그래프/소스코드/프롬프트 오버헤드 + 응답 32K ≈ 220K < 256K.
+  # (기존 context_max_tokens 키는 코드 어디서도 참조되지 않는 죽은 설정이라 제거)
+  parent_document_enabled: true
+  parent_document_max_doc_tokens: 32000   # 문서당 한도 — 초과 문서는 섹션 청크 유지
+  parent_document_total_tokens: 96000     # 전문 첨부 총합 한도 (벡터+그래프 합산)

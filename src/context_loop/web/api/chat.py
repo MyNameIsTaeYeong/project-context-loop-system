@@ -105,6 +105,11 @@ async def chat_api(
         rerank_top_k=config.get("search.reranker_top_k", None),
         rerank_score_threshold=config.get("search.reranker_score_threshold", 0.0),
         hyde_enabled=config.get("search.hyde_enabled", False),
+        max_graph_docs=config.get("mcp.max_graph_context_docs", 3),
+        max_graph_tokens=config.get("mcp.max_graph_context_tokens", 6000),
+        parent_doc_enabled=config.get("mcp.parent_document_enabled", False),
+        parent_doc_max_doc_tokens=config.get("mcp.parent_document_max_doc_tokens", 32000),
+        parent_doc_total_tokens=config.get("mcp.parent_document_total_tokens", 96000),
     )
 
     sources_payload = [asdict(s) for s in assembled.sources]
