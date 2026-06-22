@@ -178,10 +178,34 @@ cp opencode.json.example opencode.json
 - **모든 프로젝트에서 전역**: `~/.config/opencode/opencode.json`에 동일한 `mcp`
   블록을 두되 `command`는 위의 **절대경로**로 적는다.
 
-**원격/팀 공유(SSE) 방식**
+**사내 LAN 공유(SSE) 방식 — 한 PC에 띄우고 부서원 opencode에서 접속**
 
-다른 머신·팀과 공유하려면 서버를 SSE로 띄우고(`context-loop mcp serve --transport sse --port 3001`)
-opencode는 `remote`로 연결한다.
+호스트 PC(서버를 띄울 PC)에서 SSE 전송으로, `0.0.0.0`(모든 인터페이스)에
+바인딩해 실행한다. 기본 `127.0.0.1`은 그 PC 자신만 접속되므로 반드시 `--host`를 준다.
+
+```bash
+context-loop mcp serve --transport sse --host 0.0.0.0 --port 3001
+```
+
+> `--host`를 비-로컬 값으로 주면 서버가 DNS rebinding 보호(Host 헤더 검증)를
+> 자동으로 해제한다. 이 검증이 켜져 있으면 LAN IP 접속이 `421 Invalid Host
+> header`로 거부되기 때문이다.
+>
+> ⚠️ **이 MCP 서버에는 인증이 없다.** `0.0.0.0` 바인딩은 같은 네트워크의 누구나
+> 사내 지식을 조회할 수 있다는 뜻이므로, **신뢰된 사내망**에서만 노출하고
+> 외부에서 닿지 않도록 방화벽으로 포트(3001)를 사내 대역으로 제한할 것.
+
+호스트 PC의 LAN IP를 확인한다(예: `192.168.0.42`).
+
+```bash
+# macOS / Linux
+ipconfig getifaddr en0 2>/dev/null || hostname -I
+# Windows
+ipconfig   # IPv4 주소 확인
+```
+
+부서원 각자의 PC에서는 opencode 설정(`opencode.json` 또는
+`~/.config/opencode/opencode.json`)에 호스트 PC의 IP로 `remote` 서버를 등록한다.
 
 ```json
 {
@@ -189,12 +213,16 @@ opencode는 `remote`로 연결한다.
   "mcp": {
     "context-loop": {
       "type": "remote",
-      "url": "http://localhost:3001/sse",
+      "url": "http://192.168.0.42:3001/sse",
       "enabled": true
     }
   }
 }
 ```
+
+> 부서원 PC에는 이 저장소나 `.venv`가 필요 없다. `url`만 호스트 PC를 가리키면 된다.
+> `mcp.sse_host`를 config(`~/.context-loop/config.yaml`)에 `"0.0.0.0"`으로 적어두면
+> 매번 `--host`를 주지 않아도 된다.
 
 opencode 실행 후 도구 목록에 `context-loop`의 4종
 (`search_context`, `list_documents`, `get_document`, `get_graph_context`)이

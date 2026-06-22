@@ -105,12 +105,38 @@ def run_stdio() -> None:
     asyncio.run(_run())
 
 
-def run_sse(port: int = 3001) -> None:
-    """SSE 전송으로 MCP 서버를 실행한다."""
+def run_sse(port: int = 3001, host: str = "127.0.0.1") -> None:
+    """SSE 전송으로 MCP 서버를 실행한다.
+
+    Args:
+        port: 바인딩할 포트.
+        host: 바인딩할 인터페이스. 기본값 ``127.0.0.1`` 은 호스트 PC 자신만
+            접속 가능하다. 사내 LAN 의 다른 PC(부서원 opencode 등)에서 접속하게
+            하려면 ``0.0.0.0`` (모든 인터페이스) 또는 해당 LAN IP 를 지정한다.
+    """
 
     async def _run() -> None:
         await _initialize()
+        mcp.settings.host = host
         mcp.settings.port = port
+
+        # LAN 공유: MCP SDK 는 기본적으로 DNS rebinding 보호로 Host 헤더를
+        # localhost 계열만 허용한다. 비-로컬 인터페이스로 띄우면 부서원 PC 가
+        # 호스트 LAN IP 로 접속할 때 421(Invalid Host header)로 거부되므로,
+        # 신뢰된 사내망 노출을 위해 해당 검증을 해제한다. (인증이 없으므로
+        # 신뢰된 사내망에서만 사용할 것.)
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False,
+            )
+            logger.warning(
+                "DNS rebinding 보호를 해제하고 %s 에 바인딩합니다 "
+                "(인증 없음 — 신뢰된 사내망에서만 노출하세요).",
+                host,
+            )
+
         await mcp.run_sse_async()
 
     asyncio.run(_run())

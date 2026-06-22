@@ -8,6 +8,8 @@
     context-loop mcp serve                 # stdio 전송 (Claude Code 등 로컬 연동)
     context-loop mcp serve --transport sse # SSE 전송 (원격/팀 공유)
     context-loop mcp serve --transport sse --port 3001
+    context-loop mcp serve --transport sse --host 0.0.0.0 --port 3001
+                                           # 사내 LAN 의 다른 PC 에서 접속 허용
 """
 
 from __future__ import annotations
@@ -20,21 +22,25 @@ from collections.abc import Sequence
 logger = logging.getLogger(__name__)
 
 
-def _default_transport_and_port() -> tuple[str, int]:
-    """설정 파일에서 MCP 전송 방식·포트 기본값을 읽는다 (실패 시 안전한 기본값)."""
+def _default_transport_port_host() -> tuple[str, int, str]:
+    """설정 파일에서 MCP 전송 방식·포트·바인딩 호스트 기본값을 읽는다.
+
+    설정 로드 실패 시에도 CLI 는 동작해야 하므로 안전한 기본값으로 폴백한다.
+    """
     try:
         from context_loop.config import Config
 
         config = Config()
         transport = config.get("mcp.transport", "stdio")
         port = int(config.get("mcp.sse_port", 3001))
-        return transport, port
+        host = str(config.get("mcp.sse_host", "127.0.0.1"))
+        return transport, port, host
     except Exception:  # 설정 로드 실패 시에도 CLI 는 동작해야 한다
-        return "stdio", 3001
+        return "stdio", 3001, "127.0.0.1"
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    default_transport, default_port = _default_transport_and_port()
+    default_transport, default_port, default_host = _default_transport_port_host()
 
     parser = argparse.ArgumentParser(
         prog="context-loop",
@@ -58,6 +64,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=default_port,
         help=f"SSE 전송 시 포트 (기본값: {default_port})",
     )
+    serve_parser.add_argument(
+        "--host",
+        default=default_host,
+        help=(
+            "SSE 전송 시 바인딩할 인터페이스 "
+            f"(기본값: {default_host}). 사내 LAN 의 다른 PC 에서 접속하려면 "
+            "0.0.0.0 을 지정한다."
+        ),
+    )
 
     return parser
 
@@ -74,10 +89,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.transport == "sse":
             # SSE 는 사람이 읽는 안내를 stderr 로 (stdout 오염 방지)
             print(
-                f"[context-loop] MCP 서버를 SSE 로 실행합니다 (port={args.port})",
+                f"[context-loop] MCP 서버를 SSE 로 실행합니다 "
+                f"(host={args.host}, port={args.port})",
                 file=sys.stderr,
             )
-            run_sse(port=args.port)
+            run_sse(port=args.port, host=args.host)
         else:
             # stdio 는 stdout 이 JSON-RPC 채널이므로 어떤 것도 stdout 으로 출력하지 않는다
             run_stdio()
