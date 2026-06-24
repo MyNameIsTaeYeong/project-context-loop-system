@@ -138,6 +138,96 @@ claude mcp add --scope project context-loop -- /절대경로/.venv/bin/context-l
 (`search_context`, `list_documents`, `get_document`, `get_graph_context`)이
 보이면 연결 완료다.
 
+### 6.3 opencode에 연동
+
+opencode는 stdio(`local`)·HTTP/SSE(`remote`) MCP 서버를 모두 지원한다.
+로컬 코딩 에이전트로 쓰는 경우 stdio 방식이 가장 간단하다 — opencode가
+`context-loop mcp serve` 프로세스를 직접 띄운다.
+
+프로젝트 루트의 `opencode.json.example`을 `opencode.json`으로 복사한다.
+
+```bash
+cp opencode.json.example opencode.json
+```
+
+`opencode.json` 내용(stdio / local 방식):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "context-loop": {
+      "type": "local",
+      "command": [".venv/bin/context-loop", "mcp", "serve"],
+      "enabled": true,
+      "environment": {}
+    }
+  }
+}
+```
+
+> `command`는 셸을 거치지 않고 그대로 실행되므로 `${VAR}` 같은 셸 확장은
+> 동작하지 않는다. opencode를 이 저장소 루트가 아닌 다른 디렉터리에서 실행하거나
+> 모든 프로젝트에서 전역으로 쓰려면 **절대경로**로 지정한다.
+> 예: `["/절대경로/project-context-loop-system/.venv/bin/context-loop", "mcp", "serve"]`
+
+**적용 범위 선택**
+
+- **이 저장소 안에서만**: 위처럼 저장소 루트에 `opencode.json`을 둔다
+  (커밋하면 팀이 공유, 상대경로 `.venv/bin/...` 사용 가능).
+- **모든 프로젝트에서 전역**: `~/.config/opencode/opencode.json`에 동일한 `mcp`
+  블록을 두되 `command`는 위의 **절대경로**로 적는다.
+
+**사내 LAN 공유(SSE) 방식 — 한 PC에 띄우고 부서원 opencode에서 접속**
+
+호스트 PC(서버를 띄울 PC)에서 SSE 전송으로, `0.0.0.0`(모든 인터페이스)에
+바인딩해 실행한다. 기본 `127.0.0.1`은 그 PC 자신만 접속되므로 반드시 `--host`를 준다.
+
+```bash
+context-loop mcp serve --transport sse --host 0.0.0.0 --port 3001
+```
+
+> `--host`를 비-로컬 값으로 주면 서버가 DNS rebinding 보호(Host 헤더 검증)를
+> 자동으로 해제한다. 이 검증이 켜져 있으면 LAN IP 접속이 `421 Invalid Host
+> header`로 거부되기 때문이다.
+>
+> ⚠️ **이 MCP 서버에는 인증이 없다.** `0.0.0.0` 바인딩은 같은 네트워크의 누구나
+> 사내 지식을 조회할 수 있다는 뜻이므로, **신뢰된 사내망**에서만 노출하고
+> 외부에서 닿지 않도록 방화벽으로 포트(3001)를 사내 대역으로 제한할 것.
+
+호스트 PC의 LAN IP를 확인한다(예: `192.168.0.42`).
+
+```bash
+# macOS / Linux
+ipconfig getifaddr en0 2>/dev/null || hostname -I
+# Windows
+ipconfig   # IPv4 주소 확인
+```
+
+부서원 각자의 PC에서는 opencode 설정(`opencode.json` 또는
+`~/.config/opencode/opencode.json`)에 호스트 PC의 IP로 `remote` 서버를 등록한다.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "context-loop": {
+      "type": "remote",
+      "url": "http://192.168.0.42:3001/sse",
+      "enabled": true
+    }
+  }
+}
+```
+
+> 부서원 PC에는 이 저장소나 `.venv`가 필요 없다. `url`만 호스트 PC를 가리키면 된다.
+> `mcp.sse_host`를 config(`~/.context-loop/config.yaml`)에 `"0.0.0.0"`으로 적어두면
+> 매번 `--host`를 주지 않아도 된다.
+
+opencode 실행 후 도구 목록에 `context-loop`의 4종
+(`search_context`, `list_documents`, `get_document`, `get_graph_context`)이
+보이면 연결 완료다.
+
 ## 현재 구현 상태
 
 | Phase | 내용 | 상태 |

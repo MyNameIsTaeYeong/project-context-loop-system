@@ -212,6 +212,9 @@ web:
 mcp:
   transport: "stdio"
   sse_port: 3001
+  sse_host: "127.0.0.1"                    # SSE 바인딩 인터페이스. 기본값은 호스트 PC 자신만 접속.
+                                           # 사내 LAN 의 다른 PC(부서원 opencode)에서 접속하려면 "0.0.0.0"
+                                           # (주의: 인증이 없으므로 신뢰된 사내망에서만 노출할 것)
   max_context_chunks: 10
   include_graph_by_default: true
   # 그래프 탐색이 도달했지만 벡터 검색이 못 찾은 문서의 본문을 컨텍스트에
