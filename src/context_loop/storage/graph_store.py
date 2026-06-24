@@ -8,6 +8,7 @@ LLM 기반 탐색을 위한 그래프 스키마 요약을 제공한다.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -21,6 +22,14 @@ from context_loop.storage.entity_normalizer import normalize_entity_name
 from context_loop.storage.metadata_store import MetadataStore
 
 logger = logging.getLogger(__name__)
+
+# 엔티티 임베딩을 build 할 때 한 번의 embedding 호출에 묶는 최대 엔티티 수.
+# 노드가 수천 개에 달하면 전부를 한 호출로 보낼 때 rate limit/타임아웃에
+# 걸려 전체가 실패하므로, 이 크기로 잘라 청크 단위로 호출한다.
+_ENTITY_EMBED_BATCH_SIZE = 500
+# 청크 호출 실패 시 재시도 횟수와 지수 백오프 기준(초).
+_ENTITY_EMBED_MAX_RETRIES = 3
+_ENTITY_EMBED_BACKOFF_BASE = 2.0
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -906,20 +915,61 @@ class GraphStore:
         if not missing:
             return 0
 
-        # 임베딩 입력은 표시명(코드 FQN 은 파일 범위 제거)을 쓰되, 캐시에 저장하는
-        # 이름은 원본 entity_name 으로 유지해 다운스트림 표기는 그대로 보존한다.
-        embed_inputs = [_embedding_display_name(name) for _, name in missing]
-        try:
-            embeddings = await embedding_client.aembed_documents(embed_inputs)
-        except Exception:
-            logger.warning("엔티티 임베딩 생성 실패", exc_info=True)
-            return 0
+        # 노드 수가 수천 개에 달하면 한 호출로 전부 보낼 때 rate limit/타임아웃에
+        # 걸려 전체가 실패한다. _ENTITY_EMBED_BATCH_SIZE 단위로 잘라 청크별로
+        # 호출하고, 성공한 청크는 즉시 캐시에 반영해 일부 실패가 전체 손실로
+        # 번지지 않게 한다(다음 호출에서 누락분만 재시도).
+        added = 0
+        for start in range(0, len(missing), _ENTITY_EMBED_BATCH_SIZE):
+            batch = missing[start : start + _ENTITY_EMBED_BATCH_SIZE]
+            embeddings = await self._embed_entity_batch(embedding_client, batch)
+            if embeddings is None:
+                logger.warning(
+                    "엔티티 임베딩 청크 실패: %d~%d (총 %d개 중) — 이번 청크 건너뜀",
+                    start, start + len(batch), len(missing),
+                )
+                continue
+            for (node_id, name), emb in zip(batch, embeddings):
+                self._entity_embeddings[node_id] = (name, emb)
+            added += len(batch)
 
-        for (node_id, name), emb in zip(missing, embeddings):
-            self._entity_embeddings[node_id] = (name, emb)
+        logger.debug(
+            "엔티티 임베딩 캐시 구축: %d개 추가 (요청 %d개, 총 %d개)",
+            added, len(missing), len(self._entity_embeddings),
+        )
+        return added
 
-        logger.debug("엔티티 임베딩 캐시 구축: %d개 추가 (총 %d개)", len(missing), len(self._entity_embeddings))
-        return len(missing)
+    async def _embed_entity_batch(
+        self,
+        embedding_client: Any,
+        batch: list[tuple[int, str]],
+    ) -> list[list[float]] | None:
+        """엔티티 한 청크의 임베딩을 재시도와 함께 생성한다.
+
+        성공 시 입력 순서에 대응하는 임베딩 목록을, 모든 재시도가 실패하면
+        None 을 반환한다.
+
+        임베딩 입력은 표시명(코드 FQN 은 파일 범위 제거)을 쓰되, 캐시에 저장하는
+        이름은 원본 entity_name 으로 유지해 다운스트림 표기는 그대로 보존한다.
+        """
+        embed_inputs = [_embedding_display_name(name) for _, name in batch]
+        for attempt in range(_ENTITY_EMBED_MAX_RETRIES):
+            try:
+                return await embedding_client.aembed_documents(embed_inputs)
+            except Exception:
+                if attempt + 1 >= _ENTITY_EMBED_MAX_RETRIES:
+                    logger.warning(
+                        "엔티티 임베딩 생성 실패 (재시도 %d회 소진)",
+                        _ENTITY_EMBED_MAX_RETRIES, exc_info=True,
+                    )
+                    return None
+                delay = _ENTITY_EMBED_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "엔티티 임베딩 청크 실패 (시도 %d/%d), %.1f초 후 재시도",
+                    attempt + 1, _ENTITY_EMBED_MAX_RETRIES, delay, exc_info=True,
+                )
+                await asyncio.sleep(delay)
+        return None
 
     def search_entities_by_embedding(
         self,

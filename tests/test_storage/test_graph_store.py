@@ -357,6 +357,112 @@ async def test_build_entity_embeddings_uses_display_name_for_fqn(
 
 
 @pytest.mark.asyncio
+async def test_build_entity_embeddings_batches_large_node_set(
+    graph_store: GraphStore, meta_store: MetadataStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """엔티티 수가 배치 크기를 넘으면 여러 청크로 나눠 호출한다."""
+    from context_loop.storage import graph_store as gs_mod
+
+    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_BATCH_SIZE", 100)
+
+    doc_id = await _create_doc(meta_store)
+    entities = [Entity(name=f"Entity{i}") for i in range(250)]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    async def fake_embed(texts: list[str]) -> list[list[float]]:
+        return [[float(len(t)), 0.0] for t in texts]
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(side_effect=fake_embed)
+
+    count = await graph_store.build_entity_embeddings(mock_embed)
+
+    assert count == 250
+    assert graph_store.entity_embedding_count == 250
+    # 250개를 100개 단위로 → 3번 호출 (100, 100, 50)
+    assert mock_embed.aembed_documents.await_count == 3
+    batch_sizes = [len(call.args[0]) for call in mock_embed.aembed_documents.await_args_list]
+    assert batch_sizes == [100, 100, 50]
+
+
+@pytest.mark.asyncio
+async def test_build_entity_embeddings_partial_failure_keeps_successful_chunks(
+    graph_store: GraphStore, meta_store: MetadataStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """한 청크가 실패해도 성공한 청크는 보존되고, 누락분은 재호출로 복구된다."""
+    from context_loop.storage import graph_store as gs_mod
+
+    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_BATCH_SIZE", 100)
+    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_MAX_RETRIES", 1)  # 재시도 없이 즉시 실패
+
+    doc_id = await _create_doc(meta_store)
+    entities = [Entity(name=f"Entity{i}") for i in range(250)]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    calls = {"n": 0}
+
+    async def flaky_embed(texts: list[str]) -> list[list[float]]:
+        calls["n"] += 1
+        # 2번째 청크만 실패시킨다.
+        if calls["n"] == 2:
+            raise RuntimeError("rate limited")
+        return [[1.0, 0.0] for _ in texts]
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(side_effect=flaky_embed)
+
+    count = await graph_store.build_entity_embeddings(mock_embed)
+    # 성공한 2개 청크(100+50)만 반영, 실패한 1개 청크(100)는 누락.
+    assert count == 150
+    assert graph_store.entity_embedding_count == 150
+
+    # 재호출 시 누락된 100개만 다시 시도하여 복구.
+    mock_embed.aembed_documents = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
+    count2 = await graph_store.build_entity_embeddings(mock_embed)
+    assert count2 == 100
+    assert graph_store.entity_embedding_count == 250
+    assert mock_embed.aembed_documents.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_build_entity_embeddings_retries_transient_failure(
+    graph_store: GraphStore, meta_store: MetadataStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """청크 호출이 일시적으로 실패하면 백오프 후 재시도하여 성공한다."""
+    from context_loop.storage import graph_store as gs_mod
+
+    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_MAX_RETRIES", 3)
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(gs_mod.asyncio, "sleep", fake_sleep)
+
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(
+        doc_id, GraphData(entities=[Entity(name="Gateway")], relations=[]),
+    )
+
+    attempts = {"n": 0}
+
+    async def flaky_embed(texts: list[str]) -> list[list[float]]:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("transient")
+        return [[1.0, 0.0] for _ in texts]
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(side_effect=flaky_embed)
+
+    count = await graph_store.build_entity_embeddings(mock_embed)
+    assert count == 1
+    assert attempts["n"] == 3
+    # 2번 실패 → 2번 백오프(2^0, 2^1).
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
 async def test_search_entities_by_embedding(graph_store: GraphStore, meta_store: MetadataStore) -> None:
     """임베딩 유사도로 엔티티를 검색한다."""
     doc_id = await _create_doc(meta_store)
