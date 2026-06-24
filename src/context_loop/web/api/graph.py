@@ -128,10 +128,11 @@ async def graph_explore(
     노드를 시드로 사용한다(엔티티 임베딩 캐시가 있을 때). 각 노드에는 시드
     로부터의 hop 거리가 포함된다.
     """
-    # 임베딩 fallback 준비 — 캐시가 비어 있으면 1회 구축, 키워드 임베딩 계산.
+    # 임베딩 fallback 준비 — 아직 임베딩되지 않은 엔티티가 남아 있으면 구축
+    # (기동 사전 구축에서 부분 실패한 노드를 점진적으로 보완), 키워드 임베딩 계산.
     embedding_fallback = None
     try:
-        if graph_store.entity_embedding_count == 0 and graph_store.stats()["nodes"] > 0:
+        if graph_store.unembedded_entity_count > 0:
             await graph_store.build_entity_embeddings(embedding_client)
         if graph_store.entity_embedding_count > 0:
             embedding_fallback = await embedding_client.aembed_query(keyword)

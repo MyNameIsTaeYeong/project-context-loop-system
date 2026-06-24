@@ -517,8 +517,10 @@ async def _search_graph_with_llm(
     4. LLM이 탐색 불필요로 판단하면 None을 반환한다.
     """
     try:
-        # 엔티티 임베딩 자동 구축 (최초 1회만 비용 발생)
-        if embedding_client and graph_store.entity_embedding_count == 0:
+        # 엔티티 임베딩 자동 구축. 캐시가 비었을 때뿐 아니라 아직 임베딩되지
+        # 않은 엔티티가 남아 있을 때도 호출해, 기동 사전 구축에서 부분 실패한
+        # 노드가 다음 검색 때 점진적으로 보완되게 한다(누락분만 재시도).
+        if embedding_client and graph_store.unembedded_entity_count > 0:
             await graph_store.build_entity_embeddings(embedding_client)
 
         plan = await plan_graph_search(

@@ -8,6 +8,7 @@ LLM 기반 탐색을 위한 그래프 스키마 요약을 제공한다.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -21,6 +22,18 @@ from context_loop.storage.entity_normalizer import normalize_entity_name
 from context_loop.storage.metadata_store import MetadataStore
 
 logger = logging.getLogger(__name__)
+
+# 엔티티 임베딩을 build 할 때 한 번의 embedding 호출에 묶는 최대 엔티티 수.
+# 노드가 수천 개에 달하면 전부를 한 호출로 보낼 때 rate limit/타임아웃에
+# 걸려 전체가 실패하므로, 이 크기로 잘라 청크 단위로 호출한다.
+# (config 의 processor.entity_embedding_batch_size 로 재정의 가능 — 기본값)
+_ENTITY_EMBED_BATCH_SIZE = 100
+# 청크를 동시에 호출하는 최대 개수(병렬도). 너무 크면 rate limit(429)에 걸린다.
+# (config 의 processor.entity_embedding_concurrency 로 재정의 가능 — 기본값)
+_ENTITY_EMBED_CONCURRENCY = 4
+# 청크 호출 실패 시 재시도 횟수와 지수 백오프 기준(초).
+_ENTITY_EMBED_MAX_RETRIES = 3
+_ENTITY_EMBED_BACKOFF_BASE = 2.0
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -98,6 +111,9 @@ class GraphStore:
         self._graph: nx.DiGraph = nx.DiGraph()
         # 엔티티 임베딩 캐시: node_id → (entity_name, embedding)
         self._entity_embeddings: dict[int, tuple[str, list[float]]] = {}
+        # build_entity_embeddings 동시 호출(기동 사전 구축 + 검색 lazy 보완)을
+        # 직렬화해 같은 노드를 중복 임베딩하지 않게 한다.
+        self._embed_lock = asyncio.Lock()
 
     async def load_from_db(self) -> None:
         """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다.
@@ -894,8 +910,46 @@ class GraphStore:
 
     # --- 엔티티 임베딩 기반 유사도 검색 ---
 
-    async def build_entity_embeddings(self, embedding_client: Any) -> int:
-        """모든 엔티티 이름의 임베딩을 생성하여 캐시한다."""
+    async def build_entity_embeddings(
+        self,
+        embedding_client: Any,
+        *,
+        batch_size: int | None = None,
+        concurrency: int | None = None,
+    ) -> int:
+        """모든 엔티티 이름의 임베딩을 생성하여 캐시한다.
+
+        엔티티가 많으면 ``batch_size`` 단위 청크로 나눠 최대 ``concurrency`` 개를
+        동시에 호출한다. 성공한 청크만 캐시에 반영하므로 일부 실패가 전체
+        손실로 번지지 않는다(다음 호출에서 누락분만 재시도).
+
+        동시 호출은 lock 으로 직렬화한다. lock 획득 후 누락분(missing)을 다시
+        계산하므로, 먼저 끝낸 호출이 이미 채웠으면 두 번째 호출은 빈 작업으로
+        즉시 반환한다(중복 임베딩 방지).
+
+        Args:
+            embedding_client: aembed_documents 를 제공하는 임베딩 클라이언트.
+            batch_size: 청크당 엔티티 수. None 이면 _ENTITY_EMBED_BATCH_SIZE.
+            concurrency: 동시 호출 최대 개수. None 이면 _ENTITY_EMBED_CONCURRENCY.
+
+        Returns:
+            새로 캐시에 추가된 엔티티 임베딩 수.
+        """
+        async with self._embed_lock:
+            return await self._build_entity_embeddings_locked(
+                embedding_client, batch_size, concurrency,
+            )
+
+    async def _build_entity_embeddings_locked(
+        self,
+        embedding_client: Any,
+        batch_size: int | None,
+        concurrency: int | None,
+    ) -> int:
+        """build_entity_embeddings 의 실제 본문 (_embed_lock 보유 상태로 호출)."""
+        batch_size = batch_size if batch_size and batch_size > 0 else _ENTITY_EMBED_BATCH_SIZE
+        concurrency = concurrency if concurrency and concurrency > 0 else _ENTITY_EMBED_CONCURRENCY
+
         missing: list[tuple[int, str]] = []
         for node_id, data in self._graph.nodes(data=True):
             if node_id not in self._entity_embeddings:
@@ -906,20 +960,69 @@ class GraphStore:
         if not missing:
             return 0
 
-        # 임베딩 입력은 표시명(코드 FQN 은 파일 범위 제거)을 쓰되, 캐시에 저장하는
-        # 이름은 원본 entity_name 으로 유지해 다운스트림 표기는 그대로 보존한다.
-        embed_inputs = [_embedding_display_name(name) for _, name in missing]
-        try:
-            embeddings = await embedding_client.aembed_documents(embed_inputs)
-        except Exception:
-            logger.warning("엔티티 임베딩 생성 실패", exc_info=True)
-            return 0
+        # batch_size 단위로 청크를 만들고, semaphore 로 동시 호출 수를 제한해
+        # 병렬로 임베딩한다. 한 청크가 실패하면 그 청크만 건너뛰므로 일부 실패가
+        # 전체 손실로 번지지 않는다(다음 호출에서 누락분만 재시도).
+        batches = [
+            missing[start : start + batch_size]
+            for start in range(0, len(missing), batch_size)
+        ]
+        semaphore = asyncio.Semaphore(concurrency)
 
-        for (node_id, name), emb in zip(missing, embeddings):
-            self._entity_embeddings[node_id] = (name, emb)
+        async def _run(batch: list[tuple[int, str]]) -> list[list[float]] | None:
+            async with semaphore:
+                return await self._embed_entity_batch(embedding_client, batch)
 
-        logger.debug("엔티티 임베딩 캐시 구축: %d개 추가 (총 %d개)", len(missing), len(self._entity_embeddings))
-        return len(missing)
+        results = await asyncio.gather(*(_run(b) for b in batches))
+
+        added = 0
+        for batch, embeddings in zip(batches, results):
+            if embeddings is None:
+                logger.warning(
+                    "엔티티 임베딩 청크 실패 (%d개) — 이번 청크 건너뜀", len(batch),
+                )
+                continue
+            for (node_id, name), emb in zip(batch, embeddings):
+                self._entity_embeddings[node_id] = (name, emb)
+            added += len(batch)
+
+        logger.debug(
+            "엔티티 임베딩 캐시 구축: %d개 추가 (요청 %d개, 청크 %d개, 병렬 %d, 총 %d개)",
+            added, len(missing), len(batches), concurrency, len(self._entity_embeddings),
+        )
+        return added
+
+    async def _embed_entity_batch(
+        self,
+        embedding_client: Any,
+        batch: list[tuple[int, str]],
+    ) -> list[list[float]] | None:
+        """엔티티 한 청크의 임베딩을 재시도와 함께 생성한다.
+
+        성공 시 입력 순서에 대응하는 임베딩 목록을, 모든 재시도가 실패하면
+        None 을 반환한다.
+
+        임베딩 입력은 표시명(코드 FQN 은 파일 범위 제거)을 쓰되, 캐시에 저장하는
+        이름은 원본 entity_name 으로 유지해 다운스트림 표기는 그대로 보존한다.
+        """
+        embed_inputs = [_embedding_display_name(name) for _, name in batch]
+        for attempt in range(_ENTITY_EMBED_MAX_RETRIES):
+            try:
+                return await embedding_client.aembed_documents(embed_inputs)
+            except Exception:
+                if attempt + 1 >= _ENTITY_EMBED_MAX_RETRIES:
+                    logger.warning(
+                        "엔티티 임베딩 생성 실패 (재시도 %d회 소진)",
+                        _ENTITY_EMBED_MAX_RETRIES, exc_info=True,
+                    )
+                    return None
+                delay = _ENTITY_EMBED_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "엔티티 임베딩 청크 실패 (시도 %d/%d), %.1f초 후 재시도",
+                    attempt + 1, _ENTITY_EMBED_MAX_RETRIES, delay, exc_info=True,
+                )
+                await asyncio.sleep(delay)
+        return None
 
     def search_entities_by_embedding(
         self,
@@ -954,3 +1057,18 @@ class GraphStore:
     def entity_embedding_count(self) -> int:
         """캐시된 엔티티 임베딩 수."""
         return len(self._entity_embeddings)
+
+    @property
+    def unembedded_entity_count(self) -> int:
+        """이름이 있으나 아직 임베딩되지 않은 엔티티 수.
+
+        lazy 보완 트리거용. 0보다 크면 build_entity_embeddings 를 호출해
+        누락분(부분 실패로 빠진 노드 포함)을 채울 수 있다. 이름이 빈 노드는
+        임베딩 대상이 아니므로 세지 않아, 그런 노드만 남았을 때 매 검색마다
+        무의미하게 재구축을 트리거하지 않는다.
+        """
+        count = 0
+        for node_id, data in self._graph.nodes(data=True):
+            if node_id not in self._entity_embeddings and data.get("entity_name"):
+                count += 1
+        return count
