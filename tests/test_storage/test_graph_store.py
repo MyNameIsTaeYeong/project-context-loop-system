@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -358,13 +359,9 @@ async def test_build_entity_embeddings_uses_display_name_for_fqn(
 
 @pytest.mark.asyncio
 async def test_build_entity_embeddings_batches_large_node_set(
-    graph_store: GraphStore, meta_store: MetadataStore, monkeypatch: pytest.MonkeyPatch,
+    graph_store: GraphStore, meta_store: MetadataStore,
 ) -> None:
-    """엔티티 수가 배치 크기를 넘으면 여러 청크로 나눠 호출한다."""
-    from context_loop.storage import graph_store as gs_mod
-
-    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_BATCH_SIZE", 100)
-
+    """엔티티 수가 배치 크기를 넘으면 batch_size 단위로 나눠 호출한다."""
     doc_id = await _create_doc(meta_store)
     entities = [Entity(name=f"Entity{i}") for i in range(250)]
     await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
@@ -375,14 +372,45 @@ async def test_build_entity_embeddings_batches_large_node_set(
     mock_embed = AsyncMock()
     mock_embed.aembed_documents = AsyncMock(side_effect=fake_embed)
 
-    count = await graph_store.build_entity_embeddings(mock_embed)
+    count = await graph_store.build_entity_embeddings(mock_embed, batch_size=100)
 
     assert count == 250
     assert graph_store.entity_embedding_count == 250
-    # 250개를 100개 단위로 → 3번 호출 (100, 100, 50)
+    # 250개를 100개 단위로 → 3청크 (100, 100, 50). 병렬이라 순서 비결정적.
     assert mock_embed.aembed_documents.await_count == 3
-    batch_sizes = [len(call.args[0]) for call in mock_embed.aembed_documents.await_args_list]
-    assert batch_sizes == [100, 100, 50]
+    batch_sizes = sorted(len(call.args[0]) for call in mock_embed.aembed_documents.await_args_list)
+    assert batch_sizes == [50, 100, 100]
+
+
+@pytest.mark.asyncio
+async def test_build_entity_embeddings_respects_concurrency_limit(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """concurrency 파라미터로 동시 호출 수를 제한한다."""
+    doc_id = await _create_doc(meta_store)
+    entities = [Entity(name=f"Entity{i}") for i in range(500)]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    state = {"in_flight": 0, "max": 0}
+
+    async def fake_embed(texts: list[str]) -> list[list[float]]:
+        state["in_flight"] += 1
+        state["max"] = max(state["max"], state["in_flight"])
+        await asyncio.sleep(0.01)  # 겹침을 강제해 동시 실행 수를 측정
+        state["in_flight"] -= 1
+        return [[1.0, 0.0] for _ in texts]
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(side_effect=fake_embed)
+
+    count = await graph_store.build_entity_embeddings(
+        mock_embed, batch_size=100, concurrency=2,
+    )
+
+    assert count == 500
+    # 500개를 100개씩 → 5청크, 동시 실행은 최대 2.
+    assert mock_embed.aembed_documents.await_count == 5
+    assert state["max"] == 2
 
 
 @pytest.mark.asyncio
@@ -392,33 +420,29 @@ async def test_build_entity_embeddings_partial_failure_keeps_successful_chunks(
     """한 청크가 실패해도 성공한 청크는 보존되고, 누락분은 재호출로 복구된다."""
     from context_loop.storage import graph_store as gs_mod
 
-    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_BATCH_SIZE", 100)
     monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_MAX_RETRIES", 1)  # 재시도 없이 즉시 실패
 
     doc_id = await _create_doc(meta_store)
     entities = [Entity(name=f"Entity{i}") for i in range(250)]
     await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
 
-    calls = {"n": 0}
-
     async def flaky_embed(texts: list[str]) -> list[list[float]]:
-        calls["n"] += 1
-        # 2번째 청크만 실패시킨다.
-        if calls["n"] == 2:
+        # 두 번째 청크(Entity100~199)만 실패 — 실행 순서와 무관하게 내용으로 판별.
+        if "Entity150" in texts:
             raise RuntimeError("rate limited")
         return [[1.0, 0.0] for _ in texts]
 
     mock_embed = AsyncMock()
     mock_embed.aembed_documents = AsyncMock(side_effect=flaky_embed)
 
-    count = await graph_store.build_entity_embeddings(mock_embed)
+    count = await graph_store.build_entity_embeddings(mock_embed, batch_size=100)
     # 성공한 2개 청크(100+50)만 반영, 실패한 1개 청크(100)는 누락.
     assert count == 150
     assert graph_store.entity_embedding_count == 150
 
     # 재호출 시 누락된 100개만 다시 시도하여 복구.
     mock_embed.aembed_documents = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
-    count2 = await graph_store.build_entity_embeddings(mock_embed)
+    count2 = await graph_store.build_entity_embeddings(mock_embed, batch_size=100)
     assert count2 == 100
     assert graph_store.entity_embedding_count == 250
     assert mock_embed.aembed_documents.await_count == 1

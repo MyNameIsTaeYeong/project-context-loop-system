@@ -84,7 +84,11 @@ async def _initialize() -> None:
     # (최초 그래프 검색 시 누락분이 lazy 하게 재시도된다).
     if _embedding_client:
         try:
-            count = await _graph_store.build_entity_embeddings(_embedding_client)
+            count = await _graph_store.build_entity_embeddings(
+                _embedding_client,
+                batch_size=_config.get("processor.entity_embedding_batch_size", 100),
+                concurrency=_config.get("processor.entity_embedding_concurrency", 4),
+            )
             logger.info("그래프 엔티티 임베딩 사전 구축 완료: %d개", count)
         except Exception:
             logger.warning(
