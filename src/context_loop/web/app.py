@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -130,6 +130,17 @@ def _build_embedding_client(config: Config):
     )
 
 
+async def _prebuild_entity_embeddings(graph_store: GraphStore, embedding_client: Any) -> None:
+    """그래프 엔티티 임베딩을 시작 시 미리 구축한다 (실패해도 기동을 막지 않음)."""
+    if not embedding_client:
+        return
+    try:
+        count = await graph_store.build_entity_embeddings(embedding_client)
+        logger.info("그래프 엔티티 임베딩 사전 구축 완료: %d개", count)
+    except Exception:
+        logger.warning("그래프 엔티티 임베딩 사전 구축 실패 (검색 시 lazy 재시도)", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
@@ -158,6 +169,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.llm_client = llm_client
     app.state.embedding_client = embedding_client
     app.state.reranker_client = reranker_client
+
+    # 그래프 엔티티 임베딩을 시작 시 미리 구축한다. 노드가 수천 개면
+    # 청크 단위로 나눠 호출하며, 일부/전체 실패해도 서버 기동은 막지 않는다
+    # (최초 그래프 검색 시 누락분이 lazy 하게 재시도된다).
+    await _prebuild_entity_embeddings(graph_store, embedding_client)
 
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield

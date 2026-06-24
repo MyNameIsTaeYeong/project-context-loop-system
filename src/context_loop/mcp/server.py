@@ -79,6 +79,18 @@ async def _initialize() -> None:
         logger.warning("리랭커 클라이언트 초기화 실패 (리랭킹 비활성화)", exc_info=True)
         _reranker_client = None
 
+    # 그래프 엔티티 임베딩을 시작 시 미리 구축한다. 노드가 수천 개면 청크
+    # 단위로 나눠 호출하며, 일부/전체 실패해도 서버 기동은 막지 않는다
+    # (최초 그래프 검색 시 누락분이 lazy 하게 재시도된다).
+    if _embedding_client:
+        try:
+            count = await _graph_store.build_entity_embeddings(_embedding_client)
+            logger.info("그래프 엔티티 임베딩 사전 구축 완료: %d개", count)
+        except Exception:
+            logger.warning(
+                "그래프 엔티티 임베딩 사전 구축 실패 (검색 시 lazy 재시도)", exc_info=True,
+            )
+
     logger.info("MCP Server 저장소 초기화 완료")
 
 

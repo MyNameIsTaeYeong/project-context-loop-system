@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # 엔티티 임베딩을 build 할 때 한 번의 embedding 호출에 묶는 최대 엔티티 수.
 # 노드가 수천 개에 달하면 전부를 한 호출로 보낼 때 rate limit/타임아웃에
 # 걸려 전체가 실패하므로, 이 크기로 잘라 청크 단위로 호출한다.
-_ENTITY_EMBED_BATCH_SIZE = 500
+_ENTITY_EMBED_BATCH_SIZE = 200
 # 청크 호출 실패 시 재시도 횟수와 지수 백오프 기준(초).
 _ENTITY_EMBED_MAX_RETRIES = 3
 _ENTITY_EMBED_BACKOFF_BASE = 2.0
