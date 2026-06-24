@@ -487,6 +487,87 @@ async def test_build_entity_embeddings_retries_transient_failure(
 
 
 @pytest.mark.asyncio
+async def test_unembedded_entity_count_tracks_pending(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """unembedded_entity_count 는 이름이 있는 미임베딩 노드만 센다."""
+    doc_id = await _create_doc(meta_store)
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="Gateway"), Entity(name="AuthService")],
+        relations=[],
+    ))
+
+    # 빌드 전: 둘 다 미임베딩.
+    assert graph_store.unembedded_entity_count == 2
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+    await graph_store.build_entity_embeddings(mock_embed)
+
+    # 빌드 후: 보완할 노드 없음.
+    assert graph_store.unembedded_entity_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unembedded_entity_count_drops_after_partial_heal(
+    graph_store: GraphStore, meta_store: MetadataStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """부분 실패 후 남은 미임베딩 수가 재호출(다음 검색 lazy 보완)로 0이 된다."""
+    from context_loop.storage import graph_store as gs_mod
+
+    monkeypatch.setattr(gs_mod, "_ENTITY_EMBED_MAX_RETRIES", 1)
+
+    doc_id = await _create_doc(meta_store)
+    entities = [Entity(name=f"Entity{i}") for i in range(250)]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    async def flaky_embed(texts: list[str]) -> list[list[float]]:
+        if "Entity150" in texts:  # 두 번째 청크(100~199)만 실패
+            raise RuntimeError("rate limited")
+        return [[1.0, 0.0] for _ in texts]
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(side_effect=flaky_embed)
+
+    await graph_store.build_entity_embeddings(mock_embed, batch_size=100)
+    # 100개 청크가 실패로 누락 → 보완 대상 100개.
+    assert graph_store.unembedded_entity_count == 100
+
+    # 다음 검색이 lazy 보완을 트리거하는 상황: 다시 호출하면 0이 된다.
+    mock_embed.aembed_documents = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
+    await graph_store.build_entity_embeddings(mock_embed, batch_size=100)
+    assert graph_store.unembedded_entity_count == 0
+
+
+@pytest.mark.asyncio
+async def test_build_entity_embeddings_serializes_concurrent_calls(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """동시 호출은 lock 으로 직렬화되어 같은 노드를 중복 임베딩하지 않는다."""
+    doc_id = await _create_doc(meta_store)
+    entities = [Entity(name=f"Entity{i}") for i in range(300)]
+    await graph_store.save_graph_data(doc_id, GraphData(entities=entities, relations=[]))
+
+    async def slow_embed(texts: list[str]) -> list[list[float]]:
+        await asyncio.sleep(0.01)
+        return [[1.0, 0.0] for _ in texts]
+
+    mock_embed = AsyncMock()
+    mock_embed.aembed_documents = AsyncMock(side_effect=slow_embed)
+
+    # 두 빌드를 동시에 시작. 두 번째는 lock 대기 후 missing 이 비어 빈 작업.
+    c1, c2 = await asyncio.gather(
+        graph_store.build_entity_embeddings(mock_embed, batch_size=100),
+        graph_store.build_entity_embeddings(mock_embed, batch_size=100),
+    )
+
+    assert c1 + c2 == 300  # 한쪽이 300, 다른 쪽은 0 (중복 없음)
+    assert graph_store.entity_embedding_count == 300
+    # 300개를 100개씩 → 정확히 3청크만 호출 (중복 임베딩 없음).
+    assert mock_embed.aembed_documents.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_search_entities_by_embedding(graph_store: GraphStore, meta_store: MetadataStore) -> None:
     """임베딩 유사도로 엔티티를 검색한다."""
     doc_id = await _create_doc(meta_store)

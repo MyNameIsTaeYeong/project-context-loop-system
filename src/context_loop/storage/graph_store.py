@@ -111,6 +111,9 @@ class GraphStore:
         self._graph: nx.DiGraph = nx.DiGraph()
         # 엔티티 임베딩 캐시: node_id → (entity_name, embedding)
         self._entity_embeddings: dict[int, tuple[str, list[float]]] = {}
+        # build_entity_embeddings 동시 호출(기동 사전 구축 + 검색 lazy 보완)을
+        # 직렬화해 같은 노드를 중복 임베딩하지 않게 한다.
+        self._embed_lock = asyncio.Lock()
 
     async def load_from_db(self) -> None:
         """SQLite에서 그래프 데이터를 로드하여 NetworkX 그래프를 재구성한다.
@@ -920,6 +923,10 @@ class GraphStore:
         동시에 호출한다. 성공한 청크만 캐시에 반영하므로 일부 실패가 전체
         손실로 번지지 않는다(다음 호출에서 누락분만 재시도).
 
+        동시 호출은 lock 으로 직렬화한다. lock 획득 후 누락분(missing)을 다시
+        계산하므로, 먼저 끝낸 호출이 이미 채웠으면 두 번째 호출은 빈 작업으로
+        즉시 반환한다(중복 임베딩 방지).
+
         Args:
             embedding_client: aembed_documents 를 제공하는 임베딩 클라이언트.
             batch_size: 청크당 엔티티 수. None 이면 _ENTITY_EMBED_BATCH_SIZE.
@@ -928,6 +935,18 @@ class GraphStore:
         Returns:
             새로 캐시에 추가된 엔티티 임베딩 수.
         """
+        async with self._embed_lock:
+            return await self._build_entity_embeddings_locked(
+                embedding_client, batch_size, concurrency,
+            )
+
+    async def _build_entity_embeddings_locked(
+        self,
+        embedding_client: Any,
+        batch_size: int | None,
+        concurrency: int | None,
+    ) -> int:
+        """build_entity_embeddings 의 실제 본문 (_embed_lock 보유 상태로 호출)."""
         batch_size = batch_size if batch_size and batch_size > 0 else _ENTITY_EMBED_BATCH_SIZE
         concurrency = concurrency if concurrency and concurrency > 0 else _ENTITY_EMBED_CONCURRENCY
 
@@ -1038,3 +1057,18 @@ class GraphStore:
     def entity_embedding_count(self) -> int:
         """캐시된 엔티티 임베딩 수."""
         return len(self._entity_embeddings)
+
+    @property
+    def unembedded_entity_count(self) -> int:
+        """이름이 있으나 아직 임베딩되지 않은 엔티티 수.
+
+        lazy 보완 트리거용. 0보다 크면 build_entity_embeddings 를 호출해
+        누락분(부분 실패로 빠진 노드 포함)을 채울 수 있다. 이름이 빈 노드는
+        임베딩 대상이 아니므로 세지 않아, 그런 노드만 남았을 때 매 검색마다
+        무의미하게 재구축을 트리거하지 않는다.
+        """
+        count = 0
+        for node_id, data in self._graph.nodes(data=True):
+            if node_id not in self._entity_embeddings and data.get("entity_name"):
+                count += 1
+        return count
