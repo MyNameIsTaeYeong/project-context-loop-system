@@ -69,12 +69,32 @@ class EndpointEmbeddingClient(Embeddings):
         self._backoff_base = backoff_base
         # asyncio.Semaphore는 이벤트 루프에 바인딩되므로 첫 비동기 호출 시 lazy 생성한다.
         self._semaphore: asyncio.Semaphore | None = None
+        # httpx.AsyncClient 도 이벤트 루프에 바인딩되므로 첫 비동기 호출 시 lazy
+        # 생성해 재사용한다. 호출마다 클라이언트를 새로 만들면 매 요청 TCP/TLS
+        # 핸드셰이크가 반복되고 동시성이 올라갈수록 커넥션 churn·FD 사용이 늘어
+        # 병목이 된다 — 공유 클라이언트로 커넥션 풀(keep-alive)을 유지한다.
+        self._aclient: httpx.AsyncClient | None = None
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         """동시성 제한용 세마포어를 lazy 생성해 반환한다 (실행 중 이벤트 루프에 바인딩)."""
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
         return self._semaphore
+
+    def _get_aclient(self) -> httpx.AsyncClient:
+        """공유 비동기 HTTP 클라이언트를 lazy 생성해 반환한다 (커넥션 풀 재사용).
+
+        실행 중 이벤트 루프에 바인딩되며, 닫혔으면 새로 만든다(루프 교체 대비).
+        """
+        if self._aclient is None or self._aclient.is_closed:
+            self._aclient = httpx.AsyncClient(timeout=self._timeout)
+        return self._aclient
+
+    async def aclose(self) -> None:
+        """공유 비동기 HTTP 클라이언트를 닫는다 (앱 종료 시 호출 권장)."""
+        if self._aclient is not None and not self._aclient.is_closed:
+            await self._aclient.aclose()
+        self._aclient = None
 
     def _parse_response(self, data: dict) -> list[list[float]]:
         """응답 JSON에서 임베딩 벡터 목록을 인덱스 순으로 반환한다."""
@@ -178,11 +198,11 @@ class EndpointEmbeddingClient(Embeddings):
             )
         start = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                for i in range(0, len(texts), _BATCH_SIZE):
-                    batch = texts[i : i + _BATCH_SIZE]
-                    results.extend(await self._apost_batch(client, batch))
-                    batch_count += 1
+            client = self._get_aclient()
+            for i in range(0, len(texts), _BATCH_SIZE):
+                batch = texts[i : i + _BATCH_SIZE]
+                results.extend(await self._apost_batch(client, batch))
+                batch_count += 1
             return results
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000

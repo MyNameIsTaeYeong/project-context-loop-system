@@ -310,6 +310,52 @@ def _parse_plan(data: Any) -> GraphSearchPlan:
     )
 
 
+async def _build_seed_embeddings(
+    plan: GraphSearchPlan,
+    embedding_client: Any,
+) -> dict[str, list[float]]:
+    """탐색 계획의 시드 이름들을 한 번의 배치 호출로 임베딩해 name→vector 맵을 만든다.
+
+    ``target_entities`` / ``target_relations`` 끝점 / ``search_steps`` 의 이름을
+    모아 중복 제거 후 ``aembed_documents`` 1회로 임베딩한다. 이전에는 시드마다
+    개별 ``aembed_query`` 를 순차 await 하여 검색 1건이 임베딩 HTTP 를 10여 회
+    발생시켰다(전역 동시성 세마포어를 그만큼 점유).
+
+    임베딩 입력은 호출부 lookup 키와 동일하도록 원본 이름을 그대로 쓴다(strip
+    하지 않음 — 기존 ``_maybe_embed`` 가 원본 텍스트를 임베딩하던 것과 동일).
+    ``embedding_client`` 가 없거나 호출이 실패하면 빈 맵을 반환한다(= fallback
+    없이 표면 매칭에만 의존하는 graceful 동작, 기존 예외 처리와 동일).
+    """
+    if embedding_client is None:
+        return {}
+
+    seen: set[str] = set()
+    texts: list[str] = []
+
+    def _queue(text: str) -> None:
+        if text and text not in seen:
+            seen.add(text)
+            texts.append(text)
+
+    for te in plan.target_entities:
+        _queue(te.name)
+    for tr in plan.target_relations:
+        _queue(tr.source)
+        _queue(tr.target)
+    for step in plan.search_steps:
+        _queue(step.entity_name)
+
+    if not texts:
+        return {}
+
+    try:
+        embeddings = await embedding_client.aembed_documents(texts)
+    except Exception:
+        logger.debug("그래프 시드 일괄 임베딩 실패 — fallback 없이 진행", exc_info=True)
+        return {}
+    return dict(zip(texts, embeddings))
+
+
 async def execute_graph_search(
     plan: GraphSearchPlan,
     graph_store: GraphStore,
@@ -359,15 +405,10 @@ async def execute_graph_search(
     priority_node_ids: list[int] = []
     searched_entities: list[str] = []
 
-    # step 별 임베딩 fallback 을 위한 헬퍼 — embedding_client 가 있을 때만 사용.
-    async def _maybe_embed(text: str) -> list[float] | None:
-        if not embedding_client or not text:
-            return None
-        try:
-            return await embedding_client.aembed_query(text)
-        except Exception:
-            logger.debug("step 임베딩 fallback 실패 — %s", text, exc_info=True)
-            return None
+    # 시드 fallback 임베딩을 한 번의 배치 호출로 미리 계산 (name → vector).
+    # get_neighbors 는 표면 매칭이 성공하면 이 fallback 을 쓰지 않으므로,
+    # 미리 전부 임베딩해도 매칭 결과는 동일하고 임베딩 호출 수만 1회로 준다.
+    emb_map = await _build_seed_embeddings(plan, embedding_client)
 
     priority_set: set[int] = set()
 
@@ -386,7 +427,7 @@ async def execute_graph_search(
     if plan.has_targets:
         # 1) target_entities: 각 정답 후보를 그래프에서 찾고 우선 시드로 추가.
         for te in plan.target_entities:
-            te_emb = await _maybe_embed(te.name)
+            te_emb = emb_map.get(te.name)
             neighbors = graph_store.get_neighbors(
                 te.name, depth=1, embedding_fallback=te_emb,
             )
@@ -410,7 +451,7 @@ async def execute_graph_search(
             for endpoint in (tr.source, tr.target):
                 if not endpoint:
                     continue
-                ep_emb = await _maybe_embed(endpoint)
+                ep_emb = emb_map.get(endpoint)
                 neighbors = graph_store.get_neighbors(
                     endpoint, depth=1, embedding_fallback=ep_emb,
                 )
@@ -433,7 +474,7 @@ async def execute_graph_search(
     # 직접 search_steps 만 채운 경우). R3 target_* 가 있어도 추가 시드 보강
     # 으로 활용 가능.
     for step in plan.search_steps:
-        step_emb = await _maybe_embed(step.entity_name)
+        step_emb = emb_map.get(step.entity_name)
         neighbors = graph_store.get_neighbors(
             step.entity_name,
             depth=step.depth,
