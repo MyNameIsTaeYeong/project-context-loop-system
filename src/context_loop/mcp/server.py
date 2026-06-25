@@ -47,24 +47,20 @@ async def _initialize() -> None:
     _graph_store = GraphStore(_meta_store)
     await _graph_store.load_from_db()
 
-    # 임베딩 클라이언트 초기화
-    from context_loop.processor.embedder import EndpointEmbeddingClient, LocalEmbeddingClient
+    # 임베딩/LLM/리랭커 클라이언트 초기화. 웹 경로와 동일한 빌더를 재사용해
+    # rate-limit 설정(embedding_max_concurrency, max_retries, backoff_base)이
+    # MCP 검색 경로에도 일관되게 적용되도록 한다 — 이전에는 MCP 서버가
+    # EndpointEmbeddingClient 를 직접 생성하며 max_concurrency 를 넘기지 않아
+    # config 값과 무관하게 항상 기본값(4)으로 고정돼 있었다.
+    from context_loop.web.app import (
+        _build_embedding_client,
+        _build_llm_client,
+        _build_reranker_client,
+    )
 
-    provider = _config.get("processor.embedding_provider", "endpoint")
-    if provider == "endpoint":
-        _embedding_client = EndpointEmbeddingClient(
-            endpoint=_config.get("processor.embedding_endpoint", ""),
-            model=_config.get("processor.embedding_model", "text-embedding-3-small"),
-            api_key=_config.get("processor.embedding_api_key", ""),
-            headers=_config.get("processor.embedding_headers") or None,
-        )
-    else:
-        _embedding_client = LocalEmbeddingClient(
-            model=_config.get("processor.embedding_model", "all-MiniLM-L6-v2"),
-        )
+    _embedding_client = _build_embedding_client(_config)
 
     # LLM 클라이언트 초기화 (그래프 탐색 플래너용)
-    from context_loop.web.app import _build_llm_client, _build_reranker_client
 
     try:
         _llm_client = _build_llm_client(_config)

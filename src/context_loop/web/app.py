@@ -201,6 +201,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     await meta_store.close()
+    # 공유 임베딩 HTTP 커넥션 풀 정리 (aclose 미구현 클라이언트는 무시).
+    aclose = getattr(embedding_client, "aclose", None)
+    if callable(aclose):
+        try:
+            await aclose()
+        except Exception:
+            logger.warning("임베딩 클라이언트 종료 실패", exc_info=True)
     logger.info("웹 대시보드 스토어 종료.")
 
 
