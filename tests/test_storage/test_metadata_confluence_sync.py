@@ -509,6 +509,58 @@ async def test_list_failed_member_doc_ids_empty_when_no_members(
     assert await store.list_failed_member_doc_ids(t["id"]) == []
 
 
+async def test_list_degraded_member_doc_ids_returns_only_degraded_members(
+    store: MetadataStore,
+) -> None:
+    """Target membership + llm_degraded=1 + status='completed' 문서만 반환한다."""
+    t = await store.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    # 300=degraded(member), 301=clean(member), 302=degraded(member 아님)
+    d300 = await store.create_document(
+        source_type="confluence_mcp", source_id="300",
+        title="P1", original_content="x", content_hash="h1",
+    )
+    d301 = await store.create_document(
+        source_type="confluence_mcp", source_id="301",
+        title="P2", original_content="x", content_hash="h2",
+    )
+    d302 = await store.create_document(
+        source_type="confluence_mcp", source_id="302",
+        title="P3", original_content="x", content_hash="h3",
+    )
+    await store.update_document_status(d300, "completed")
+    await store.update_document_status(d301, "completed")
+    await store.update_document_status(d302, "completed")
+    await store.set_llm_degraded(d300, degraded=True, detail={"q": True})
+    await store.set_llm_degraded(d302, degraded=True, detail={"q": True})
+    await store.upsert_membership(target_id=t["id"], page_id="300", space_key="ENG")
+    await store.upsert_membership(target_id=t["id"], page_id="301", space_key="ENG")
+
+    ids = await store.list_degraded_member_doc_ids(t["id"])
+    assert ids == [d300]
+
+
+async def test_set_llm_degraded_sets_and_clears(store: MetadataStore) -> None:
+    """set_llm_degraded 가 플래그/detail 을 기록하고, degraded=False 면 해제한다."""
+    doc_id = await store.create_document(
+        source_type="confluence_mcp", source_id="400",
+        title="P", original_content="x", content_hash="h",
+    )
+    # 기본값은 0
+    assert (await store.get_document(doc_id))["llm_degraded"] == 0
+
+    await store.set_llm_degraded(doc_id, degraded=True, detail={"units_failed": 2})
+    doc = await store.get_document(doc_id)
+    assert doc["llm_degraded"] == 1
+    assert "units_failed" in doc["llm_degraded_detail"]
+
+    await store.set_llm_degraded(doc_id, degraded=False)
+    doc = await store.get_document(doc_id)
+    assert doc["llm_degraded"] == 0
+    assert doc["llm_degraded_detail"] is None
+
+
 # --- orphan detection via remove_memberships / delete_sync_target ---
 
 

@@ -128,6 +128,8 @@ async def complete_reprocessing(
     new_storage_method: str,
     *,
     error_message: str | None = None,
+    llm_degraded: bool = False,
+    llm_degradation_detail: dict[str, Any] | None = None,
 ) -> None:
     """재처리 완료를 기록한다.
 
@@ -137,6 +139,11 @@ async def complete_reprocessing(
         history_id: 완료할 processing_history ID.
         new_storage_method: 재처리 후 결정된 저장 방식 ("chunk", "graph", "hybrid").
         error_message: 오류 메시지. None이면 성공으로 처리.
+        llm_degraded: 성공했지만 생성형 LLM 단계(가상 질문/본문 그래프)가
+            결손되어 검색 품질이 저하된 경우 True. status 는 'completed' 를
+            유지하고 documents.llm_degraded 플래그로 분리 기록한다.
+        llm_degradation_detail: 결손 상세(질문/그래프 결손 수치). degraded
+            일 때만 JSON 으로 저장된다.
     """
     if error_message:
         await store.update_document_status(document_id, status="failed")
@@ -148,11 +155,20 @@ async def complete_reprocessing(
         await store.update_document_status(
             document_id, status="completed", storage_method=new_storage_method
         )
+        # 성공이라도 LLM 결손 여부를 항상 기록한다. clean 성공이면 degraded=False
+        # 로 플래그가 0 으로 리셋되어, 이전에 degraded 였던 문서가 정상
+        # 재처리되면 자동으로 해제된다.
+        await store.set_llm_degraded(
+            document_id,
+            degraded=llm_degraded,
+            detail=llm_degradation_detail,
+        )
         await store.complete_processing_history(history_id, status="completed")
         logger.info(
-            "재처리 완료: document_id=%d, storage_method=%s",
+            "재처리 완료: document_id=%d, storage_method=%s, llm_degraded=%s",
             document_id,
             new_storage_method,
+            llm_degraded,
         )
 
 

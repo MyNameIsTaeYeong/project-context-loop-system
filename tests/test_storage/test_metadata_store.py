@@ -1,5 +1,6 @@
 """MetadataStore 테스트."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,52 @@ async def store(tmp_path: Path) -> MetadataStore:
     await s.initialize()
     yield s  # type: ignore[misc]
     await s.close()
+
+
+async def test_migration_adds_llm_degraded_columns(tmp_path: Path) -> None:
+    """llm_degraded 컬럼이 없는 기존 DB 를 열면 마이그레이션으로 추가된다 (idempotent)."""
+    db_path = tmp_path / "old.db"
+    # llm_degraded/detail 이 없는 구버전 documents 스키마를 직접 생성
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            title TEXT NOT NULL,
+            original_content TEXT,
+            content_hash TEXT,
+            storage_method TEXT,
+            status TEXT DEFAULT 'pending',
+            version INTEGER DEFAULT 1,
+            url TEXT,
+            author TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source_type, source_id)
+        )""",
+    )
+    conn.commit()
+    conn.close()
+
+    store = MetadataStore(db_path)
+    await store.initialize()  # _migrate_schema 가 컬럼 추가
+    try:
+        cursor = await store.db.execute("PRAGMA table_info(documents)")
+        cols = {row["name"] for row in await cursor.fetchall()}
+        assert "llm_degraded" in cols
+        assert "llm_degraded_detail" in cols
+
+        # idempotent — 다시 호출해도 에러 없음 (이미 존재하는 컬럼 재추가 안 함)
+        await store._migrate_schema()
+
+        # 기존 행/신규 행 기본값은 0
+        doc_id = await store.create_document(
+            source_type="manual", title="t", original_content="x", content_hash="h",
+        )
+        assert (await store.get_document(doc_id))["llm_degraded"] == 0
+    finally:
+        await store.close()
 
 
 async def test_create_and_get_document(store: MetadataStore) -> None:

@@ -26,6 +26,7 @@
 .badge-failed { background: #f8d7da; color: #721c24; }
 .badge-started { background: #cce5ff; color: #004085; }
 .badge-changed { background: #fff3cd; color: #856404; }
+.badge-degraded { background: #ffe0b2; color: #8a4b00; }
 
 /* 소스/메서드 배지 */
 .badge-source { background: #e2e3e5; color: #383d41; }

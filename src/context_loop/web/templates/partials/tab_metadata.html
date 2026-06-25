@@ -11,6 +11,16 @@
             <tr><td>Version</td><td>{{ doc.version }}</td></tr>
             <tr><td>Storage Method</td><td>{{ doc.storage_method or '-' }}</td></tr>
             <tr><td>Status</td><td>{{ doc.status }}</td></tr>
+            {% if doc.llm_degraded %}
+            <tr>
+                <td>LLM Quality</td>
+                <td>
+                    <span class="badge badge-degraded">degraded</span>
+                    생성형 LLM 단계 결손 — 검색 품질 저하 (다음 sync 시 자동 재인덱싱)
+                    {% if doc.llm_degraded_detail %}<br><small>{{ doc.llm_degraded_detail }}</small>{% endif %}
+                </td>
+            </tr>
+            {% endif %}
             <tr><td>Created</td><td>{{ doc.created_at }}</td></tr>
             <tr><td>Updated</td><td>{{ doc.updated_at }}</td></tr>
         </tbody>
