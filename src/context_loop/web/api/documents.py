@@ -100,6 +100,19 @@ async def editor_edit(
 # --- HTMX 파셜 라우트 ---
 
 
+# 소스 타입 → 표시 라벨 및 그룹 정렬 순서.
+_SOURCE_LABELS: dict[str, str] = {
+    "confluence": "Confluence",
+    "confluence_mcp": "Confluence MCP",
+    "upload": "Upload",
+    "manual": "Manual",
+    "code_file_summary": "File Summary",
+    "code_doc": "Code Doc",
+    "code_summary": "Code Summary",
+    "git_code": "Git Code",
+}
+
+
 @router.get("/partials/document-list")
 async def document_list_partial(
     request: Request,
@@ -107,15 +120,32 @@ async def document_list_partial(
     status: str | None = None,
     meta_store: MetadataStore = Depends(get_meta_store),
 ):
-    """문서 목록 HTML 파셜."""
+    """문서 목록 HTML 파셜 (소스 타입별 그룹 + 카드)."""
     docs = await meta_store.list_documents(
         source_type=source_type or None,
         status=status or None,
     )
+    # 소스 타입별로 묶고, 사전 정의 순서 → 그 외 순으로 그룹을 정렬한다.
+    # (list_documents 가 updated_at DESC 정렬이므로 그룹 내 순서는 그대로 보존)
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for doc in docs:
+        by_source.setdefault(doc["source_type"], []).append(doc)
+    ordered = [s for s in _SOURCE_LABELS if s in by_source]
+    ordered += [s for s in by_source if s not in _SOURCE_LABELS]
+    groups = [
+        {
+            "source_type": s,
+            "label": _SOURCE_LABELS.get(s, s),
+            "docs": by_source[s],
+            "count": len(by_source[s]),
+        }
+        for s in ordered
+    ]
     templates = get_templates(request)
     return templates.TemplateResponse("partials/document_list.html", {
         "request": request,
-        "documents": docs,
+        "groups": groups,
+        "total": len(docs),
     })
 
 

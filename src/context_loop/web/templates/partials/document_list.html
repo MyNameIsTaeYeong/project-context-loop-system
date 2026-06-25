@@ -1,37 +1,33 @@
-{% if documents %}
-<table>
-    <thead>
-        <tr>
-            <th>Title</th>
-            <th>Source</th>
-            <th>Status</th>
-            <th>Storage</th>
-            <th>Updated</th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for doc in documents %}
-        <tr>
-            <td><a href="/documents/{{ doc.id }}">{{ doc.title }}</a></td>
-            <td><span class="badge badge-source badge-source-{{ doc.source_type }}">{{ doc.source_type }}</span></td>
-            <td>
+{% if groups %}
+{% for group in groups %}
+<section class="doc-group">
+    <div class="doc-group-header">
+        <span class="badge badge-source badge-source-{{ group.source_type }}">{{ group.label }}</span>
+        <span class="doc-group-count">{{ group.count }}</span>
+    </div>
+    <div class="doc-card-grid">
+        {% for doc in group.docs %}
+        <article class="doc-card">
+            <a class="doc-card-title" href="/documents/{{ doc.id }}">{{ doc.title }}</a>
+            <div class="doc-card-badges">
                 <span class="badge badge-{{ doc.status }}">{{ doc.status }}</span>
+                {% if doc.storage_method %}
+                <span class="badge badge-method">{{ doc.storage_method }}</span>
+                {% endif %}
                 {% if doc.llm_degraded %}
                 <span class="badge badge-degraded" title="생성형 LLM 단계(가상 질문/본문 그래프) 결손 — 검색 품질 저하. 다음 sync 시 자동 재인덱싱.">LLM degraded</span>
                 {% endif %}
-            </td>
-            <td>
-                {% if doc.storage_method %}
-                <span class="badge badge-method">{{ doc.storage_method }}</span>
-                {% else %}
-                <span class="badge badge-none">-</span>
-                {% endif %}
-            </td>
-            <td>{{ doc.updated_at[:16] if doc.updated_at else '-' }}</td>
-        </tr>
+            </div>
+            <div class="doc-card-meta">
+                <span title="청크 수">📄 {{ doc.chunk_count or 0 }} chunks</span>
+                <span title="그래프 노드 수">🔗 {{ doc.node_count or 0 }} nodes</span>
+                <span title="수정일">🕒 {{ doc.updated_at[:16] if doc.updated_at else '-' }}</span>
+            </div>
+        </article>
         {% endfor %}
-    </tbody>
-</table>
+    </div>
+</section>
+{% endfor %}
 {% else %}
 <p>No documents found. <a href="/editor">Create one</a> or upload a file.</p>
 {% endif %}

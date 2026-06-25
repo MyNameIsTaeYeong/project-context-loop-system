@@ -321,16 +321,27 @@ class MetadataStore:
         source_type: str | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        """문서 목록을 조회한다."""
-        query = "SELECT * FROM documents WHERE 1=1"
+        """문서 목록을 조회한다.
+
+        각 문서에 파생 데이터 집계(``chunk_count``: 청크 수, ``node_count``:
+        기여한 그래프 노드 수)를 상관 서브쿼리로 함께 반환한다.
+        """
+        query = (
+            "SELECT d.*, "
+            "(SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) "
+            "AS chunk_count, "
+            "(SELECT COUNT(*) FROM graph_node_documents gnd "
+            "WHERE gnd.document_id = d.id) AS node_count "
+            "FROM documents d WHERE 1=1"
+        )
         params: list[Any] = []
         if source_type:
-            query += " AND source_type = ?"
+            query += " AND d.source_type = ?"
             params.append(source_type)
         if status:
-            query += " AND status = ?"
+            query += " AND d.status = ?"
             params.append(status)
-        query += " ORDER BY updated_at DESC"
+        query += " ORDER BY d.updated_at DESC"
         cursor = await self.db.execute(query, params)
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
