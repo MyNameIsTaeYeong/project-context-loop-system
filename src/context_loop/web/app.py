@@ -106,7 +106,21 @@ def _build_reranker_client(config: Config):
 
 def _build_embedding_client(config: Config):
     """설정에 따라 임베딩 클라이언트를 생성한다."""
-    from context_loop.processor.embedder import EndpointEmbeddingClient, LocalEmbeddingClient
+    from context_loop.processor.embedder import (
+        _EMBED_BACKOFF_BASE,
+        _EMBED_MAX_CONCURRENCY,
+        _EMBED_MAX_RETRIES,
+        EndpointEmbeddingClient,
+        LocalEmbeddingClient,
+    )
+
+    rate_limit_kwargs = {
+        "max_concurrency": config.get(
+            "processor.embedding_max_concurrency", _EMBED_MAX_CONCURRENCY
+        ),
+        "max_retries": config.get("processor.embedding_max_retries", _EMBED_MAX_RETRIES),
+        "backoff_base": config.get("processor.embedding_backoff_base", _EMBED_BACKOFF_BASE),
+    }
 
     embed_provider = config.get("processor.embedding_provider", "endpoint")
     if embed_provider == "endpoint":
@@ -115,6 +129,7 @@ def _build_embedding_client(config: Config):
             model=config.get("processor.embedding_model", ""),
             api_key=config.get("processor.embedding_api_key", ""),
             headers=config.get("processor.embedding_headers") or None,
+            **rate_limit_kwargs,
         )
     if embed_provider == "local":
         return LocalEmbeddingClient(
@@ -127,6 +142,7 @@ def _build_embedding_client(config: Config):
         endpoint="https://api.openai.com/v1",
         model=config.get("processor.embedding_model", "text-embedding-3-small"),
         api_key=api_key,
+        **rate_limit_kwargs,
     )
 
 
