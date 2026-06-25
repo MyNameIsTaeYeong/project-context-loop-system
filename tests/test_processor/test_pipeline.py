@@ -1096,3 +1096,170 @@ async def test_question_indexing_per_section_mapping(
     assert c1_texts == {"B 의 책임은?", "B 의 의존성은?"}
     # vector ID 명명 규칙: {chunk_id}#q{i}
     assert any(i.endswith("#q0") for i in ids)
+
+
+# ---------------------------------------------------------------------------
+# LLM 결손(degradation) 추적 — 생성형 LLM 단계 실패 시 status=completed 유지 +
+# llm_degraded 플래그로 분리 기록.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_question_generation_failure_marks_degraded(
+    store: MetadataStore,
+) -> None:
+    """가상 질문 생성 LLM 이 실패하면 status=completed 이지만 llm_degraded=1 로 기록."""
+    from context_loop.processor.chunker import Chunk
+    from context_loop.processor.question_generator import QuestionGenStats
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    fake_chunks = [
+        Chunk(id="c-q", index=0, content="본문", token_count=10, section_index=None),
+    ]
+    # 호출은 했으나 실패 → 빈 question_map + llm_failed=True
+    failed_stats = QuestionGenStats(llm_called=True, llm_failed=True)
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=fake_chunks,
+    ), patch(
+        "context_loop.processor.pipeline.generate_questions_for_document",
+        new=AsyncMock(return_value=({}, failed_stats)),
+    ), patch(
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ):
+        result = await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(
+                enable_question_indexing=True, enable_llm_body_extraction=False,
+            ),
+            llm_client=llm_client,
+        )
+
+    assert result["llm_degraded"] is True
+    assert result["llm_degradation"]["question_generation_failed"] is True
+
+    doc = await store.get_document(doc_id)
+    assert doc["status"] == "completed"  # 검색 가능 상태 유지
+    assert doc["llm_degraded"] == 1
+    assert doc["llm_degraded_detail"]  # JSON detail 기록됨
+
+
+@pytest.mark.asyncio
+async def test_body_extraction_unit_failure_marks_degraded(
+    store: MetadataStore,
+) -> None:
+    """LLM 본문 그래프 추출에서 units_failed>0 이면 llm_degraded 로 기록."""
+    from context_loop.processor.llm_body_extractor import LLMBodyExtractionStats
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    # 호출했으나 일부 unit 실패 (units_failed=1)
+    degraded_stats = LLMBodyExtractionStats(units_total=2, units_called=1, units_failed=1)
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=[],
+    ), patch(
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ), patch(
+        "context_loop.processor.pipeline.extract_llm_body_graph_for_document",
+        new=AsyncMock(return_value=(GraphData(), degraded_stats)),
+    ):
+        result = await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+            llm_client=llm_client,
+        )
+
+    assert result["llm_degraded"] is True
+    assert result["llm_degradation"]["body_extraction_units_failed"] == 1
+
+    doc = await store.get_document(doc_id)
+    assert doc["status"] == "completed"
+    assert doc["llm_degraded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_clean_success_clears_degraded_flag(
+    store: MetadataStore,
+) -> None:
+    """이전에 degraded 였던 문서가 정상 재처리되면 llm_degraded 플래그가 0 으로 리셋."""
+    from context_loop.processor.llm_body_extractor import LLMBodyExtractionStats
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    # 1) 먼저 결손 상태로 만든다
+    await store.set_llm_degraded(doc_id, degraded=True, detail={"x": 1})
+    assert (await store.get_document(doc_id))["llm_degraded"] == 1
+
+    # 2) 결손 없는 정상 stats 로 재처리
+    clean_stats = LLMBodyExtractionStats(units_total=1, units_called=1, units_failed=0)
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=[],
+    ), patch(
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ), patch(
+        "context_loop.processor.pipeline.extract_llm_body_graph_for_document",
+        new=AsyncMock(return_value=(GraphData(), clean_stats)),
+    ):
+        result = await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(enable_llm_body_extraction=True),
+            llm_client=llm_client,
+        )
+
+    assert result["llm_degraded"] is False
+    doc = await store.get_document(doc_id)
+    assert doc["llm_degraded"] == 0
+    assert doc["llm_degraded_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_git_code_never_degraded(store: MetadataStore) -> None:
+    """git_code 는 생성형 LLM 미사용 → 항상 llm_degraded=False."""
+    code = "def f():\n    return 1\n"
+    doc_id = await store.create_document(
+        source_type="git_code",
+        source_id="src/f.py",
+        title="src/f.py",
+        original_content=code,
+        content_hash="h-git",
+    )
+    vector_store, graph_store, embedding_client = _make_stores()
+
+    result = await process_document(
+        doc_id,
+        meta_store=store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embedding_client,
+        config=PipelineConfig(),
+    )
+
+    assert result["llm_degraded"] is False
+    doc = await store.get_document(doc_id)
+    assert doc["llm_degraded"] == 0

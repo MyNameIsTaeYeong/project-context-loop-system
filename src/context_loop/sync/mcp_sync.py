@@ -195,13 +195,18 @@ async def _run_processing_phase(
     pipeline_config: PipelineConfig | None,
     concurrency: int,
 ) -> None:
-    """Phase 1 결과의 created/updated + 기존 failed 문서를 파이프라인으로 인덱싱.
+    """Phase 1 결과의 created/updated + 기존 failed/degraded 문서를 인덱싱.
 
     처리 대상:
       - ``result.created`` + ``result.updated`` — 이번 싱크에서 신규·변경 감지된 문서
       - Target 의 membership 에 속한 ``status='failed'`` 기존 문서 — 지난 번
         인덱싱 실패를 재싱크 시 자동 재시도 (본문 해시는 그대로라도 인덱싱만
         다시 시도). :meth:`MetadataStore.list_failed_member_doc_ids` 로 식별.
+      - Target 의 membership 에 속한 ``llm_degraded=1`` 기존 문서 — 생성형 LLM
+        단계(가상 질문/본문 그래프) 결손으로 검색 품질이 저하된 채
+        ``status='completed'`` 로 마감된 문서. 재싱크 시 자동으로 재인덱싱을
+        시도해 그래프·질문 view 를 복구한다.
+        :meth:`MetadataStore.list_degraded_member_doc_ids` 로 식별.
 
     처리 제외:
       - ``result.unchanged`` — 내용이 그대로면 재임베딩은 낭비.
@@ -224,10 +229,19 @@ async def _run_processing_phase(
         )
         failed_retries = []
 
+    try:
+        degraded_retries = await meta_store.list_degraded_member_doc_ids(target_id)
+    except Exception:  # noqa: BLE001
+        # degraded 재시도 식별이 실패해도 primary/failed 는 계속 처리.
+        logger.debug(
+            "list_degraded_member_doc_ids 실패 target_id=%s", target_id, exc_info=True,
+        )
+        degraded_retries = []
+
     # 중복 제거 (created/updated 와 겹치면 primary 우선 — 위치는 크게 중요치 않음).
     seen: set[int] = set()
     to_process: list[int] = []
-    for doc_id in primary + failed_retries:
+    for doc_id in primary + failed_retries + degraded_retries:
         if doc_id in seen:
             continue
         seen.add(doc_id)

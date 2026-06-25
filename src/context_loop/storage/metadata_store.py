@@ -6,6 +6,7 @@ document_sources 테이블을 관리한다.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,12 @@ CREATE TABLE IF NOT EXISTS documents (
     content_hash TEXT,
     storage_method TEXT,
     status TEXT DEFAULT 'pending',
+    -- 생성형 LLM 인덱싱 단계(가상 질문 생성 / LLM 본문 그래프 추출) 의 호출이
+    -- 실패해 그래프·질문 view 가 누락된 채 status='completed' 로 마감된 문서를
+    -- 표시한다. status 는 '검색 가능' 의미를 보존(completed)하고, 품질 결손은
+    -- 이 플래그로 분리 추적한다. 다음 sync 에서 자동 재인덱싱 대상이 된다.
+    llm_degraded INTEGER DEFAULT 0,
+    llm_degraded_detail TEXT,
     version INTEGER DEFAULT 1,
     url TEXT,
     author TEXT,
@@ -186,6 +193,14 @@ class MetadataStore:
         existing_columns = {row["name"] for row in await cursor.fetchall()}
         if "raw_content" not in existing_columns:
             await self.db.execute("ALTER TABLE documents ADD COLUMN raw_content TEXT")
+        if "llm_degraded" not in existing_columns:
+            await self.db.execute(
+                "ALTER TABLE documents ADD COLUMN llm_degraded INTEGER DEFAULT 0",
+            )
+        if "llm_degraded_detail" not in existing_columns:
+            await self.db.execute(
+                "ALTER TABLE documents ADD COLUMN llm_degraded_detail TEXT",
+            )
 
         cursor = await self.db.execute("PRAGMA table_info(chunks)")
         chunk_columns = {row["name"] for row in await cursor.fetchall()}
@@ -1162,6 +1177,57 @@ class MetadataStore:
         )
         rows = await cursor.fetchall()
         return [row["id"] for row in rows]
+
+    async def list_degraded_member_doc_ids(self, target_id: int) -> list[int]:
+        """Target 의 membership 에 속한 문서 중 LLM 결손(``llm_degraded=1``) 목록.
+
+        가상 질문 생성 / LLM 본문 그래프 추출 호출이 실패해 검색 품질이
+        저하된 채 ``status='completed'`` 로 마감된 문서를 다음 재싱크 때
+        자동으로 재인덱싱 큐에 포함시키기 위한 헬퍼. ``failed`` 자동 재시도
+        (:meth:`list_failed_member_doc_ids`) 와 동일한 JOIN 구조를 쓴다.
+        """
+        cursor = await self.db.execute(
+            """SELECT d.id FROM documents d
+               INNER JOIN confluence_sync_membership m
+                 ON d.source_id = m.page_id
+                 AND d.source_type = 'confluence_mcp'
+               WHERE m.target_id = ?
+                 AND d.llm_degraded = 1
+                 AND d.status = 'completed'""",
+            (target_id,),
+        )
+        rows = await cursor.fetchall()
+        return [row["id"] for row in rows]
+
+    async def set_llm_degraded(
+        self,
+        document_id: int,
+        *,
+        degraded: bool,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """문서의 LLM 결손 플래그/상세를 기록한다.
+
+        Args:
+            document_id: 대상 문서 ID.
+            degraded: 결손 여부. ``False`` 면 플래그를 해제하고 detail 을 비운다
+                (이전에 degraded 였던 문서가 정상 재처리되면 자동 해제).
+            detail: 결손 상세(질문/그래프 결손 수치). ``None`` 이거나 degraded
+                 가 ``False`` 면 detail 컬럼은 NULL 로 저장된다.
+        """
+        detail_json = (
+            json.dumps(detail, ensure_ascii=False)
+            if degraded and detail is not None
+            else None
+        )
+        await self.db.execute(
+            """UPDATE documents
+               SET llm_degraded = ?, llm_degraded_detail = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (1 if degraded else 0, detail_json, document_id),
+        )
+        await self.db.commit()
 
     async def remove_memberships(
         self,

@@ -149,6 +149,10 @@ async def process_document(
         link_node_count = 0
         link_edge_count = 0
         extracted: ExtractedDocument | None = None  # Confluence 경로에서만 채워짐
+        # 생성형 LLM 단계 결손 추적용 stats — confluence 경로에서만 채워질 수
+        # 있다 (git_code 는 생성형 LLM 미사용). None = 해당 단계 미실행.
+        q_stats: Any = None  # QuestionGenStats | None
+        llm_stats: Any = None  # LLMBodyExtractionStats | None
 
         if source_type == "git_code":
             # --- git_code: AST 기반 정적 추출 + 멀티뷰 임베딩 ---
@@ -500,11 +504,34 @@ async def process_document(
             has_graph=node_count > 0,
         )
 
+        # 생성형 LLM 결손 판정 — 실제 호출 실패만 degraded 로 본다 (정상인데
+        # 추출 결과가 0건인 경우는 제외해 거짓 양성을 막는다). InputTooLarge
+        # 류의 의도적 skip/폴백은 llm_failed/units_failed 로 잡히지 않는다.
+        question_degraded = bool(
+            q_stats is not None and q_stats.llm_called and q_stats.llm_failed
+        )
+        body_degraded = bool(llm_stats is not None and llm_stats.units_failed > 0)
+        llm_degraded = question_degraded or body_degraded
+        llm_degradation: dict[str, Any] = {
+            "question_generation_failed": question_degraded,
+            "body_extraction_units_failed": (
+                llm_stats.units_failed if llm_stats is not None else 0
+            ),
+            "body_extraction_units_called": (
+                llm_stats.units_called if llm_stats is not None else 0
+            ),
+            "body_extraction_units_total": (
+                llm_stats.units_total if llm_stats is not None else 0
+            ),
+        }
+
         await complete_reprocessing(
             meta_store,
             document_id,
             history_id,
             storage_method,
+            llm_degraded=llm_degraded,
+            llm_degradation_detail=llm_degradation if llm_degraded else None,
         )
 
         return {
@@ -515,6 +542,8 @@ async def process_document(
             "edge_count": edge_count,
             "link_node_count": link_node_count,
             "link_edge_count": link_edge_count,
+            "llm_degraded": llm_degraded,
+            "llm_degradation": llm_degradation,
             "extraction": (
                 {
                     "sections": len(extracted.sections),

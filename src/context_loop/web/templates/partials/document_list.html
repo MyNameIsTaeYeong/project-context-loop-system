@@ -14,7 +14,12 @@
         <tr>
             <td><a href="/documents/{{ doc.id }}">{{ doc.title }}</a></td>
             <td><span class="badge badge-source badge-source-{{ doc.source_type }}">{{ doc.source_type }}</span></td>
-            <td><span class="badge badge-{{ doc.status }}">{{ doc.status }}</span></td>
+            <td>
+                <span class="badge badge-{{ doc.status }}">{{ doc.status }}</span>
+                {% if doc.llm_degraded %}
+                <span class="badge badge-degraded" title="생성형 LLM 단계(가상 질문/본문 그래프) 결손 — 검색 품질 저하. 다음 sync 시 자동 재인덱싱.">LLM degraded</span>
+                {% endif %}
+            </td>
             <td>
                 {% if doc.storage_method %}
                 <span class="badge badge-method">{{ doc.storage_method }}</span>

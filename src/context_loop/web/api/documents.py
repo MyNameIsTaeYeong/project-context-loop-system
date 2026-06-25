@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request, Response
 from langchain_core.embeddings import Embeddings
@@ -297,7 +298,21 @@ async def document_status(
     doc = await meta_store.get_document(document_id)
     if not doc:
         raise HTTPException(404)
-    return {"status": doc["status"], "storage_method": doc.get("storage_method")}
+    detail_raw = doc.get("llm_degraded_detail")
+    llm_degradation: dict[str, Any] | None = None
+    if detail_raw:
+        try:
+            llm_degradation = json.loads(detail_raw)
+        except (ValueError, TypeError):
+            llm_degradation = None
+    return {
+        "status": doc["status"],
+        "storage_method": doc.get("storage_method"),
+        # 검색 품질 결손(생성형 LLM 단계 실패) 여부. status='completed' 라도
+        # True 일 수 있다 — 청크는 있으나 그래프·질문 view 가 누락된 상태.
+        "llm_degraded": bool(doc.get("llm_degraded")),
+        "llm_degradation": llm_degradation,
+    }
 
 
 @router.post("/api/documents")

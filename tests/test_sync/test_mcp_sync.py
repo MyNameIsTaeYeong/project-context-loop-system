@@ -865,6 +865,42 @@ async def test_phase2_retries_previously_failed_docs(stores, monkeypatch) -> Non
     assert result2.processing_errors == []
 
 
+async def test_phase2_retries_degraded_docs(stores, monkeypatch) -> None:
+    """llm_degraded=1 멤버 문서는 created/updated 가 없어도 Phase 2 재처리 큐에 포함."""
+    meta, vec, graph = stores
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    # completed 이지만 LLM 결손인 멤버 문서
+    doc_id = await meta.create_document(
+        source_type="confluence_mcp", source_id="500",
+        title="P", original_content="x", content_hash="h",
+    )
+    await meta.update_document_status(doc_id, "completed")
+    await meta.set_llm_degraded(doc_id, degraded=True, detail={"q": True})
+    await meta.upsert_membership(target_id=t["id"], page_id="500", space_key="ENG")
+
+    called, fake_proc = _make_recording_process_document()
+    monkeypatch.setattr(mcp_sync, "process_document", fake_proc)
+
+    result = SyncResult()  # created/updated 비어 있음
+    await mcp_sync._run_processing_phase(
+        result,
+        target_id=t["id"],
+        meta_store=meta,
+        vector_store=vec,
+        graph_store=graph,
+        embedding_client=_DummyEmbeddings(),
+        llm_client=None,
+        pipeline_config=None,
+        concurrency=1,
+    )
+
+    assert doc_id in called
+    assert doc_id in result.processed
+
+
 async def test_phase2_concurrency_zero_or_negative_defaults_to_1(
     stores, monkeypatch,
 ) -> None:
