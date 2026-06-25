@@ -2,13 +2,81 @@
 
 {% block title %}소개 - Context Loop{% endblock %}
 
-{% block content %}
-<hgroup>
-    <h2>Context Loop</h2>
-    <p>사내 지식을 LLM 컨텍스트로 변환·저장하고, 웹 대시보드와 MCP 서버로 관리하는 통합 지식 시스템입니다.</p>
-</hgroup>
+{% block head %}
+<style>
+    .about-hero {
+        padding: 2rem 1.5rem;
+        border-radius: var(--pico-border-radius);
+        background: var(--pico-card-background-color);
+        border: 1px solid var(--pico-card-border-color);
+        margin-bottom: 2rem;
+    }
+    .about-hero h2 { margin-bottom: 0.5rem; }
+    .about-hero p { color: var(--pico-muted-color); margin: 0; }
 
-<section>
+    .about-section { margin-top: 2.75rem; }
+    .about-section > h3 { margin-bottom: 1rem; }
+
+    .feature-card { height: 100%; margin-bottom: 0; }
+    .feature-icon { font-size: 1.6rem; line-height: 1; }
+    .feature-card h4 { margin: 0.4rem 0 0.6rem; }
+    .feature-card ul { margin-bottom: 0; padding-left: 1.1rem; }
+    .feature-card li { margin-bottom: 0.35rem; }
+
+    /* 번호가 매겨진 스텝 카드 */
+    .step-card {
+        display: flex;
+        gap: 0.9rem;
+        align-items: flex-start;
+        margin-bottom: 0;
+        height: 100%;
+    }
+    .step-num {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2rem;
+        height: 2rem;
+        border-radius: 50%;
+        background: var(--pico-primary-background);
+        color: var(--pico-primary-inverse);
+        font-weight: 700;
+        font-size: 0.95rem;
+    }
+    .step-card strong { display: block; margin-bottom: 0.2rem; }
+    .step-card p { margin: 0; font-size: 0.92rem; color: var(--pico-muted-color); }
+
+    .callout {
+        border-left: 4px solid var(--pico-primary);
+        padding: 1rem 1.25rem;
+        background: var(--pico-card-background-color);
+        border-radius: var(--pico-border-radius);
+    }
+    .callout h4 { margin-top: 0; }
+    .callout p { margin-bottom: 0; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    .chip {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 1rem;
+        background: var(--pico-card-background-color);
+        border: 1px solid var(--pico-card-border-color);
+        font-size: 0.85rem;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="about-hero">
+    <hgroup>
+        <h2>🔄 Context Loop</h2>
+        <p>사내 지식을 LLM 컨텍스트로 변환·저장하고, 웹 대시보드와 MCP 서버로 관리하는 통합 지식 시스템</p>
+    </hgroup>
+</div>
+
+<section class="about-section">
     <h3>이 프로젝트는 무엇을 위한 건가요?</h3>
     <p>
         회사의 지식은 Confluence, 위키, 코드 저장소, 개인 메모 등 여러 곳에 흩어져 있습니다.
@@ -18,154 +86,140 @@
     </p>
 </section>
 
-<section>
+<section class="about-section">
     <h3>주요 기능</h3>
-
-    <article>
-        <h4>다양한 입력 경로 (4가지)</h4>
-        <ul>
-            <li><strong>Confluence MCP 클라이언트</strong> — MCP로 Confluence 문서를 검색·임포트</li>
-            <li><strong>파일 업로드</strong> — 마크다운·텍스트·HTML 파일</li>
-            <li><strong>마크다운 직접 작성</strong> — 내장 에디터(편집/미리보기 분할 뷰)</li>
-            <li><strong>Git 코드 수집</strong> — 저장소를 clone/pull 하여 코드 심볼 단위로 수집</li>
-        </ul>
-    </article>
-
-    <article>
-        <h4>웹 대시보드</h4>
-        <ul>
-            <li>등록된 문서 관리 및 소스/상태별 필터링, 통계 확인</li>
-            <li>지식 그래프 시각화 — 엔티티·관계 탐색, 병합된 노드 확인</li>
-            <li>문서 상세 보기 — 원본 / 청크 / 그래프 / 메타데이터(처리 이력) 탭</li>
-        </ul>
-    </article>
-
-    <article>
-        <h4>연동과 동기화</h4>
-        <ul>
-            <li><strong>자동 동기화</strong> — content hash로 원본 변경을 감지해 재처리(Delete &amp; Recreate)</li>
-            <li><strong>MCP 서버</strong> — 사내 LLM 앱에 <code>search_context</code>, <code>list_documents</code>,
-                <code>get_document</code>, <code>get_graph_context</code> 도구 제공</li>
-        </ul>
-    </article>
+    <div class="grid">
+        <article class="feature-card">
+            <span class="feature-icon">📥</span>
+            <h4>4가지 입력 경로</h4>
+            <ul>
+                <li><strong>Confluence MCP</strong> — 문서 검색·임포트</li>
+                <li><strong>파일 업로드</strong> — md·txt·html</li>
+                <li><strong>마크다운 작성</strong> — 내장 에디터</li>
+                <li><strong>Git 코드</strong> — 심볼 단위 수집</li>
+            </ul>
+        </article>
+        <article class="feature-card">
+            <span class="feature-icon">🖥️</span>
+            <h4>웹 대시보드</h4>
+            <ul>
+                <li>문서 관리·필터링·통계</li>
+                <li>지식 그래프 시각화</li>
+                <li>원본/청크/그래프/이력 탭</li>
+            </ul>
+        </article>
+        <article class="feature-card">
+            <span class="feature-icon">🔌</span>
+            <h4>연동과 동기화</h4>
+            <ul>
+                <li><strong>자동 동기화</strong> — 변경 감지 후 재처리</li>
+                <li><strong>MCP 서버</strong> — <code>search_context</code> 등 4개 도구 제공</li>
+            </ul>
+        </article>
+    </div>
 </section>
 
-<section>
-    <h3>검색은 어떻게 이루어지나요?</h3>
-    <p>
-        질의가 들어오면 <strong>벡터 검색</strong>과 <strong>지식 그래프 탐색</strong>을 함께 수행해
-        하나의 컨텍스트로 조립합니다. 단계는 다음과 같습니다.
+<section class="about-section">
+    <h3>🛠️ 인덱싱은 어떻게 이루어지나요?</h3>
+    <p>문서가 들어오면 다음 6단계를 거쳐 검색 가능한 인덱스로 변환합니다.</p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>수집</strong><p>원본과 <code>content_hash</code>를 함께 보관</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>전처리</strong><p>HTML→마크다운, 구조 정규화 (코드는 AST 분석)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>청킹</strong><p>토큰 단위(문서) 또는 심볼 단위(코드)로 분할</p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>임베딩</strong><p>본문·메타·가상질문을 각각 별도 view로 임베딩</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">5</span>
+            <div><strong>그래프 추출</strong><p>엔티티·관계 추출, 표기 변형은 병합</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">6</span>
+            <div><strong>저장</strong><p>ChromaDB·NetworkX+SQLite·SQLite에 저장</p></div>
+        </article>
+    </div>
+    <p style="margin-top: 1.25rem;">
+        원본이 바뀌면 <code>content_hash</code> 비교로 변경을 감지해, 기존 파생 데이터를 지우고 다시 만드는
+        <strong>Delete &amp; Recreate</strong> 방식으로 재처리합니다.
     </p>
-    <ol>
-        <li>
-            <strong>질의 임베딩</strong> — 사용자 질의를 임베딩 벡터로 변환합니다. 선택적으로
-            <strong>HyDE</strong>를 켜면 질의로부터 가상의 답변 문서를 만들어 그 임베딩을 평균내어,
-            짧은 질의의 의미를 보강합니다.
-        </li>
-        <li>
-            <strong>벡터 검색</strong> — ChromaDB에서 코사인 유사도로 가장 가까운 청크를 찾습니다.
-            본문·메타데이터·가상 질문이 각각 별도 view로 색인되어 있어, 필요 수의 몇 배를 넉넉히
-            가져온 뒤(over-fetch) <strong>문서 단위로 중복을 제거</strong>하고 유사도 임계값 미만은
-            걸러 상위 top-k만 남깁니다. 가상 질문 view로 적중하면 "매칭 질문" 라벨이 함께 붙습니다.
-        </li>
-        <li>
-            <strong>그래프 탐색</strong> — LLM 플래너가 질의 의도에 맞는 대상 엔티티·관계를
-            식별하고(<code>plan_graph_search</code>), 이름 일치(완전·부분) → 엔티티 임베딩 유사도
-            순으로 시작 노드를 찾습니다. 찾은 노드에서 <strong>깊이 1의 양방향 BFS</strong>로 직접
-            연결된 엔티티·관계를 모읍니다.
-        </li>
-        <li>
-            <strong>리랭킹(선택)</strong> — 리랭커가 켜져 있으면 전용 cross-encoder 모델로 벡터 결과를
-            다시 점수화하고, 점수 임계값을 넘는 상위 항목만 남겨 정밀도를 높입니다.
-        </li>
-        <li>
-            <strong>병합·정렬·보강</strong> — 벡터 결과와, 그래프가 도달했지만 벡터가 놓친 문서의
-            본문을 합쳐 문서 단위로 중복 제거하고 유사도 순으로 정렬합니다. 필요 시 적중 청크를 그
-            문서의 전문으로 치환하는 <strong>Parent-document</strong> 검색, 코드 문서에 원본 소스를
-            덧붙이는 보강도 선택적으로 동작합니다.
-        </li>
-    </ol>
 
-    <h4>검색 결과로 무엇을 돌려주나요?</h4>
-    <p>
-        검색은 <strong>① 포맷된 컨텍스트 텍스트</strong>와 <strong>② 구조화된 출처 목록</strong>을
-        함께 반환합니다.
-    </p>
-    <ul>
-        <li>
-            <strong>컨텍스트 텍스트</strong> — <code>## 관련 문서</code>, <code>## 관련 그래프 컨텍스트</code>,
-            <code>## 그래프 연결 문서</code>, <code>## 원본 소스 코드(검증용)</code> 등 여러 섹션으로
-            구성된 하나의 문자열로, 각 항목에 문서 제목·유사도·섹션 경로(가상 질문 매칭 시 해당 질문)가
-            붙습니다. 이 텍스트가 LLM에 그대로 전달됩니다.
-        </li>
-        <li>
-            <strong>출처 목록</strong> — 각 출처는 <code>document_id</code>, <code>title</code>,
-            <code>similarity</code>(코사인 유사도), <code>full_document</code>(전문 치환 여부) 필드를
-            가지며, 그래프 탐색으로 찾은 엔티티·관계 참조도 함께 반환됩니다. 웹 질의응답에서는 답변
-            스트림과 별도로 이 출처가 전달되어 근거 문서를 표시할 수 있습니다.
-        </li>
-    </ul>
-    <p>
+    <div class="callout" style="margin-top: 1.25rem;">
+        <h4>💡 가상 질문 생성 (멀티 벡터 인덱싱)</h4>
+        <p>
+            임베딩 단계에서 LLM이 각 섹션마다 "이 섹션이 답할 수 있는 자연스러운 질문"을 미리 만들어
+            별도 view로 등록합니다(문서당 1회 호출, 섹션당 약 5개). 사용자의 자연어 질의가 본문보다
+            <strong>질문 형태의 임베딩</strong>과 더 가깝게 매칭되어 검색 재현율·정밀도가 향상됩니다.
+            생성된 질문은 문서 상세의 청크 탭에서 볼 수 있습니다.
+        </p>
+    </div>
+</section>
+
+<section class="about-section">
+    <h3>🔍 검색은 어떻게 이루어지나요?</h3>
+    <p><strong>벡터 검색</strong>과 <strong>지식 그래프 탐색</strong>을 함께 수행해 하나의 컨텍스트로 조립합니다.</p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>질의 임베딩</strong><p>질의를 벡터로 변환 (선택: HyDE로 가상 답변 보강)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>벡터 검색</strong><p>ChromaDB 코사인 유사도 → 문서 단위 dedup → top-k</p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>그래프 탐색</strong><p>LLM 플래너가 엔티티 식별 → 깊이 1 양방향 BFS</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>리랭킹(선택)</strong><p>cross-encoder로 재점수화해 정밀도 향상</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">5</span>
+            <div><strong>병합·정렬</strong><p>벡터+그래프 결과 통합, 중복 제거 후 유사도 정렬</p></div>
+        </article>
+    </div>
+
+    <h4 style="margin-top: 1.75rem;">검색 결과로 무엇을 돌려주나요?</h4>
+    <div class="grid">
+        <article>
+            <h5>📄 ① 포맷된 컨텍스트 텍스트</h5>
+            <p style="margin-bottom: 0;">
+                <code>## 관련 문서</code>, <code>## 관련 그래프 컨텍스트</code>,
+                <code>## 그래프 연결 문서</code> 등 섹션으로 구성된 문자열. 항목마다 제목·유사도·섹션
+                경로(가상 질문 매칭 시 해당 질문)가 붙어 LLM에 그대로 전달됩니다.
+            </p>
+        </article>
+        <article>
+            <h5>🔖 ② 구조화된 출처 목록</h5>
+            <p style="margin-bottom: 0;">
+                각 출처는 <code>document_id</code>, <code>title</code>, <code>similarity</code>,
+                <code>full_document</code> 필드를 가지며 그래프 엔티티·관계 참조도 포함됩니다. 웹
+                질의응답은 답변과 별도로 이 출처를 전달해 근거 문서를 표시합니다.
+            </p>
+        </article>
+    </div>
+    <p style="margin-top: 1rem;">
         이 조립 로직은 MCP <code>search_context</code> 도구와 웹 질의응답이 동일하게 사용합니다.
-        (MCP 도구는 컨텍스트 텍스트를, 웹은 텍스트와 출처를 함께 돌려줍니다.)
     </p>
 </section>
 
-<section>
-    <h3>어떤 원리로 구현되어 있나요?</h3>
-
-    <h4>6단계 인덱싱 파이프라인</h4>
-    <p>문서가 들어오면 다음 단계를 거쳐 검색 가능한 인덱스로 변환합니다.</p>
-    <ol>
-        <li>
-            <strong>수집</strong> — Confluence(MCP)·파일 업로드·마크다운 작성·Git 저장소 등에서
-            원본을 가져오고, 원문과 <code>content_hash</code>를 함께 보관합니다.
-        </li>
-        <li>
-            <strong>전처리</strong> — HTML을 마크다운으로 변환하고 제목·섹션 같은 구조를 추출해
-            정규화합니다. 코드 소스는 이 단계에서 AST로 심볼(함수·클래스) 경계를 파악합니다.
-        </li>
-        <li>
-            <strong>청킹</strong> — 정규화된 텍스트를 토큰 기준으로 분할하거나(문서),
-            함수·클래스 같은 <strong>심볼 단위</strong>로 분할합니다(코드). 분할 단위마다 안정적인
-            논리 청크 ID를 부여합니다.
-        </li>
-        <li>
-            <strong>임베딩</strong> — 각 청크 본문을 임베딩하고, 아래의 <strong>가상 질문</strong>도
-            함께 임베딩하여 본문·메타데이터·질문을 각각 별도 view로 등록합니다(멀티 벡터 인덱싱).
-        </li>
-        <li>
-            <strong>그래프 추출</strong> — 엔티티(노드)와 관계(엣지)를 뽑아냅니다. 코드는 AST 기반으로
-            import·호출 관계를, Confluence는 제목·섹션 계층의 링크 관계를, 일반 문서는 필요 시 LLM으로
-            의미 관계를 추출합니다. 같은 엔티티의 표기 변형은 정규화 키로 <strong>병합</strong>됩니다.
-        </li>
-        <li>
-            <strong>저장</strong> — 청크·임베딩은 ChromaDB에, 엔티티·관계는 NetworkX + SQLite에,
-            문서·청크·처리 이력은 SQLite에 저장하여 벡터 검색과 그래프 탐색 모두에 대비합니다.
-        </li>
-    </ol>
-    <p>
-        원본이 바뀌면 <code>content_hash</code> 비교로 변경을 감지해, 기존 파생 데이터(청크·그래프)를
-        지우고 다시 만드는 <strong>Delete &amp; Recreate</strong> 방식으로 재처리합니다.
-    </p>
-
-    <h4>가상 질문 생성 (멀티 벡터 인덱싱)</h4>
-    <p>
-        임베딩 단계에서, LLM이 각 섹션마다 "이 섹션이 답할 수 있는 자연스러운 질문"을 미리 만들어 둡니다
-        (문서당 한 번 호출, 섹션당 약 5개 목표, 중복은 제거). 이 가상 질문들을 별도의 임베딩 view로 함께
-        등록하면, 사용자가 자연어로 던지는 질의가 본문보다 <strong>질문 형태의 임베딩</strong>과 같은
-        의미 공간에서 더 가깝게 매칭되어 검색 재현율과 정밀도가 향상됩니다. 생성된 질문은 문서 상세의
-        청크 탭에서 확인할 수 있습니다.
-    </p>
-
-    <h4>소스 타입별 최적화</h4>
-    <ul>
-        <li><strong>Git 코드</strong> — AST 정적 분석으로 함수·클래스를 추출(LLM 호출 없음, 비용 0)</li>
-        <li><strong>Confluence 문서</strong> — 제목·섹션 계층을 구조 기반 링크 그래프로 변환</li>
-        <li><strong>일반 문서</strong> — 토큰 기반 청킹(필요 시 LLM 본문 추출로 의미 관계 보강)</li>
-    </ul>
-
-    <h4>하이브리드 저장소</h4>
+<section class="about-section">
+    <h3>🗄️ 하이브리드 저장소</h3>
     <figure>
         <table>
             <thead>
@@ -178,15 +232,28 @@
             </tbody>
         </table>
     </figure>
+</section>
 
-    <h4>기술 스택</h4>
-    <p>
-        Python 3.11+ · FastAPI + Jinja2(백엔드/템플릿) · HTMX + Alpine.js + Pico CSS(프론트엔드) ·
-        임베딩/LLM은 OpenAI·Anthropic·로컬·커스텀 엔드포인트를 지원합니다.
+<section class="about-section">
+    <h3>⚙️ 기술 스택</h3>
+    <div class="chips">
+        <span class="chip">Python 3.11+</span>
+        <span class="chip">FastAPI</span>
+        <span class="chip">Jinja2</span>
+        <span class="chip">HTMX</span>
+        <span class="chip">Alpine.js</span>
+        <span class="chip">Pico CSS</span>
+        <span class="chip">ChromaDB</span>
+        <span class="chip">NetworkX</span>
+        <span class="chip">SQLite</span>
+        <span class="chip">MCP</span>
+    </div>
+    <p style="margin-top: 0.75rem; color: var(--pico-muted-color);">
+        임베딩·LLM은 OpenAI·Anthropic·로컬·커스텀 엔드포인트를 지원합니다.
     </p>
 </section>
 
-<section>
+<section class="about-section">
     <p>
         <a href="/" role="button" class="outline">대시보드로 이동</a>
         <a href="/graph" role="button" class="outline">지식 그래프 보기</a>
