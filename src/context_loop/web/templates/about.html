@@ -17,8 +17,7 @@
         Claude 같은 사내 LLM 애플리케이션에 <strong>구조화된 컨텍스트</strong>로 제공합니다.
     </p>
     <p>
-        모든 데이터는 사용자 환경에 로컬로 저장되어(로컬 퍼스트) 보안과 자율성을 유지하며,
-        원본이 바뀌면 변경을 감지해 저장된 지식을 자동으로 갱신합니다 —
+        원본 문서가 바뀌면 변경을 감지해 저장된 지식을 자동으로 갱신합니다 —
         지식이 수집·가공·제공되고 다시 갱신되는 이 <em>순환(loop)</em>이 프로젝트 이름의 배경입니다.
     </p>
 </section>
@@ -27,10 +26,9 @@
     <h3>주요 기능</h3>
 
     <article>
-        <h4>다양한 입력 경로 (5가지)</h4>
+        <h4>다양한 입력 경로 (4가지)</h4>
         <ul>
-            <li><strong>Confluence API 임포트</strong> — 스페이스/페이지를 탐색해 선택적으로 가져오기</li>
-            <li><strong>Confluence MCP 클라이언트</strong> — REST 접근이 막힌 환경에서 MCP로 연동</li>
+            <li><strong>Confluence MCP 클라이언트</strong> — MCP로 Confluence 문서를 검색·임포트</li>
             <li><strong>파일 업로드</strong> — 마크다운·텍스트·HTML 파일</li>
             <li><strong>마크다운 직접 작성</strong> — 내장 에디터(편집/미리보기 분할 뷰)</li>
             <li><strong>Git 코드 수집</strong> — 저장소를 clone/pull 하여 코드 심볼 단위로 수집</li>
@@ -42,15 +40,13 @@
         <ul>
             <li>등록된 문서 관리 및 소스/상태별 필터링, 통계 확인</li>
             <li>지식 그래프 시각화 — 엔티티·관계 탐색, 병합된 노드 확인</li>
-            <li>RAG 기반 채팅 — 사내 지식에 근거한 질의응답과 출처 표시</li>
             <li>문서 상세 보기 — 원본 / 청크 / 그래프 / 메타데이터(처리 이력) 탭</li>
         </ul>
     </article>
 
     <article>
-        <h4>검색과 연동</h4>
+        <h4>연동과 동기화</h4>
         <ul>
-            <li><strong>하이브리드 검색</strong> — 벡터 유사도 검색과 지식 그래프 관계 탐색을 결합</li>
             <li><strong>자동 동기화</strong> — content hash로 원본 변경을 감지해 재처리(Delete &amp; Recreate)</li>
             <li><strong>MCP 서버</strong> — 사내 LLM 앱에 <code>search_context</code>, <code>list_documents</code>,
                 <code>get_document</code>, <code>get_graph_context</code> 도구 제공</li>
@@ -59,10 +55,44 @@
 </section>
 
 <section>
+    <h3>검색은 어떻게 이루어지나요?</h3>
+    <p>
+        질의가 들어오면 <strong>벡터 검색</strong>과 <strong>지식 그래프 탐색</strong>을 함께 수행해
+        관련 컨텍스트를 조립합니다.
+    </p>
+    <ol>
+        <li><strong>질의 임베딩</strong> — 사용자 질의를 임베딩 벡터로 변환합니다.
+            (선택적으로 HyDE로 가상 답변을 함께 임베딩해 검색을 보강합니다.)</li>
+        <li><strong>벡터 검색</strong> — ChromaDB에서 코사인 유사도로 가장 가까운 청크를 top-k로 찾고,
+            같은 문서가 여러 번 매칭되면 중복을 제거합니다.</li>
+        <li><strong>그래프 탐색</strong> — LLM 플래너가 질의 의도에 맞는 엔티티·관계를 식별하고,
+            이름 매칭과 엔티티 임베딩으로 시작 노드를 찾은 뒤 깊이 1의 BFS로 주변 노드를 탐색합니다.</li>
+        <li><strong>리랭킹(선택)</strong> — 전용 리랭커(cross-encoder) 모델로 벡터 결과를 다시 점수화해
+            정밀도를 높입니다.</li>
+        <li><strong>병합·정렬</strong> — 벡터 결과와, 그래프가 도달했지만 벡터가 놓친 문서의 본문을 합치고,
+            중복 제거 후 유사도 순으로 정렬합니다. (필요 시 적중 청크를 문서 전문으로 치환하는
+            Parent-document 검색도 지원합니다.)</li>
+    </ol>
+    <p>
+        이렇게 조립된 컨텍스트는 출처 정보와 함께 반환되어, MCP <code>search_context</code> 도구와
+        질의응답 양쪽에서 동일하게 사용됩니다.
+    </p>
+</section>
+
+<section>
     <h3>어떤 원리로 구현되어 있나요?</h3>
 
     <h4>6단계 인덱싱 파이프라인</h4>
     <p>수집 → 전처리 → 청킹 → 임베딩 → 그래프 추출 → 저장의 단계를 거쳐, 원본을 검색 가능한 인덱스로 변환합니다.</p>
+
+    <h4>가상 질문 생성 (멀티 벡터 인덱싱)</h4>
+    <p>
+        색인 단계에서 LLM이 각 섹션마다 "이 섹션이 답할 수 있는 자연스러운 질문"을 미리 만들어 둡니다
+        (문서당 한 번 호출, 섹션당 약 5개 목표). 이 가상 질문들을 별도의 임베딩 view로 함께 등록하면,
+        사용자가 자연어로 던지는 질의가 본문보다 <strong>질문 형태의 임베딩</strong>과 같은 의미 공간에서
+        더 가깝게 매칭되어 검색 재현율과 정밀도가 향상됩니다. 생성된 질문은 문서 상세의 청크 탭에서
+        확인할 수 있습니다.
+    </p>
 
     <h4>소스 타입별 최적화</h4>
     <ul>
