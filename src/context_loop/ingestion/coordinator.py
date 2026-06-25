@@ -162,14 +162,21 @@ class CoordinatorAgent:
 
         # 1단계: 파일 저장 (DB 쓰기 — 순차)
         pending_ids: list[tuple[str, int]] = []
+        retry_count = 0
         for pr in result.product_results:
             for fi in pr.files:
                 try:
                     doc_result = await store_git_code(
                         self._store, fi, pr.repo_url,
                     )
-                    if doc_result.get("changed", False):
+                    # 변경된 파일 + 이전에 완료되지 못한 파일(failed/pending/processing)을
+                    # 재처리 큐에 넣는다. 'completed'만 터미널 성공 상태로 보고 건너뛴다.
+                    changed = doc_result.get("changed", False)
+                    completed = doc_result.get("status") == "completed"
+                    if changed or not completed:
                         pending_ids.append((fi.relative_path, doc_result["id"]))
+                        if not changed:
+                            retry_count += 1
                 except Exception as exc:
                     logger.error(
                         "git_code 저장 실패: %s — %s",
@@ -202,8 +209,8 @@ class CoordinatorAgent:
                     pipeline_failed += 1
 
             logger.info(
-                "파이프라인 처리 집계: 성공=%d, 실패=%d",
-                pipeline_processed, pipeline_failed,
+                "파이프라인 처리 집계: 성공=%d, 실패=%d (미완료 파일 재처리=%d건 포함)",
+                pipeline_processed, pipeline_failed, retry_count,
             )
 
         return result

@@ -425,7 +425,7 @@ class TestPipelineProcessing:
     async def test_run_and_store_idempotent_skips_pipeline(
         self, store: MetadataStore, tmp_path: Path,
     ) -> None:
-        """두 번째 실행에서는 변경 없으므로 파이프라인 호출 안 함."""
+        """완료(completed)된 파일은 변경이 없으면 파이프라인을 다시 호출하지 않는다."""
         from unittest.mock import MagicMock, patch
 
         origin = tmp_path / "origin"
@@ -434,11 +434,13 @@ class TestPipelineProcessing:
         config = _make_config(tmp_path, str(origin))
         git_cfg = load_git_source_config(config)
 
-        # 첫 번째 실행 — 파이프라인 없이
+        # 첫 번째 실행 — 파일 저장 후 완료 상태로 만든다(성공적으로 인덱싱된 상태 시뮬레이션).
         coord1 = CoordinatorAgent(store, config, git_config=git_cfg)
         await coord1.run_and_store()
+        for doc in await store.list_documents(source_type="git_code"):
+            await store.update_document_status(doc["id"], status="completed")
 
-        # 두 번째 실행 — 파이프라인 있지만 변경 없음
+        # 두 번째 실행 — 파이프라인 있지만 변경 없고 이미 완료됨
         call_count = 0
 
         async def mock_process_document(document_id, **kwargs):
@@ -465,5 +467,54 @@ class TestPipelineProcessing:
         ):
             await coord2.run_and_store()
 
-        # 변경 없으므로 파이프라인 호출 0회
+        # 변경 없고 완료 상태이므로 파이프라인 호출 0회
         assert call_count == 0
+
+    async def test_run_and_store_retries_failed_files(
+        self, store: MetadataStore, tmp_path: Path,
+    ) -> None:
+        """이전 sync에서 실패(status='failed')한 파일은 변경이 없어도 재처리된다."""
+        from unittest.mock import MagicMock, patch
+
+        origin = tmp_path / "origin"
+        _init_git_repo(origin, {"services/vpc/main.go": "package main"})
+
+        config = _make_config(tmp_path, str(origin))
+        git_cfg = load_git_source_config(config)
+
+        # 첫 번째 실행 — 파일 저장 후 실패 상태로 만든다(이전 인덱싱 실패 시뮬레이션).
+        coord1 = CoordinatorAgent(store, config, git_config=git_cfg)
+        await coord1.run_and_store()
+        docs = await store.list_documents(source_type="git_code")
+        assert len(docs) == 1
+        failed_doc_id = docs[0]["id"]
+        await store.update_document_status(failed_doc_id, status="failed")
+
+        # 두 번째 실행 — 내용 변경 없지만 실패 상태이므로 재처리되어야 한다.
+        processed_ids: list[int] = []
+
+        async def mock_process_document(document_id, **kwargs):
+            processed_ids.append(document_id)
+            return {
+                "document_id": document_id,
+                "storage_method": "graph",
+                "chunk_count": 0,
+                "node_count": 2,
+                "edge_count": 1,
+            }
+
+        coord2 = CoordinatorAgent(
+            store, config, git_config=git_cfg,
+            vector_store=MagicMock(),
+            graph_store=MagicMock(),
+            embedding_client=MagicMock(),
+        )
+
+        with patch(
+            "context_loop.processor.pipeline.process_document",
+            side_effect=mock_process_document,
+        ):
+            await coord2.run_and_store()
+
+        # 실패했던 문서가 변경 없이도 재처리됨
+        assert failed_doc_id in processed_ids
