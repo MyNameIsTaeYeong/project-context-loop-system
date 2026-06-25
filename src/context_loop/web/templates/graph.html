@@ -57,6 +57,12 @@
 
     <!-- 병합된 노드 -->
     <section x-show="tab === 'merges'">
+        <label style="display: inline-flex; align-items: center; gap: 0.4rem;">
+            <input type="checkbox" id="graph-merges-include-deleted"
+                   role="switch"
+                   @change="if (window.graphLoadMerges) window.graphLoadMerges()">
+            삭제된 노드도 표시
+        </label>
         <p id="graph-merges-status" style="min-height: 1.2rem;"></p>
         <div id="graph-merges-table"></div>
     </section>

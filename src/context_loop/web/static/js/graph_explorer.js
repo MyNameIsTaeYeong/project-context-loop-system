@@ -168,8 +168,11 @@ function _escapeHtml(s) {
 async function graphLoadMerges() {
     _setStatus("graph-merges-status", "불러오는 중...");
     var container = document.getElementById("graph-merges-table");
+    var includeToggle = document.getElementById("graph-merges-include-deleted");
+    var includeDeleted = !!(includeToggle && includeToggle.checked);
     try {
-        var resp = await fetch("/api/graph/merges");
+        var url = "/api/graph/merges" + (includeDeleted ? "?include_deleted=true" : "");
+        var resp = await fetch(url);
         if (!resp.ok) {
             _setStatus("graph-merges-status", "요청 실패: " + resp.status);
             return;
@@ -187,7 +190,8 @@ async function graphLoadMerges() {
             var variants = (g.variant_names || []).map(_escapeHtml).join("<br>");
             var methods = (g.methods || []).map(_escapeHtml).join(", ");
             var docs = (g.document_ids || []).length;
-            return "<tr>" +
+            var rowStyle = g.is_deleted ? ' style="opacity: 0.6;"' : "";
+            return "<tr" + rowStyle + ">" +
                 "<td>" + _escapeHtml(g.entity_name) + "</td>" +
                 "<td>" + _escapeHtml(g.entity_type) + "</td>" +
                 "<td>" + variants + "</td>" +
