@@ -118,6 +118,11 @@ processor:
   embedding_endpoint: ""           # embedding_provider: "endpoint"일 때 사용 (예: "http://localhost:8080/v1")
   embedding_api_key: ""            # 엔드포인트 인증 키 (불필요한 경우 빈 문자열)
   embedding_headers: {}            # 엔드포인트 호출 시 추가 헤더 (예: {X-Org-Id: "abc"})
+  # 임베딩 HTTP 요청 속도 제한 (git sync 등에서 429 Too Many Requests 방지).
+  # 공유 클라이언트 1개 안의 전역 세마포어로 동시 in-flight 요청 총수를 캡한다.
+  embedding_max_concurrency: 4     # 임베딩 동시 HTTP 요청 상한(전역) — "한 번에 너무 많은 요청" 방지
+  embedding_max_retries: 5         # 429/일시적 오류 시 배치당 최대 시도 횟수
+  embedding_backoff_base: 2.0      # 지수 백오프 밑(초). 429 응답에 Retry-After 헤더가 있으면 우선
   # 그래프 엔티티 임베딩 사전 구축(build_entity_embeddings) 설정.
   # 노드를 batch_size 단위 청크로 나눠 concurrency 개씩 병렬 호출한다.
   entity_embedding_batch_size: 100   # 청크당 엔티티 수
