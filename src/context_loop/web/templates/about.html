@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+
+{% block title %}소개 - Context Loop{% endblock %}
+
+{% block content %}
+<hgroup>
+    <h2>Context Loop</h2>
+    <p>사내 지식을 LLM 컨텍스트로 변환·저장하고, 웹 대시보드와 MCP 서버로 관리하는 통합 지식 시스템입니다.</p>
+</hgroup>
+
+<section>
+    <h3>이 프로젝트는 무엇을 위한 건가요?</h3>
+    <p>
+        회사의 지식은 Confluence, 위키, 코드 저장소, 개인 메모 등 여러 곳에 흩어져 있습니다.
+        <strong>Context Loop</strong>는 이렇게 분산된 지식을 한곳으로 자동 수집·처리하여,
+        웹 대시보드에서 시각적으로 관리하고 <abbr title="Model Context Protocol">MCP</abbr> 프로토콜을 통해
+        Claude 같은 사내 LLM 애플리케이션에 <strong>구조화된 컨텍스트</strong>로 제공합니다.
+    </p>
+    <p>
+        모든 데이터는 사용자 환경에 로컬로 저장되어(로컬 퍼스트) 보안과 자율성을 유지하며,
+        원본이 바뀌면 변경을 감지해 저장된 지식을 자동으로 갱신합니다 —
+        지식이 수집·가공·제공되고 다시 갱신되는 이 <em>순환(loop)</em>이 프로젝트 이름의 배경입니다.
+    </p>
+</section>
+
+<section>
+    <h3>주요 기능</h3>
+
+    <article>
+        <h4>다양한 입력 경로 (5가지)</h4>
+        <ul>
+            <li><strong>Confluence API 임포트</strong> — 스페이스/페이지를 탐색해 선택적으로 가져오기</li>
+            <li><strong>Confluence MCP 클라이언트</strong> — REST 접근이 막힌 환경에서 MCP로 연동</li>
+            <li><strong>파일 업로드</strong> — 마크다운·텍스트·HTML 파일</li>
+            <li><strong>마크다운 직접 작성</strong> — 내장 에디터(편집/미리보기 분할 뷰)</li>
+            <li><strong>Git 코드 수집</strong> — 저장소를 clone/pull 하여 코드 심볼 단위로 수집</li>
+        </ul>
+    </article>
+
+    <article>
+        <h4>웹 대시보드</h4>
+        <ul>
+            <li>등록된 문서 관리 및 소스/상태별 필터링, 통계 확인</li>
+            <li>지식 그래프 시각화 — 엔티티·관계 탐색, 병합된 노드 확인</li>
+            <li>RAG 기반 채팅 — 사내 지식에 근거한 질의응답과 출처 표시</li>
+            <li>문서 상세 보기 — 원본 / 청크 / 그래프 / 메타데이터(처리 이력) 탭</li>
+        </ul>
+    </article>
+
+    <article>
+        <h4>검색과 연동</h4>
+        <ul>
+            <li><strong>하이브리드 검색</strong> — 벡터 유사도 검색과 지식 그래프 관계 탐색을 결합</li>
+            <li><strong>자동 동기화</strong> — content hash로 원본 변경을 감지해 재처리(Delete &amp; Recreate)</li>
+            <li><strong>MCP 서버</strong> — 사내 LLM 앱에 <code>search_context</code>, <code>list_documents</code>,
+                <code>get_document</code>, <code>get_graph_context</code> 도구 제공</li>
+        </ul>
+    </article>
+</section>
+
+<section>
+    <h3>어떤 원리로 구현되어 있나요?</h3>
+
+    <h4>6단계 인덱싱 파이프라인</h4>
+    <p>수집 → 전처리 → 청킹 → 임베딩 → 그래프 추출 → 저장의 단계를 거쳐, 원본을 검색 가능한 인덱스로 변환합니다.</p>
+
+    <h4>소스 타입별 최적화</h4>
+    <ul>
+        <li><strong>Git 코드</strong> — AST 정적 분석으로 함수·클래스를 추출(LLM 호출 없음, 비용 0)</li>
+        <li><strong>Confluence 문서</strong> — 제목·섹션 계층을 구조 기반 링크 그래프로 변환</li>
+        <li><strong>일반 문서</strong> — 토큰 기반 청킹(필요 시 LLM 본문 추출로 의미 관계 보강)</li>
+    </ul>
+
+    <h4>하이브리드 저장소</h4>
+    <figure>
+        <table>
+            <thead>
+                <tr><th>저장소</th><th>기술</th><th>역할</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>메타데이터 DB</td><td>SQLite</td><td>문서·청크·처리 이력</td></tr>
+                <tr><td>벡터 DB</td><td>ChromaDB</td><td>텍스트 청크 임베딩 / 유사도 검색</td></tr>
+                <tr><td>그래프 DB</td><td>NetworkX + SQLite</td><td>엔티티 노드와 관계 엣지</td></tr>
+            </tbody>
+        </table>
+    </figure>
+
+    <h4>기술 스택</h4>
+    <p>
+        Python 3.11+ · FastAPI + Jinja2(백엔드/템플릿) · HTMX + Alpine.js + Pico CSS(프론트엔드) ·
+        임베딩/LLM은 OpenAI·Anthropic·로컬·커스텀 엔드포인트를 지원합니다.
+    </p>
+</section>
+
+<section>
+    <p>
+        <a href="/" role="button" class="outline">대시보드로 이동</a>
+        <a href="/graph" role="button" class="outline">지식 그래프 보기</a>
+    </p>
+</section>
+{% endblock %}

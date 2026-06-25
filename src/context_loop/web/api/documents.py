@@ -73,6 +73,13 @@ async def editor_new(request: Request):
     })
 
 
+@router.get("/about")
+async def about_page(request: Request):
+    """프로젝트 소개 페이지."""
+    templates = get_templates(request)
+    return templates.TemplateResponse("about.html", {"request": request})
+
+
 @router.get("/editor/{document_id}")
 async def editor_edit(
     request: Request,
