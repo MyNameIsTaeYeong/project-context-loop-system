@@ -55,6 +55,15 @@
     }
     .callout h4 { margin-top: 0; }
     .callout p { margin-bottom: 0; }
+    .callout pre {
+        margin: 0.6rem 0;
+        padding: 0.85rem 1rem;
+        border-radius: var(--pico-border-radius);
+        font-size: 0.82rem;
+        overflow-x: auto;
+    }
+    .tool-list { margin: 0; padding-left: 1.1rem; }
+    .tool-list li { margin-bottom: 0.3rem; }
 
     .chips { display: flex; flex-wrap: wrap; gap: 0.5rem; }
     .chip {
@@ -72,18 +81,77 @@
 <div class="about-hero">
     <hgroup>
         <h2>🔄 Context Loop</h2>
-        <p>사내 지식을 LLM 컨텍스트로 변환·저장하고, 웹 대시보드와 MCP 서버로 관리하는 통합 지식 시스템</p>
+        <p>사내 지식을 인덱싱해 <strong>MCP로 AI 툴(Claude 등)에 컨텍스트로 제공</strong>하는 시스템.
+            웹 대시보드는 그 지식이 백엔드에 어떻게 저장됐는지 들여다보는 도구입니다.</p>
     </hgroup>
 </div>
 
 <section class="about-section">
     <h3>이 프로젝트는 무엇을 위한 건가요?</h3>
     <p>
-        회사의 지식은 Confluence, 위키, 코드 저장소, 개인 메모 등 여러 곳에 흩어져 있습니다.
-        <strong>Context Loop</strong>는 이렇게 분산된 지식을 한곳으로 자동 수집·처리하여,
-        웹 대시보드에서 시각적으로 관리하고 <abbr title="Model Context Protocol">MCP</abbr> 프로토콜을 통해
-        Claude 같은 사내 LLM 애플리케이션에 <strong>구조화된 컨텍스트</strong>로 제공합니다.
+        회사의 지식은 Confluence, 코드 저장소, 개인 메모 등 여러 곳에 흩어져 있습니다.
+        <strong>Context Loop</strong>는 이 분산된 지식을 한곳에 인덱싱해,
+        <abbr title="Model Context Protocol">MCP</abbr> 프로토콜로 <strong>Claude 같은 AI 툴에 구조화된
+        컨텍스트로 제공</strong>하는 것을 주 목적으로 합니다.
     </p>
+    <p>
+        웹 대시보드는 그 지식이 <strong>백엔드(벡터·그래프·메타데이터 저장소)에 실제로 어떻게 저장됐는지</strong>를
+        눈으로 확인하고 점검하는 도구입니다. 즉, 인덱싱 결과를 들여다보고 다듬는 <strong>관찰창</strong>이며,
+        실제 활용은 AI 툴에서 MCP를 통해 이뤄집니다.
+    </p>
+</section>
+
+<section class="about-section">
+    <h3>🚀 어떻게 사용하나요?</h3>
+    <p>
+        주 사용처는 <strong>AI 툴에서 MCP로 사내 지식을 불러오는 것</strong>입니다. 흐름은 다음과 같습니다.
+    </p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>지식 인덱싱</strong><p>Confluence MCP·Git 코드·파일 업로드·직접 작성으로 문서를 등록하면 자동으로 청킹·임베딩·그래프화됩니다.</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>대시보드로 확인</strong><p>무엇이 어떻게 저장됐는지(청크·그래프·메타데이터)를 웹에서 점검하고 필요하면 다듬습니다.</p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>AI 툴에 MCP 연결</strong><p>Claude Code·opencode 등의 설정에 Context Loop MCP 서버를 등록합니다(로컬 stdio 또는 원격 SSE).</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>AI에서 질의</strong><p>AI가 MCP 도구로 사내 지식을 자동으로 컨텍스트에 포함해 답변합니다.</p></div>
+        </article>
+    </div>
+
+    <div class="callout" style="margin-top: 1.5rem;">
+        <h4>🔗 AI 툴에 연결하기</h4>
+        <p>MCP 서버를 실행하고(로컬은 기본 stdio), AI 툴 설정에 등록합니다.</p>
+        <pre><code># 로컬 에이전트용 (stdio)
+context-loop mcp serve
+
+# 원격/팀 공유용 (SSE)
+context-loop mcp serve --transport sse --host 0.0.0.0 --port 3001</code></pre>
+        <p>Claude Code 예시 — 프로젝트 루트의 <code>.mcp.json</code>:</p>
+        <pre><code>{
+  "mcpServers": {
+    "context-loop": {
+      "command": ".venv/bin/context-loop",
+      "args": ["mcp", "serve"]
+    }
+  }
+}</code></pre>
+        <p style="margin-top: 0.75rem;">연결되면 AI가 다음 4가지 도구를 사용합니다.</p>
+        <ul class="tool-list">
+            <li><code>search_context</code> — 질의로 관련 지식(벡터+그래프)을 검색·조립</li>
+            <li><code>list_documents</code> — 인덱싱된 문서 목록 조회(소스/상태 필터)</li>
+            <li><code>get_document</code> — 특정 문서를 원본/청크/그래프 형식으로 조회</li>
+            <li><code>get_graph_context</code> — 특정 엔티티 중심의 그래프 관계 탐색</li>
+        </ul>
+    </div>
 </section>
 
 <section class="about-section">
@@ -101,11 +169,11 @@
         </article>
         <article class="feature-card">
             <span class="feature-icon">🖥️</span>
-            <h4>웹 대시보드</h4>
+            <h4>웹 대시보드 (저장 상태 확인)</h4>
             <ul>
-                <li>문서 관리·필터링·통계</li>
-                <li>지식 그래프 시각화</li>
-                <li>원본/청크/그래프/이력 탭</li>
+                <li>백엔드에 저장된 문서·청크·그래프·통계 확인</li>
+                <li>지식 그래프 시각화로 관계 점검</li>
+                <li>원본/청크/그래프/이력 탭으로 상세 확인</li>
             </ul>
         </article>
         <article class="feature-card">
