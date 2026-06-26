@@ -312,27 +312,30 @@
     </div>
 
     <h4 style="margin-top: 1.75rem;">검색 결과로 무엇을 돌려주나요?</h4>
+    <p>
+        검색 조립 로직은 MCP 도구와 웹 대시보드가 공유하지만, <strong>반환 형태는 서로 다릅니다.</strong>
+    </p>
     <div class="grid">
         <article>
-            <h5>📄 ① 포맷된 컨텍스트 텍스트</h5>
+            <h5>🔧 MCP <code>search_context</code></h5>
             <p style="margin-bottom: 0;">
+                <strong>포맷된 컨텍스트 텍스트(문자열) 하나만</strong> 반환합니다.
                 <code>## 관련 문서</code>, <code>## 관련 그래프 컨텍스트</code>,
-                <code>## 그래프 연결 문서</code> 등 섹션으로 구성된 문자열. 항목마다 제목·유사도·섹션
-                경로(가상 질문 매칭 시 해당 질문)가 붙어 LLM에 그대로 전달됩니다.
+                <code>## 그래프 연결 문서</code> 등 섹션으로 구성되고, 항목마다 제목·유사도·섹션
+                경로(가상 질문 매칭 시 해당 질문)가 텍스트로 붙습니다. <code>document_id</code> 같은
+                구조화된 필드는 없으며, AI는 이 텍스트에서 근거를 읽습니다.
             </p>
         </article>
         <article>
-            <h5>🔖 ② 구조화된 출처 목록</h5>
+            <h5>🖥️ 웹 대시보드 질의응답</h5>
             <p style="margin-bottom: 0;">
+                위 컨텍스트 텍스트에 더해 <strong>구조화된 출처 목록</strong>을 별도로 반환합니다.
                 각 출처는 <code>document_id</code>, <code>title</code>, <code>similarity</code>,
-                <code>full_document</code> 필드를 가지며 그래프 엔티티·관계 참조도 포함됩니다. 웹
-                질의응답은 답변과 별도로 이 출처를 전달해 근거 문서를 표시합니다.
+                <code>full_document</code> 필드를 가지며 그래프 엔티티·관계 참조도 포함되어, 답변과
+                함께 근거 문서를 UI에 표시합니다. (웹 전용)
             </p>
         </article>
     </div>
-    <p style="margin-top: 1rem;">
-        이 조립 로직은 MCP <code>search_context</code> 도구와 웹 질의응답이 동일하게 사용합니다.
-    </p>
 </section>
 
 <section class="about-section">
