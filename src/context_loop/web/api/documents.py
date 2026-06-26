@@ -112,6 +112,28 @@ _SOURCE_LABELS: dict[str, str] = {
     "git_code": "Git Code",
 }
 
+# 소스 안에서 한 단계 더 나눌 때(세부 그룹) 쓰는 소스 집합.
+_CODE_SOURCES = {"git_code", "code_doc", "code_summary", "code_file_summary"}
+_CONFLUENCE_SOURCES = {"confluence", "confluence_mcp"}
+
+
+def _repo_label(url: str | None) -> str:
+    """저장소 URL 에서 표시용 레포 이름을 뽑는다 (마지막 경로 + .git 제거)."""
+    if not url:
+        return ""
+    name = url.rstrip("/").rsplit("/", 1)[-1]
+    return name[:-4] if name.endswith(".git") else name
+
+
+def _subgroup_label(doc: dict[str, Any]) -> str | None:
+    """문서의 세부 그룹 라벨. 세부 그룹이 없는 소스는 None."""
+    st = doc["source_type"]
+    if st in _CODE_SOURCES:
+        return _repo_label(doc.get("url")) or doc.get("author") or "(저장소 미상)"
+    if st in _CONFLUENCE_SOURCES:
+        return doc.get("space_key") or "(스페이스 미상)"
+    return None
+
 
 @router.get("/partials/document-list")
 async def document_list_partial(
@@ -120,27 +142,43 @@ async def document_list_partial(
     status: str | None = None,
     meta_store: MetadataStore = Depends(get_meta_store),
 ):
-    """문서 목록 HTML 파셜 (소스 타입별 그룹 + 카드)."""
+    """문서 목록 HTML 파셜 (소스 타입별 그룹 → 세부 그룹 → 카드).
+
+    git_code/code_* 는 저장소별로, confluence/confluence_mcp 는 스페이스별로
+    한 단계 더 나눈다. 그 외 소스(manual/upload)는 세부 그룹 없이 카드만 나열.
+    """
     docs = await meta_store.list_documents(
         source_type=source_type or None,
         status=status or None,
     )
-    # 소스 타입별로 묶고, 사전 정의 순서 → 그 외 순으로 그룹을 정렬한다.
-    # (list_documents 가 updated_at DESC 정렬이므로 그룹 내 순서는 그대로 보존)
+    # 1) 소스 타입별로 묶고 사전 정의 순서로 정렬한다.
     by_source: dict[str, list[dict[str, Any]]] = {}
     for doc in docs:
         by_source.setdefault(doc["source_type"], []).append(doc)
     ordered = [s for s in _SOURCE_LABELS if s in by_source]
     ordered += [s for s in by_source if s not in _SOURCE_LABELS]
-    groups = [
-        {
+
+    # 2) 각 소스 안에서 세부 그룹(레포/스페이스)으로 다시 나눈다.
+    groups = []
+    for s in ordered:
+        src_docs = by_source[s]
+        sub_map: dict[str | None, list[dict[str, Any]]] = {}
+        for doc in src_docs:
+            sub_map.setdefault(_subgroup_label(doc), []).append(doc)
+        if list(sub_map) == [None]:
+            subgroups = [{"label": None, "count": len(src_docs), "docs": src_docs}]
+        else:
+            subgroups = [
+                {"label": k, "count": len(v), "docs": v}
+                for k, v in sorted(sub_map.items(), key=lambda kv: (kv[0] or ""))
+            ]
+        groups.append({
             "source_type": s,
             "label": _SOURCE_LABELS.get(s, s),
-            "docs": by_source[s],
-            "count": len(by_source[s]),
-        }
-        for s in ordered
-    ]
+            "count": len(src_docs),
+            "subgroups": subgroups,
+        })
+
     templates = get_templates(request)
     return templates.TemplateResponse("partials/document_list.html", {
         "request": request,

@@ -5,8 +5,15 @@
         <span class="badge badge-source badge-source-{{ group.source_type }}">{{ group.label }}</span>
         <span class="doc-group-count">{{ group.count }}</span>
     </div>
+    {% for sub in group.subgroups %}
+    {% if sub.label %}
+    <div class="doc-subgroup-header">
+        <span class="doc-subgroup-label">{{ sub.label }}</span>
+        <span class="doc-subgroup-count">{{ sub.count }}</span>
+    </div>
+    {% endif %}
     <div class="doc-card-grid">
-        {% for doc in group.docs %}
+        {% for doc in sub.docs %}
         <article class="doc-card">
             <a class="doc-card-title" href="/documents/{{ doc.id }}">{{ doc.title }}</a>
             <div class="doc-card-badges">
@@ -26,6 +33,7 @@
         </article>
         {% endfor %}
     </div>
+    {% endfor %}
 </section>
 {% endfor %}
 {% else %}

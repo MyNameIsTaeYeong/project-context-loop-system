@@ -331,7 +331,9 @@ class MetadataStore:
             "(SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) "
             "AS chunk_count, "
             "(SELECT COUNT(*) FROM graph_node_documents gnd "
-            "WHERE gnd.document_id = d.id) AS node_count "
+            "WHERE gnd.document_id = d.id) AS node_count, "
+            "(SELECT m.space_key FROM confluence_sync_membership m "
+            "WHERE m.page_id = d.source_id LIMIT 1) AS space_key "
             "FROM documents d WHERE 1=1"
         )
         params: list[Any] = []
