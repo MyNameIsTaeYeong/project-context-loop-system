@@ -1,3 +1,23 @@
+{% macro doc_card(doc) %}
+<article class="doc-card">
+    <a class="doc-card-title" href="/documents/{{ doc.id }}">{{ doc.title }}</a>
+    <div class="doc-card-badges">
+        <span class="badge badge-{{ doc.status }}">{{ doc.status }}</span>
+        {% if doc.storage_method %}
+        <span class="badge badge-method">{{ doc.storage_method }}</span>
+        {% endif %}
+        {% if doc.llm_degraded %}
+        <span class="badge badge-degraded" title="생성형 LLM 단계(가상 질문/본문 그래프) 결손 — 검색 품질 저하. 다음 sync 시 자동 재인덱싱.">LLM degraded</span>
+        {% endif %}
+    </div>
+    <div class="doc-card-meta">
+        <span title="청크 수">📄 {{ doc.chunk_count or 0 }} chunks</span>
+        <span title="그래프 노드 수">🔗 {{ doc.node_count or 0 }} nodes</span>
+        <span title="수정일">🕒 {{ doc.updated_at[:16] if doc.updated_at else '-' }}</span>
+    </div>
+</article>
+{% endmacro %}
+
 {% if groups %}
 {% for group in groups %}
 <section class="doc-group">
@@ -7,32 +27,20 @@
     </div>
     {% for sub in group.subgroups %}
     {% if sub.label %}
-    <div class="doc-subgroup-header">
-        <span class="doc-subgroup-label">{{ sub.label }}</span>
-        <span class="doc-subgroup-count">{{ sub.count }}</span>
+    <details class="doc-subgroup" open>
+        <summary class="doc-subgroup-summary">
+            <span class="doc-subgroup-label">{{ sub.label }}</span>
+            <span class="doc-subgroup-count">{{ sub.count }}</span>
+        </summary>
+        <div class="doc-card-grid">
+            {% for doc in sub.docs %}{{ doc_card(doc) }}{% endfor %}
+        </div>
+    </details>
+    {% else %}
+    <div class="doc-card-grid">
+        {% for doc in sub.docs %}{{ doc_card(doc) }}{% endfor %}
     </div>
     {% endif %}
-    <div class="doc-card-grid">
-        {% for doc in sub.docs %}
-        <article class="doc-card">
-            <a class="doc-card-title" href="/documents/{{ doc.id }}">{{ doc.title }}</a>
-            <div class="doc-card-badges">
-                <span class="badge badge-{{ doc.status }}">{{ doc.status }}</span>
-                {% if doc.storage_method %}
-                <span class="badge badge-method">{{ doc.storage_method }}</span>
-                {% endif %}
-                {% if doc.llm_degraded %}
-                <span class="badge badge-degraded" title="생성형 LLM 단계(가상 질문/본문 그래프) 결손 — 검색 품질 저하. 다음 sync 시 자동 재인덱싱.">LLM degraded</span>
-                {% endif %}
-            </div>
-            <div class="doc-card-meta">
-                <span title="청크 수">📄 {{ doc.chunk_count or 0 }} chunks</span>
-                <span title="그래프 노드 수">🔗 {{ doc.node_count or 0 }} nodes</span>
-                <span title="수정일">🕒 {{ doc.updated_at[:16] if doc.updated_at else '-' }}</span>
-            </div>
-        </article>
-        {% endfor %}
-    </div>
     {% endfor %}
 </section>
 {% endfor %}

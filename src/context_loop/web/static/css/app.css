@@ -56,25 +56,27 @@
     font-size: 0.8rem;
     font-weight: 600;
 }
-.doc-subgroup-header {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin: 0.85rem 0 0.5rem;
-    padding-left: 0.1rem;
+/* 접기/펼치기 세부 그룹 (<details>) */
+.doc-subgroup {
+    margin: 0.5rem 0 0.75rem;
+    border: none;
+    padding: 0;
+}
+.doc-subgroup-summary {
+    cursor: pointer;
+    padding: 0.3rem 0;
 }
 .doc-subgroup-label {
     font-weight: 600;
     font-size: 0.9rem;
-    color: var(--pico-muted-color, #777);
-}
-.doc-subgroup-label::before {
-    content: "└ ";
-    opacity: 0.6;
 }
 .doc-subgroup-count {
     font-size: 0.75rem;
     color: var(--pico-muted-color, #999);
+    margin-left: 0.4rem;
+}
+.doc-subgroup[open] > .doc-subgroup-summary {
+    margin-bottom: 0.6rem;
 }
 .doc-card-grid {
     display: grid;
