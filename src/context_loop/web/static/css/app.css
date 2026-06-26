@@ -93,6 +93,11 @@
     border-radius: var(--pico-border-radius, 0.5rem);
     background: var(--pico-card-background-color, #fff);
     transition: border-color 0.15s ease, transform 0.15s ease;
+    /* 화면 밖 카드는 렌더(레이아웃/페인트)를 건너뛰어, 수천 개 문서에서도
+       펼침/스크롤이 끊기지 않게 한다. contain-intrinsic-size 는 렌더 전
+       높이 추정치(스크롤바 안정용). */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 116px;
 }
 .doc-card:hover {
     border-color: var(--pico-primary, #1095c1);
