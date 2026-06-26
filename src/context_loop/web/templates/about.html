@@ -134,6 +134,45 @@
 </section>
 
 <section class="about-section">
+    <h3>🔧 Git 코드는 어떻게 임포트되나요?</h3>
+    <p>
+        설정한 Git 저장소의 코드를 <strong>심볼 단위</strong>로 인덱싱합니다. 저장소는
+        URL·브랜치·상품(파일 경로 스코프) 단위로 여러 개 설정할 수 있습니다.
+    </p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>저장소 동기화</strong><p>저장소를 clone/pull 하고 커밋 해시를 기록(증분 대비)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>파일 수집</strong><p>상품 경로(glob)·제외 패턴 + 지원 확장자·크기 한도로 필터링 (node_modules·build 자동 제외)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>심볼 추출 (AST)</strong><p>함수·클래스·메서드를 정적 분석으로 추출. Python=ast, Go·Java·TS·JS 지원. <strong>LLM 호출 없음(비용 0)</strong></p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>멀티뷰 임베딩</strong><p>심볼 1개 = 청크 1개. 본문(코드)과 메타(이름·시그니처)를 별도 view로 임베딩</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">5</span>
+            <div><strong>import 그래프</strong><p>파일↔모듈 import, 클래스→메서드 contains 관계 추출. 같은 모듈 import는 한 노드로 병합</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">6</span>
+            <div><strong>증분 저장</strong><p>content_hash 비교로 변경된 파일만 재처리(Delete &amp; Recreate)</p></div>
+        </article>
+    </div>
+    <p style="margin-top: 1.25rem;">
+        <a href="/git-sync" role="button" class="outline">Git Sync 열기 →</a>
+    </p>
+</section>
+
+<section class="about-section">
     <h3>🛠️ 인덱싱은 어떻게 이루어지나요?</h3>
     <p>문서가 들어오면 다음 6단계를 거쳐 검색 가능한 인덱스로 변환합니다.</p>
     <div class="grid">
