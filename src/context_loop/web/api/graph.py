@@ -247,8 +247,16 @@ async def graph_node_detail(
 
 @router.get("/api/graph/merges")
 async def graph_merges(
+    include_deleted: bool = False,
     meta_store: MetadataStore = Depends(get_meta_store),
 ) -> dict[str, Any]:
-    """병합된(크로스-문서 수렴) 노드 그룹 목록을 반환한다."""
-    groups = await meta_store.get_merged_node_groups(min_variants=2)
+    """병합된(크로스-문서 수렴) 노드 그룹 목록을 반환한다.
+
+    기본값은 정규 노드가 이미 삭제된(병합 로그만 남은) 그룹을 제외한다.
+    ``include_deleted=true`` 면 삭제된 노드도 함께 반환한다.
+    """
+    groups = await meta_store.get_merged_node_groups(
+        min_variants=2,
+        include_deleted=include_deleted,
+    )
     return {"groups": groups, "count": len(groups)}

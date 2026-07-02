@@ -321,16 +321,29 @@ class MetadataStore:
         source_type: str | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        """문서 목록을 조회한다."""
-        query = "SELECT * FROM documents WHERE 1=1"
+        """문서 목록을 조회한다.
+
+        각 문서에 파생 데이터 집계(``chunk_count``: 청크 수, ``node_count``:
+        기여한 그래프 노드 수)를 상관 서브쿼리로 함께 반환한다.
+        """
+        query = (
+            "SELECT d.*, "
+            "(SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) "
+            "AS chunk_count, "
+            "(SELECT COUNT(*) FROM graph_node_documents gnd "
+            "WHERE gnd.document_id = d.id) AS node_count, "
+            "(SELECT m.space_key FROM confluence_sync_membership m "
+            "WHERE m.page_id = d.source_id LIMIT 1) AS space_key "
+            "FROM documents d WHERE 1=1"
+        )
         params: list[Any] = []
         if source_type:
-            query += " AND source_type = ?"
+            query += " AND d.source_type = ?"
             params.append(source_type)
         if status:
-            query += " AND status = ?"
+            query += " AND d.status = ?"
             params.append(status)
-        query += " ORDER BY updated_at DESC"
+        query += " ORDER BY d.updated_at DESC"
         cursor = await self.db.execute(query, params)
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -731,6 +744,7 @@ class MetadataStore:
         self,
         *,
         min_variants: int = 2,
+        include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
         """크로스-문서 병합이 일어난 노드 그룹을 집계해 반환한다 (관측·디버깅용).
 
@@ -743,6 +757,10 @@ class MetadataStore:
             min_variants: 그룹으로 노출할 최소 기준 (원본 표기 종류 수 또는
                 기여 문서 수 중 큰 값). 기본 2 — 단일 문서에서 한 번만
                 등장(신규 1건)한 노드는 병합이 아니므로 제외.
+            include_deleted: 정규 노드가 이미 그래프에서 삭제되어
+                ``graph_nodes`` 조인이 비는(병합 로그만 남은) 그룹을 포함할지
+                여부. 기본 False — 삭제된 노드는 숨긴다. True 면 함께 노출하며
+                해당 그룹은 ``entity_name`` 이 "(삭제된 노드)" 로 표시된다.
 
         Returns:
             각 그룹 dict (variant 수 → 문서 수 내림차순 정렬):
@@ -753,6 +771,7 @@ class MetadataStore:
               - document_ids: 기여한 문서 ID 목록 (중복 제거, 정렬)
               - methods: 등장한 merge_method 집합 (exact/normalized/new)
               - log_count: 이 노드에 기록된 총 로그 행 수
+              - is_deleted: 정규 노드가 삭제되어 병합 로그만 남았는지 여부
         """
         cursor = await self.db.execute(
             """SELECT m.canonical_node_id      AS canonical_node_id,
@@ -776,6 +795,10 @@ class MetadataStore:
                     "canonical_node_id": cid,
                     "entity_name": r.get("entity_name") or "(삭제된 노드)",
                     "entity_type": r.get("entity_type") or "other",
+                    # graph_nodes 조인이 비면(LEFT JOIN 미매칭) 정규 노드가
+                    # 삭제된 것. entity_name 은 NOT NULL 컬럼이므로 None 이면
+                    # 노드가 사라진 경우로 판정한다.
+                    "is_deleted": r.get("entity_name") is None,
                     "variant_names": set(),
                     "document_ids": set(),
                     "methods": set(),
@@ -798,6 +821,9 @@ class MetadataStore:
             # 2개 이상 문서가 같은 노드로 수렴.
             if max(variant_count, doc_count) < min_variants:
                 continue
+            # 기본적으로 삭제된(고아) 정규 노드는 숨긴다.
+            if g["is_deleted"] and not include_deleted:
+                continue
             result.append({
                 "canonical_node_id": g["canonical_node_id"],
                 "entity_name": g["entity_name"],
@@ -806,6 +832,7 @@ class MetadataStore:
                 "document_ids": sorted(g["document_ids"]),
                 "methods": sorted(g["methods"]),
                 "log_count": g["log_count"],
+                "is_deleted": g["is_deleted"],
             })
 
         result.sort(

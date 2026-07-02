@@ -1,0 +1,364 @@
+{% extends "base.html" %}
+
+{% block title %}소개 - Context Loop{% endblock %}
+
+{% block head %}
+<style>
+    .about-hero {
+        padding: 2rem 1.5rem;
+        border-radius: var(--pico-border-radius);
+        background: var(--pico-card-background-color);
+        border: 1px solid var(--pico-card-border-color);
+        margin-bottom: 2rem;
+    }
+    .about-hero h2 { margin-bottom: 0.5rem; }
+    .about-hero p { color: var(--pico-muted-color); margin: 0; }
+
+    .about-section { margin-top: 2.75rem; }
+    .about-section > h3 { margin-bottom: 1rem; }
+
+    .feature-card { height: 100%; margin-bottom: 0; }
+    .feature-icon { font-size: 1.6rem; line-height: 1; }
+    .feature-card h4 { margin: 0.4rem 0 0.6rem; }
+    .feature-card ul { margin-bottom: 0; padding-left: 1.1rem; }
+    .feature-card li { margin-bottom: 0.35rem; }
+
+    /* 번호가 매겨진 스텝 카드 */
+    .step-card {
+        display: flex;
+        gap: 0.9rem;
+        align-items: flex-start;
+        margin-bottom: 0;
+        height: 100%;
+    }
+    .step-num {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2rem;
+        height: 2rem;
+        border-radius: 50%;
+        background: var(--pico-primary-background);
+        color: var(--pico-primary-inverse);
+        font-weight: 700;
+        font-size: 0.95rem;
+    }
+    .step-card strong { display: block; margin-bottom: 0.2rem; }
+    .step-card p { margin: 0; font-size: 0.92rem; color: var(--pico-muted-color); }
+
+    .callout {
+        border-left: 4px solid var(--pico-primary);
+        padding: 1rem 1.25rem;
+        background: var(--pico-card-background-color);
+        border-radius: var(--pico-border-radius);
+    }
+    .callout h4 { margin-top: 0; }
+    .callout p { margin-bottom: 0; }
+    .callout pre {
+        margin: 0.6rem 0;
+        padding: 0.85rem 1rem;
+        border-radius: var(--pico-border-radius);
+        font-size: 0.82rem;
+        overflow-x: auto;
+    }
+    .tool-list { margin: 0; padding-left: 1.1rem; }
+    .tool-list li { margin-bottom: 0.3rem; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    .chip {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 1rem;
+        background: var(--pico-card-background-color);
+        border: 1px solid var(--pico-card-border-color);
+        font-size: 0.85rem;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="about-hero">
+    <hgroup>
+        <h2>🔄 Context Loop</h2>
+        <p>사내 지식을 인덱싱해 <strong>MCP로 AI 툴(Claude 등)에 컨텍스트로 제공</strong>하는 시스템.
+            웹 대시보드는 그 지식이 백엔드에 어떻게 저장됐는지 들여다보는 도구입니다.</p>
+    </hgroup>
+</div>
+
+<section class="about-section">
+    <h3>이 프로젝트는 무엇을 위한 건가요?</h3>
+    <p>
+        회사의 지식은 Confluence, 코드 저장소, 개인 메모 등 여러 곳에 흩어져 있습니다.
+        <strong>Context Loop</strong>는 이 분산된 지식을 한곳에 인덱싱해,
+        <abbr title="Model Context Protocol">MCP</abbr> 프로토콜로 <strong>Claude 같은 AI 툴에 구조화된
+        컨텍스트로 제공</strong>하는 것을 주 목적으로 합니다.
+    </p>
+    <p>
+        웹 대시보드는 그 지식이 <strong>백엔드(벡터·그래프·메타데이터 저장소)에 실제로 어떻게 저장됐는지</strong>를
+        눈으로 확인하고 점검하는 도구입니다. 즉, 인덱싱 결과를 들여다보고 다듬는 <strong>관찰창</strong>이며,
+        실제 활용은 AI 툴에서 MCP를 통해 이뤄집니다.
+    </p>
+</section>
+
+<section class="about-section">
+    <h3>🚀 어떻게 사용하나요?</h3>
+    <p>
+        주 사용처는 <strong>AI 툴에서 MCP로 사내 지식을 불러오는 것</strong>입니다. 흐름은 다음과 같습니다.
+    </p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>지식 인덱싱</strong><p>Confluence MCP·Git 코드·파일 업로드·직접 작성으로 문서를 등록하면 자동으로 청킹·임베딩·그래프화됩니다.</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>대시보드로 확인</strong><p>무엇이 어떻게 저장됐는지(청크·그래프·메타데이터)를 웹에서 점검하고 필요하면 다듬습니다.</p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>AI 툴에 MCP 연결</strong><p>Claude Code·opencode 등의 설정에 Context Loop MCP 서버를 등록합니다(로컬 stdio 또는 원격 SSE).</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>AI에서 질의</strong><p>AI가 MCP 도구로 사내 지식을 자동으로 컨텍스트에 포함해 답변합니다.</p></div>
+        </article>
+    </div>
+
+    <div class="callout" style="margin-top: 1.5rem;">
+        <h4>🔗 AI 툴에 연결하기</h4>
+        <p>사내 PC에 떠 있는 MCP 서버에 AI 툴에서 그 주소로 <strong>원격 연결</strong>합니다.</p>
+        <p>opencode 설정 (<code>opencode.json</code>):</p>
+        <pre><code>{
+  "mcp": {
+    "context-loop": {
+      "type": "remote",
+      "url": "http://70.50.170.15:3001/sse",
+      "enabled": true
+    }
+  }
+}</code></pre>
+        <p style="margin-top: 0.75rem;">연결되면 AI가 다음 4가지 도구를 사용합니다.</p>
+        <ul class="tool-list">
+            <li><code>search_context</code> — 질의로 관련 지식(벡터+그래프)을 검색·조립</li>
+            <li><code>list_documents</code> — 인덱싱된 문서 목록 조회(소스/상태 필터)</li>
+            <li><code>get_document</code> — 특정 문서를 원본/청크/그래프 형식으로 조회</li>
+            <li><code>get_graph_context</code> — 특정 엔티티 중심의 그래프 관계 탐색</li>
+        </ul>
+    </div>
+</section>
+
+<section class="about-section">
+    <h3>주요 기능</h3>
+    <div class="grid">
+        <article class="feature-card">
+            <span class="feature-icon">📥</span>
+            <h4>4가지 입력 경로</h4>
+            <ul>
+                <li><strong>Confluence MCP</strong> — 페이지·서브트리·스페이스 단위 임포트</li>
+                <li><strong>파일 업로드</strong> — md·txt·html</li>
+                <li><strong>마크다운 작성</strong> — 내장 에디터</li>
+                <li><strong>Git 코드</strong> — 심볼 단위 수집</li>
+            </ul>
+        </article>
+        <article class="feature-card">
+            <span class="feature-icon">🖥️</span>
+            <h4>웹 대시보드 (저장 상태 확인)</h4>
+            <ul>
+                <li>백엔드에 저장된 문서·청크·그래프·통계 확인</li>
+                <li>지식 그래프 시각화로 관계 점검</li>
+                <li>원본/청크/그래프/이력 탭으로 상세 확인</li>
+            </ul>
+        </article>
+        <article class="feature-card">
+            <span class="feature-icon">🔌</span>
+            <h4>연동과 동기화</h4>
+            <ul>
+                <li><strong>자동 동기화</strong> — 변경 감지 후 재처리</li>
+                <li><strong>MCP 서버</strong> — <code>search_context</code> 등 4개 도구 제공</li>
+            </ul>
+        </article>
+    </div>
+
+    <div class="callout" style="margin-top: 1.5rem;">
+        <h4>📚 Confluence MCP 임포트 범위</h4>
+        <p>Confluence MCP에서는 세 가지 단위로 페이지를 가져올 수 있습니다.</p>
+        <ul>
+            <li><strong>페이지</strong> — 선택한 페이지 1건만</li>
+            <li><strong>서브트리</strong> — 선택한 페이지와 그 <strong>하위 페이지 전체</strong>를
+                재귀적으로 모두 임포트</li>
+            <li><strong>스페이스</strong> — 스페이스 전체</li>
+        </ul>
+        <p style="margin-top: 0.75rem;">
+            <a href="/confluence-mcp" role="button">Confluence MCP 열기 →</a>
+        </p>
+    </div>
+</section>
+
+<section class="about-section">
+    <h3>🔧 Git 코드는 어떻게 임포트되나요?</h3>
+    <p>
+        설정한 Git 저장소의 코드를 <strong>심볼 단위</strong>로 인덱싱합니다. 저장소는
+        URL·브랜치·상품(파일 경로 스코프) 단위로 여러 개 설정할 수 있습니다.
+    </p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>저장소 동기화</strong><p>저장소를 clone/pull 하고 커밋 해시를 기록(증분 대비)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>파일 수집</strong><p>상품 경로(glob)·제외 패턴 + 지원 확장자·크기 한도로 필터링 (node_modules·build 자동 제외)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>심볼 추출 (AST)</strong><p>함수·클래스·메서드를 정적 분석으로 추출. Python=ast, Go·Java·TS·JS 지원. <strong>LLM 호출 없음(비용 0)</strong></p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>멀티뷰 임베딩</strong><p>심볼 1개 = 청크 1개. 본문(코드)과 메타(이름·시그니처)를 별도 view로 임베딩</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">5</span>
+            <div><strong>import 그래프</strong><p>파일↔모듈 import, 클래스→메서드 contains 관계 추출. 같은 모듈 import는 한 노드로 병합</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">6</span>
+            <div><strong>증분 저장</strong><p>content_hash 비교로 변경된 파일만 재처리(Delete &amp; Recreate)</p></div>
+        </article>
+    </div>
+    <p style="margin-top: 1.25rem;">
+        <a href="/git-sync" role="button" class="outline">Git Sync 열기 →</a>
+    </p>
+</section>
+
+<section class="about-section">
+    <h3>🛠️ 인덱싱은 어떻게 이루어지나요?</h3>
+    <p>문서가 들어오면 다음 6단계를 거쳐 검색 가능한 인덱스로 변환합니다.</p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>수집</strong><p>원본과 <code>content_hash</code>를 함께 보관</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>전처리</strong><p>HTML→마크다운, 구조 정규화 (코드는 AST 분석)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>청킹</strong><p>토큰 단위(문서) 또는 심볼 단위(코드)로 분할</p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>임베딩</strong><p>본문·메타·가상질문을 각각 별도 view로 임베딩</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">5</span>
+            <div><strong>그래프 추출</strong><p>엔티티·관계 추출, 표기 변형은 병합</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">6</span>
+            <div><strong>저장</strong><p>ChromaDB·NetworkX+SQLite·SQLite에 저장</p></div>
+        </article>
+    </div>
+    <p style="margin-top: 1.25rem;">
+        원본이 바뀌면 <code>content_hash</code> 비교로 변경을 감지해, 기존 파생 데이터를 지우고 다시 만드는
+        <strong>Delete &amp; Recreate</strong> 방식으로 재처리합니다.
+    </p>
+
+    <div class="callout" style="margin-top: 1.25rem;">
+        <h4>💡 가상 질문 생성 (멀티 벡터 인덱싱)</h4>
+        <p>
+            임베딩 단계에서 LLM이 각 섹션마다 "이 섹션이 답할 수 있는 자연스러운 질문"을 미리 만들어
+            별도 view로 등록합니다(문서당 1회 호출, 섹션당 약 5개). 사용자의 자연어 질의가 본문보다
+            <strong>질문 형태의 임베딩</strong>과 더 가깝게 매칭되어 검색 재현율·정밀도가 향상됩니다.
+            생성된 질문은 문서 상세의 청크 탭에서 볼 수 있습니다.
+        </p>
+    </div>
+</section>
+
+<section class="about-section">
+    <h3>🔍 검색은 어떻게 이루어지나요?</h3>
+    <p><strong>벡터 검색</strong>과 <strong>지식 그래프 탐색</strong>을 함께 수행해 하나의 컨텍스트로 조립합니다.</p>
+    <div class="grid">
+        <article class="step-card">
+            <span class="step-num">1</span>
+            <div><strong>질의 임베딩</strong><p>질의를 벡터로 변환 (선택: HyDE로 가상 답변 보강)</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">2</span>
+            <div><strong>벡터 검색</strong><p>ChromaDB 코사인 유사도 → 문서 단위 dedup → top-k</p></div>
+        </article>
+    </div>
+    <div class="grid" style="margin-top: 1rem;">
+        <article class="step-card">
+            <span class="step-num">3</span>
+            <div><strong>그래프 탐색</strong><p>LLM 플래너가 엔티티 식별 → 깊이 1 양방향 BFS</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">4</span>
+            <div><strong>리랭킹(선택)</strong><p>cross-encoder로 재점수화해 정밀도 향상</p></div>
+        </article>
+        <article class="step-card">
+            <span class="step-num">5</span>
+            <div><strong>병합·정렬</strong><p>벡터+그래프 결과 통합, 중복 제거 후 유사도 정렬</p></div>
+        </article>
+    </div>
+
+    <h4 style="margin-top: 1.75rem;">검색 결과로 무엇을 돌려주나요?</h4>
+    <p>
+        MCP <code>search_context</code>는 <strong>포맷된 컨텍스트 텍스트(문자열)</strong>를 반환합니다.
+        <code>## 관련 문서</code>, <code>## 관련 그래프 컨텍스트</code>, <code>## 그래프 연결 문서</code>
+        등 섹션으로 구성되고, 항목마다 제목·유사도·섹션 경로(가상 질문 매칭 시 해당 질문)가 텍스트로
+        붙습니다. AI는 이 텍스트에서 근거를 읽습니다.
+    </p>
+</section>
+
+<section class="about-section">
+    <h3>🗄️ 하이브리드 저장소</h3>
+    <figure>
+        <table>
+            <thead>
+                <tr><th>저장소</th><th>기술</th><th>역할</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>메타데이터 DB</td><td>SQLite</td><td>문서·청크·처리 이력</td></tr>
+                <tr><td>벡터 DB</td><td>ChromaDB</td><td>텍스트 청크 임베딩 / 유사도 검색</td></tr>
+                <tr><td>그래프 DB</td><td>NetworkX + SQLite</td><td>엔티티 노드와 관계 엣지</td></tr>
+            </tbody>
+        </table>
+    </figure>
+</section>
+
+<section class="about-section">
+    <h3>⚙️ 기술 스택</h3>
+    <div class="chips">
+        <span class="chip">Python 3.11+</span>
+        <span class="chip">FastAPI</span>
+        <span class="chip">Jinja2</span>
+        <span class="chip">HTMX</span>
+        <span class="chip">Alpine.js</span>
+        <span class="chip">Pico CSS</span>
+        <span class="chip">ChromaDB</span>
+        <span class="chip">NetworkX</span>
+        <span class="chip">SQLite</span>
+        <span class="chip">MCP</span>
+    </div>
+    <p style="margin-top: 0.75rem; color: var(--pico-muted-color);">
+        임베딩·LLM은 OpenAI·Anthropic·로컬·커스텀 엔드포인트를 지원합니다.
+    </p>
+</section>
+
+<section class="about-section">
+    <p>
+        <a href="/" role="button" class="outline">대시보드로 이동</a>
+        <a href="/graph" role="button" class="outline">지식 그래프 보기</a>
+    </p>
+</section>
+{% endblock %}

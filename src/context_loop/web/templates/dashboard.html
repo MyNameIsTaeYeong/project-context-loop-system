@@ -18,12 +18,9 @@
             <select x-model="sourceType"
                     @change="htmx.ajax('GET', '/partials/document-list?source_type=' + sourceType + '&status=' + status, {target: '#doc-list', swap: 'innerHTML'})">
                 <option value="">All</option>
-                <option value="confluence">Confluence</option>
+                <option value="confluence_mcp">Confluence MCP</option>
                 <option value="upload">Upload</option>
                 <option value="manual">Manual</option>
-                <option value="code_file_summary">File Summary</option>
-                <option value="code_doc">Code Doc</option>
-                <option value="code_summary">Code Summary</option>
                 <option value="git_code">Git Code</option>
             </select>
         </label>

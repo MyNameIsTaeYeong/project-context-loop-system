@@ -18,6 +18,7 @@ from context_loop.processor.llm_client import LLMClient
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
+from context_loop.web.api.documents import _repo_label
 from context_loop.web.dependencies import (
     get_config,
     get_embedding_client,
@@ -122,19 +123,40 @@ async def sync_documents_partial(
     request: Request,
     meta_store: MetadataStore = Depends(get_meta_store),
 ):
-    """Git 관련 문서 목록 파셜."""
+    """Git 코드 문서 목록 파셜 — 레포별 → 상품별로 그룹화한다."""
     templates = get_templates(request)
-    docs: list[dict[str, Any]] = []
-    for source_type in ("git_code",):
-        type_docs = await meta_store.list_documents(source_type=source_type)
-        docs.extend(type_docs)
-    # 최신순 정렬, 상위 50개
-    docs.sort(key=lambda d: d.get("updated_at", ""), reverse=True)
-    docs = docs[:50]
+    docs = await meta_store.list_documents(source_type="git_code")
+    # 최신순 정렬 (그룹 내 순서로 보존됨)
+    docs.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+
+    # 1) 레포(url)별로 묶고, 2) 각 레포 안에서 상품(author)별로 다시 나눈다.
+    by_repo: dict[str, list[dict[str, Any]]] = {}
+    for doc in docs:
+        repo = _repo_label(doc.get("url")) or "(저장소 미상)"
+        by_repo.setdefault(repo, []).append(doc)
+
+    groups = []
+    for repo in sorted(by_repo):
+        repo_docs = by_repo[repo]
+        by_product: dict[str, list[dict[str, Any]]] = {}
+        for doc in repo_docs:
+            product = doc.get("author") or "(상품 미상)"
+            by_product.setdefault(product, []).append(doc)
+        subgroups = [
+            {"label": product, "count": len(p_docs), "docs": p_docs}
+            for product, p_docs in sorted(by_product.items())
+        ]
+        groups.append({
+            "source_type": "git_code",
+            "label": repo,
+            "count": len(repo_docs),
+            "subgroups": subgroups,
+        })
 
     return templates.TemplateResponse("partials/document_list.html", {
         "request": request,
-        "documents": docs,
+        "groups": groups,
+        "total": len(docs),
     })
 
 

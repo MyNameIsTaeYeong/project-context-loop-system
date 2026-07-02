@@ -607,3 +607,48 @@ async def test_get_merged_node_groups_excludes_single_variant(
         merge_method="new",
     )
     assert await store.get_merged_node_groups(min_variants=2) == []
+
+
+async def test_get_merged_node_groups_deleted_node_visibility(
+    store: MetadataStore,
+) -> None:
+    """정규 노드가 삭제되면 기본은 숨기고, include_deleted 면 노출한다."""
+    doc1 = await store.create_document(
+        source_type="manual", title="D1",
+        original_content="c", content_hash="h1",
+    )
+    doc2 = await store.create_document(
+        source_type="manual", title="D2",
+        original_content="c", content_hash="h2",
+    )
+    node_id = await store.create_graph_node_with_link(
+        document_id=doc1, entity_name="Gateway", entity_type="component",
+    )
+    await store.record_graph_merge(
+        canonical_node_id=node_id, raw_entity_name="Gateway",
+        raw_entity_type="component", source_document_id=doc1,
+        merge_method="new",
+    )
+    await store.record_graph_merge(
+        canonical_node_id=node_id, raw_entity_name="gateway",
+        raw_entity_type="component", source_document_id=doc2,
+        merge_method="normalized",
+    )
+
+    # 노드가 살아있을 때는 기본 조회로도 보인다.
+    assert len(await store.get_merged_node_groups(min_variants=2)) == 1
+
+    # doc1 의 그래프 데이터 삭제 → 고아가 된 정규 노드가 제거되고
+    # graph_merge_log 만 남는다.
+    await store.delete_graph_data_by_document(doc1)
+
+    # 기본값: 삭제된 노드는 숨긴다.
+    assert await store.get_merged_node_groups(min_variants=2) == []
+
+    # include_deleted=True: 삭제된 노드도 노출하며 라벨/플래그가 붙는다.
+    groups = await store.get_merged_node_groups(
+        min_variants=2, include_deleted=True,
+    )
+    assert len(groups) == 1
+    assert groups[0]["is_deleted"] is True
+    assert groups[0]["entity_name"] == "(삭제된 노드)"
