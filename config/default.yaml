@@ -16,6 +16,12 @@ sources:
     transport: "http"                       # 전송 방식: "http" (Streamable HTTP) 또는 "sse"
     token_storage: "keyring"                # 인증 토큰은 OS keyring에 저장 (x-auth 헤더로 전달)
     sync_interval_minutes: 30
+    sync_watermark_margin_minutes: 1440     # 증분 fetch 변경 조회(lastModified CQL) 마진(분).
+                                            # CQL 날짜는 인증 사용자 타임존으로 해석되므로 기본
+                                            # 24시간 마진이 어떤 타임존 조합에서도 누락을 막는다.
+                                            # 중복 후보는 해시 비교로 걸러져 재인덱싱은 없다.
+    sync_enumeration_max_pages: 100000      # 공간/서브트리 열거 안전 상한. 이 상한에 걸려 열거가
+                                            # 잘리면 해당 싱크의 stale 삭제(prune)는 생략된다.
 
   git:
     enabled: false
