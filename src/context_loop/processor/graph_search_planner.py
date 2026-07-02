@@ -362,6 +362,9 @@ async def execute_graph_search(
     *,
     query_embedding: list[float] | None = None,
     embedding_client: Any = None,
+    require_targets: bool = True,
+    enable_query_boost: bool = True,
+    enable_seed_fallback: bool = True,
 ) -> GraphSearchResult | None:
     """탐색 계획에 따라 그래프를 탐색하고 결과를 포맷팅한다.
 
@@ -387,6 +390,13 @@ async def execute_graph_search(
         query_embedding: 쿼리 임베딩. 시드 보강(2)과 폴백(3)에 사용.
         embedding_client: step 별 임베딩 fallback 에 사용 (없으면 step 별
             fallback 만 skip; 전체 fallback 은 query_embedding 으로 가능).
+        require_targets: True(기본)면 target/step 이 모두 빈 계획은 즉시 종료.
+            False 면 빈 계획도 진행 — query_embedding 폴백만으로 시딩하는
+            ablation("no-planner") 경로에서 사용.
+        enable_query_boost: False 면 always-on 쿼리 임베딩 시드 보강(2)을
+            생략한다 (ablation "no-boost" — 보강 층의 기여도 측정용).
+        enable_seed_fallback: False 면 시드 이름 임베딩 fallback(1)을 생략하고
+            표면 매칭에만 의존한다 (ablation "no-seed-fallback").
 
     Returns:
         그래프 탐색 결과(텍스트 + 관련 document_id). 결과가 없으면 None.
@@ -394,7 +404,9 @@ async def execute_graph_search(
     if not plan.should_search:
         return None
     # R3 1차 신호 (target_*) 가 없고 R2 이하 search_steps 도 없으면 종료.
-    if not plan.has_targets and not plan.search_steps:
+    # (ablation no-planner 모드는 require_targets=False 로 빈 계획을 허용 —
+    #  아래 query_embedding 폴백들이 시딩을 담당한다.)
+    if not plan.has_targets and not plan.search_steps and require_targets:
         return None
 
     all_nodes: list[dict[str, Any]] = []
@@ -408,7 +420,11 @@ async def execute_graph_search(
     # 시드 fallback 임베딩을 한 번의 배치 호출로 미리 계산 (name → vector).
     # get_neighbors 는 표면 매칭이 성공하면 이 fallback 을 쓰지 않으므로,
     # 미리 전부 임베딩해도 매칭 결과는 동일하고 임베딩 호출 수만 1회로 준다.
-    emb_map = await _build_seed_embeddings(plan, embedding_client)
+    emb_map = (
+        await _build_seed_embeddings(plan, embedding_client)
+        if enable_seed_fallback
+        else {}
+    )
 
     priority_set: set[int] = set()
 
@@ -498,7 +514,7 @@ async def execute_graph_search(
     # entity_name 으로 선택하면 retrieved 가 sink 자신만 담겨 gold seed 누락
     # (양방향 traversal 도입 후에도 LLM 선택의 잡음을 보완). 임계값 0.6 으로
     # 보수 — 의미 무관 노드 유입 최소화.
-    if query_embedding is not None:
+    if enable_query_boost and query_embedding is not None:
         boost = graph_store.search_entities_by_embedding(
             query_embedding, threshold=0.6, top_k=3,
         )

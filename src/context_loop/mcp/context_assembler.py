@@ -17,6 +17,7 @@ from typing import Any
 from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
 from context_loop.processor.chunker import count_tokens
 from context_loop.processor.graph_search_planner import (
+    GraphSearchPlan,
     GraphSearchResult,
     execute_graph_search,
     plan_graph_search,
@@ -29,6 +30,14 @@ from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
+
+# 그래프 탐색 ablation 모드 (평가 전용 — 실서비스는 "full" 고정).
+# 각 모드는 execute_graph_search 의 한 층만 끈다:
+#   full             — 현행 전체 파이프라인 (기본값)
+#   no-planner       — LLM 플래너 생략, 쿼리 임베딩 시딩만 (플래너 기여도 측정)
+#   no-boost         — always-on 쿼리 임베딩 시드 보강(0.6/top-3) 생략
+#   no-seed-fallback — LLM 시드 이름의 임베딩 fallback 생략 (표면 매칭만)
+GRAPH_ABLATION_MODES = ("full", "no-planner", "no-boost", "no-seed-fallback")
 
 
 @dataclass
@@ -508,6 +517,7 @@ async def _search_graph_with_llm(
     query_embedding: list[float] | None = None,
     embedding_client: Any = None,
     graph_planner_seed: int | None = None,
+    graph_ablation: str = "full",
 ) -> GraphSearchResult | None:
     """LLM 기반 플래너로 그래프를 탐색한다.
 
@@ -515,6 +525,11 @@ async def _search_graph_with_llm(
     2. LLM에게 쿼리 관련 스키마 + 질의를 보여주고 탐색 계획을 받는다.
     3. 계획에 따라 GraphStore에서 실제 탐색을 수행한다.
     4. LLM이 탐색 불필요로 판단하면 None을 반환한다.
+
+    ``graph_ablation`` (평가 전용, GRAPH_ABLATION_MODES 참조):
+    "no-planner" 는 1~2 를 생략하고 빈 계획으로 execute 에 진입해
+    쿼리 임베딩 시딩만으로 탐색한다 (LLM 호출 0회). "no-boost" /
+    "no-seed-fallback" 은 execute 내부의 해당 층만 끈다.
     """
     try:
         # 엔티티 임베딩 자동 구축. 캐시가 비었을 때뿐 아니라 아직 임베딩되지
@@ -523,14 +538,20 @@ async def _search_graph_with_llm(
         if embedding_client and graph_store.unembedded_entity_count > 0:
             await graph_store.build_entity_embeddings(embedding_client)
 
-        plan = await plan_graph_search(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            seed=graph_planner_seed,
-        )
-        if not plan.should_search:
-            logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
-            return None
+        if graph_ablation == "no-planner":
+            plan = GraphSearchPlan(
+                should_search=True,
+                reasoning="ablation: no-planner — 쿼리 임베딩 시딩만 사용",
+            )
+        else:
+            plan = await plan_graph_search(
+                query, graph_store, llm_client,
+                query_embedding=query_embedding,
+                seed=graph_planner_seed,
+            )
+            if not plan.should_search:
+                logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
+                return None
         # query_embedding + embedding_client 전달 — execute_graph_search 가
         # LLM 추측 entity_name 의 표면 매칭 실패 시 임베딩 fallback 으로 시드
         # 노드를 보강할 수 있게 한다 (그래프 메트릭 0% 의 핵심 funnel 손실 완화).
@@ -538,6 +559,9 @@ async def _search_graph_with_llm(
             plan, graph_store,
             query_embedding=query_embedding,
             embedding_client=embedding_client,
+            require_targets=(graph_ablation != "no-planner"),
+            enable_query_boost=(graph_ablation != "no-boost"),
+            enable_seed_fallback=(graph_ablation != "no-seed-fallback"),
         )
     except Exception:
         logger.warning("LLM 기반 그래프 탐색 실패", exc_info=True)
@@ -558,6 +582,7 @@ async def _rerank_and_search_graph(
     rerank_score_threshold: float,
     include_graph: bool,
     graph_planner_seed: int | None = None,
+    graph_ablation: str = "full",
 ) -> tuple[list[dict[str, Any]], GraphSearchResult | None]:
     """리랭킹과 그래프 탐색을 병렬 실행한다.
 
@@ -578,13 +603,17 @@ async def _rerank_and_search_graph(
         return reranked
 
     async def _maybe_graph() -> GraphSearchResult | None:
-        if not (include_graph and llm_client):
+        if not include_graph:
+            return None
+        # no-planner ablation 은 LLM 을 쓰지 않으므로 llm_client 없이도 진행.
+        if llm_client is None and graph_ablation != "no-planner":
             return None
         return await _search_graph_with_llm(
             query, graph_store, llm_client,
             query_embedding=query_embedding,
             embedding_client=embedding_client,
             graph_planner_seed=graph_planner_seed,
+            graph_ablation=graph_ablation,
         )
 
     return await asyncio.gather(_maybe_rerank(), _maybe_graph())
@@ -613,6 +642,7 @@ async def assemble_context_with_sources(
     parent_doc_max_doc_tokens: int = 32000,
     parent_doc_total_tokens: int = 96000,
     graph_planner_seed: int | None = None,
+    graph_ablation: str = "full",
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
@@ -643,6 +673,9 @@ async def assemble_context_with_sources(
             미전달 — 실서비스 동작은 변경되지 않는다. 평가 경로에서만 쿼리 기반
             결정적 seed 를 주입해 그래프 탐색 계획(→ 청크 recall)의 재현성을
             확보한다.
+        graph_ablation: 그래프 탐색 ablation 모드 (GRAPH_ABLATION_MODES).
+            "full"(기본)이면 현행 동작. 평가 경로 전용 — 플래너/보강/시드
+            fallback 각 층의 기여도를 개별 측정하기 위한 스위치.
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -678,6 +711,7 @@ async def assemble_context_with_sources(
         rerank_score_threshold=rerank_score_threshold,
         include_graph=include_graph,
         graph_planner_seed=graph_planner_seed,
+        graph_ablation=graph_ablation,
     )
 
     if chunk_results:

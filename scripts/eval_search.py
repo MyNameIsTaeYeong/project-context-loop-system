@@ -97,6 +97,7 @@ from context_loop.eval.metrics import (  # noqa: E402
     recall_at_k,
 )
 from context_loop.mcp.context_assembler import (  # noqa: E402
+    GRAPH_ABLATION_MODES,
     AssembledContext,
     assemble_context_with_sources,
 )
@@ -393,6 +394,7 @@ async def evaluate_one(
     judge_n_samples: int = 1,
     planner_seed_base: int | None = None,
     embedding_model_id: str = "",
+    graph_ablation: str = "full",
 ) -> dict[str, Any]:
     """단일 질의에 대한 검색 + 채점.
 
@@ -430,6 +432,7 @@ async def evaluate_one(
         rerank_score_threshold=rerank_score_threshold,
         hyde_enabled=hyde_enabled,
         graph_planner_seed=graph_planner_seed,
+        graph_ablation=graph_ablation,
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -1238,6 +1241,7 @@ async def _evaluate_gold_set(
                     judge_seed_base=args.judge_seed_base,
                     judge_n_samples=args.judge_n_samples,
                     planner_seed_base=getattr(args, "planner_seed_base", None),
+                    graph_ablation=getattr(args, "graph_ablation", "full"),
                 )
                 row["_idx"] = idx
             except Exception as exc:
@@ -1429,6 +1433,8 @@ async def run(args: argparse.Namespace) -> int:
         "rerank_enabled": rerank_enabled,
         "hyde_enabled": hyde_enabled,
         "include_graph": args.include_graph,
+        # Ablation — 그래프 탐색의 어느 층을 끄고 측정했는지 (full 이 기본).
+        "graph_ablation": getattr(args, "graph_ablation", "full"),
         "embedding_model": embedding_model_id,
         "llm_model": config.get("llm.model"),
         "judge_enabled": args.judge,
@@ -1721,6 +1727,20 @@ def main() -> None:
     parser.add_argument(
         "--no-graph", action="store_false", dest="include_graph",
         help="그래프 컨텍스트 제외",
+    )
+    # Ablation — 그래프 탐색 파이프라인의 한 층씩 끄고 기여도를 측정한다.
+    # 운영 흐름 (같은 인덱스·골드셋·설정에서 4회 실행 후 compare):
+    #   --graph-ablation full             → baseline
+    #   --graph-ablation no-planner       → LLM 플래너 제거 (임베딩 시딩만)
+    #   --graph-ablation no-boost         → always-on 쿼리 임베딩 보강 제거
+    #   --graph-ablation no-seed-fallback → 시드 이름 임베딩 fallback 제거
+    parser.add_argument(
+        "--graph-ablation", default="full",
+        choices=list(GRAPH_ABLATION_MODES),
+        help="그래프 탐색 ablation 모드 (기본 'full'). 'no-planner' 는 플래너 "
+             "LLM 호출 없이 쿼리 임베딩 시딩만으로 그래프를 탐색, 'no-boost' 는 "
+             "always-on 시드 보강 생략, 'no-seed-fallback' 은 LLM 시드 이름의 "
+             "임베딩 fallback 생략. summary 에 graph_ablation 으로 기록된다.",
     )
     parser.add_argument(
         "--limit", type=int, default=0,

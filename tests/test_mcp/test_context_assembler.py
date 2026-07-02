@@ -1426,3 +1426,71 @@ async def test_parent_doc_question_view_hit(stores) -> None:
     assert "전문 첨부" in result
     assert "매칭 질문: QDoc 의 동작은?" in result
     assert "섹션2 본문 전체 맥락" in result
+
+
+# --- graph ablation 모드 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_graph_search_no_planner_mode_skips_llm(stores) -> None:
+    """ablation no-planner: 플래너 LLM 을 호출하지 않고 쿼리 임베딩 시딩만으로
+    그래프를 탐색한다."""
+    meta_store, _, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="Arch", original_content="c", content_hash="h",
+    )
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[
+            Entity(name="Gateway", entity_type="component"),
+            Entity(name="AuthService", entity_type="service"),
+        ],
+        relations=[
+            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
+        ],
+    ))
+    embed_client = AsyncMock()
+    embed_client.aembed_documents = AsyncMock(return_value=[[1.0, 0.0], [0.0, 1.0]])
+
+    llm = _make_llm_client({"should_search": True})
+
+    result = await _search_graph_with_llm(
+        "게이트웨이 구조", graph_store, llm,
+        query_embedding=[0.95, 0.05],
+        embedding_client=embed_client,
+        graph_ablation="no-planner",
+    )
+    assert result is not None
+    assert "Gateway" in result.text
+    # 플래너 LLM 은 한 번도 호출되지 않았다
+    llm.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_assemble_with_sources_no_planner_works_without_llm(stores) -> None:
+    """ablation no-planner: llm_client=None 이어도 그래프 탐색이 수행된다
+    (기존에는 llm_client 없으면 그래프 자체가 스킵)."""
+    meta_store, vector_store, graph_store = stores
+
+    doc_id = await meta_store.create_document(
+        source_type="manual", title="Arch", original_content="본문", content_hash="h",
+    )
+    await graph_store.save_graph_data(doc_id, GraphData(
+        entities=[Entity(name="Gateway", entity_type="component")],
+        relations=[],
+    ))
+    embed_client = _make_embedding_client([0.95, 0.05])
+    embed_client.aembed_documents = AsyncMock(return_value=[[1.0, 0.0]])
+
+    assembled = await assemble_context_with_sources(
+        "게이트웨이 구조",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        llm_client=None,
+        include_graph=True,
+        graph_ablation="no-planner",
+    )
+    assert "Gateway" in assembled.context_text
+    assert any(e.name == "Gateway" for e in assembled.retrieved_graph_entities)
