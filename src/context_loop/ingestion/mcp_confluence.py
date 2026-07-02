@@ -641,6 +641,20 @@ async def walk_subtree(
     return nodes
 
 
+def _with_modified_since(cql: str, modified_since: str | None) -> str:
+    """CQL 에 ``lastModified >= "..."`` 조건을 덧붙인다.
+
+    ``modified_since`` 는 CQL 날짜 리터럴 형식(``"yyyy-MM-dd HH:mm"``)의
+    문자열. 필터는 **서버 측**에서 적용되므로 searchContent 응답에
+    lastModified 필드가 포함되는지와 무관하게 동작한다. ``None`` 이면
+    조건 없이 원본 CQL 을 반환한다.
+    """
+    if not modified_since:
+        return cql
+    escaped = modified_since.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{cql} AND lastModified >= "{escaped}"'
+
+
 def _space_cql(space_key: str) -> str:
     """공간 내 모든 페이지를 매치하는 CQL을 만든다.
 
@@ -735,12 +749,23 @@ async def _paginate_cql(
         start += advance
 
 
+DEFAULT_ENUMERATION_MAX_PAGES = 100_000
+"""열거 안전 상한 기본값.
+
+폭주 방지용 상한일 뿐 정상 크기 제한이 아니다 — 대형 공간(수만 페이지)이
+이 값에 걸리면 열거가 조용히 잘리고, 잘린 열거로 stale prune 을 돌리면
+멀쩡한 문서가 삭제될 수 있다. 호출측(sync)은 이 상한 도달을 열거 불완전으로
+간주해 prune 을 건너뛰어야 한다.
+"""
+
+
 async def enumerate_space_pages(
     session: ClientSession,
     space_key: str,
     *,
     page_size: int = 100,
-    max_pages: int = 10000,
+    max_pages: int = DEFAULT_ENUMERATION_MAX_PAGES,
+    modified_since: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """공간의 모든 페이지를 CQL 페이지네이션으로 순회하며 하나씩 yield 한다.
 
@@ -752,13 +777,16 @@ async def enumerate_space_pages(
         space_key: 공간 키.
         page_size: 한 번에 요청할 결과 수.
         max_pages: yield할 수 있는 최대 페이지 수 (안전 상한).
+        modified_since: 지정하면 ``lastModified >= "값"`` 조건을 추가해
+            그 이후 수정된 페이지만 열거한다 (증분 fetch 의 변경 후보 조회).
+            형식은 CQL 날짜 리터럴 ``"yyyy-MM-dd HH:mm"``.
 
     Yields:
         ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
         ``type`` 등을 포함한다.
     """
     async for page in _paginate_cql(
-        session, _space_cql(space_key),
+        session, _with_modified_since(_space_cql(space_key), modified_since),
         page_size=page_size, max_pages=max_pages,
         label=f"enumerate_space_pages(space={space_key})",
     ):
@@ -800,7 +828,8 @@ async def enumerate_subtree_pages(
     ancestor_page_id: str,
     *,
     page_size: int = 100,
-    max_pages: int = 10000,
+    max_pages: int = DEFAULT_ENUMERATION_MAX_PAGES,
+    modified_since: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """서브트리의 후손 페이지(depth 무관)를 CQL 페이지네이션으로 순회한다.
 
@@ -810,12 +839,23 @@ async def enumerate_subtree_pages(
     격리·자식 페이지네이션 오류 등에 의한 누락이 없다. 루트 자신은 결과에
     포함되지 않으므로 호출측이 별도로 추가한다.
 
+    Args:
+        session: 초기화된 ClientSession.
+        ancestor_page_id: 서브트리 루트 페이지 ID.
+        page_size: 한 번에 요청할 결과 수.
+        max_pages: yield할 수 있는 최대 페이지 수 (안전 상한).
+        modified_since: 지정하면 ``lastModified >= "값"`` 조건을 추가해
+            그 이후 수정된 후손만 열거한다. 루트 자신은 ``ancestor`` CQL
+            결과에 포함되지 않으므로 루트의 변경은 호출측이 별도 확인해야
+            한다.
+
     Yields:
         ``searchContent`` 결과 dict. 일반적으로 ``id``, ``title``, ``space``,
         ``type`` 을 포함한다.
     """
     async for page in _paginate_cql(
-        session, _subtree_cql(ancestor_page_id),
+        session,
+        _with_modified_since(_subtree_cql(ancestor_page_id), modified_since),
         page_size=page_size, max_pages=max_pages,
         label=f"enumerate_subtree_pages(ancestor={ancestor_page_id})",
     ):
@@ -939,6 +979,29 @@ def _extract_page_title(page_data: dict[str, Any], page_id: str) -> str:
     return page_data.get("title") or page_data.get("name") or f"Confluence Page {page_id}"
 
 
+def _extract_page_version(page_data: dict[str, Any]) -> int | None:
+    """페이지 데이터에서 Confluence 리비전 번호(``version.number``)를 추출한다.
+
+    ``getPageByID`` 는 ``expand=version`` 으로 호출되므로 표준 응답이면
+    ``{"version": {"number": N, ...}}`` 형태가 온다. 서버 변종에 대비해
+    ``version`` 이 int 로 평탄화된 경우도 허용한다. 없거나 형태를 알 수
+    없으면 ``None``.
+    """
+    version = page_data.get("version")
+    if isinstance(version, dict):
+        number = version.get("number")
+        if isinstance(number, int):
+            return number
+        if isinstance(number, str) and number.isdigit():
+            return int(number)
+        return None
+    if isinstance(version, int):
+        return version
+    if isinstance(version, str) and version.isdigit():
+        return int(version)
+    return None
+
+
 def convert_html_to_markdown(html: str) -> str:
     """HTML 콘텐츠를 마크다운으로 변환한다.
 
@@ -979,15 +1042,17 @@ async def import_page_via_mcp(
     page_data = await get_page(session, page_id)
     html_body = _extract_page_content(page_data)
     title = _extract_page_title(page_data, page_id)
+    source_version = _extract_page_version(page_data)
 
     # HTML → 마크다운 변환
     content = convert_html_to_markdown(html_body) if html_body else html_body
 
     content_hash = compute_content_hash(content)
 
-    # 기존 문서 확인
-    existing_docs = await store.list_documents(source_type=SOURCE_TYPE)
-    existing = next((d for d in existing_docs if d.get("source_id") == page_id), None)
+    # 기존 문서 확인 — (source_type, source_id) 인덱스 단건 lookup.
+    # (list_documents 전체 스캔은 페이지 수 N 에 대해 임포트 루프 전체가
+    # O(N^2) 이 되고 본문 컬럼까지 모두 실어 나르므로 대량 공간에서 병목.)
+    existing = await store.get_document_by_source(SOURCE_TYPE, page_id)
 
     if existing is None:
         doc_id = await store.create_document(
@@ -997,6 +1062,7 @@ async def import_page_via_mcp(
             original_content=content,
             content_hash=content_hash,
             raw_content=html_body or None,
+            source_version=source_version,
         )
         await store.add_processing_history(
             document_id=doc_id,
@@ -1008,6 +1074,15 @@ async def import_page_via_mcp(
         return {**doc, "created": True, "changed": True}
 
     if existing["content_hash"] == content_hash:
+        # 본문은 그대로인데 소스 리비전만 오른 경우(라벨/제한 등 메타데이터성
+        # 편집) — 진단 데이터가 뒤처지지 않도록 리비전만 따라간다.
+        if (
+            source_version is not None
+            and existing.get("source_version") != source_version
+        ):
+            await store.update_document_source_version(
+                existing["id"], source_version,
+            )
         return {**existing, "created": False, "changed": False}
 
     # 내용 변경
@@ -1016,6 +1091,7 @@ async def import_page_via_mcp(
         original_content=content,
         content_hash=content_hash,
         raw_content=html_body or None,
+        source_version=source_version,
     )
     await store.update_document_status(existing["id"], status="changed")
     await store.add_processing_history(

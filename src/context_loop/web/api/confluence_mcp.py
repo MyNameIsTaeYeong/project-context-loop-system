@@ -14,6 +14,7 @@ from langchain_core.embeddings import Embeddings
 from context_loop.auth import get_token, store_token
 from context_loop.config import Config
 from context_loop.ingestion.mcp_confluence import (
+    DEFAULT_ENUMERATION_MAX_PAGES,
     MCPConnectionError,
     connect_mcp,
     estimate_space_page_count,
@@ -34,7 +35,10 @@ from context_loop.storage.cascade import delete_document_cascade
 from context_loop.storage.graph_store import GraphStore
 from context_loop.storage.metadata_store import MetadataStore
 from context_loop.storage.vector_store import VectorStore
-from context_loop.sync.mcp_sync import execute_sync_target
+from context_loop.sync.mcp_sync import (
+    DEFAULT_WATERMARK_MARGIN_MINUTES,
+    execute_sync_target,
+)
 from context_loop.web.dependencies import (
     get_config,
     get_embedding_client,
@@ -557,6 +561,18 @@ async def _run_sync_in_background(
             phase2_concurrency = int(
                 config.get("processor.phase2_concurrency", 5),
             )
+            watermark_margin_minutes = int(
+                config.get(
+                    "sources.confluence_mcp.sync_watermark_margin_minutes",
+                    DEFAULT_WATERMARK_MARGIN_MINUTES,
+                ),
+            )
+            enumeration_max_pages = int(
+                config.get(
+                    "sources.confluence_mcp.sync_enumeration_max_pages",
+                    DEFAULT_ENUMERATION_MAX_PAGES,
+                ),
+            )
             async with connect_mcp(
                 _get_server_url(config),
                 token=_get_token(),
@@ -571,6 +587,8 @@ async def _run_sync_in_background(
                     llm_client=llm_client,
                     pipeline_config=pipeline_config,
                     phase2_concurrency=phase2_concurrency,
+                    watermark_margin_minutes=watermark_margin_minutes,
+                    enumeration_max_pages=enumeration_max_pages,
                 )
 
             await meta_store.update_sync_result(
