@@ -1375,6 +1375,144 @@ async def test_import_page_via_mcp_changed(meta_store: MetadataStore) -> None:
     assert result2["status"] == "changed"
 
 
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_stores_source_version(
+    meta_store: MetadataStore,
+) -> None:
+    """getPageByID 응답의 version.number 가 documents.source_version 에 저장된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "pv1", "title": "P", "content": "Body", '
+        '"version": {"number": 7}}'
+    )
+
+    result = await import_page_via_mcp(session, meta_store, "pv1")
+    doc = await meta_store.get_document(result["id"])
+    assert doc is not None
+    assert doc["source_version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_unchanged_hash_still_updates_version(
+    meta_store: MetadataStore,
+) -> None:
+    """본문 해시는 동일한데 리비전만 오른 경우 source_version 만 따라간다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "pv2", "title": "P", "content": "Same", '
+        '"version": {"number": 3}}'
+    )
+    result1 = await import_page_via_mcp(session, meta_store, "pv2")
+
+    # 메타데이터성 편집 — 본문 동일, version 만 4 로 증가
+    session.call_tool.return_value = _make_result(
+        '{"id": "pv2", "title": "P", "content": "Same", '
+        '"version": {"number": 4}}'
+    )
+    result2 = await import_page_via_mcp(session, meta_store, "pv2")
+    assert result2["changed"] is False
+
+    doc = await meta_store.get_document(result1["id"])
+    assert doc is not None
+    assert doc["source_version"] == 4
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_version_flat_int(
+    meta_store: MetadataStore,
+) -> None:
+    """서버 변종 — version 이 int 로 평탄화된 응답도 처리한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "pv3", "title": "P", "content": "Body", "version": 12}'
+    )
+    result = await import_page_via_mcp(session, meta_store, "pv3")
+    doc = await meta_store.get_document(result["id"])
+    assert doc is not None
+    assert doc["source_version"] == 12
+
+
+@pytest.mark.asyncio
+async def test_import_page_via_mcp_version_missing_is_null(
+    meta_store: MetadataStore,
+) -> None:
+    """version 필드가 없으면 source_version 은 NULL."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "pv4", "title": "P", "content": "Body"}'
+    )
+    result = await import_page_via_mcp(session, meta_store, "pv4")
+    doc = await meta_store.get_document(result["id"])
+    assert doc is not None
+    assert doc["source_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_document_by_source_lookup(meta_store: MetadataStore) -> None:
+    """(source_type, source_id) 단건 lookup 이 전체 스캔을 대체한다."""
+    doc_id = await meta_store.create_document(
+        source_type="confluence_mcp", source_id="42",
+        title="T", original_content="c", content_hash="h",
+    )
+    found = await meta_store.get_document_by_source("confluence_mcp", "42")
+    assert found is not None
+    assert found["id"] == doc_id
+    assert await meta_store.get_document_by_source("confluence_mcp", "43") is None
+    assert await meta_store.get_document_by_source("git_code", "42") is None
+
+
+# --- modified_since CQL 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_with_modified_since_appends_cql() -> None:
+    """modified_since 지정 시 lastModified 조건이 CQL 에 추가된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "1"}], "totalSize": 1, "size": 1}'
+    )
+
+    pages = [
+        p async for p in enumerate_space_pages(
+            session, "ENG", modified_since="2026-07-01 09:00",
+        )
+    ]
+    assert [p["id"] for p in pages] == ["1"]
+    cql = session.call_tool.call_args.args[1]["cql"]
+    assert 'space = "ENG" AND type = "page"' in cql
+    assert 'lastModified >= "2026-07-01 09:00"' in cql
+
+
+@pytest.mark.asyncio
+async def test_enumerate_space_pages_without_modified_since_keeps_cql() -> None:
+    """modified_since 미지정 시 기존 CQL 그대로."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "1"}], "totalSize": 1, "size": 1}'
+    )
+
+    _ = [p async for p in enumerate_space_pages(session, "ENG")]
+    cql = session.call_tool.call_args.args[1]["cql"]
+    assert "lastModified" not in cql
+
+
+@pytest.mark.asyncio
+async def test_enumerate_subtree_pages_with_modified_since_appends_cql() -> None:
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"results": [{"id": "2"}], "totalSize": 1, "size": 1}'
+    )
+
+    _ = [
+        p async for p in enumerate_subtree_pages(
+            session, "100", modified_since="2026-07-01 09:00",
+        )
+    ]
+    cql = session.call_tool.call_args.args[1]["cql"]
+    assert 'ancestor = "100" AND type = "page"' in cql
+    assert 'lastModified >= "2026-07-01 09:00"' in cql
+
+
 # --- convert_html_to_markdown 테스트 ---
 
 

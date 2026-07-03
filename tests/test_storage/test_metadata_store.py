@@ -241,6 +241,79 @@ async def test_migration_adds_raw_content_to_legacy_db(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_migration_adds_source_version_and_watermark_to_legacy_db(
+    tmp_path: Path,
+) -> None:
+    """구버전 DB 를 열면 documents.source_version 과
+    confluence_sync_targets.last_watermark 컬럼이 ALTER 로 추가된다."""
+    import aiosqlite
+
+    db_path = tmp_path / "legacy_v2.db"
+
+    async with aiosqlite.connect(db_path) as legacy:
+        await legacy.execute(
+            """CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                title TEXT NOT NULL,
+                original_content TEXT,
+                content_hash TEXT,
+                storage_method TEXT,
+                status TEXT DEFAULT 'pending',
+                version INTEGER DEFAULT 1,
+                url TEXT,
+                author TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_type, source_id)
+            )"""
+        )
+        await legacy.execute(
+            """CREATE TABLE confluence_sync_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                space_key TEXT NOT NULL,
+                page_id TEXT,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_sync_at TIMESTAMP,
+                last_result_json TEXT
+            )"""
+        )
+        await legacy.execute(
+            "INSERT INTO confluence_sync_targets (scope, space_key, name)"
+            " VALUES (?, ?, ?)",
+            ("space", "ENG", "Engineering"),
+        )
+        await legacy.commit()
+
+    store = MetadataStore(db_path)
+    await store.initialize()
+    try:
+        cursor = await store.db.execute("PRAGMA table_info(documents)")
+        doc_columns = {row["name"] for row in await cursor.fetchall()}
+        assert "source_version" in doc_columns
+
+        cursor = await store.db.execute(
+            "PRAGMA table_info(confluence_sync_targets)",
+        )
+        target_columns = {row["name"] for row in await cursor.fetchall()}
+        assert "last_watermark" in target_columns
+
+        # 기존 target 행은 워터마크 NULL (= 다음 싱크 때 전체 fetch)
+        target = await store.get_sync_target(1)
+        assert target is not None
+        assert target["last_watermark"] is None
+
+        # 새 메서드가 레거시 DB 에서도 동작
+        await store.update_sync_watermark(1, "2026-07-02 09:00")
+        target = await store.get_sync_target(1)
+        assert target["last_watermark"] == "2026-07-02 09:00"
+    finally:
+        await store.close()
+
+
 async def test_migration_adds_section_columns_to_legacy_chunks(
     tmp_path: Path,
 ) -> None:

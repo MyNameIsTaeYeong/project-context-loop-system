@@ -96,6 +96,60 @@ def _make_fake_enumerate(pages: list[dict[str, Any]]):
     return fake
 
 
+def _make_incremental_enumerate(
+    all_pages: list[dict[str, Any]],
+    changed_pages: list[dict[str, Any]],
+):
+    """``modified_since`` 유무에 따라 전체/변경 목록을 구분해 돌려주는 fake.
+
+    실제 CQL 서버처럼 ``lastModified`` 필터가 걸리면 변경분만 반환한다.
+    space/subtree 열거 양쪽에 쓸 수 있다 (두 번째 위치 인자는 무시).
+    """
+
+    async def fake(session: Any, _key: str, **kwargs: Any):
+        pages = changed_pages if kwargs.get("modified_since") else all_pages
+        for p in pages:
+            yield p
+
+    return fake
+
+
+def _make_recording_importer(fail_pages: set[str] | None = None):
+    """호출된 page_id 를 기록하는 fake importer. ``(calls, fake)`` 를 반환한다.
+
+    증분 fetch 검증용 — 어떤 페이지가 실제로 fetch(getPageByID)됐는지 추적.
+    """
+    fail = fail_pages or set()
+    calls: list[str] = []
+
+    async def fake(
+        session: Any,
+        store: MetadataStore,
+        page_id: str,
+    ) -> dict[str, Any]:
+        pid = str(page_id)
+        calls.append(pid)
+        if pid in fail:
+            raise RuntimeError(f"simulated import failure: {pid}")
+
+        existing = await store.get_document_by_source("confluence_mcp", pid)
+        if existing is not None:
+            return {**existing, "created": False, "changed": False}
+
+        doc_id = await store.create_document(
+            source_type="confluence_mcp",
+            source_id=pid,
+            title=f"Page {pid}",
+            original_content="content",
+            content_hash=f"hash-{pid}",
+        )
+        doc = await store.get_document(doc_id)
+        assert doc is not None
+        return {**doc, "created": True, "changed": True}
+
+    return calls, fake
+
+
 def _make_failing_enumerate():
     async def fake(session: Any, space_key: str, **_: Any):
         raise RuntimeError("enumerate blew up")
@@ -450,6 +504,411 @@ async def test_sync_space_stale_removal(stores, monkeypatch) -> None:
     assert await meta.list_membership_page_ids(t["id"]) == {"1", "3"}
 
 
+# --- prune 가드 (열거 불완전 시 stale 삭제 차단) ---
+
+
+async def test_sync_space_prune_skipped_when_enumeration_short_of_total(
+    stores, monkeypatch,
+) -> None:
+    """열거 개수가 서버 totalSize 에 못 미치면 prune 을 건너뛴다.
+
+    잘린/불완전한 열거로 diff 하면 Confluence 에 존재하는 문서가 삭제되므로,
+    이번 싱크는 삭제를 보류하고 다음 완전한 열거 때 반영한다.
+    """
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    # 첫 싱크 — 3 페이지 전부 임포트 (estimate 는 session=None 이라 실패 → 가드 무동작)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}, {"id": "2"}, {"id": "3"}]),
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert await meta.list_membership_page_ids(t["id"]) == {"1", "2", "3"}
+
+    # 두 번째 싱크 — 서버는 3개라는데 열거는 2개만 돌아옴 (불완전)
+    async def fake_estimate(session: Any, space_key: str) -> int:
+        return 3
+
+    monkeypatch.setattr(mcp_sync, "estimate_space_page_count", fake_estimate)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}, {"id": "2"}]),
+    )
+    t = await meta.get_sync_target(t["id"])  # 워터마크 반영된 최신 행
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    # 3 은 열거에서 빠졌지만 삭제되지 않아야 한다
+    assert result.removed == []
+    assert await meta.list_membership_page_ids(t["id"]) == {"1", "2", "3"}
+    docs = await meta.list_documents(source_type="confluence_mcp")
+    assert {d["source_id"] for d in docs} == {"1", "2", "3"}
+
+
+async def test_sync_space_prune_proceeds_when_total_matches(
+    stores, monkeypatch,
+) -> None:
+    """열거 개수가 totalSize 와 일치하면 (완전한 열거) prune 이 정상 수행된다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}, {"id": "2"}, {"id": "3"}]),
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    async def fake_estimate(session: Any, space_key: str) -> int:
+        return 2
+
+    monkeypatch.setattr(mcp_sync, "estimate_space_page_count", fake_estimate)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}, {"id": "2"}]),
+    )
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert len(result.removed) == 1
+    assert await meta.list_membership_page_ids(t["id"]) == {"1", "2"}
+
+
+async def test_sync_space_prune_skipped_when_truncated_at_max_pages(
+    stores, monkeypatch,
+) -> None:
+    """열거가 enumeration_max_pages 상한에 걸리면 (잘림 가능) prune 을 건너뛴다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}, {"id": "2"}, {"id": "3"}]),
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    # 상한 2 로 열거 — 2개 반환은 "상한 도달 = 잘렸을 수 있음" 신호
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}, {"id": "2"}]),
+    )
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        enumeration_max_pages=2,
+    )
+
+    assert result.removed == []
+    assert await meta.list_membership_page_ids(t["id"]) == {"1", "2", "3"}
+
+
+async def test_sync_subtree_prune_skipped_when_enumeration_short_of_total(
+    stores, monkeypatch,
+) -> None:
+    """subtree 도 동일한 prune 가드가 적용된다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}, {"id": "201"}]),
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert await meta.list_membership_page_ids(t["id"]) == {"100", "200", "201"}
+
+    # 서버는 후손 2개라는데 열거는 1개 — 불완전 → prune 생략
+    async def fake_estimate(session: Any, root_id: str) -> int:
+        return 2
+
+    monkeypatch.setattr(mcp_sync, "estimate_subtree_page_count", fake_estimate)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_fake_subtree_enum([{"id": "200"}]),
+    )
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert result.removed == []
+    assert await meta.list_membership_page_ids(t["id"]) == {"100", "200", "201"}
+
+
+# --- 워터마크 증분 fetch ---
+
+
+async def test_sync_space_first_sync_sets_watermark(stores, monkeypatch) -> None:
+    """첫 싱크(전체 fetch)가 오류 없이 끝나면 워터마크가 기록된다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate([{"id": "1"}]),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    assert t.get("last_watermark") is None
+
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    refreshed = await meta.get_sync_target(t["id"])
+    assert refreshed is not None
+    wm = refreshed["last_watermark"]
+    assert wm is not None
+    # 저장 형식 = CQL 날짜 리터럴 "YYYY-MM-DD HH:MM"
+    from datetime import datetime as _dt
+
+    _dt.strptime(wm, "%Y-%m-%d %H:%M")  # 파싱 실패 시 ValueError 로 테스트 실패
+
+
+async def test_sync_space_incremental_fetches_only_changed_and_new(
+    stores, monkeypatch,
+) -> None:
+    """워터마크가 있으면 변경 후보 + 신규만 fetch 하고 나머지는 생략한다."""
+    meta, vec, graph = stores
+    calls1, importer1 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer1)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}, {"id": "3"}],
+            changed_pages=[],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    # 첫 싱크 — 워터마크 없음 → 전체 fetch
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert set(calls1) == {"1", "2", "3"}
+
+    # 두 번째 싱크: 4 신규 등장, 2 만 변경됨
+    calls2, importer2 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer2)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}, {"id": "3"}, {"id": "4"}],
+            changed_pages=[{"id": "2"}],
+        ),
+    )
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    # 변경(2) + 신규(4) 만 fetch — 1, 3 은 MCP 왕복 없이 생략
+    assert set(calls2) == {"2", "4"}
+    assert result.skipped == 2
+    # 생략된 페이지도 membership 은 유지·갱신된다
+    assert await meta.list_membership_page_ids(t["id"]) == {"1", "2", "3", "4"}
+    # 생략분은 unchanged (fetch 후 해시판정) 목록엔 없다
+    assert len(result.unchanged) == 1  # "2" 는 fetch 됐지만 해시 동일
+
+
+async def test_sync_subtree_incremental_always_fetches_root(
+    stores, monkeypatch,
+) -> None:
+    """ancestor CQL 은 루트를 못 보므로 루트는 증분 싱크에서도 항상 fetch 된다."""
+    meta, vec, graph = stores
+    calls1, importer1 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer1)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_subtree_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "200"}], changed_pages=[],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="subtree", space_key="ENG", page_id="100", name="Root",
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert set(calls1) == {"100", "200"}
+
+    # 두 번째 싱크 — 변경 없음이어도 루트는 fetch, 후손은 생략
+    calls2, importer2 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer2)
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert calls2 == ["100"]
+    assert result.skipped == 1
+    assert await meta.list_membership_page_ids(t["id"]) == {"100", "200"}
+
+
+async def test_sync_space_watermark_not_advanced_on_import_error(
+    stores, monkeypatch,
+) -> None:
+    """임포트 오류가 있으면 워터마크가 전진하지 않는다 — 실패한 변경은
+    다음 싱크의 변경 조회 범위에 남아야 한다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}],
+            changed_pages=[{"id": "2"}],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    # 구분 가능한 과거 워터마크를 심는다 (분 해상도라 연속 실행 구분 불가 대비)
+    old_wm = "2020-01-01 00:00"
+    await meta.update_sync_watermark(t["id"], old_wm)
+
+    # 변경 페이지 2 의 임포트가 실패
+    monkeypatch.setattr(
+        mcp_sync, "import_page_via_mcp",
+        _make_fake_importer(fail_pages={"2"}),
+    )
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert len(result.errors) == 1
+
+    refreshed = await meta.get_sync_target(t["id"])
+    assert refreshed["last_watermark"] == old_wm  # 전진 안 함
+
+    # 오류 없이 재싱크하면 전진한다
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    result = await execute_sync_target(
+        None, refreshed, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert result.errors == []
+    refreshed = await meta.get_sync_target(t["id"])
+    assert refreshed["last_watermark"] != old_wm
+
+
+async def test_sync_space_corrupt_watermark_falls_back_to_full_fetch(
+    stores, monkeypatch,
+) -> None:
+    """저장된 워터마크가 파싱 불가면 전체 fetch 로 안전하게 폴백한다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}],
+            changed_pages=[],  # 증분 경로였다면 아무것도 fetch 안 했을 것
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    calls1, importer1 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer1)
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert set(calls1) == {"1", "2"}
+
+    await meta.update_sync_watermark(t["id"], "not-a-timestamp")
+
+    calls2, importer2 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer2)
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert set(calls2) == {"1", "2"}  # 전체 fetch
+    assert result.skipped == 0
+
+
+async def test_sync_space_changed_query_failure_falls_back_to_full_fetch(
+    stores, monkeypatch,
+) -> None:
+    """변경 후보 조회(lastModified CQL)가 실패하면 전체 fetch 로 폴백한다."""
+    meta, vec, graph = stores
+
+    all_pages = [{"id": "1"}, {"id": "2"}]
+
+    async def flaky_enumerate(session: Any, space_key: str, **kwargs: Any):
+        if kwargs.get("modified_since"):
+            raise RuntimeError("changed query blew up")
+        for p in all_pages:
+            yield p
+
+    monkeypatch.setattr(mcp_sync, "enumerate_space_pages", flaky_enumerate)
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    calls1, importer1 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer1)
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    calls2, importer2 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer2)
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert set(calls2) == {"1", "2"}
+    assert result.skipped == 0
+    assert result.errors == []
+
+
+def test_watermark_query_since_applies_margin() -> None:
+    """마진(분)이 워터마크에서 빼진 lastModified 하한을 만든다."""
+    since = mcp_sync._watermark_query_since("2026-07-02 12:00", 60)
+    assert since == "2026-07-02 11:00"
+    # 자정 경계
+    since = mcp_sync._watermark_query_since("2026-07-02 00:30", 60)
+    assert since == "2026-07-01 23:30"
+
+
+def test_watermark_query_since_none_or_garbage_returns_none() -> None:
+    assert mcp_sync._watermark_query_since(None, 60) is None
+    assert mcp_sync._watermark_query_since("", 60) is None
+    assert mcp_sync._watermark_query_since("garbage", 60) is None
+
+
 # --- 중복 소유 (shared ownership) 시나리오 ---
 
 
@@ -568,15 +1027,16 @@ def test_sync_result_to_dict_summary() -> None:
     r.unchanged = [4, 5, 6]
     r.errors = [{"page_id": "x", "error": "boom"}]
     r.removed = [7]
+    r.skipped = 4
     r.processed = [1, 2, 3]
     r.processing_errors = [{"doc_id": 9, "error": "embed failed"}]
 
     d = r.to_dict()
     assert d["summary"] == {
         "created": 2, "updated": 1, "unchanged": 3,
-        "errors": 1, "removed": 1,
+        "errors": 1, "removed": 1, "skipped": 4,
         "processed": 3, "processing_errors": 1,
-        "total": 7,
+        "total": 11,  # created+updated+unchanged+errors+skipped
     }
     assert d["removed"] == [7]
     assert d["processed"] == [1, 2, 3]

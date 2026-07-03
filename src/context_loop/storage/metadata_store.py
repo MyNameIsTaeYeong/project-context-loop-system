@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS documents (
     llm_degraded INTEGER DEFAULT 0,
     llm_degraded_detail TEXT,
     version INTEGER DEFAULT 1,
+    -- 소스 시스템 측 리비전 (예: Confluence version.number). 내부 version 과
+    -- 달리 서버가 부여한 값 그대로 저장 — "서버는 v5 인데 마지막 인덱싱은 v3"
+    -- 같은 누락 진단과, 향후 열거 응답에 version 이 포함될 때 문서별 변경
+    -- 비교로 전환하기 위한 기반 데이터.
+    source_version INTEGER,
     url TEXT,
     author TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -123,7 +128,11 @@ CREATE TABLE IF NOT EXISTS confluence_sync_targets (
     name              TEXT NOT NULL,
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_sync_at      TIMESTAMP,
-    last_result_json  TEXT
+    last_result_json  TEXT,
+    -- 증분 fetch 워터마크. CQL ``lastModified >= "..."`` 에 쓰는
+    -- "YYYY-MM-DD HH:MM" 문자열. 싱크가 오류 없이 완주했을 때만 전진한다.
+    -- NULL 이면 전체 fetch (첫 싱크 또는 워터마크 리셋).
+    last_watermark    TEXT
 );
 
 -- scope+space_key+page_id 조합의 유일성. page_id NULL(=space scope)도
@@ -200,6 +209,20 @@ class MetadataStore:
         if "llm_degraded_detail" not in existing_columns:
             await self.db.execute(
                 "ALTER TABLE documents ADD COLUMN llm_degraded_detail TEXT",
+            )
+        if "source_version" not in existing_columns:
+            await self.db.execute(
+                "ALTER TABLE documents ADD COLUMN source_version INTEGER",
+            )
+
+        cursor = await self.db.execute(
+            "PRAGMA table_info(confluence_sync_targets)",
+        )
+        target_columns = {row["name"] for row in await cursor.fetchall()}
+        if "last_watermark" not in target_columns:
+            await self.db.execute(
+                "ALTER TABLE confluence_sync_targets "
+                "ADD COLUMN last_watermark TEXT",
             )
 
         cursor = await self.db.execute("PRAGMA table_info(chunks)")
@@ -291,24 +314,42 @@ class MetadataStore:
         url: str | None = None,
         author: str | None = None,
         raw_content: str | None = None,
+        source_version: int | None = None,
     ) -> int:
         """문서를 생성하고 ID를 반환한다.
 
         ``raw_content``는 소스 원본 (예: Confluence Storage Format HTML).
         하류에서 구조화 추출기가 재파싱할 수 있도록 보존한다. 없으면 NULL.
+        ``source_version`` 은 소스 시스템의 리비전 번호 (예: Confluence
+        ``version.number``). 알 수 없으면 NULL.
         """
         cursor = await self.db.execute(
             """INSERT INTO documents
                (source_type, source_id, title, original_content, raw_content,
-                content_hash, url, author)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                content_hash, url, author, source_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 source_type, source_id, title, original_content, raw_content,
-                content_hash, url, author,
+                content_hash, url, author, source_version,
             ),
         )
         await self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
+
+    async def get_document_by_source(
+        self, source_type: str, source_id: str,
+    ) -> dict[str, Any] | None:
+        """``(source_type, source_id)`` 로 문서 한 건을 조회한다.
+
+        ``list_documents`` 전체 스캔 없이 ``idx_documents_source`` 인덱스를
+        타는 단건 lookup — 대량 임포트 루프에서 기존 문서 확인용.
+        """
+        cursor = await self.db.execute(
+            "SELECT * FROM documents WHERE source_type = ? AND source_id = ?",
+            (source_type, source_id),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def get_document(self, document_id: int) -> dict[str, Any] | None:
         """ID로 문서를 조회한다."""
@@ -375,30 +416,45 @@ class MetadataStore:
         original_content: str,
         content_hash: str,
         raw_content: str | None = None,
+        source_version: int | None = None,
     ) -> None:
         """문서 원본 내용과 해시를 갱신한다.
 
         ``raw_content``가 ``None``이 아니면 함께 갱신한다. ``None``이면
         기존 ``raw_content`` 값을 유지한다 (마크다운만 수정되는 케이스 지원).
+        ``source_version`` 도 동일 규칙 — ``None`` 이면 기존 값 유지.
         """
-        if raw_content is None:
-            await self.db.execute(
-                """UPDATE documents
-                   SET original_content = ?, content_hash = ?,
-                       version = version + 1,
-                       updated_at = CURRENT_TIMESTAMP
-                   WHERE id = ?""",
-                (original_content, content_hash, document_id),
-            )
-        else:
-            await self.db.execute(
-                """UPDATE documents
-                   SET original_content = ?, raw_content = ?, content_hash = ?,
-                       version = version + 1,
-                       updated_at = CURRENT_TIMESTAMP
-                   WHERE id = ?""",
-                (original_content, raw_content, content_hash, document_id),
-            )
+        sets = [
+            "original_content = ?", "content_hash = ?",
+            "version = version + 1", "updated_at = CURRENT_TIMESTAMP",
+        ]
+        params: list[Any] = [original_content, content_hash]
+        if raw_content is not None:
+            sets.insert(1, "raw_content = ?")
+            params.insert(1, raw_content)
+        if source_version is not None:
+            sets.append("source_version = ?")
+            params.append(source_version)
+        params.append(document_id)
+        await self.db.execute(
+            f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",  # noqa: S608
+            params,
+        )
+        await self.db.commit()
+
+    async def update_document_source_version(
+        self, document_id: int, source_version: int,
+    ) -> None:
+        """소스 리비전 번호만 갱신한다.
+
+        본문 해시는 동일한데 소스 측 리비전만 오른 경우 (예: Confluence
+        메타데이터성 편집) 진단 데이터를 최신으로 유지하기 위한 경량 경로.
+        ``updated_at``/``version`` 은 건드리지 않는다 — 내용 변경이 아니다.
+        """
+        await self.db.execute(
+            "UPDATE documents SET source_version = ? WHERE id = ?",
+            (source_version, document_id),
+        )
         await self.db.commit()
 
     async def delete_document(self, document_id: int) -> None:
@@ -1089,6 +1145,20 @@ class MetadataStore:
                SET last_sync_at = CURRENT_TIMESTAMP, last_result_json = ?
                WHERE id = ?""",
             (result_json, target_id),
+        )
+        await self.db.commit()
+
+    async def update_sync_watermark(
+        self, target_id: int, watermark: str,
+    ) -> None:
+        """증분 fetch 워터마크를 갱신한다.
+
+        싱크가 오류 없이 완주한 경우에만 호출되어야 한다 — 실패한 싱크에서
+        전진시키면 그 사이의 변경이 다음 싱크의 변경 조회에서 누락된다.
+        """
+        await self.db.execute(
+            "UPDATE confluence_sync_targets SET last_watermark = ? WHERE id = ?",
+            (watermark, target_id),
         )
         await self.db.commit()
 
