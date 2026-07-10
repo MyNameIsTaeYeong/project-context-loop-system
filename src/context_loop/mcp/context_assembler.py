@@ -2,7 +2,8 @@
 
 벡터 유사도 검색과 그래프 탐색 결과를 병합하여
 LLM에 제공할 컨텍스트를 조립한다.
-LLM 기반 그래프 탐색 플래너로 질의 의도에 맞는 그래프 영역을 탐색한다.
+그래프 탐색은 쿼리 임베딩으로 엔티티를 직접 시딩하는 결정적 검색이다
+(LLM 호출 없음 — graph_search 모듈).
 유사도 threshold로 무관한 청크를 제외하고,
 LLM 기반 리랭커로 검색 결과의 정밀도를 높인다.
 """
@@ -16,11 +17,7 @@ from typing import Any
 
 from context_loop.eval.gold_set import GraphEntityRef, GraphRelationRef
 from context_loop.processor.chunker import count_tokens
-from context_loop.processor.graph_search_planner import (
-    GraphSearchResult,
-    execute_graph_search,
-    plan_graph_search,
-)
+from context_loop.processor.graph_search import GraphSearchResult, search_graph
 from context_loop.processor.query_expander import expand_query_embedding
 from context_loop.processor.reranker import rerank
 from context_loop.processor.reranker_client import RerankerClient
@@ -80,10 +77,10 @@ async def assemble_context(
     parent_doc_max_doc_tokens: int = 32000,
     parent_doc_total_tokens: int = 96000,
 ) -> str:
-    """질의에 대해 벡터 검색 + LLM 기반 그래프 탐색으로 컨텍스트를 조립한다.
+    """질의에 대해 벡터 검색 + 임베딩 시딩 그래프 탐색으로 컨텍스트를 조립한다.
 
-    LLM에게 그래프 스키마를 보여주고 사용자 질의에 맞는 탐색 계획을
-    세운 뒤 해당 영역만 탐색한다. llm_client가 없으면 그래프 탐색을 스킵한다.
+    그래프 탐색은 쿼리 임베딩과 유사한 엔티티를 시드로 1-hop 확장하는
+    결정적 검색이다. threshold 를 넘는 시드가 없으면 그래프 섹션을 생략한다.
 
     Args:
         query: 검색 질의 문자열.
@@ -91,7 +88,7 @@ async def assemble_context(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트 (Embeddings 인터페이스).
-        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        llm_client: LLM 클라이언트 (HyDE 가상 문서 생성용). None이면 HyDE 스킵.
         reranker_client: 전용 리랭커 모델 클라이언트. None이면 리랭킹 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
@@ -125,11 +122,10 @@ async def assemble_context(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (모델 호출 두 건을 동시에 처리).
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (외부 호출 두 건을 동시에 처리).
     chunk_results, graph_result = await _rerank_and_search_graph(
         query, chunk_results,
         graph_store=graph_store,
-        llm_client=llm_client,
         reranker_client=reranker_client,
         embedding_client=embedding_client,
         query_embedding=query_embedding,
@@ -500,56 +496,11 @@ async def _format_graph_chunk_results(
     return "\n".join(lines)
 
 
-async def _search_graph_with_llm(
-    query: str,
-    graph_store: GraphStore,
-    llm_client: Any,
-    *,
-    query_embedding: list[float] | None = None,
-    embedding_client: Any = None,
-    graph_planner_seed: int | None = None,
-) -> GraphSearchResult | None:
-    """LLM 기반 플래너로 그래프를 탐색한다.
-
-    1. 엔티티 임베딩이 없으면 자동으로 구축한다.
-    2. LLM에게 쿼리 관련 스키마 + 질의를 보여주고 탐색 계획을 받는다.
-    3. 계획에 따라 GraphStore에서 실제 탐색을 수행한다.
-    4. LLM이 탐색 불필요로 판단하면 None을 반환한다.
-    """
-    try:
-        # 엔티티 임베딩 자동 구축. 캐시가 비었을 때뿐 아니라 아직 임베딩되지
-        # 않은 엔티티가 남아 있을 때도 호출해, 기동 사전 구축에서 부분 실패한
-        # 노드가 다음 검색 때 점진적으로 보완되게 한다(누락분만 재시도).
-        if embedding_client and graph_store.unembedded_entity_count > 0:
-            await graph_store.build_entity_embeddings(embedding_client)
-
-        plan = await plan_graph_search(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            seed=graph_planner_seed,
-        )
-        if not plan.should_search:
-            logger.debug("LLM 판단: 그래프 탐색 불필요 — %s", plan.reasoning)
-            return None
-        # query_embedding + embedding_client 전달 — execute_graph_search 가
-        # LLM 추측 entity_name 의 표면 매칭 실패 시 임베딩 fallback 으로 시드
-        # 노드를 보강할 수 있게 한다 (그래프 메트릭 0% 의 핵심 funnel 손실 완화).
-        return await execute_graph_search(
-            plan, graph_store,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-        )
-    except Exception:
-        logger.warning("LLM 기반 그래프 탐색 실패", exc_info=True)
-        return None
-
-
 async def _rerank_and_search_graph(
     query: str,
     chunk_results: list[dict[str, Any]],
     *,
     graph_store: GraphStore,
-    llm_client: Any,
     reranker_client: RerankerClient | None,
     embedding_client: Any,
     query_embedding: list[float] | None,
@@ -557,12 +508,11 @@ async def _rerank_and_search_graph(
     rerank_top_k: int | None,
     rerank_score_threshold: float,
     include_graph: bool,
-    graph_planner_seed: int | None = None,
 ) -> tuple[list[dict[str, Any]], GraphSearchResult | None]:
     """리랭킹과 그래프 탐색을 병렬 실행한다.
 
-    리랭킹은 chunk_results, 그래프 계획은 query_embedding 에만 의존하므로
-    서로 무관한 두 외부 호출을 동시에 보내 응답 지연을 줄인다.
+    리랭킹은 chunk_results, 그래프 탐색은 query_embedding 에만 의존하므로
+    서로 무관한 두 작업을 동시에 수행해 응답 지연을 줄인다.
     """
     async def _maybe_rerank() -> list[dict[str, Any]]:
         if not (chunk_results and rerank_enabled and reranker_client):
@@ -578,14 +528,16 @@ async def _rerank_and_search_graph(
         return reranked
 
     async def _maybe_graph() -> GraphSearchResult | None:
-        if not (include_graph and llm_client):
+        if not include_graph:
             return None
-        return await _search_graph_with_llm(
-            query, graph_store, llm_client,
-            query_embedding=query_embedding,
-            embedding_client=embedding_client,
-            graph_planner_seed=graph_planner_seed,
-        )
+        try:
+            return await search_graph(
+                query_embedding, graph_store,
+                embedding_client=embedding_client,
+            )
+        except Exception:
+            logger.warning("그래프 탐색 실패", exc_info=True)
+            return None
 
     return await asyncio.gather(_maybe_rerank(), _maybe_graph())
 
@@ -612,12 +564,11 @@ async def assemble_context_with_sources(
     parent_doc_enabled: bool = False,
     parent_doc_max_doc_tokens: int = 32000,
     parent_doc_total_tokens: int = 96000,
-    graph_planner_seed: int | None = None,
 ) -> AssembledContext:
     """컨텍스트를 조립하고 출처 정보를 함께 반환한다.
 
-    LLM에게 그래프 스키마를 보여주고 사용자 질의에 맞는 탐색 계획을
-    세운 뒤 해당 영역만 탐색한다.
+    그래프 탐색은 쿼리 임베딩과 유사한 엔티티를 시드로 1-hop 확장하는
+    결정적 검색이다. threshold 를 넘는 시드가 없으면 그래프 섹션을 생략한다.
 
     Args:
         query: 검색 질의 문자열.
@@ -625,7 +576,7 @@ async def assemble_context_with_sources(
         vector_store: 벡터 저장소.
         graph_store: 그래프 저장소.
         embedding_client: 임베딩 클라이언트.
-        llm_client: LLM 클라이언트 (그래프 탐색 계획용). None이면 그래프 탐색 스킵.
+        llm_client: LLM 클라이언트 (HyDE 가상 문서 생성용). None이면 HyDE 스킵.
         reranker_client: 전용 리랭커 모델 클라이언트. None이면 리랭킹 스킵.
         max_chunks: 반환할 최대 청크 수.
         include_graph: 그래프 컨텍스트 포함 여부.
@@ -639,10 +590,6 @@ async def assemble_context_with_sources(
             (parent-document retrieval) 여부.
         parent_doc_max_doc_tokens: 전문 치환의 문서당 토큰 한도.
         parent_doc_total_tokens: 전문 치환 총합 토큰 예산 (벡터+그래프 합산).
-        graph_planner_seed: 그래프 탐색 플래너 LLM 호출 seed. None(기본)이면
-            미전달 — 실서비스 동작은 변경되지 않는다. 평가 경로에서만 쿼리 기반
-            결정적 seed 를 주입해 그래프 탐색 계획(→ 청크 recall)의 재현성을
-            확보한다.
 
     Returns:
         컨텍스트 텍스트와 출처 정보를 담은 AssembledContext.
@@ -665,11 +612,10 @@ async def assemble_context_with_sources(
         similarity_threshold=similarity_threshold,
     )
 
-    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (모델 호출 두 건을 동시에 처리).
+    # 2. 리랭킹과 그래프 탐색을 병렬 실행 (외부 호출 두 건을 동시에 처리).
     chunk_results, graph_result = await _rerank_and_search_graph(
         query, chunk_results,
         graph_store=graph_store,
-        llm_client=llm_client,
         reranker_client=reranker_client,
         embedding_client=embedding_client,
         query_embedding=query_embedding,
@@ -677,7 +623,6 @@ async def assemble_context_with_sources(
         rerank_top_k=rerank_top_k,
         rerank_score_threshold=rerank_score_threshold,
         include_graph=include_graph,
-        graph_planner_seed=graph_planner_seed,
     )
 
     if chunk_results:

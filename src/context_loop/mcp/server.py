@@ -60,12 +60,12 @@ async def _initialize() -> None:
 
     _embedding_client = _build_embedding_client(_config)
 
-    # LLM 클라이언트 초기화 (그래프 탐색 플래너용)
+    # LLM 클라이언트 초기화 (HyDE 가상 문서 생성용)
 
     try:
         _llm_client = _build_llm_client(_config)
     except Exception:
-        logger.warning("LLM 클라이언트 초기화 실패 (그래프 탐색 비활성화)", exc_info=True)
+        logger.warning("LLM 클라이언트 초기화 실패 (HyDE 비활성화)", exc_info=True)
         _llm_client = None
 
     # 전용 리랭커 클라이언트 초기화 (config 미설정 시 None — 리랭킹 스킵)

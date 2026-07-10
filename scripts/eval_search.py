@@ -41,7 +41,7 @@
     # 2) 절대 점수 측정 (CI 동반, 앵커 검증)
     python scripts/eval_search.py --gold-set eval/frozen/main/gold_set.yaml \\
         --judge --judge-seed-base 1000 --judge-n-samples 3 \\
-        --planner-seed-base 2000 --absolute-mode \\
+        --absolute-mode \\
         --frozen-benchmark eval/frozen/main --label absolute
 
 자세한 프로토콜은 ``docs/absolute_score_protocol.md`` 참조.
@@ -391,7 +391,6 @@ async def evaluate_one(
     judge_mode: str = "reference-free",
     judge_seed_base: int | None = None,
     judge_n_samples: int = 1,
-    planner_seed_base: int | None = None,
     embedding_model_id: str = "",
 ) -> dict[str, Any]:
     """단일 질의에 대한 검색 + 채점.
@@ -405,15 +404,8 @@ async def evaluate_one(
     공유한다 (D-7).
     """
     start = time.perf_counter()
-    # 평가 재현성: 그래프 탐색 플래너 LLM 에 쿼리 기반 결정적 seed 를 주입한다.
-    # search_context Step 4 가 그래프 도달 문서를 추가 회수하므로, 플래너가
-    # 흔들리면 청크 recall 자체가 비결정적이 된다. planner_seed_base 가 None 이면
-    # 미전달(기존 동작 유지).
-    graph_planner_seed = (
-        stable_seed(item.query, planner_seed_base)
-        if planner_seed_base is not None
-        else None
-    )
+    # 그래프 탐색은 임베딩 시딩 기반의 결정적 검색이므로 별도 seed 주입 없이
+    # 재현 가능하다 (같은 인덱스 + 같은 쿼리 임베딩 → 같은 결과).
     assembled: AssembledContext = await assemble_context_with_sources(
         item.query,
         meta_store=meta_store,
@@ -429,7 +421,6 @@ async def evaluate_one(
         rerank_top_k=rerank_top_k,
         rerank_score_threshold=rerank_score_threshold,
         hyde_enabled=hyde_enabled,
-        graph_planner_seed=graph_planner_seed,
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -854,8 +845,6 @@ def check_absolute_mode_requirements(
     allow_self_judge: bool,
     judge_seed_base: int | None,
     judge_n_samples: int,
-    include_graph: bool,
-    planner_seed_base: int | None,
     vector_store_sha256: str,
 ) -> list[str]:
     """절대 점수 보고(absolute-mode) 요건 위반 목록을 반환한다(순수 함수).
@@ -873,10 +862,6 @@ def check_absolute_mode_requirements(
             violations.append(
                 f"--judge-n-samples >= 3 필요 (현재 {judge_n_samples})",
             )
-    if include_graph and planner_seed_base is None:
-        violations.append(
-            "--planner-seed-base 미설정 (그래프 증강→청크 recall 재현성 필요)",
-        )
     if not vector_store_sha256:
         violations.append("인덱스 지문(vector_store_sha256) 비어 있음 (앵커링 불가)")
     return violations
@@ -1217,7 +1202,7 @@ async def _evaluate_gold_set(
                     vector_store=vector_store,
                     graph_store=graph_store,
                     embedding_client=embedding_client,
-                    llm_client=llm_client if args.include_graph else None,
+                    llm_client=llm_client,
                     reranker_client=reranker_client,
                     top_k=args.top_k,
                     max_chunks=args.max_chunks,
@@ -1237,7 +1222,6 @@ async def _evaluate_gold_set(
                     judge_mode=args.judge_mode,
                     judge_seed_base=args.judge_seed_base,
                     judge_n_samples=args.judge_n_samples,
-                    planner_seed_base=getattr(args, "planner_seed_base", None),
                 )
                 row["_idx"] = idx
             except Exception as exc:
@@ -1454,7 +1438,6 @@ async def run(args: argparse.Namespace) -> int:
         "corpus_sha256": index_fingerprint.get("corpus", {}).get("sha256", ""),
         # Phase 1 — 재현성 seed 베이스(기록·디버그용).
         "judge_seed_base": getattr(args, "judge_seed_base", None),
-        "planner_seed_base": getattr(args, "planner_seed_base", None),
     }
 
     # Phase 4 — 절대 점수 보고 모드 게이트. 재현성·비편향·앵커링을 강제한다.
@@ -1465,8 +1448,6 @@ async def run(args: argparse.Namespace) -> int:
             allow_self_judge=bool(args.allow_self_judge),
             judge_seed_base=args.judge_seed_base,
             judge_n_samples=int(args.judge_n_samples),
-            include_graph=bool(args.include_graph),
-            planner_seed_base=args.planner_seed_base,
             vector_store_sha256=index_fingerprint.get("vector", {}).get("sha256", ""),
         )
         if violations:
@@ -1769,16 +1750,6 @@ def main() -> None:
         help="Judge 호출 반복 횟수 (S3 — 분산 측정). 1 이면 단일 호출, 2+ 면 "
              "seed+i 로 N회 호출 후 median 을 최종 점수, std/min/max 를 row 에 "
              "기록. 운영 안정성 진단용.",
-    )
-    # Phase 1 — 그래프 탐색 플래너 결정성(평가 재현성). search_context Step 4 가
-    # 그래프 도달 문서를 추가 회수하므로, 플래너가 흔들리면 청크 recall 도
-    # 비결정적이 된다. None 이면 미전달(기존 동작).
-    parser.add_argument(
-        "--planner-seed-base", type=int, default=None,
-        help="그래프 탐색 플래너 LLM 호출 seed base (평가 재현성). None 이면 "
-             "미전달. 정수 명시 시 쿼리별 seed = base + sha256(query) mod 10M 으로 "
-             "OpenAI 호환 endpoint 에서 그래프 탐색(→ 청크 recall) 결정성 확보. "
-             "실서비스 동작에는 영향 없음(평가 경로 전용).",
     )
     # Phase 4 — 절대 점수 보고 프로토콜. 재현성·비편향·앵커링·불확실성 동반을
     # 강제하여 청크/문서 절대 점수를 신뢰 가능 수준으로 끌어올린다.

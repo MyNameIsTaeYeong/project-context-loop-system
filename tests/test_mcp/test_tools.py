@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -149,7 +147,7 @@ async def test_assemble_context_with_graph(
     vector_store: VectorStore,
     graph_store: GraphStore,
 ) -> None:
-    """LLM 기반 그래프 탐색으로 컨텍스트가 포함된 결과를 반환한다."""
+    """임베딩 시딩 그래프 탐색으로 컨텍스트가 포함된 결과를 반환한다."""
     from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 
     doc_id = await meta_store.create_document(
@@ -167,15 +165,10 @@ async def test_assemble_context_with_graph(
 
     mock_embedding = AsyncMock()
     mock_embedding.aembed_query = AsyncMock(return_value=[1.0, 0.0])
-
-    mock_llm = AsyncMock()
-    mock_llm.complete = AsyncMock(return_value=json.dumps({
-        "should_search": True,
-        "reasoning": "Gateway 관련 구조 파악 필요",
-        "search_steps": [
-            {"entity_name": "Gateway", "depth": 1, "focus_relations": ["depends_on"]},
-        ],
-    }))
+    # 엔티티 임베딩 lazy 구축 — Gateway 가 쿼리와 유사해 시드가 된다.
+    mock_embedding.aembed_documents = AsyncMock(
+        return_value=[[1.0, 0.0], [0.0, 1.0]],
+    )
 
     result = await assemble_context(
         query="Gateway",
@@ -183,7 +176,6 @@ async def test_assemble_context_with_graph(
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=mock_embedding,
-        llm_client=mock_llm,
         include_graph=True,
     )
     assert "Gateway" in result

@@ -20,7 +20,7 @@
 
 | 도구/플래그 | 역할 | 기둥 |
 |---|---|---|
-| `eval_search.py --planner-seed-base` | 그래프 탐색 플래너 LLM seed 고정 → 그래프 증강이 청크 recall 에 주는 비결정성 제거 | 1 |
+| 임베딩 시딩 그래프 검색 (LLM 플래너 제거) | 그래프 탐색이 결정적 → 그래프 증강이 청크 recall 에 주는 비결정성 원천 제거 | 1 |
 | `eval_search.py --judge-seed-base` + sha256 기반 seed | Judge 점수 프로세스 독립 결정성 | 1 |
 | `build_synthetic_gold_set.py --equivalence-detection` | 같은 답을 담은 동등 문서를 OR 그룹(`relevant_doc_groups`)으로 기록 → recall 과소평가 해소 | 2 |
 | 인덱스/코퍼스 지문(`index_fingerprint`) | summary 에 vector/corpus/graph sha256 기록 | 3 |
@@ -35,8 +35,10 @@
 - `--judge-seed-base` 설정(Judge 재현성)
 - `--judge-n-samples >= 3`(Judge 변덕 완화 — 중앙값 + 분산 보고)
 - 비-self Judge(`--allow-self-judge` 없이) — 자기평가 편향 차단
-- `--include-graph` 시 `--planner-seed-base` 설정(그래프 증강→청크 recall 재현성)
 - 인덱스 지문(`vector_store_sha256`) 비어 있지 않음(앵커링 가능)
+
+그래프 탐색은 임베딩 시딩 기반의 결정적 검색이므로(LLM 플래너 제거) 별도
+seed 요건이 없다 — 같은 인덱스 + 같은 쿼리 임베딩이면 같은 결과.
 
 충족 시 summary 에 `absolute_mode: true` 와 청크 메트릭별 `metric_ci`
 (`mean`/`ci_low`/`ci_high`/`n`, 95% bootstrap, seed=42)가 기록된다.
@@ -53,7 +55,7 @@ python scripts/verify_frozen_benchmark.py --benchmark eval/frozen/main
 # (c) 절대 점수 측정 — 앵커 검증 + CI 동반
 python scripts/eval_search.py --gold-set eval/frozen/main/gold_set.yaml \
     --judge --judge-seed-base 1000 --judge-n-samples 3 \
-    --planner-seed-base 2000 --absolute-mode \
+    --absolute-mode \
     --frozen-benchmark eval/frozen/main --label absolute --output-dir eval/runs
 
 # (d) 인덱스 변경(재인덱싱) 후에는 (a) 로 돌아가 재동결 + 재캘리브레이션
@@ -97,6 +99,6 @@ python scripts/build_synthetic_gold_set.py --n-chunks 50 \
 - `AnthropicClient` Judge 는 seed 미지원 → Judge 점수 레이어의 완전 bit-identity 는
   불가. `--judge-n-samples >= 3` 의 중앙값 + CI 로 대체하며, 검색 레이어 메트릭은
   여전히 bit-identical.
-- 재현성 수정은 **평가 경로 전용**이다(`graph_planner_seed` 기본 `None`). 실서비스
-  동작은 변경되지 않으므로, 절대 점수가 실서버 동률 처리 순서를 100% 대변하지는
-  않는다(6배 over-fetch + 결정적 재정렬로 top-k 영향은 무시 가능).
+- Judge seed(`--judge-seed-base`)는 **평가 경로 전용**이다. 절대 점수가 실서버
+  동률 처리 순서를 100% 대변하지는 않는다(6배 over-fetch + 결정적 재정렬로
+  top-k 영향은 무시 가능).

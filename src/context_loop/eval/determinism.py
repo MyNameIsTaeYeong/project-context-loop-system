@@ -1,6 +1,6 @@
 """평가 재현성을 위한 결정적 seed 유틸.
 
-LLM 호출(Judge, 그래프 탐색 플래너)에 전달할 seed 를 입력 텍스트로부터
+LLM 호출(Judge)에 전달할 seed 를 입력 텍스트로부터
 **프로세스에 독립적으로** 유도한다.
 
 주의: Python 내장 ``hash(str)`` 은 ``PYTHONHASHSEED`` 로 프로세스마다 salt 되어
