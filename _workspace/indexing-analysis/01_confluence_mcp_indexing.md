@@ -1,6 +1,8 @@
 # Confluence MCP 인덱싱 파이프라인 분석
 
-> 기준: 현재 HEAD (origin/main 머지 완료). 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+> 기준: 현재 HEAD `28e18d3` ("feat: 128K 컨텍스트 모델 대응 — LLM 입력 한도 설정화 및 초과 폴백 (R-1/R-2/R-3)"). 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+>
+> **이번 갱신 반영분(28e18d3):** 인덱싱 LLM 호출의 입력 토큰 한도가 하드코딩에서 `llm.max_input_tokens` 설정값으로 바뀌었고(R-1), 한도 초과 시 통째 스킵/실패가 아니라 폴백으로 self-heal 하도록 배선됐다 — LLM 본문 그래프는 API 컨텍스트 초과를 감지해 unit 폴백으로 강등(R-2), 가상 질문 생성은 섹션을 배치로 나눠 재호출(R-3). 세 변경 모두 기본값이 종전 하드코딩(200,000)과 동일하여 정상 경로 동작은 불변이고, 오직 초과 경로만 달라진다.
 
 ## 0. 진입점 & 전체 흐름
 
@@ -30,6 +32,7 @@ else:  # git_code가 아닌 경로
 **중요 사실:**
 - confluence는 **3중 그래프 추출**을 한다: 링크(결정론) + 본문 휴리스틱(결정론) + LLM 의미관계(opt-in). git_code는 AST 1종뿐.
 - LLM 호출이 **2곳**: 가상 질문 생성(`enable_question_indexing`, 기본 ON) + LLM 본문 그래프(`enable_llm_body_extraction`, 기본 ON). 둘 다 `llm_client`가 주입돼야 동작.
+- **두 LLM 호출의 입력 토큰 한도는 이제 설정값 `PipelineConfig.llm_max_input_tokens`(기본 200,000)로 통일** (R-1). `process_document`가 이 값을 각각 `QuestionGenConfig(max_input_tokens=...)`(pipeline.py:291-293)과 `LLMBodyExtractionConfig(max_input_tokens=...)`(pipeline.py:469-471)로 주입한다. 한도 초과 시 두 호출 모두 스킵이 아니라 폴백으로 처리를 이어간다(R-2/R-3, §4·§5c 참조).
 - `storage_method`는 결과 파생(`_derive_storage_method`, pipeline.py:542). 청크+그래프 모두 있으면 hybrid.
 
 ```
@@ -135,7 +138,11 @@ process_document(document_id)
 **진입:** pipeline.py:266-396 (confluence 분기).
 
 **처리 로직 (멀티뷰 + 가상 질문):**
-1. **가상 질문 생성 (LLM, opt-in)** — `extracted`가 있고 `enable_question_indexing`(기본 True)이고 `llm_client`가 있으면 `generate_questions_for_document(doc_title, extracted, llm_client)` (라인 277, question_generator.py:139). LLM 1회 호출로 섹션별 자연 질의 추출 → `{section_index: [questions]}`. 입력 토큰 초과 시 `InputTooLargeError`로 스킵 (라인 293).
+1. **가상 질문 생성 (LLM, opt-in)** — `extracted`가 있고 `enable_question_indexing`(기본 True)이고 `llm_client`가 있으면 `generate_questions_for_document(doc_title=title, extracted, llm_client, config=QuestionGenConfig(max_input_tokens=cfg.llm_max_input_tokens))` (pipeline.py:286-295, question_generator.py:155). **R-1: 한도를 하드코딩이 아니라 `cfg.llm_max_input_tokens`로 주입한다.** LLM 1회 호출로 섹션별 자연 질의 추출 → `{section_index: [questions]}`.
+   - **R-3 배치 폴백 (128K 대응):** 입력 토큰이 한도를 초과해도 이제 통째 스킵/raise 하지 않고 **섹션을 배치로 나눠 재호출하여 self-heal** 한다. 트리거 2경로: (a) 사전 토큰 가드 초과 시 곧바로 `_run_batched`로 진입(question_generator.py:198-207), (b) 단일 전체 호출이 API 레벨 컨텍스트 초과 예외를 던지면 `is_context_length_error(exc)` 판별 후 `_run_batched`로 전환(question_generator.py:225-235).
+   - `_plan_section_batches`(question_generator.py:379)가 `budget = max_input_tokens − (시스템프롬프트+제목+_TEMPLATE_SLACK) − _SAFETY_MARGIN`(하한 `_MIN_BUDGET=512`)을 계산해 **문서 순서를 유지한 탐욕적 패킹**으로 배치를 만든다. 단일 섹션이 예산을 넘으면 그 섹션만 단독 배치로 분리하되 `_truncate_to_tokens`로 head-절단하고 `stats.sections_truncated++`(스킵 대신 절단). `_run_batched`(question_generator.py:441)는 배치들을 `asyncio.gather(..., return_exceptions=True)`로 병렬 호출하되, `_merge_sections_into`(question_generator.py:283, 단일/배치 공용)로 **입력 순서대로** 병합하여 결정성·문서 전체 중복제거(`seen_global`)·`max_questions_per_doc` 총량 상한을 유지한다. 모든 배치가 실패할 때만 `llm_failed=True`(부분 실패는 성공 배치 결과 보존).
+   - 일반(비-컨텍스트) API 예외나 파싱 실패는 종전대로 빈 dict + `llm_failed=True` 반환(폴백 아님). 로그(pipeline.py:296-306)에 `fallback`/`batches` 노출.
+   - pipeline.py:307의 `except QuestionInputTooLargeError`는 **방어적 dead-path** — R-3 이후 `generate_questions_for_document`가 더 이상 이 예외를 raise 하지 않으므로 실질 도달하지 않으나 안전망으로 존치.
 2. **3종 뷰 텍스트 구성** (라인 303-330):
    - `body_texts` = 청크 본문
    - `meta_texts` = `build_meta_view_text(title, section_path)` (pipeline.py:575) — title+section_path. 빈 값이면 meta 뷰 스킵(`meta_mask`).
@@ -145,14 +152,19 @@ process_document(document_id)
 
 **산출 데이터 형태:** 청크당 최대 3종(body/meta/question N개) 벡터. 모두 `logical_chunk_id` 공유.
 
-**질문 생성 파라미터 (question_generator.py):**
-| 이름 | 기본값 | 위치 |
-|------|--------|------|
-| questions_per_section | 5 | :58 |
-| max_input_tokens | 200,000 | :60 |
-| max_output_tokens | 32,768 | :61 |
-| max_questions_per_doc | 50 | :63 |
-| temperature | 0.0 | :62 |
+**질문 생성 파라미터 (`QuestionGenConfig`, question_generator.py:50-76):**
+| 이름 | 기본값 | 위치 | 비고 |
+|------|--------|------|------|
+| questions_per_section | 5 | :71 | 섹션당 질문 수(LLM 지시) |
+| min_section_tokens | 100 | :72 | 짧은 섹션 후순위 |
+| max_input_tokens | 200,000 | :73 | **R-1: pipeline이 `cfg.llm_max_input_tokens`로 덮어씀.** 초과 시 R-3 배치 폴백 기준 |
+| max_output_tokens | 32,768 | :74 | LLM 응답 max_tokens |
+| temperature | 0.0 | :75 | 결정성 우선 |
+| max_questions_per_doc | 50 | :76 | 문서 전체 질문 총량 상한(배치 간에도 유지) |
+
+**R-3 배치 예산 상수 (question_generator.py:41-43, 모듈 내부·설정 아님):** `_TEMPLATE_SLACK=64`, `_SAFETY_MARGIN=1000`, `_MIN_BUDGET=512`.
+
+**`QuestionGenStats` 신규 필드 (R-3, question_generator.py:92-94):** `fallback_used`(배치 폴백 사용 여부), `batch_count`(배치=LLM 호출 수, 비폴백=0), `sections_truncated`(단독 절단된 섹션 수).
 
 **git_code와 차이:** git_code는 body+meta 2뷰만, 가상 질문 뷰 없음.
 
@@ -178,9 +190,13 @@ confluence는 세 추출 경로가 같은 `document` 노드로 GraphStore에서 
   - 추출 관계 없으면 빈 그래프 (self-entity도 미방출, 라인 170).
 
 ### 5c. LLM 의미 관계 그래프 (opt-in, 비용 발생)
-**진입:** `processor/llm_body_extractor.py::extract_llm_body_graph_for_document(doc_title, body, llm_client)` (라인 277). `enable_llm_body_extraction`(기본 True) + `llm_client`가 있을 때 (pipeline.py:453).
+**진입:** `processor/llm_body_extractor.py::extract_llm_body_graph_for_document(doc_title, body, llm_client, config)` (라인 288). `enable_llm_body_extraction`(기본 True) + `llm_client`가 있을 때 (pipeline.py:467). **R-1: `config=LLMBodyExtractionConfig(max_input_tokens=cfg.llm_max_input_tokens)`(body_cfg)를 문서 호출·unit 폴백 호출 양쪽에 동일 주입** (pipeline.py:469-471, 478, 500).
 - 입력 body = `_assemble_document_body(extracted)` (pipeline.py:551) — 섹션 헤딩+md_content 트리 순서 합본. **문서 단위 1회 호출**이 기본(256K 컨텍스트 가정).
-- `max_input_tokens=200,000`(라인 88) 초과 시 `InputTooLargeError` → unit 단위 `extract_llm_body_graph`로 폴백 (pipeline.py:471-480). unit 폴백은 `_gate_units`(라인 429)로 short unit(`min_unit_tokens=200`)/overlap part 스킵.
+- **폴백 트리거 2경로 → 모두 `InputTooLargeError`로 수렴해 unit 단위 `extract_llm_body_graph`로 강등** (pipeline.py:489-501):
+  - (사전 가드) 본문 토큰이 `cfg.max_input_tokens` 초과 시 즉시 `InputTooLargeError` raise (llm_body_extractor.py:318-322).
+  - (**R-2, 128K 대응**) 사전 가드는 통과했으나 **API 레벨에서 컨텍스트 초과**가 발생하는 경우. `extract_llm_body_graph_for_document`가 이제 **LLM 호출과 JSON 파싱을 물리적으로 분리된 try 블록으로 다뤄**(llm_body_extractor.py:336-371), 호출 예외가 `is_context_length_error(exc)`(llm_client.py:470)로 판별되면 `InputTooLargeError`로 **승격**한다(llm_body_extractor.py:346-352). 이로써 실제 컨텍스트 초과가 기존 unit 폴백 계약에 합류한다. 반면 **파싱 실패(ValueError 등)나 그 외 일반 호출 예외는 승격하지 않고** `units_failed=1` + 빈 `GraphData`로 degraded 반환(오분류·폴백 남용 방지, llm_body_extractor.py:353-357, 365-371).
+- `is_context_length_error`(llm_client.py:470)는 컨텍스트 초과 판별의 단일 출처: (1) `openai.BadRequestError`의 구조화 code `context_length_exceeded`(중첩 `body.error.code` 포함), (2) 400 메시지 또는 비-openai 예외 메시지가 `_CONTEXT_OVERFLOW_MARKERS`(llm_client.py:458, "maximum context length"/"longer than the maximum"/vLLM 문구 등)에 매칭. 그 외 400·타임아웃·5xx·파싱오류는 False.
+- unit 폴백은 `_gate_units`(라인 429)로 short unit(`min_unit_tokens=200`)/overlap part 스킵.
 - 시스템 프롬프트(라인 108)가 허용 entity_type/relation_type 어휘를 강제. 출력은 JSON `{entities, relations}`. 어휘 외 타입은 드롭(stats.dropped).
 - 어휘는 `graph_vocabulary.py`에서 단일 관리: entity_type 15종(document/person/ticket/api/concept/system/module/policy/team/function/class/method/struct/interface), relation_type 19종(references/depends_on/implements/calls/owned_by/uses 등).
 - 설정: `temperature=0.0`, `max_tokens=32768`, `max_concurrency=3` (라인 76-83).
@@ -206,16 +222,21 @@ confluence는 세 추출 경로가 같은 `document` 노드로 GraphStore에서 
 |------|--------|------|------|
 | SOURCE_TYPE | confluence_mcp | mcp_confluence.py | 1 수집 |
 | 파서 | BeautifulSoup html.parser | confluence_extractor.py:144 | 2 전처리 |
-| max_embedding_tokens | 8000 | pipeline.py:89 | 3 청킹 |
-| enable_question_indexing | True | pipeline.py:90 | 4 임베딩(LLM) |
-| questions_per_section | 5 | question_generator.py:58 | 4 임베딩 |
-| max_questions_per_doc | 50 | question_generator.py:63 | 4 임베딩 |
+| max_embedding_tokens | 8000 | pipeline.py:90 | 3 청킹 |
+| **llm.max_input_tokens** | **200000** | **config/default.yaml:154 (R-1 신설)** | **4·5c LLM 입력 한도 설정키** |
+| **PipelineConfig.llm_max_input_tokens** | **200_000** | **pipeline.py:95 (R-1)** | **위 값의 런타임 캐리어 → 두 LLM cfg에 주입** |
+| enable_question_indexing | True | pipeline.py:91 | 4 임베딩(LLM) |
+| questions_per_section | 5 | question_generator.py:71 | 4 임베딩 |
+| QuestionGenConfig.max_input_tokens | 200,000 (pipeline이 R-1로 덮어씀) | question_generator.py:73 | 4 임베딩 |
+| max_questions_per_doc | 50 | question_generator.py:76 | 4 임베딩 |
+| R-3 배치 예산 상수 (slack/margin/min) | 64/1000/512 | question_generator.py:41-43 | 4 임베딩 폴백 |
 | BodyExtractionConfig.api/jira | ON | body_extractor.py:85-86 | 5b 그래프 |
 | BodyExtractionConfig.bold/table | OFF | body_extractor.py:87-88 | 5b 그래프 |
 | extraction unit target/max tokens | 1500/2400 | extraction_unit.py:56-57 | 5b 그래프 |
-| enable_llm_body_extraction | True | pipeline.py:80 | 5c 그래프(LLM) |
-| llm max_input_tokens | 200,000 | llm_body_extractor.py:88 | 5c 그래프 |
+| enable_llm_body_extraction | True | pipeline.py:81 | 5c 그래프(LLM) |
+| LLMBodyExtractionConfig.max_input_tokens | 200,000 (pipeline이 R-1로 덮어씀) | llm_body_extractor.py:91 | 5c 그래프 |
 | llm temperature/max_tokens | 0.0/32768 | llm_body_extractor.py:82-83 | 5c 그래프 |
+| _CONTEXT_OVERFLOW_MARKERS | (컨텍스트 초과 문자열 튜플) | llm_client.py:458 (R-2) | 5c 폴백 판별 |
 | 노드 병합 키 | LOWER(name)+type | metadata_store.py:455 | 6 저장 |
 
 ## 부록 B: 데이터 모델
@@ -226,6 +247,10 @@ confluence는 세 추출 경로가 같은 `document` 노드로 GraphStore에서 
 - `ExtractionUnit` (extraction_unit.py:68): section_ids, section_path, body, breadcrumb
 - `Entity`/`Relation`/`GraphData` (graph_extractor.py:15/30/48)
 - `LLMBodyExtractionConfig`/`Stats` (llm_body_extractor.py:54/92)
+- `QuestionGenConfig` (question_generator.py:50) / `QuestionGenStats` (question_generator.py:79 — R-3로 `fallback_used`/`batch_count`/`sections_truncated` 필드 추가)
+- `PipelineConfig` (pipeline.py:65 — R-1로 `llm_max_input_tokens` 필드 추가)
+
+**R-1 설정 배선 경로 (config → 런타임):** `config/default.yaml llm.max_input_tokens`(154) → `Config.get("llm.max_input_tokens", 200_000)` → 3개 `PipelineConfig` 생성부(`web/api/confluence_mcp.py:525`, `web/api/documents.py:492`, `ingestion/coordinator.py:309-311`) → `PipelineConfig.llm_max_input_tokens` → `process_document(cfg)` → `QuestionGenConfig(max_input_tokens=...)`(pipeline.py:292) / `LLMBodyExtractionConfig(max_input_tokens=...)`(pipeline.py:470) → 각 모듈의 사전 토큰 가드. 나머지 2개 `PipelineConfig()` 생성부(`pipeline.py:138` 기본, `sync/mcp_sync.py`는 상위 config 전달만)는 기본 200_000 사용 — 전 경로 200000 수렴(하위 호환). coordinator(git_code)는 균일성 목적 배선이며 LLM 미사용이라 실효 없음.
 
 ## 검토하지 못한 영역
 
