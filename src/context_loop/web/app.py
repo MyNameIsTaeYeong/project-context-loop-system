@@ -207,6 +207,48 @@ def _build_mcp_sync_engine(
     )
 
 
+def _build_git_sync_engine(
+    config: Config,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Any,
+    llm_client: Any,
+):
+    """설정이 허용하면 git_code 자동 싱크 엔진을 만들어 반환한다 (아니면 None).
+
+    ``sources.git`` 의 ``enabled`` + ``auto_sync_enabled`` 가 모두 켜져 있고
+    ``repositories`` 가 설정된 경우에만 엔진을 만든다. 러너로는 수동 트리거
+    (``POST /api/git-sync/start``)와 같은 전역 싱크 상태를 공유하는
+    :func:`run_sync_in_background` 를 주입해 두 경로의 중복 실행을 막는다.
+    """
+    from context_loop.ingestion.git_config import load_git_source_config
+    from context_loop.sync.periodic import PeriodicSyncEngine
+    from context_loop.web.api.git_sync import run_sync_in_background
+
+    git_config = load_git_source_config(config)
+    if not git_config.enabled or not git_config.auto_sync_enabled:
+        return None
+    if not git_config.repositories:
+        logger.warning(
+            "git.auto_sync_enabled 이지만 repositories 미설정 — "
+            "자동 싱크를 시작하지 않습니다.",
+        )
+        return None
+
+    async def _run_cycle() -> bool:
+        return await run_sync_in_background(
+            config, meta_store, vector_store, graph_store,
+            embedding_client, llm_client,
+        )
+
+    return PeriodicSyncEngine(
+        _run_cycle,
+        name="git",
+        interval_minutes=git_config.sync_interval_minutes,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
@@ -241,7 +283,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # (최초 그래프 검색 시 누락분이 lazy 하게 재시도된다).
     await _prebuild_entity_embeddings(graph_store, embedding_client, config)
 
-    # Confluence MCP 자동 주기 싱크 — auto_sync_enabled 토글이 켜진 경우에만.
+    # 소스별 자동 주기 싱크 — 각 소스의 auto_sync_enabled 토글이 켜진 경우에만.
     mcp_sync_engine = _build_mcp_sync_engine(
         config, meta_store, vector_store, graph_store,
         embedding_client, llm_client,
@@ -250,9 +292,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if mcp_sync_engine is not None:
         mcp_sync_engine.start()
 
+    git_sync_engine = _build_git_sync_engine(
+        config, meta_store, vector_store, graph_store,
+        embedding_client, llm_client,
+    )
+    app.state.git_sync_engine = git_sync_engine
+    if git_sync_engine is not None:
+        git_sync_engine.start()
+
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
 
+    if git_sync_engine is not None:
+        await git_sync_engine.stop()
     if mcp_sync_engine is not None:
         await mcp_sync_engine.stop()
     await meta_store.close()

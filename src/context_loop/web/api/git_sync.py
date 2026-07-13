@@ -166,9 +166,22 @@ async def sync_documents_partial(
 
 
 @router.get("/api/git-sync/status")
-async def sync_status_json():
-    """동기화 상태를 JSON으로 반환한다."""
-    return _get_sync_status()
+async def sync_status_json(request: Request):
+    """동기화 상태 + 자동 주기 싱크 엔진 상태를 JSON으로 반환한다."""
+    engine = getattr(request.app.state, "git_sync_engine", None)
+    return {
+        **_get_sync_status(),
+        "auto_sync": {
+            "enabled": engine is not None,
+            "running": engine.is_running if engine else False,
+            "interval_minutes": engine.interval_minutes if engine else None,
+            "last_cycle_at": (
+                engine.last_cycle_at.isoformat()
+                if engine and engine.last_cycle_at
+                else None
+            ),
+        },
+    }
 
 
 @router.post("/api/git-sync/start")
@@ -348,3 +361,49 @@ async def _run_sync(
         _sync_status.completed_at = time.time()
         _sync_status.phase = "실패"
         _sync_status.error = str(exc)
+
+
+async def run_sync_in_background(
+    config: Config,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Embeddings,
+    llm_client: LLMClient | None = None,
+) -> bool:
+    """자동 주기 싱크(PeriodicSyncEngine)가 사용하는 싱크 러너.
+
+    수동 트리거(``POST /api/git-sync/start``)와 같은 전역 싱크 상태
+    (``_sync_status``)를 공유한다 — 어느 경로로든 싱크가 진행 중이면 이번
+    사이클은 건너뛰고, 여기서 시작한 싱크는 수동 트리거의 409 가드에도
+    걸린다. 소스가 꺼져 있거나 레포가 없으면 아무 것도 하지 않는다.
+
+    Returns:
+        싱크를 실제로 실행했으면 True, 건너뛰었으면 False.
+    """
+    global _sync_status
+
+    if _sync_status.state == "running":
+        logger.info("git 자동 싱크 건너뜀 — 이미 진행 중")
+        return False
+
+    git_config = load_git_source_config(config)
+    if not git_config.enabled or not git_config.repositories:
+        logger.warning("git 자동 싱크 건너뜀 — 소스 비활성화 또는 레포 미설정")
+        return False
+
+    # 상태 확인(위)과 running 마킹 사이에 await 가 없으므로 단일 이벤트 루프
+    # 안에서 수동 트리거와의 이중 실행은 없다.
+    _sync_status = SyncStatus(
+        state="running",
+        phase="초기화 중...",
+        started_at=time.time(),
+    )
+    await _run_sync(
+        config, meta_store, git_config,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embedding_client,
+        llm_client=llm_client,
+    )
+    return True

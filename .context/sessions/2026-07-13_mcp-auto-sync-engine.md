@@ -49,9 +49,34 @@
   테스트 픽스처 비호환, clean tree 에서 동일 재현) — 회귀 없음.
 - ruff: 신규/변경 파일 클린 (기존 E501 6건 + UP035 1건은 미변경 라인).
 
+## 2차: git_code 자동 주기 싱크 (같은 세션 후속 요청)
+
+MCP 와 동일 패턴을 git_code 소스에 적용하면서 주기 루프를 공용 베이스로 추출.
+
+1. **`sync/periodic.py::PeriodicSyncEngine` 신설** — start/stop/협조적 종료/
+   사이클 실패 격리만 아는 범용 루프. 사이클 정의는 `run_cycle` 콜러블 주입
+   또는 `run_once` 오버라이드. `MCPSyncEngine` 은 이 베이스의 서브클래스로
+   리팩터링 (기존 테스트 7건 무수정 통과 — 공개 동작 불변).
+2. **`web/api/git_sync.py::run_sync_in_background` 신설** — 수동 트리거
+   (`POST /api/git-sync/start`)와 같은 전역 `_sync_status` 를 guard 로 공유.
+   자동·수동 어느 경로든 진행 중이면 상대가 건너뜀. guard 확인과 running
+   마킹 사이에 await 가 없어 단일 이벤트 루프에서 이중 실행 불가.
+   git 엔진은 서브클래스 없이 `PeriodicSyncEngine(run_cycle, name="git")` 그대로 사용.
+3. **`GitSourceConfig.auto_sync_enabled` 필드 + 파싱 추가**,
+   `config/default.yaml` 의 `sources.git.auto_sync_enabled: false` 신규.
+   `sources.git.sync_interval_minutes: 60` 이 처음으로 실제 소비됨.
+4. **lifespan**: `_build_git_sync_engine` — `enabled` + `auto_sync_enabled` +
+   `repositories` 3조건 충족 시에만 기동. `app.state.git_sync_engine` 노출.
+5. **관측성**: `GET /api/git-sync/status` 에 `auto_sync` 필드 추가.
+
+테스트 +10 (`test_periodic.py` 3, `test_git_auto_sync.py` 7).
+전체 1284 passed / 사전 실패 27 동일 — 회귀 없음.
+
 ## 남은 것
 
-- git_code 소스 자동 주기 싱크 — 여전히 `POST /api/git-sync/start` 수동뿐,
-  `sources.git.sync_interval_minutes` 미소비.
 - UI 토글 — 현재 config 파일로만 on/off. 대시보드 토글은 후순위.
 - REST `SyncEngine`(`sync/engine.py`) 데드 코드 정리 여부 결정.
+- STATUS 9.9 체크박스 정합 확인 — `git_repository.py::get_changed_files`
+  의 git diff 기반 증분 + 변경 없음 조기 종료(`sync_repository`)가 이미
+  구현돼 있어 자동 주기 싱크의 무변경 사이클은 저렴. 체크박스만 미갱신으로
+  보이므로 다음 세션에서 검증 후 갱신.

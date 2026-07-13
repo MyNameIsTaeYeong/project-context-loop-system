@@ -1,16 +1,17 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Confluence MCP 자동 주기 재싱크 — `MCPSyncEngine` (2026-07-13)
-- **Step**: 2026-04-23 백엔드 완성 시 후순위로 남겨둔 "자동 주기 실행" 구현. 지금까지 재싱크는 대시보드 버튼 트리거뿐이었고 `sync_interval_minutes` 설정은 어느 코드도 소비하지 않는 죽은 설정이었음 (기존 REST `SyncEngine` 은 어디서도 기동되지 않는 데드 코드 + I-011 로 REST 경로 자체가 사용 불가).
+- **Phase**: 소스별 자동 주기 재싱크 — Confluence MCP `MCPSyncEngine` + git_code `PeriodicSyncEngine` (2026-07-13)
+- **Step**: 2026-04-23 백엔드 완성 시 후순위로 남겨둔 "자동 주기 실행" 구현. 지금까지 재싱크는 대시보드 버튼 트리거뿐이었고 `sync_interval_minutes` 설정은 어느 코드도 소비하지 않는 죽은 설정이었음 (기존 REST `SyncEngine` 은 어디서도 기동되지 않는 데드 코드 + I-011 로 REST 경로 자체가 사용 불가). 같은 세션 2차로 git_code 소스에도 동일 패턴 적용.
 - **최신(2026-07-13)**: 브랜치 `claude/document-resync-review-cqy2i6`. 세션 로그 `2026-07-13_mcp-auto-sync-engine.md`.
-  1. **`sync/mcp_engine.py::MCPSyncEngine` 신설** — 커널(`execute_sync_target`)/러너 분리 설계 그대로, 대상 1건 싱크 콜러블(`run_target`)만 주입받는 주기 루프. `run_once()` 는 등록된 모든 싱크 대상을 **순차** 실행(대상들이 같은 MCP 서버·임베딩 엔드포인트를 공유하므로 대상 간 병렬화는 rate limit 만 압박), 대상 단위 실패 격리. stop 은 `asyncio.Event` 기반 협조적 종료 — sleep 중이면 즉시 깨어나고, 싱크 진행 중이면 해당 대상까지만 마침(강제 cancel 로 워터마크/membership 이 어중간하게 남지 않도록).
-  2. **웹 러너 공개 승격**: `web/api/confluence_mcp.py` 의 `_run_sync_in_background` → `run_sync_in_background`. 수동 버튼 싱크(BackgroundTasks)와 자동 주기 싱크(엔진)가 같은 함수를 통과 → target 단위 락(`_target_locks`)/진행 상태(`_target_status`)가 두 경로에서 공유되어 중복 실행이 락에서 걸러짐.
-  3. **lifespan 연결** (`web/app.py::_build_mcp_sync_engine`): `sources.confluence_mcp.enabled` + `auto_sync_enabled` + `server_url` 3조건 충족 시에만 엔진 생성·start, 종료 시 `await engine.stop()`. `app.state.mcp_sync_engine` 로 노출.
-  4. **설정**: `sources.confluence_mcp.auto_sync_enabled: false` (기본 off — 기존 동작 무변경), `sync_interval_minutes: 30` 이 처음으로 실제 소비됨. 첫 사이클은 기동 60초 후(엔티티 임베딩 사전 구축과 겹침 방지).
-  5. **관측성**: `GET /api/confluence-mcp/health` 응답에 `auto_sync: {enabled, running, interval_minutes, last_cycle_at}` 추가.
-- 테스트 +6 건 (`tests/test_sync/test_mcp_engine.py` — run_once 전체/빈 목록/실패 격리, start/stop 라이프사이클, stop 즉시성, start 멱등, 사이클 중단). 싱크 42 passed, 전체 1274 passed / 27 사전 실패(테스트 환경 Jinja2·Starlette 픽스처, baseline 동일 — 회귀 없음).
-- **미해결 후속**: git_code 소스 자동 주기 싱크(현재 `POST /api/git-sync/start` 수동뿐, `sources.git.sync_interval_minutes` 여전히 미소비), UI 토글(현재 config 파일로만 제어), REST `SyncEngine`(engine.py) 데드 코드 정리 여부 결정.
+  1. **`sync/periodic.py::PeriodicSyncEngine` 신설 (공용 베이스)** — "주기마다 사이클 1회"만 아는 범용 루프. 사이클 정의는 `run_cycle` 콜러블 주입(git) 또는 `run_once` 오버라이드(MCP). stop 은 `asyncio.Event` 기반 협조적 종료 — sleep 중이면 즉시 깨어나고, 진행 중이면 사이클을 마치고 멈춤(강제 cancel 로 워터마크/membership 이 어중간하게 남지 않도록).
+  2. **`sync/mcp_engine.py::MCPSyncEngine`** — 베이스 서브클래스. 커널(`execute_sync_target`)/러너 분리 설계 그대로, 대상 1건 싱크 콜러블(`run_target`)만 주입받아 `run_once()` 에서 등록된 모든 싱크 대상을 **순차** 실행(대상들이 같은 MCP 서버·임베딩 엔드포인트를 공유하므로 대상 간 병렬화는 rate limit 만 압박) + 대상 단위 실패 격리.
+  3. **웹 러너 공개 승격 (양 소스 공통 패턴)**: confluence_mcp 는 `_run_sync_in_background` → `run_sync_in_background` (target 단위 락/진행 상태 공유), git_sync 는 신규 `run_sync_in_background` — 수동 트리거와 같은 전역 `_sync_status` 를 guard 로 공유해 자동·수동 어느 경로든 진행 중이면 상대가 건너뜀 (guard 와 running 마킹 사이 await 없음 → 단일 이벤트 루프에서 이중 실행 불가).
+  4. **lifespan 연결** (`web/app.py::_build_mcp_sync_engine` / `_build_git_sync_engine`): MCP 는 `enabled`+`auto_sync_enabled`+`server_url`, git 은 `enabled`+`auto_sync_enabled`+`repositories` 충족 시에만 생성·start, 종료 시 `await engine.stop()`. `app.state.{mcp,git}_sync_engine` 노출.
+  5. **설정**: `sources.confluence_mcp.auto_sync_enabled: false` + `sources.git.auto_sync_enabled: false` (기본 off — 기존 동작 무변경). `sync_interval_minutes` (MCP 30분 / git 60분) 이 처음으로 실제 소비됨. `GitSourceConfig.auto_sync_enabled` 필드 추가. 첫 사이클은 기동 60초 후(엔티티 임베딩 사전 구축과 겹침 방지).
+  6. **관측성**: `GET /api/confluence-mcp/health` 와 `GET /api/git-sync/status` 응답에 `auto_sync: {enabled, running, interval_minutes, last_cycle_at}` 추가.
+- 테스트 +17 건 (`test_mcp_engine.py` 7 — run_once 전체/빈 목록/실패 격리, start/stop 라이프사이클, stop 즉시성, start 멱등, 사이클 중단 · `test_periodic.py` 3 — run_cycle 주입/미주입 오류/사이클 실패 후 루프 생존 · `test_git_auto_sync.py` 7 — 러너 실행/중복 스킵/미설정 스킵, 빌더 게이트). 전체 1284 passed / 27 사전 실패(테스트 환경 Jinja2·Starlette 픽스처, baseline 동일 — 회귀 없음).
+- **미해결 후속**: UI 토글(현재 config 파일로만 제어), REST `SyncEngine`(engine.py) 데드 코드 정리 여부 결정, 9.9 체크박스 정합 확인(`git_repository.py::get_changed_files` 의 diff 기반 증분 + 변경 없음 조기 종료가 이미 구현돼 있어 자동 주기 싱크의 무변경 사이클은 저렴 — 체크박스만 미갱신으로 보임).
 
 ## 이전 단계
 - **Phase 7.19(2026-05-12)**: 변동성 측정 인프라 + I-046 효과 측정 워크플로 확정. 같은 source_type 으로 N개 골드셋을 빌드/평가해서 변동성을 잡는 인프라 추가 + 이미 머지된 I-046 (git_code 멀티뷰) 의 효과를 baseline/after 로 측정할 수 있게 SQL hash 우회 방식의 평가 워크플로 확정. 코드 추적으로 doc_id 보존(UPDATE 만, DELETE+INSERT 경로 없음) 과 7단계 재인덱싱 파이프라인 검증 완료. 브랜치 `claude/fix-multiview-asymmetry-kUoHn`. 커밋 1개 (`54f9d49`).
