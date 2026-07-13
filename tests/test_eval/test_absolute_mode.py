@@ -29,8 +29,6 @@ def _ok_kwargs() -> dict:
         allow_self_judge=False,
         judge_seed_base=1000,
         judge_n_samples=3,
-        include_graph=True,
-        planner_seed_base=2000,
         vector_store_sha256="abc123",
     )
 
@@ -66,21 +64,6 @@ def test_self_judge_allowed_optin() -> None:
     kw["allow_self_judge"] = True
     v = eval_search.check_absolute_mode_requirements(**kw)
     assert not any("self-evaluation" in x for x in v)
-
-
-def test_missing_planner_seed_when_graph() -> None:
-    kw = _ok_kwargs()
-    kw["planner_seed_base"] = None
-    v = eval_search.check_absolute_mode_requirements(**kw)
-    assert any("planner-seed-base" in x for x in v)
-
-
-def test_planner_seed_not_required_without_graph() -> None:
-    kw = _ok_kwargs()
-    kw["include_graph"] = False
-    kw["planner_seed_base"] = None
-    v = eval_search.check_absolute_mode_requirements(**kw)
-    assert not any("planner-seed-base" in x for x in v)
 
 
 def test_empty_fingerprint_blocked() -> None:

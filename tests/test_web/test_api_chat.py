@@ -206,14 +206,12 @@ async def test_chat_api_with_graph_context(chat_stores, chat_client: AsyncClient
         ],
     ))
 
-    # 그래프 탐색 계획용 complete + 최종 답변용 stream 분리
+    # 임베딩 시딩 그래프 탐색 — 엔티티 임베딩 lazy 구축(aembed_documents)에서
+    # Gateway 가 쿼리 임베딩([1,0,0,0])과 유사해 시드가 된다.
     app = chat_client._transport.app  # type: ignore[attr-defined]
-    plan_response = json.dumps({
-        "should_search": True,
-        "reasoning": "Gateway 구조 파악 필요",
-        "search_steps": [{"entity_name": "Gateway", "depth": 1, "focus_relations": []}],
-    })
-    app.state.llm_client.complete = AsyncMock(side_effect=[plan_response])
+    app.state.embedding_client.aembed_documents = AsyncMock(
+        return_value=[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+    )
     app.state.llm_client.stream = _stream_returning("테스트 답변입니다.")
     app.state.llm_client.stream_events = _stream_events_returning("테스트 답변입니다.")
 

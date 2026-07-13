@@ -711,7 +711,7 @@ class GraphStore:
             "sha256": digest,
         }
 
-    # --- LLM 기반 그래프 탐색 지원 ---
+    # --- 그래프 스키마 요약 (검색 경로 미사용 — 진단·표시용 보존 API) ---
 
     def get_schema_summary(self, max_entities_per_type: int = 10) -> dict[str, Any]:
         """LLM에게 제공할 그래프 스키마 요약을 생성한다."""

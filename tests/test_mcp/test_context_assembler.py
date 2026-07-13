@@ -1,8 +1,7 @@
-"""context_assembler LLM 기반 그래프 탐색 + 리랭킹/threshold 테스트."""
+"""context_assembler 임베딩 시딩 그래프 탐색 + 리랭킹/threshold 테스트."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -14,7 +13,6 @@ from context_loop.mcp.context_assembler import (
     _format_graph_chunk_results,
     _search_chunks,
     _search_graph_sourced_chunks,
-    _search_graph_with_llm,
     assemble_context,
     assemble_context_with_sources,
 )
@@ -36,24 +34,26 @@ async def stores(tmp_path: Path):
     await meta_store.close()
 
 
-def _make_llm_client(plan_response: dict) -> AsyncMock:
-    """탐색 계획 JSON을 반환하는 mock LLM 클라이언트를 생성한다."""
-    mock = AsyncMock()
-    mock.complete = AsyncMock(return_value=json.dumps(plan_response, ensure_ascii=False))
-    return mock
+def _make_embedding_client(
+    query_embedding: list[float],
+    entity_embeddings: list[list[float]] | None = None,
+) -> AsyncMock:
+    """테스트용 임베딩 클라이언트를 생성한다.
 
-
-def _make_embedding_client(query_embedding: list[float]) -> AsyncMock:
-    """테스트용 임베딩 클라이언트를 생성한다."""
+    ``entity_embeddings`` 는 그래프 탐색의 엔티티 임베딩 lazy 구축
+    (aembed_documents) 응답 — 그래프 노드 저장 순서와 대응해야 한다.
+    """
     mock = AsyncMock()
     mock.aembed_query = AsyncMock(return_value=query_embedding)
+    mock.aembed_documents = AsyncMock(return_value=entity_embeddings or [])
     return mock
 
 
 @pytest.mark.asyncio
-async def test_graph_search_skipped_when_llm_says_no(stores) -> None:
-    """LLM이 should_search=false를 반환하면 그래프 탐색이 스킵된다."""
-    meta_store, _, graph_store = stores
+async def test_graph_search_skipped_when_no_seed(stores) -> None:
+    """쿼리 임베딩이 threshold 를 넘는 엔티티가 없으면 그래프 섹션이 생략된다
+    — LLM should_search 게이팅의 대체."""
+    meta_store, vector_store, graph_store = stores
 
     doc_id = await meta_store.create_document(
         source_type="manual", title="T", original_content="c", content_hash="h",
@@ -63,102 +63,25 @@ async def test_graph_search_skipped_when_llm_says_no(stores) -> None:
         relations=[],
     ))
 
-    llm = _make_llm_client({
-        "should_search": False,
-        "reasoning": "질의가 그래프와 무관합니다",
-        "search_steps": [],
-    })
-
-    result = await _search_graph_with_llm("오늘 날씨 어때?", graph_store, llm)
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_graph_search_finds_entities_via_llm_plan(stores) -> None:
-    """LLM이 탐색 계획을 세우면 해당 엔티티를 중심으로 탐색한다."""
-    meta_store, _, graph_store = stores
-
-    doc_id = await meta_store.create_document(
-        source_type="manual", title="Arch", original_content="c", content_hash="h",
+    # 쿼리 임베딩이 엔티티 임베딩과 직교 → 시드 없음
+    embed_client = _make_embedding_client(
+        [0.0, 1.0], entity_embeddings=[[1.0, 0.0]],
     )
-    await graph_store.save_graph_data(doc_id, GraphData(
-        entities=[
-            Entity(name="Gateway", entity_type="component"),
-            Entity(name="AuthService", entity_type="service"),
-        ],
-        relations=[
-            Relation(source="Gateway", target="AuthService", relation_type="depends_on"),
-        ],
-    ))
 
-    llm = _make_llm_client({
-        "should_search": True,
-        "reasoning": "Gateway 관련 구조를 파악해야 합니다",
-        "search_steps": [
-            {"entity_name": "Gateway", "depth": 1, "focus_relations": ["depends_on"]},
-        ],
-    })
-
-    result = await _search_graph_with_llm("게이트웨이 구조", graph_store, llm)
-    assert result is not None
-    assert "Gateway" in result.text
-    assert "AuthService" in result.text
-    assert "depends_on" in result.text
-    assert doc_id in result.document_ids
-
-
-@pytest.mark.asyncio
-async def test_graph_search_with_multiple_steps(stores) -> None:
-    """LLM이 여러 엔티티를 탐색 계획에 포함할 수 있다."""
-    meta_store, _, graph_store = stores
-
-    doc_id = await meta_store.create_document(
-        source_type="manual", title="T", original_content="c", content_hash="hm",
+    result = await assemble_context(
+        query="오늘 날씨 어때?",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=True,
     )
-    await graph_store.save_graph_data(doc_id, GraphData(
-        entities=[
-            Entity(name="ServiceA", entity_type="service"),
-            Entity(name="ServiceB", entity_type="service"),
-            Entity(name="Database", entity_type="system"),
-        ],
-        relations=[
-            Relation(source="ServiceA", target="Database", relation_type="uses"),
-            Relation(source="ServiceB", target="Database", relation_type="uses"),
-        ],
-    ))
-
-    llm = _make_llm_client({
-        "should_search": True,
-        "reasoning": "ServiceA와 ServiceB의 DB 의존성 파악",
-        "search_steps": [
-            {"entity_name": "ServiceA", "depth": 1, "focus_relations": []},
-            {"entity_name": "ServiceB", "depth": 1, "focus_relations": []},
-        ],
-    })
-
-    result = await _search_graph_with_llm("서비스 구조", graph_store, llm)
-    assert result is not None
-    assert "ServiceA" in result.text
-    assert "ServiceB" in result.text
-    assert "Database" in result.text
+    assert "그래프 컨텍스트" not in result
 
 
 @pytest.mark.asyncio
-async def test_graph_search_empty_graph(stores) -> None:
-    """빈 그래프에서는 LLM 호출 없이 None을 반환한다."""
-    _, _, graph_store = stores
-
-    llm = _make_llm_client({"should_search": True, "search_steps": []})
-
-    result = await _search_graph_with_llm("어떤 질의", graph_store, llm)
-    assert result is None
-    # 그래프가 비어있으므로 LLM이 호출되지 않아야 함
-    llm.complete.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_assemble_context_with_llm_graph_search(stores) -> None:
-    """assemble_context가 LLM 기반 그래프 탐색을 사용한다."""
+async def test_assemble_context_embedding_seeded_graph_search(stores) -> None:
+    """assemble_context 가 LLM 없이 임베딩 시딩 그래프 탐색을 수행한다."""
     meta_store, vector_store, graph_store = stores
 
     doc_id = await meta_store.create_document(
@@ -174,14 +97,10 @@ async def test_assemble_context_with_llm_graph_search(stores) -> None:
         ],
     ))
 
-    embed_client = _make_embedding_client([0.9, 0.1])
-    llm = _make_llm_client({
-        "should_search": True,
-        "reasoning": "ServiceA 관련 정보 필요",
-        "search_steps": [
-            {"entity_name": "ServiceA", "depth": 1, "focus_relations": ["calls"]},
-        ],
-    })
+    # ServiceA 가 쿼리와 유사 → 시드, ServiceB 는 1-hop 이웃으로 포함
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
 
     result = await assemble_context(
         query="ServiceA 관련 정보",
@@ -189,16 +108,17 @@ async def test_assemble_context_with_llm_graph_search(stores) -> None:
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=embed_client,
-        llm_client=llm,
+        llm_client=None,  # LLM 없이도 그래프 탐색 동작
         include_graph=True,
     )
     assert "ServiceA" in result
+    assert "ServiceB" in result
     assert "calls" in result
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_no_llm_skips_graph(stores) -> None:
-    """llm_client가 None이면 그래프 탐색을 스킵한다."""
+async def test_assemble_context_include_graph_false_skips_graph(stores) -> None:
+    """include_graph=False 면 그래프 탐색을 수행하지 않는다."""
     meta_store, vector_store, graph_store = stores
 
     doc_id = await meta_store.create_document(
@@ -209,24 +129,25 @@ async def test_assemble_context_no_llm_skips_graph(stores) -> None:
         relations=[],
     ))
 
-    embed_client = _make_embedding_client([0.0, 0.0])
+    embed_client = _make_embedding_client(
+        [1.0, 0.0], entity_embeddings=[[1.0, 0.0]],
+    )
 
     result = await assemble_context(
-        query="test",
+        query="NodeX",
         meta_store=meta_store,
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=embed_client,
-        llm_client=None,  # LLM 없음
-        include_graph=True,
+        include_graph=False,
     )
-    # 벡터 데이터도 없으므로 컨텍스트 없음 메시지
+    # 그래프가 유일한 소스인데 비활성 → 컨텍스트 없음 메시지
     assert "찾을 수 없습니다" in result
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_with_sources_llm_graph(stores) -> None:
-    """assemble_context_with_sources도 LLM 기반 그래프 탐색을 사용한다."""
+async def test_assemble_context_with_sources_graph(stores) -> None:
+    """assemble_context_with_sources 도 임베딩 시딩 그래프 탐색을 사용한다."""
     meta_store, vector_store, graph_store = stores
 
     doc_id = await meta_store.create_document(
@@ -243,12 +164,9 @@ async def test_assemble_context_with_sources_llm_graph(stores) -> None:
         relations=[],
     ))
 
-    embed_client = _make_embedding_client([0.9, 0.1])
-    llm = _make_llm_client({
-        "should_search": True,
-        "reasoning": "API 구조 확인 필요",
-        "search_steps": [{"entity_name": "API", "depth": 1, "focus_relations": []}],
-    })
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0]],
+    )
 
     assembled = await assemble_context_with_sources(
         query="API 구조",
@@ -256,56 +174,54 @@ async def test_assemble_context_with_sources_llm_graph(stores) -> None:
         vector_store=vector_store,
         graph_store=graph_store,
         embedding_client=embed_client,
-        llm_client=llm,
         include_graph=True,
     )
     assert assembled.context_text != ""
+    assert "그래프 컨텍스트" in assembled.context_text
     assert len(assembled.sources) >= 1
     assert assembled.sources[0].title == "ArchDoc"
+    assert {e.name for e in assembled.retrieved_graph_entities} == {"API"}
 
 
 @pytest.mark.asyncio
-async def test_graph_search_llm_failure_graceful(stores) -> None:
-    """LLM 호출 실패 시 그래프 탐색이 None을 반환한다."""
-    meta_store, _, graph_store = stores
+async def test_graph_search_failure_graceful(stores) -> None:
+    """그래프 탐색이 예외를 던져도 조립은 그래프 섹션 없이 계속된다."""
+    meta_store, vector_store, graph_store = stores
 
     doc_id = await meta_store.create_document(
         source_type="manual", title="T", original_content="c", content_hash="hf",
+    )
+    vector_store.add_chunks(
+        chunk_ids=[f"chunk_{doc_id}_0"],
+        embeddings=[[0.9, 0.1]],
+        documents=["벡터 본문"],
+        metadatas=[{"document_id": doc_id, "chunk_index": 0}],
     )
     await graph_store.save_graph_data(doc_id, GraphData(
         entities=[Entity(name="X", entity_type="component")],
         relations=[],
     ))
 
-    llm = AsyncMock()
-    llm.complete = AsyncMock(side_effect=Exception("LLM 서버 다운"))
-
-    result = await _search_graph_with_llm("질의", graph_store, llm)
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_graph_search_reasoning_in_output(stores) -> None:
-    """탐색 근거(reasoning)가 출력에 포함된다."""
-    meta_store, _, graph_store = stores
-
-    doc_id = await meta_store.create_document(
-        source_type="manual", title="T", original_content="c", content_hash="hr",
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0]],
     )
-    await graph_store.save_graph_data(doc_id, GraphData(
-        entities=[Entity(name="Auth", entity_type="service")],
-        relations=[],
-    ))
 
-    llm = _make_llm_client({
-        "should_search": True,
-        "reasoning": "인증 서비스 구조 파악 필요",
-        "search_steps": [{"entity_name": "Auth", "depth": 1, "focus_relations": []}],
-    })
+    # 그래프 저장소 시딩 검색이 예외를 던지는 상황
+    def _boom(*args, **kwargs):
+        raise RuntimeError("그래프 저장소 오류")
 
-    result = await _search_graph_with_llm("인증", graph_store, llm)
-    assert result is not None
-    assert "인증 서비스 구조 파악 필요" in result.text
+    graph_store.search_entities_by_embedding = _boom
+
+    result = await assemble_context(
+        query="질의",
+        meta_store=meta_store,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embed_client,
+        include_graph=True,
+    )
+    assert "벡터 본문" in result
+    assert "그래프 컨텍스트" not in result
 
 
 # --- 유사도 threshold 테스트 ---
@@ -1045,18 +961,14 @@ async def test_assemble_context_attaches_graph_sourced_document(stores) -> None:
         relations=[],
     ))
 
-    embed_client = _make_embedding_client([0.9, 0.1])
-    llm = _make_llm_client({
-        "should_search": True, "reasoning": "x",
-        "search_steps": [
-            {"entity_name": "GraphEntity", "depth": 1, "focus_relations": []},
-        ],
-    })
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0]],
+    )
 
     result = await assemble_context(
         query="GraphEntity 관련",
         meta_store=meta_store, vector_store=vector_store, graph_store=graph_store,
-        embedding_client=embed_client, llm_client=llm,
+        embedding_client=embed_client,
         include_graph=True, similarity_threshold=0.5, max_graph_docs=3,
     )
     assert "## 그래프 연결 문서" in result
@@ -1078,15 +990,13 @@ async def test_assemble_context_graph_doc_overlaps_vector_no_section(stores) -> 
         entities=[Entity(name="EntD", entity_type="service")], relations=[],
     ))
 
-    embed_client = _make_embedding_client([0.9, 0.1])
-    llm = _make_llm_client({
-        "should_search": True, "reasoning": "x",
-        "search_steps": [{"entity_name": "EntD", "depth": 1, "focus_relations": []}],
-    })
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0]],
+    )
 
     result = await assemble_context(
         query="EntD", meta_store=meta_store, vector_store=vector_store,
-        graph_store=graph_store, embedding_client=embed_client, llm_client=llm,
+        graph_store=graph_store, embedding_client=embed_client,
         include_graph=True, max_graph_docs=3,
     )
     assert "## 그래프 연결 문서" not in result
@@ -1115,15 +1025,13 @@ async def test_with_sources_graph_doc_gets_real_similarity(stores) -> None:
         entities=[Entity(name="GEnt", entity_type="service")], relations=[],
     ))
 
-    embed_client = _make_embedding_client([0.9, 0.1])
-    llm = _make_llm_client({
-        "should_search": True, "reasoning": "x",
-        "search_steps": [{"entity_name": "GEnt", "depth": 1, "focus_relations": []}],
-    })
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0]],
+    )
 
     ctx = await assemble_context_with_sources(
         query="GEnt", meta_store=meta_store, vector_store=vector_store,
-        graph_store=graph_store, embedding_client=embed_client, llm_client=llm,
+        graph_store=graph_store, embedding_client=embed_client,
         include_graph=True, similarity_threshold=0.5, max_graph_docs=3,
     )
     graph_source = next(s for s in ctx.sources if s.document_id == doc_graph)
@@ -1391,15 +1299,13 @@ async def test_assemble_context_parent_doc_on_graph_sourced(stores) -> None:
         entities=[Entity(name="PEnt", entity_type="service")], relations=[],
     ))
 
-    embed_client = _make_embedding_client([0.9, 0.1])
-    llm = _make_llm_client({
-        "should_search": True, "reasoning": "x",
-        "search_steps": [{"entity_name": "PEnt", "depth": 1, "focus_relations": []}],
-    })
+    embed_client = _make_embedding_client(
+        [0.9, 0.1], entity_embeddings=[[1.0, 0.0]],
+    )
 
     result = await assemble_context(
         query="PEnt", meta_store=meta_store, vector_store=vector_store,
-        graph_store=graph_store, embedding_client=embed_client, llm_client=llm,
+        graph_store=graph_store, embedding_client=embed_client,
         include_graph=True, similarity_threshold=0.5, max_graph_docs=3,
         parent_doc_enabled=True,
     )

@@ -42,10 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 # 인덱싱 LLM 어휘 단일 출처 — ``graph_vocabulary.py`` 의 llm_body subset.
-# 검색 LLM (``graph_search_planner``) 도 같은 모듈의 어휘를 사용하여 mental
-# model 정합. 어휘 변경 시 graph_vocabulary 한 곳만 갱신하면 양쪽 LLM 에 자동
-# 반영된다 (이전에는 llm_body_extractor 가 자체 _DEFAULT_ 상수를 유지하여
-# graph_vocabulary 와 분기 위험 존재).
+# 어휘 변경 시 graph_vocabulary 한 곳만 갱신하면 자동 반영된다 (이전에는
+# llm_body_extractor 가 자체 _DEFAULT_ 상수를 유지하여 graph_vocabulary 와
+# 분기 위험 존재).
 _DEFAULT_ENTITY_TYPES: tuple[str, ...] = llm_body_entity_type_names()
 _DEFAULT_RELATION_TYPES: tuple[str, ...] = llm_body_relation_type_names()
 

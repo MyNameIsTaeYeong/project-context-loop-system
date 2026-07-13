@@ -751,3 +751,25 @@
   - 향후 과제(비채택): confluence 본문의 코드 심볼 참조 인식(정규식/LLM) → 엣지화, `document_sources` 실제 채우기(`add_document_source` 미호출 상태), 인덱싱측 코드↔문서 명시 링크.
 - **관련 결정**: D-040 (LLM classifier 제거 — 결정론 파이프라인. 본 결정도 검색측 결정론 유지), D-045 (검색 파이프라인 병렬화 — 같은 `context_assembler`/`graph_search_planner` 경로).
 
+
+## D-047: 그래프 검색 단순화 — LLM 플래너 제거, 임베딩 시딩 단일 경로
+
+- **일시**: 2026-07-10
+- **맥락**: `execute_graph_search` 의 복잡도가 설계가 아니라 R1→R2→R3 패치의 지층이라는 분석 (세션 노트 `2026-07-10_search-context-분석-그래프검색-단순화-준비.md`). 시드 이름 임베딩 fallback / always-on 보강(0.6/top-3) / 최후 폴백(0.5/top-5) 3층이 전부 "LLM 플래너가 틀리는 것"을 임베딩 검색으로 수습하는 층이었고, `search_steps`/`focus_relations` 경로는 프로덕션 호출자 없는 죽은 코드, priority 정렬·`GraphRelationRef` 등은 평가 메트릭 지원용이었다. 플래너의 고유 기여(should_search 게이팅, 관계 방향성 인식)도 실효가 없거나 대체 가능.
+- **결정**: LLM 플래너를 제거하고 수렴점이었던 임베딩 시딩 한 층만 남긴다 (D-014 의 임베딩 매칭 접근으로 회귀하되, D-046 의 정규화·브리지 인프라 위에서).
+  - `processor/graph_search.py` (신규): `search_graph(query_embedding, graph_store, *, embedding_client, seed_threshold=0.5, seed_top_k=5)` — 쿼리 임베딩 → `search_entities_by_embedding` → 각 시드 1-hop 확장(`get_neighbors_from_node_id`, 양방향) → `get_edges_between` → 텍스트 포맷 + document_ids. LLM 호출 0회, fallback 0층, 결정적.
+  - "그래프와 무관한 질문" 게이팅: LLM should_search 판단 대신 "threshold 를 넘는 시드 엔티티 없으면 그래프 섹션 생략".
+  - entities 순서: 시드(유사도 내림차순) 우선 → 1-hop 이웃. 평가 rank 메트릭(MRR/NDCG)의 rank-1 이 쿼리 최유사 노드가 되도록.
+  - `processor/graph_search_planner.py` 삭제: `plan_graph_search`/`execute_graph_search`/`GraphSearchPlan`/`SearchStep`/`TargetEntity`/`TargetRelation`/`_render_system_prompt`/`_build_seed_embeddings` 전부 제거.
+  - 호출부 계약 유지: `GraphSearchResult(text, document_ids, entities, relations)` 반환 형태, description 채움(`_natural_description` — 평가 T4 매칭), 엔티티 임베딩 lazy 보완(`build_entity_embeddings`), `document_ids` → `_search_graph_sourced_chunks` 첨부 경로 모두 보존.
+  - `context_assembler.py`: `_search_graph_with_llm` 제거, `_maybe_graph` 의 `llm_client` 가드 제거 — 그래프 탐색이 LLM 없이 동작. `llm_client` 는 이제 HyDE 전용. `graph_planner_seed` 파라미터 제거.
+  - `eval_search.py`: `--planner-seed-base` 플래그·배관 제거. 그래프 탐색이 결정적이므로 absolute-mode 의 플래너 seed 요건도 삭제 (`docs/absolute_score_protocol.md` 갱신).
+- **이유**:
+  - always-on 보강 도입 경위 자체가 "임베딩 검색이 LLM 계획보다 안정적"이라는 증거 — 3층 수습 구조를 수렴점 1층으로 대체.
+  - 검색 1건당 LLM 1회 + 시드 임베딩 배치 1회 호출 제거 → 지연·비용 감소, 평가 재현성은 seed 주입 없이 구조적으로 확보 (D-040 결정론 철학 부합).
+  - threshold/top_k 는 기존 최후 폴백 값(0.5/top-5)으로 시작 — 짧은 엔티티 이름 vs 문장형 쿼리의 임베딩 비대칭으로 그래프 섹션 생략이 잦아질 수 있어 실측 후 조정 여지.
+- **영향**:
+  - 변경: `processor/graph_search.py`(신규), `processor/graph_search_planner.py`(삭제), `mcp/context_assembler.py`, `scripts/eval_search.py`, `docs/absolute_score_protocol.md`, `processor/llm_body_extractor.py`(주석).
+  - 테스트: `test_graph_search_planner.py` 삭제 → `test_graph_search.py` 신규 14건. `test_context_assembler.py` 그래프 테스트를 임베딩 시딩 방식으로 재작성(LLM 없이 그래프 동작 검증 포함), `test_tools.py`/`test_absolute_mode.py` 갱신. 전체 회귀 — 본 변경 신규 실패 0건 (1227 passed, 기존 무관 실패 28건은 베이스 커밋과 동일).
+  - 미제거 잔여: `graph_store.py` 의 `get_schema_summary`/`format_schema_for_llm`/`get_query_relevant_schema`/`format_query_relevant_schema_for_llm` 은 사용처가 사라졌지만 저장소 API 로 보존 (웹 UI 활용 여지, 자체 테스트 유지). `graph_vocabulary` 의 프롬프트 포맷 함수도 동일.
+- **관련 결정**: D-014 (임베딩 매칭 — 본 결정이 사실상 회귀·계승), D-015 (LLM 플래너 도입 — 본 결정으로 폐기), D-040 (결정론 파이프라인), D-046 (seed 해석 정규화 — 임베딩 시딩의 기반).
