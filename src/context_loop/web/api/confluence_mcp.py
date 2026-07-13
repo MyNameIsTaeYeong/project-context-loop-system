@@ -137,20 +137,32 @@ async def connect_confluence_mcp(
 
 
 @router.get("/api/confluence-mcp/health")
-async def health_check(config: Config = Depends(get_config)):
+async def health_check(request: Request, config: Config = Depends(get_config)):
     """MCP 서버 연결 상태를 진단한다.
 
-    설정값, 토큰 존재 여부, 실제 연결 테스트 결과를 반환한다.
+    설정값, 토큰 존재 여부, 자동 싱크 엔진 상태, 실제 연결 테스트 결과를
+    반환한다.
     """
     server_url = config.get("sources.confluence_mcp.server_url", "")
     transport = _get_transport(config)
     token = _get_token()
 
+    engine = getattr(request.app.state, "mcp_sync_engine", None)
     info: dict[str, Any] = {
         "server_url": server_url,
         "transport": transport,
         "token_configured": token is not None,
         "enabled": config.get("sources.confluence_mcp.enabled", False),
+        "auto_sync": {
+            "enabled": config.get("sources.confluence_mcp.auto_sync_enabled", False),
+            "running": engine.is_running if engine else False,
+            "interval_minutes": engine.interval_minutes if engine else None,
+            "last_cycle_at": (
+                engine.last_cycle_at.isoformat()
+                if engine and engine.last_cycle_at
+                else None
+            ),
+        },
     }
 
     if not server_url:
@@ -418,7 +430,7 @@ async def create_sync_target(
     )
 
     background_tasks.add_task(
-        _run_sync_in_background,
+        run_sync_in_background,
         target["id"], config, meta_store, vector_store, graph_store,
         embedding_client, llm_client,
     )
@@ -474,7 +486,7 @@ async def trigger_sync_target(
         raise HTTPException(409, "sync already in progress")
 
     background_tasks.add_task(
-        _run_sync_in_background,
+        run_sync_in_background,
         target_id, config, meta_store, vector_store, graph_store,
         embedding_client, llm_client,
     )
@@ -526,7 +538,7 @@ def _build_pipeline_config(config: Config) -> PipelineConfig:
     )
 
 
-async def _run_sync_in_background(
+async def run_sync_in_background(
     target_id: int,
     config: Config,
     meta_store: MetadataStore,
@@ -535,11 +547,16 @@ async def _run_sync_in_background(
     embedding_client: Embeddings,
     llm_client: LLMClient | None = None,
 ) -> None:
-    """BackgroundTasks 로 호출되는 실제 싱크 러너.
+    """BackgroundTasks · MCPSyncEngine 이 공유하는 실제 싱크 러너.
 
-    Phase 1 (임포트) + Phase 2 (인덱싱) 를 한 BackgroundTask 안에서 순차
-    실행한다. ``embedding_client`` 가 주입되면 Phase 2 가 자동 수행되고,
-    실패 시에는 Phase 1 결과에 영향 없이 ``processing_errors`` 만 채워진다.
+    Phase 1 (임포트) + Phase 2 (인덱싱) 를 한 태스크 안에서 순차 실행한다.
+    ``embedding_client`` 가 주입되면 Phase 2 가 자동 수행되고, 실패 시에는
+    Phase 1 결과에 영향 없이 ``processing_errors`` 만 채워진다.
+
+    수동 버튼 싱크(BackgroundTasks)와 자동 주기 싱크(MCPSyncEngine)가 모두
+    이 함수를 통과하므로, target 단위 락(``_target_locks``)과 진행 상태
+    (``_target_status``)가 두 경로에서 공유된다 — 같은 대상의 중복 실행은
+    여기서 건너뛴다.
     """
     lock = _get_target_lock(target_id)
     if lock.locked():

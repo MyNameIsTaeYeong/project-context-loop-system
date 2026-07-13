@@ -222,12 +222,19 @@ LLM 분석 (문서 구조, 엔티티, 관계 존재 여부 판단)
 
 ### Confluence 자동 동기화
 
-Confluence 소스 문서는 주기적 증분 동기화로 자동 갱신된다.
+Confluence MCP 소스 문서는 `MCPSyncEngine`(`sync/mcp_engine.py`)의 주기적
+증분 재싱크로 자동 갱신된다. `sources.confluence_mcp.auto_sync_enabled`
+토글로 켜며(기본 off), 켜면 웹 앱 기동 시 백그라운드 루프가 시작된다.
 
-- 설정된 주기(`sync_interval_minutes`)마다 변경된 페이지를 감지
-- 변경된 문서만 선별하여 재처리 파이프라인 실행
-- 대시보드에서 수동 동기화 트리거 가능 ("지금 동기화" 버튼)
-- Confluence에서 삭제된 페이지는 로컬 데이터도 함께 정리 (옵션)
+- 설정된 주기(`sources.confluence_mcp.sync_interval_minutes`)마다 등록된
+  모든 싱크 대상을 순차 재싱크 (워터마크 기반 증분 fetch + content hash 판정)
+- 변경된 문서만 선별하여 재처리 파이프라인 실행 (청크 → 임베딩 → 그래프),
+  이전에 인덱싱 실패(`failed`)·LLM 열화(`llm_degraded`)된 문서도 자동 재시도
+- 대시보드에서 수동 동기화 트리거 가능 (싱크 대상 카드의 싱크 버튼) —
+  자동/수동 경로가 target 단위 락을 공유해 중복 실행 없음
+- Confluence에서 삭제된 페이지는 membership diff 로 감지해 로컬 데이터도
+  cascade 정리 (열거가 완전할 때만 — stale prune 가드)
+- 엔진 상태는 `GET /api/confluence-mcp/health` 의 `auto_sync` 필드로 확인
 
 ## 대시보드 화면 구성
 

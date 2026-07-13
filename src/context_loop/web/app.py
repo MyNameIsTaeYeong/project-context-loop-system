@@ -163,6 +163,50 @@ async def _prebuild_entity_embeddings(
         logger.warning("그래프 엔티티 임베딩 사전 구축 실패 (검색 시 lazy 재시도)", exc_info=True)
 
 
+def _build_mcp_sync_engine(
+    config: Config,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Any,
+    llm_client: Any,
+):
+    """설정이 허용하면 MCP 자동 싱크 엔진을 만들어 반환한다 (아니면 None).
+
+    ``sources.confluence_mcp`` 의 ``enabled`` + ``auto_sync_enabled`` 가 모두
+    켜져 있고 ``server_url`` 이 설정된 경우에만 엔진을 만든다. 러너로는
+    수동 버튼 싱크와 동일한 :func:`run_sync_in_background` 를 주입해
+    target 단위 락/진행 상태를 두 경로가 공유하도록 한다.
+    """
+    from context_loop.sync.mcp_engine import MCPSyncEngine
+    from context_loop.web.api.confluence_mcp import run_sync_in_background
+
+    if not config.get("sources.confluence_mcp.enabled", False):
+        return None
+    if not config.get("sources.confluence_mcp.auto_sync_enabled", False):
+        return None
+    if not config.get("sources.confluence_mcp.server_url", ""):
+        logger.warning(
+            "confluence_mcp.auto_sync_enabled 이지만 server_url 미설정 — "
+            "자동 싱크를 시작하지 않습니다.",
+        )
+        return None
+
+    async def _run_target(target_id: int) -> None:
+        await run_sync_in_background(
+            target_id, config, meta_store, vector_store, graph_store,
+            embedding_client, llm_client,
+        )
+
+    return MCPSyncEngine(
+        meta_store,
+        _run_target,
+        interval_minutes=config.get(
+            "sources.confluence_mcp.sync_interval_minutes", 30,
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
@@ -197,9 +241,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # (최초 그래프 검색 시 누락분이 lazy 하게 재시도된다).
     await _prebuild_entity_embeddings(graph_store, embedding_client, config)
 
+    # Confluence MCP 자동 주기 싱크 — auto_sync_enabled 토글이 켜진 경우에만.
+    mcp_sync_engine = _build_mcp_sync_engine(
+        config, meta_store, vector_store, graph_store,
+        embedding_client, llm_client,
+    )
+    app.state.mcp_sync_engine = mcp_sync_engine
+    if mcp_sync_engine is not None:
+        mcp_sync_engine.start()
+
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
 
+    if mcp_sync_engine is not None:
+        await mcp_sync_engine.stop()
     await meta_store.close()
     # 공유 임베딩 HTTP 커넥션 풀 정리 (aclose 미구현 클라이언트는 무시).
     aclose = getattr(embedding_client, "aclose", None)

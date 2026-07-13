@@ -1,9 +1,19 @@
 # 구현 진행 상황
 
 ## 현재 단계
-- **Phase**: Phase 7.19 — 변동성 측정 인프라 + I-046 효과 측정 워크플로 확정
-- **Step**: 같은 source_type 으로 N개 골드셋을 빌드/평가해서 변동성을 잡는 인프라 추가 + 이미 머지된 I-046 (git_code 멀티뷰) 의 효과를 baseline/after 로 측정할 수 있게 SQL hash 우회 방식의 평가 워크플로 확정. 코드 추적으로 doc_id 보존(UPDATE 만, DELETE+INSERT 경로 없음) 과 7단계 재인덱싱 파이프라인 검증 완료.
-- **최신(2026-05-12)**: 브랜치 `claude/fix-multiview-asymmetry-kUoHn`. 커밋 1개 (`54f9d49`).
+- **Phase**: Confluence MCP 자동 주기 재싱크 — `MCPSyncEngine` (2026-07-13)
+- **Step**: 2026-04-23 백엔드 완성 시 후순위로 남겨둔 "자동 주기 실행" 구현. 지금까지 재싱크는 대시보드 버튼 트리거뿐이었고 `sync_interval_minutes` 설정은 어느 코드도 소비하지 않는 죽은 설정이었음 (기존 REST `SyncEngine` 은 어디서도 기동되지 않는 데드 코드 + I-011 로 REST 경로 자체가 사용 불가).
+- **최신(2026-07-13)**: 브랜치 `claude/document-resync-review-cqy2i6`. 세션 로그 `2026-07-13_mcp-auto-sync-engine.md`.
+  1. **`sync/mcp_engine.py::MCPSyncEngine` 신설** — 커널(`execute_sync_target`)/러너 분리 설계 그대로, 대상 1건 싱크 콜러블(`run_target`)만 주입받는 주기 루프. `run_once()` 는 등록된 모든 싱크 대상을 **순차** 실행(대상들이 같은 MCP 서버·임베딩 엔드포인트를 공유하므로 대상 간 병렬화는 rate limit 만 압박), 대상 단위 실패 격리. stop 은 `asyncio.Event` 기반 협조적 종료 — sleep 중이면 즉시 깨어나고, 싱크 진행 중이면 해당 대상까지만 마침(강제 cancel 로 워터마크/membership 이 어중간하게 남지 않도록).
+  2. **웹 러너 공개 승격**: `web/api/confluence_mcp.py` 의 `_run_sync_in_background` → `run_sync_in_background`. 수동 버튼 싱크(BackgroundTasks)와 자동 주기 싱크(엔진)가 같은 함수를 통과 → target 단위 락(`_target_locks`)/진행 상태(`_target_status`)가 두 경로에서 공유되어 중복 실행이 락에서 걸러짐.
+  3. **lifespan 연결** (`web/app.py::_build_mcp_sync_engine`): `sources.confluence_mcp.enabled` + `auto_sync_enabled` + `server_url` 3조건 충족 시에만 엔진 생성·start, 종료 시 `await engine.stop()`. `app.state.mcp_sync_engine` 로 노출.
+  4. **설정**: `sources.confluence_mcp.auto_sync_enabled: false` (기본 off — 기존 동작 무변경), `sync_interval_minutes: 30` 이 처음으로 실제 소비됨. 첫 사이클은 기동 60초 후(엔티티 임베딩 사전 구축과 겹침 방지).
+  5. **관측성**: `GET /api/confluence-mcp/health` 응답에 `auto_sync: {enabled, running, interval_minutes, last_cycle_at}` 추가.
+- 테스트 +6 건 (`tests/test_sync/test_mcp_engine.py` — run_once 전체/빈 목록/실패 격리, start/stop 라이프사이클, stop 즉시성, start 멱등, 사이클 중단). 싱크 42 passed, 전체 1274 passed / 27 사전 실패(테스트 환경 Jinja2·Starlette 픽스처, baseline 동일 — 회귀 없음).
+- **미해결 후속**: git_code 소스 자동 주기 싱크(현재 `POST /api/git-sync/start` 수동뿐, `sources.git.sync_interval_minutes` 여전히 미소비), UI 토글(현재 config 파일로만 제어), REST `SyncEngine`(engine.py) 데드 코드 정리 여부 결정.
+
+## 이전 단계
+- **Phase 7.19(2026-05-12)**: 변동성 측정 인프라 + I-046 효과 측정 워크플로 확정. 같은 source_type 으로 N개 골드셋을 빌드/평가해서 변동성을 잡는 인프라 추가 + 이미 머지된 I-046 (git_code 멀티뷰) 의 효과를 baseline/after 로 측정할 수 있게 SQL hash 우회 방식의 평가 워크플로 확정. 코드 추적으로 doc_id 보존(UPDATE 만, DELETE+INSERT 경로 없음) 과 7단계 재인덱싱 파이프라인 검증 완료. 브랜치 `claude/fix-multiview-asymmetry-kUoHn`. 커밋 1개 (`54f9d49`).
   1. **변동성 측정 인프라**: `scripts/build_synthetic_gold_set.py --n-gold-sets N` (시드 `seed..seed+N-1`, 파일명 `_NNN` 접미사 자동). `scripts/eval_search.py --gold-set-glob "...*.yaml"` (mutually exclusive with `--gold-set`). stores/clients 1회 초기화 후 N개 골드셋 순차 채점. 잡 1개 실패해도 다음 진행. `{label}.aggregate.summary.json` 신규 — mean/std/min/max/n + per-gold-set 세부.
   2. **`aggregate_with_variance()`** (`src/context_loop/eval/metrics.py`): 잡 요약 dict 리스트를 받아 메트릭별 mean/std/min/max/n 산출. 표본 표준편차 (ddof=1) 사용 — 작은 N 에서 편차 과소추정 방지. 결측 키는 가진 잡만 모아 통계.
   3. **I-046 평가 워크플로 확정 (분석 only, 코드 변경 없음)**:
@@ -171,7 +181,7 @@
   - **아키텍처 성질**: `execute_sync_target` 은 session/stores 만 받으면 돌아가는 순수 함수 — BackgroundTasks / 주기 루프 / CLI / 테스트 어디서든 재사용. MetadataStore 는 diff 만 계산, cross-store cascade 는 facade 가 담당 — 두 계층 분리로 재시도·복구 로직 삽입 여지.
   - **남은 작업**
     - I-030: UI 구현 — 검색 박스 + 3버튼(📄 페이지만 / 🌿 하위 포함 / 🏢 공간 전체) 카드 + 확인 다이얼로그(하위 포함 / 공간 전체 / 해제) + 등록된 대상 카드 목록 + 폴링 진행률. `web/templates/confluence_mcp.html` 확장 + vanilla JS.
-    - 자동 주기 실행 — 현재 버튼 트리거만. `MCPSyncEngine` + `auto_sync_enabled` 토글 기반 백그라운드 루프는 후순위. (기존 REST `SyncEngine` 과 별도 클래스, execute_sync_target 재사용)
+    - ~~자동 주기 실행 — 현재 버튼 트리거만. `MCPSyncEngine` + `auto_sync_enabled` 토글 기반 백그라운드 루프는 후순위. (기존 REST `SyncEngine` 과 별도 클래스, execute_sync_target 재사용)~~ → **2026-07-13 구현 완료** (`sync/mcp_engine.py`, 세션 로그 `2026-07-13_mcp-auto-sync-engine.md`)
     - SSE 진행률 — 현재 폴링. 수천 페이지 공간 싱크 UX 개선에 유용하나 필수 아님.
 - 이전 (2026-04-21): Confluence 컨텍스트 추출 고도화 + LLM 기반 분류/추출 제거 (D-039, D-040, D-041).
   - **배경**: Confluence 문서는 Storage Format으로 섹션/링크/코드블록/테이블이 이미 기계 판독 가능한 구조로 들어온다. 그럼에도 파이프라인은 이 구조를 `html_to_markdown()`으로 평탄화해 버리고, 그래프 엣지는 LLM(`graph_extractor`)으로 다시 "추출"해 왔음 — 정보 손실 + 환각 + 토큰 비용의 3중 낭비.
