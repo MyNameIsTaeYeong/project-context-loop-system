@@ -220,14 +220,39 @@ LLM 분석 (문서 구조, 엔티티, 관계 존재 여부 판단)
 - 이전 `storage_method`와 새 `storage_method`가 다를 수 있음 (예: 문서 구조가 바뀌어 chunk → hybrid로 변경)
 - 대시보드 문서 상세 뷰의 **메타데이터 탭**에서 처리 이력 타임라인 확인 가능
 
-### Confluence 자동 동기화
+### 자동 주기 재싱크 (Confluence MCP / git_code)
 
-Confluence 소스 문서는 주기적 증분 동기화로 자동 갱신된다.
+두 소스 모두 `sources.<소스>.auto_sync_enabled` 토글(기본 off)로 주기적
+자동 재싱크를 켤 수 있다. 켜면 웹 앱 기동 시 백그라운드 루프가 시작되어
+`sync_interval_minutes` 주기로 재싱크한다. 주기 루프 공통 로직은
+`sync/periodic.py::PeriodicSyncEngine` (협조적 stop, 사이클 실패 격리).
 
-- 설정된 주기(`sync_interval_minutes`)마다 변경된 페이지를 감지
-- 변경된 문서만 선별하여 재처리 파이프라인 실행
-- 대시보드에서 수동 동기화 트리거 가능 ("지금 동기화" 버튼)
-- Confluence에서 삭제된 페이지는 로컬 데이터도 함께 정리 (옵션)
+**대시보드 UI 토글**: 각 소스 페이지(Confluence MCP / Git Sync)의 스위치로
+서버 재시작 없이 on/off + 주기(분) 변경이 가능하다. 토글 API
+(`POST /api/confluence-mcp/auto-sync`, `POST /api/git-sync/auto-sync`)가
+설정을 config 파일에 영속화하고 `web/app.py::reconfigure_auto_sync` 로
+엔진을 즉시 재기동/중지한다 (기존 엔진에는 비차단 `request_stop()` —
+진행 중 싱크를 기다리지 않으며, 겹침은 러너 가드가 걸러냄).
+
+**Confluence MCP** — `MCPSyncEngine`(`sync/mcp_engine.py`):
+
+- 주기(기본 30분)마다 등록된 모든 싱크 대상을 순차 재싱크
+  (워터마크 기반 증분 fetch + content hash 판정)
+- 변경된 문서만 선별하여 재처리 파이프라인 실행 (청크 → 임베딩 → 그래프),
+  이전에 인덱싱 실패(`failed`)·LLM 열화(`llm_degraded`)된 문서도 자동 재시도
+- 대시보드에서 수동 동기화 트리거 가능 (싱크 대상 카드의 싱크 버튼) —
+  자동/수동 경로가 target 단위 락을 공유해 중복 실행 없음
+- Confluence에서 삭제된 페이지는 membership diff 로 감지해 로컬 데이터도
+  cascade 정리 (열거가 완전할 때만 — stale prune 가드)
+- 엔진 상태는 `GET /api/confluence-mcp/health` 의 `auto_sync` 필드로 확인
+
+**git_code** — `PeriodicSyncEngine` + `web/api/git_sync.py::run_sync_in_background`:
+
+- 주기(기본 60분)마다 설정된 레포 전체를 `CoordinatorAgent.run_and_store()`
+  로 재싱크 (clone/pull → 변경 파일 해시 비교 → 변경분만 재인덱싱)
+- 수동 트리거(`POST /api/git-sync/start`)와 전역 싱크 상태를 공유 —
+  어느 경로든 진행 중이면 상대가 건너뜀
+- 엔진 상태는 `GET /api/git-sync/status` 의 `auto_sync` 필드로 확인
 
 ## 대시보드 화면 구성
 
@@ -237,7 +262,8 @@ Confluence 소스 문서는 주기적 증분 동기화로 자동 갱신된다.
 - 문서별 상태 표시 (원본, 처리 중, 처리 완료, 변경 감지됨)
 - 저장 방식 태그 (chunk / graph / hybrid)
 - 전체 통계 (문서 수, 청크 수, 그래프 노드/엣지 수)
-- Confluence 동기화 상태 및 "지금 동기화" 버튼
+- 동기화 제어(수동 싱크 버튼·자동 재싱크 토글)는 각 소스 페이지
+  (Confluence MCP / Git Sync)에 있음
 
 ### 문서 상세 뷰
 
@@ -417,7 +443,12 @@ sources:
     base_url: "https://yourcompany.atlassian.net"
     email: "user@company.com"
     token_storage: "keyring"              # 토큰은 OS 키체인에 저장
-    sync_interval_minutes: 30             # 증분 동기화 주기
+
+  confluence_mcp:
+    enabled: false
+    server_url: ""                        # MCP 서버 엔드포인트 URL
+    auto_sync_enabled: false              # 주기적 자동 재싱크 (대시보드 토글로도 제어)
+    sync_interval_minutes: 30             # 자동 재싱크 주기(분)
 
 processor:
   chunk_size: 512                         # 청크 토큰 수

@@ -93,6 +93,44 @@ def _get_transport(config: Config) -> str:
     return config.get("sources.confluence_mcp.transport", "http")
 
 
+def parse_interval_minutes(raw: Any) -> int | None:
+    """요청 본문의 interval_minutes 값을 검증한다 (None 이면 변경 없음).
+
+    git_sync 라우터도 같은 검증을 쓴다.
+    """
+    if raw is None:
+        return None
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "interval_minutes 는 정수여야 합니다.")
+    if interval < 1:
+        raise HTTPException(400, "interval_minutes 는 1 이상이어야 합니다.")
+    return interval
+
+
+def _auto_sync_info(config: Config, engine: Any) -> dict[str, Any]:
+    """자동 주기 싱크 상태 dict — health 응답과 토글 API 가 공유한다.
+
+    ``enabled`` 는 config 의 영속 토글 값, ``running`` 은 엔진의 실제 실행
+    여부다. 엔진이 없으면 interval 은 config 값으로 폴백해 UI 프리필에 쓴다.
+    """
+    return {
+        "enabled": config.get("sources.confluence_mcp.auto_sync_enabled", False),
+        "running": engine.is_running if engine else False,
+        "interval_minutes": (
+            engine.interval_minutes
+            if engine
+            else config.get("sources.confluence_mcp.sync_interval_minutes", 30)
+        ),
+        "last_cycle_at": (
+            engine.last_cycle_at.isoformat()
+            if engine and engine.last_cycle_at
+            else None
+        ),
+    }
+
+
 @router.get("/confluence-mcp")
 async def confluence_mcp_page(
     request: Request,
@@ -137,20 +175,23 @@ async def connect_confluence_mcp(
 
 
 @router.get("/api/confluence-mcp/health")
-async def health_check(config: Config = Depends(get_config)):
+async def health_check(request: Request, config: Config = Depends(get_config)):
     """MCP 서버 연결 상태를 진단한다.
 
-    설정값, 토큰 존재 여부, 실제 연결 테스트 결과를 반환한다.
+    설정값, 토큰 존재 여부, 자동 싱크 엔진 상태, 실제 연결 테스트 결과를
+    반환한다.
     """
     server_url = config.get("sources.confluence_mcp.server_url", "")
     transport = _get_transport(config)
     token = _get_token()
 
+    engine = getattr(request.app.state, "mcp_sync_engine", None)
     info: dict[str, Any] = {
         "server_url": server_url,
         "transport": transport,
         "token_configured": token is not None,
         "enabled": config.get("sources.confluence_mcp.enabled", False),
+        "auto_sync": _auto_sync_info(config, engine),
     }
 
     if not server_url:
@@ -172,6 +213,52 @@ async def health_check(config: Config = Depends(get_config)):
         info["message"] = f"{type(exc).__name__}: {exc}"
 
     return info
+
+
+@router.get("/api/confluence-mcp/auto-sync")
+async def get_auto_sync(
+    request: Request,
+    config: Config = Depends(get_config),
+) -> dict[str, Any]:
+    """자동 주기 싱크 상태만 반환한다 (UI 토글용 경량 조회).
+
+    ``/health`` 와 달리 MCP 서버 연결 테스트를 하지 않는다.
+    """
+    engine = getattr(request.app.state, "mcp_sync_engine", None)
+    return {"auto_sync": _auto_sync_info(config, engine)}
+
+
+@router.post("/api/confluence-mcp/auto-sync")
+async def set_auto_sync(
+    request: Request,
+    config: Config = Depends(get_config),
+) -> dict[str, Any]:
+    """자동 주기 싱크를 켜거나 끄고 엔진을 즉시 재기동/중지한다.
+
+    본문: ``{"enabled": bool, "interval_minutes": int | null}``.
+    설정은 config 파일에 영속화되므로 서버 재시작 후에도 유지된다.
+    """
+    from context_loop.web.app import reconfigure_auto_sync
+
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    interval = parse_interval_minutes(body.get("interval_minutes"))
+
+    if enabled and (
+        not config.get("sources.confluence_mcp.enabled", False)
+        or not config.get("sources.confluence_mcp.server_url", "")
+    ):
+        raise HTTPException(
+            400, "Confluence MCP 서버가 설정되지 않았습니다. 먼저 서버에 연결하세요.",
+        )
+
+    config.set("sources.confluence_mcp.auto_sync_enabled", enabled)
+    if interval is not None:
+        config.set("sources.confluence_mcp.sync_interval_minutes", interval)
+    config.save()
+
+    engine = await reconfigure_auto_sync(request.app, "confluence_mcp")
+    return {"auto_sync": _auto_sync_info(config, engine)}
 
 
 @router.get("/api/confluence-mcp/tools")
@@ -418,7 +505,7 @@ async def create_sync_target(
     )
 
     background_tasks.add_task(
-        _run_sync_in_background,
+        run_sync_in_background,
         target["id"], config, meta_store, vector_store, graph_store,
         embedding_client, llm_client,
     )
@@ -474,7 +561,7 @@ async def trigger_sync_target(
         raise HTTPException(409, "sync already in progress")
 
     background_tasks.add_task(
-        _run_sync_in_background,
+        run_sync_in_background,
         target_id, config, meta_store, vector_store, graph_store,
         embedding_client, llm_client,
     )
@@ -526,7 +613,7 @@ def _build_pipeline_config(config: Config) -> PipelineConfig:
     )
 
 
-async def _run_sync_in_background(
+async def run_sync_in_background(
     target_id: int,
     config: Config,
     meta_store: MetadataStore,
@@ -535,11 +622,16 @@ async def _run_sync_in_background(
     embedding_client: Embeddings,
     llm_client: LLMClient | None = None,
 ) -> None:
-    """BackgroundTasks 로 호출되는 실제 싱크 러너.
+    """BackgroundTasks · MCPSyncEngine 이 공유하는 실제 싱크 러너.
 
-    Phase 1 (임포트) + Phase 2 (인덱싱) 를 한 BackgroundTask 안에서 순차
-    실행한다. ``embedding_client`` 가 주입되면 Phase 2 가 자동 수행되고,
-    실패 시에는 Phase 1 결과에 영향 없이 ``processing_errors`` 만 채워진다.
+    Phase 1 (임포트) + Phase 2 (인덱싱) 를 한 태스크 안에서 순차 실행한다.
+    ``embedding_client`` 가 주입되면 Phase 2 가 자동 수행되고, 실패 시에는
+    Phase 1 결과에 영향 없이 ``processing_errors`` 만 채워진다.
+
+    수동 버튼 싱크(BackgroundTasks)와 자동 주기 싱크(MCPSyncEngine)가 모두
+    이 함수를 통과하므로, target 단위 락(``_target_locks``)과 진행 상태
+    (``_target_status``)가 두 경로에서 공유된다 — 같은 대상의 중복 실행은
+    여기서 건너뛴다.
     """
     lock = _get_target_lock(target_id)
     if lock.locked():

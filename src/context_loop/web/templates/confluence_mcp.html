@@ -110,6 +110,23 @@
         <button class="outline" style="width: auto;" @click="loadTargets()" :aria-busy="loadingTargets">새로고침</button>
     </header>
 
+    <!-- 자동 주기 싱크 토글 -->
+    <div class="auto-sync-row">
+        <label style="margin-bottom: 0; display: inline-flex; align-items: center; gap: 0.4rem;">
+            <input type="checkbox" role="switch" :checked="autoSync.enabled"
+                   :disabled="autoSyncBusy" @change="setAutoSync($event.target.checked)">
+            <span>⏰ 자동 재싱크</span>
+        </label>
+        <label style="margin-bottom: 0; display: inline-flex; align-items: center; gap: 0.4rem;">
+            주기(분)
+            <input type="number" min="1" x-model.number="autoSyncInterval"
+                   :disabled="autoSyncBusy" style="width: 6rem; margin-bottom: 0;">
+        </label>
+        <button class="outline" style="width: auto;" x-show="autoSync.enabled"
+                :disabled="autoSyncBusy" @click="setAutoSync(true)">주기 적용</button>
+        <small style="color: var(--pico-muted-color);" x-text="autoSyncStatusText()"></small>
+    </div>
+
     <p x-show="!loadingTargets && targets.length === 0" style="color: var(--pico-muted-color);">
         등록된 싱크 대상이 없습니다. 위에서 검색 후 싱크할 대상을 등록하세요.
     </p>
@@ -383,11 +400,70 @@ function syncTargetsPanel() {
         loadingTargets: false,
         pollTimer: null,
 
+        // 자동 주기 싱크
+        autoSync: { enabled: false, running: false, interval_minutes: null, last_cycle_at: null },
+        autoSyncInterval: 30,
+        autoSyncBusy: false,
+
         // 다이얼로그 상태
         dialog: { type: null, payload: null, busy: false, estimating: false, estimate: null },
 
         async init() {
-            await this.loadTargets();
+            await Promise.all([this.loadTargets(), this.loadAutoSync()]);
+        },
+
+        async loadAutoSync() {
+            try {
+                const r = await fetch('/api/confluence-mcp/auto-sync');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const data = await r.json();
+                this.autoSync = data.auto_sync || this.autoSync;
+                if (this.autoSync.interval_minutes) {
+                    this.autoSyncInterval = Math.round(this.autoSync.interval_minutes);
+                }
+            } catch (e) {
+                // 페이지 로드 시에는 조용히 무시 — 토글 시도 시 에러가 표면화된다.
+            }
+        },
+
+        async setAutoSync(enabled) {
+            this.autoSyncBusy = true;
+            try {
+                const r = await fetch('/api/confluence-mcp/auto-sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        enabled: enabled,
+                        interval_minutes: this.autoSyncInterval || null,
+                    }),
+                });
+                if (!r.ok) {
+                    const d = await r.json().catch(() => ({}));
+                    throw new Error(d.detail || ('HTTP ' + r.status));
+                }
+                const data = await r.json();
+                this.autoSync = data.auto_sync;
+                this._toast(
+                    enabled
+                        ? '자동 재싱크 켜짐 (주기 ' + Math.round(this.autoSync.interval_minutes) + '분)'
+                        : '자동 재싱크 꺼짐',
+                    'success',
+                );
+            } catch (e) {
+                this._toast('자동 싱크 설정 실패: ' + e.message, 'error');
+                await this.loadAutoSync();  // 스위치 상태 원복
+            } finally {
+                this.autoSyncBusy = false;
+            }
+        },
+
+        autoSyncStatusText() {
+            if (!this.autoSync.enabled) return '꺼짐 — 수동 재싱크만 실행됩니다';
+            const parts = ['주기 ' + Math.round(this.autoSync.interval_minutes) + '분'];
+            parts.push(this.autoSync.last_cycle_at
+                ? '마지막 사이클 ' + this.formatRelative(this.autoSync.last_cycle_at)
+                : '첫 사이클 대기 중');
+            return parts.join(' · ');
         },
 
         scopeIcon(scope) {
@@ -399,7 +475,9 @@ function syncTargetsPanel() {
 
         formatRelative(iso) {
             if (!iso) return '';
-            const d = new Date(iso.replace(' ', 'T') + (iso.includes('Z') ? '' : 'Z'));
+            // "+00:00" 같은 오프셋이 이미 있으면 'Z' 를 덧붙이지 않는다.
+            const hasTz = iso.includes('Z') || /[+-]\d{2}:\d{2}$/.test(iso);
+            const d = new Date(iso.replace(' ', 'T') + (hasTz ? '' : 'Z'));
             const diffSec = (Date.now() - d.getTime()) / 1000;
             if (diffSec < 60) return '방금 전';
             if (diffSec < 3600) return Math.floor(diffSec / 60) + '분 전';
@@ -775,6 +853,9 @@ nav ul li a.active {
 .sync-target-status  { grid-area: status; display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
 .sync-target-actions { grid-area: actions; display: flex; flex-direction: column; gap: 0.3rem; align-self: center; }
 .sync-target-actions button { width: auto; padding: 0.3rem 0.7rem; font-size: 0.85rem; margin: 0; }
+.auto-sync-row { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.auto-sync-row button { margin: 0; padding: 0.3rem 0.7rem; font-size: 0.85rem; }
+.auto-sync-row input[type="number"] { padding: 0.2rem 0.5rem; height: auto; }
 
 .scope-badge {
     display: inline-block;

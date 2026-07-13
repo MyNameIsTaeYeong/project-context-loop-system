@@ -80,6 +80,7 @@ class GitSourceConfig:
     """sources.git 전체 설정을 타입 안전하게 관리한다."""
 
     enabled: bool = False
+    auto_sync_enabled: bool = False
     sync_interval_minutes: int = 60
     file_size_limit_kb: int = 500
     supported_extensions: list[str] = field(default_factory=list)
@@ -306,6 +307,7 @@ def load_git_source_config(config: Config) -> GitSourceConfig:
 
     return GitSourceConfig(
         enabled=bool(git_raw.get("enabled", False)),
+        auto_sync_enabled=bool(git_raw.get("auto_sync_enabled", False)),
         sync_interval_minutes=git_raw.get("sync_interval_minutes", 60),
         file_size_limit_kb=git_raw.get("file_size_limit_kb", 500),
         supported_extensions=git_raw.get("supported_extensions") or [],

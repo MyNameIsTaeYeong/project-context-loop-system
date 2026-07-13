@@ -165,10 +165,76 @@ async def sync_documents_partial(
 # ---------------------------------------------------------------------------
 
 
+def _auto_sync_info(config: Config, engine: Any) -> dict[str, Any]:
+    """자동 주기 싱크 상태 dict — status 응답과 토글 API 가 공유한다.
+
+    ``enabled`` 는 config 의 영속 토글 값, ``running`` 은 엔진의 실제 실행
+    여부다. 엔진이 없으면 interval 은 config 값으로 폴백해 UI 프리필에 쓴다.
+    """
+    return {
+        "enabled": config.get("sources.git.auto_sync_enabled", False),
+        "running": engine.is_running if engine else False,
+        "interval_minutes": (
+            engine.interval_minutes
+            if engine
+            else config.get("sources.git.sync_interval_minutes", 60)
+        ),
+        "last_cycle_at": (
+            engine.last_cycle_at.isoformat()
+            if engine and engine.last_cycle_at
+            else None
+        ),
+    }
+
+
 @router.get("/api/git-sync/status")
-async def sync_status_json():
-    """동기화 상태를 JSON으로 반환한다."""
-    return _get_sync_status()
+async def sync_status_json(
+    request: Request,
+    config: Config = Depends(get_config),
+):
+    """동기화 상태 + 자동 주기 싱크 엔진 상태를 JSON으로 반환한다."""
+    engine = getattr(request.app.state, "git_sync_engine", None)
+    return {
+        **_get_sync_status(),
+        "auto_sync": _auto_sync_info(config, engine),
+    }
+
+
+@router.post("/api/git-sync/auto-sync")
+async def set_auto_sync(
+    request: Request,
+    config: Config = Depends(get_config),
+) -> dict[str, Any]:
+    """자동 주기 싱크를 켜거나 끄고 엔진을 즉시 재기동/중지한다.
+
+    본문: ``{"enabled": bool, "interval_minutes": int | null}``.
+    설정은 config 파일에 영속화되므로 서버 재시작 후에도 유지된다.
+    """
+    from context_loop.web.api.confluence_mcp import parse_interval_minutes
+    from context_loop.web.app import reconfigure_auto_sync
+
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    interval = parse_interval_minutes(body.get("interval_minutes"))
+
+    if enabled:
+        git_config = load_git_source_config(config)
+        if not git_config.enabled:
+            raise HTTPException(
+                400,
+                "Git 소스가 비활성화되어 있습니다. "
+                "config.yaml에서 sources.git.enabled를 true로 설정하세요.",
+            )
+        if not git_config.repositories:
+            raise HTTPException(400, "설정된 레포지토리가 없습니다.")
+
+    config.set("sources.git.auto_sync_enabled", enabled)
+    if interval is not None:
+        config.set("sources.git.sync_interval_minutes", interval)
+    config.save()
+
+    engine = await reconfigure_auto_sync(request.app, "git")
+    return {"auto_sync": _auto_sync_info(config, engine)}
 
 
 @router.post("/api/git-sync/start")
@@ -348,3 +414,49 @@ async def _run_sync(
         _sync_status.completed_at = time.time()
         _sync_status.phase = "실패"
         _sync_status.error = str(exc)
+
+
+async def run_sync_in_background(
+    config: Config,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Embeddings,
+    llm_client: LLMClient | None = None,
+) -> bool:
+    """자동 주기 싱크(PeriodicSyncEngine)가 사용하는 싱크 러너.
+
+    수동 트리거(``POST /api/git-sync/start``)와 같은 전역 싱크 상태
+    (``_sync_status``)를 공유한다 — 어느 경로로든 싱크가 진행 중이면 이번
+    사이클은 건너뛰고, 여기서 시작한 싱크는 수동 트리거의 409 가드에도
+    걸린다. 소스가 꺼져 있거나 레포가 없으면 아무 것도 하지 않는다.
+
+    Returns:
+        싱크를 실제로 실행했으면 True, 건너뛰었으면 False.
+    """
+    global _sync_status
+
+    if _sync_status.state == "running":
+        logger.info("git 자동 싱크 건너뜀 — 이미 진행 중")
+        return False
+
+    git_config = load_git_source_config(config)
+    if not git_config.enabled or not git_config.repositories:
+        logger.warning("git 자동 싱크 건너뜀 — 소스 비활성화 또는 레포 미설정")
+        return False
+
+    # 상태 확인(위)과 running 마킹 사이에 await 가 없으므로 단일 이벤트 루프
+    # 안에서 수동 트리거와의 이중 실행은 없다.
+    _sync_status = SyncStatus(
+        state="running",
+        phase="초기화 중...",
+        started_at=time.time(),
+    )
+    await _run_sync(
+        config, meta_store, git_config,
+        vector_store=vector_store,
+        graph_store=graph_store,
+        embedding_client=embedding_client,
+        llm_client=llm_client,
+    )
+    return True

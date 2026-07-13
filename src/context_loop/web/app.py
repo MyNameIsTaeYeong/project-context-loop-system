@@ -163,6 +163,142 @@ async def _prebuild_entity_embeddings(
         logger.warning("그래프 엔티티 임베딩 사전 구축 실패 (검색 시 lazy 재시도)", exc_info=True)
 
 
+def _build_mcp_sync_engine(
+    config: Config,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Any,
+    llm_client: Any,
+):
+    """설정이 허용하면 MCP 자동 싱크 엔진을 만들어 반환한다 (아니면 None).
+
+    ``sources.confluence_mcp`` 의 ``enabled`` + ``auto_sync_enabled`` 가 모두
+    켜져 있고 ``server_url`` 이 설정된 경우에만 엔진을 만든다. 러너로는
+    수동 버튼 싱크와 동일한 :func:`run_sync_in_background` 를 주입해
+    target 단위 락/진행 상태를 두 경로가 공유하도록 한다.
+    """
+    from context_loop.sync.mcp_engine import MCPSyncEngine
+    from context_loop.web.api.confluence_mcp import run_sync_in_background
+
+    if not config.get("sources.confluence_mcp.enabled", False):
+        return None
+    if not config.get("sources.confluence_mcp.auto_sync_enabled", False):
+        return None
+    if not config.get("sources.confluence_mcp.server_url", ""):
+        logger.warning(
+            "confluence_mcp.auto_sync_enabled 이지만 server_url 미설정 — "
+            "자동 싱크를 시작하지 않습니다.",
+        )
+        return None
+
+    async def _run_target(target_id: int) -> None:
+        await run_sync_in_background(
+            target_id, config, meta_store, vector_store, graph_store,
+            embedding_client, llm_client,
+        )
+
+    return MCPSyncEngine(
+        meta_store,
+        _run_target,
+        interval_minutes=config.get(
+            "sources.confluence_mcp.sync_interval_minutes", 30,
+        ),
+    )
+
+
+def _build_git_sync_engine(
+    config: Config,
+    meta_store: MetadataStore,
+    vector_store: VectorStore,
+    graph_store: GraphStore,
+    embedding_client: Any,
+    llm_client: Any,
+):
+    """설정이 허용하면 git_code 자동 싱크 엔진을 만들어 반환한다 (아니면 None).
+
+    ``sources.git`` 의 ``enabled`` + ``auto_sync_enabled`` 가 모두 켜져 있고
+    ``repositories`` 가 설정된 경우에만 엔진을 만든다. 러너로는 수동 트리거
+    (``POST /api/git-sync/start``)와 같은 전역 싱크 상태를 공유하는
+    :func:`run_sync_in_background` 를 주입해 두 경로의 중복 실행을 막는다.
+    """
+    from context_loop.ingestion.git_config import load_git_source_config
+    from context_loop.sync.periodic import PeriodicSyncEngine
+    from context_loop.web.api.git_sync import run_sync_in_background
+
+    git_config = load_git_source_config(config)
+    if not git_config.enabled or not git_config.auto_sync_enabled:
+        return None
+    if not git_config.repositories:
+        logger.warning(
+            "git.auto_sync_enabled 이지만 repositories 미설정 — "
+            "자동 싱크를 시작하지 않습니다.",
+        )
+        return None
+
+    async def _run_cycle() -> bool:
+        return await run_sync_in_background(
+            config, meta_store, vector_store, graph_store,
+            embedding_client, llm_client,
+        )
+
+    return PeriodicSyncEngine(
+        _run_cycle,
+        name="git",
+        interval_minutes=git_config.sync_interval_minutes,
+    )
+
+
+# request_stop 으로 중지 요청만 하고 떠나보낸 옛 엔진들. 진행 중이던 사이클이
+# 끝날 때까지 강한 참조를 유지해 태스크가 GC 로 사라지는 것을 막는다
+# (asyncio 는 pending task 의 강한 참조를 보장하지 않음).
+_draining_engines: set[Any] = set()
+
+_AUTO_SYNC_SOURCES = {
+    "confluence_mcp": ("mcp_sync_engine", _build_mcp_sync_engine),
+    "git": ("git_sync_engine", _build_git_sync_engine),
+}
+
+
+async def reconfigure_auto_sync(app: FastAPI, source: str):
+    """config 의 현재 auto_sync 설정에 맞춰 소스 엔진을 재기동/중지한다.
+
+    UI 토글 API 가 config 를 갱신한 뒤 호출한다. 기존 엔진에는 중지를
+    **요청만** 하고 기다리지 않는다 — 진행 중인 싱크 사이클이 길면 토글
+    응답이 그만큼 막히기 때문. 옛 루프가 사이클을 마무리하는 동안 새
+    엔진이 겹쳐 돌아도, 러너 쪽 가드(MCP: target 단위 락, git: 전역 싱크
+    상태)가 같은 작업의 중복 실행을 걸러낸다.
+
+    Args:
+        app: FastAPI 앱 (state 에 config/stores/clients 보유).
+        source: "confluence_mcp" 또는 "git".
+
+    Returns:
+        새로 기동된 엔진, 설정이 비활성이면 None.
+    """
+    attr, builder = _AUTO_SYNC_SOURCES[source]
+    state = app.state
+
+    old = getattr(state, attr, None)
+    if old is not None:
+        old.request_stop()
+        task = getattr(old, "_task", None)
+        if task is not None and not task.done():
+            _draining_engines.add(old)
+            task.add_done_callback(
+                lambda _t, engine=old: _draining_engines.discard(engine),
+            )
+
+    engine = builder(
+        state.config, state.meta_store, state.vector_store,
+        state.graph_store, state.embedding_client, state.llm_client,
+    )
+    setattr(state, attr, engine)
+    if engine is not None:
+        engine.start()
+    return engine
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
@@ -197,9 +333,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # (최초 그래프 검색 시 누락분이 lazy 하게 재시도된다).
     await _prebuild_entity_embeddings(graph_store, embedding_client, config)
 
+    # 소스별 자동 주기 싱크 — 각 소스의 auto_sync_enabled 토글이 켜진 경우에만.
+    mcp_sync_engine = _build_mcp_sync_engine(
+        config, meta_store, vector_store, graph_store,
+        embedding_client, llm_client,
+    )
+    app.state.mcp_sync_engine = mcp_sync_engine
+    if mcp_sync_engine is not None:
+        mcp_sync_engine.start()
+
+    git_sync_engine = _build_git_sync_engine(
+        config, meta_store, vector_store, graph_store,
+        embedding_client, llm_client,
+    )
+    app.state.git_sync_engine = git_sync_engine
+    if git_sync_engine is not None:
+        git_sync_engine.start()
+
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
 
+    # 기동 시점 로컬 변수가 아니라 app.state 를 본다 — 런타임 UI 토글
+    # (reconfigure_auto_sync)로 엔진이 교체/중지됐을 수 있다.
+    for attr in ("git_sync_engine", "mcp_sync_engine"):
+        engine = getattr(app.state, attr, None)
+        if engine is not None:
+            await engine.stop()
     await meta_store.close()
     # 공유 임베딩 HTTP 커넥션 풀 정리 (aclose 미구현 클라이언트는 무시).
     aclose = getattr(embedding_client, "aclose", None)
