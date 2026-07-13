@@ -32,7 +32,11 @@ from context_loop.processor.graph_vocabulary import (
     llm_body_relation_type_names,
     llm_body_relation_types_vocab,
 )
-from context_loop.processor.llm_client import LLMClient, extract_json
+from context_loop.processor.llm_client import (
+    LLMClient,
+    extract_json,
+    is_context_length_error,
+)
 
 
 class InputTooLargeError(Exception):
@@ -327,6 +331,8 @@ async def extract_llm_body_graph_for_document(
     )
     user = _USER_PROMPT_TEMPLATE.format(doc_title=doc_title, body=body)
 
+    # LLM 호출과 JSON 파싱을 분리한다: 파싱 실패는 컨텍스트 초과가 아니므로
+    # 오분류(폴백 남용)를 막기 위해 별도 try 블록으로 다룬다.
     try:
         response = await llm_client.complete(
             user,
@@ -336,6 +342,21 @@ async def extract_llm_body_graph_for_document(
             reasoning_mode="off",
             purpose="body_extraction_doc",
         )
+    except Exception as exc:
+        if is_context_length_error(exc):
+            # 사전 토큰 가드는 통과했으나 API 레벨 컨텍스트 초과 →
+            # 기존 폴백 계약(InputTooLargeError)에 합류시켜 호출자가
+            # unit 기반 폴백으로 전환하게 한다.
+            raise InputTooLargeError(
+                f"API 컨텍스트 초과 (doc_title={doc_title}): {exc}",
+            ) from exc
+        logger.warning(
+            "문서 단위 LLM 본문 추출 실패 — doc_title=%s", doc_title, exc_info=True,
+        )
+        stats.units_failed = 1
+        return GraphData(), stats
+
+    try:
         payload = extract_json(response)
         if not isinstance(payload, dict):
             raise ValueError(
@@ -343,7 +364,8 @@ async def extract_llm_body_graph_for_document(
             )
     except Exception:
         logger.warning(
-            "문서 단위 LLM 본문 추출 실패 — doc_title=%s", doc_title, exc_info=True,
+            "문서 단위 LLM 본문 추출 응답 파싱 실패 — doc_title=%s",
+            doc_title, exc_info=True,
         )
         stats.units_failed = 1
         return GraphData(), stats

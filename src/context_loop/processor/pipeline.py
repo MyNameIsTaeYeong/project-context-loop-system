@@ -42,6 +42,7 @@ from context_loop.processor.extraction_unit import build_extraction_units
 from context_loop.processor.link_graph_builder import build_link_graph
 from context_loop.processor.llm_body_extractor import (
     InputTooLargeError,
+    LLMBodyExtractionConfig,
     extract_llm_body_graph,
     extract_llm_body_graph_for_document,
 )
@@ -88,6 +89,10 @@ class PipelineConfig:
     #   발생 (문서당 LLM 호출 +1) 이지만 운영 기본 ON.
     max_embedding_tokens: int = 8000
     enable_question_indexing: bool = True
+    # 인덱싱 LLM 입력 토큰 상한. QuestionGenConfig / LLMBodyExtractionConfig 로
+    # 주입되어 문서 단위 1회 호출의 가드 및 R-2/R-3 폴백 전환 기준이 된다.
+    # 기본 200000 = 기존 하드코딩 가드값과 동일(하위 호환).
+    llm_max_input_tokens: int = 200_000
 
 
 async def process_document(
@@ -283,16 +288,21 @@ async def process_document(
                                 doc_title=title,
                                 extracted=extracted,
                                 llm_client=llm_client,
+                                config=QuestionGenConfig(
+                                    max_input_tokens=cfg.llm_max_input_tokens,
+                                ),
                             )
                         )
                         logger.info(
                             "가상 질문 — doc_id=%d, sections=%d→%d, questions=%d, "
-                            "input_tokens≈%d",
+                            "input_tokens≈%d, fallback=%s, batches=%d",
                             document_id,
                             q_stats.sections_total,
                             q_stats.sections_with_questions,
                             q_stats.final_questions,
                             q_stats.input_tokens_estimate,
+                            q_stats.fallback_used,
+                            q_stats.batch_count,
                         )
                     except QuestionInputTooLargeError:
                         logger.info(
@@ -456,12 +466,16 @@ async def process_document(
                     # unit 단위 폴백으로 전환된다.
                     if cfg.enable_llm_body_extraction and llm_client is not None:
                         doc_body = _assemble_document_body(extracted)
+                        body_cfg = LLMBodyExtractionConfig(
+                            max_input_tokens=cfg.llm_max_input_tokens,
+                        )
                         try:
                             llm_graph, llm_stats = (
                                 await extract_llm_body_graph_for_document(
                                     doc_title=title,
                                     body=doc_body,
                                     llm_client=llm_client,
+                                    config=body_cfg,
                                 )
                             )
                             logger.info(
@@ -480,7 +494,10 @@ async def process_document(
                                 len(units),
                             )
                             llm_graph, llm_stats = await extract_llm_body_graph(
-                                units, doc_title=title, llm_client=llm_client,
+                                units,
+                                doc_title=title,
+                                llm_client=llm_client,
+                                config=body_cfg,
                             )
                         if llm_graph.entities:
                             llm_result = await graph_store.save_graph_data(

@@ -630,3 +630,54 @@ async def test_for_document_call_disables_thinking_mode() -> None:
     )
     assert llm.complete.await_args.kwargs.get("reasoning_mode") == "off"
     assert llm.complete.await_args.kwargs.get("purpose") == "body_extraction_doc"
+
+
+# ---------------------------------------------------------------------------
+# 문서 단위 호출 — API 컨텍스트 초과 승격 (R-2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_doc_call_context_error_raises_input_too_large() -> None:
+    """LLM 호출이 API 레벨 컨텍스트 초과를 던지면 InputTooLargeError 로 승격.
+
+    사전 토큰 가드는 통과했지만(작은 body) 서버가 컨텍스트 초과를 반환한
+    경우를 흉내낸다. 승격되면 pipeline 이 unit 폴백으로 전환한다.
+    """
+    mock = AsyncMock()
+    mock.complete = AsyncMock(
+        side_effect=RuntimeError(
+            "This model's maximum context length is 4096 tokens",
+        ),
+    )
+    with pytest.raises(InputTooLargeError):
+        await extract_llm_body_graph_for_document(
+            doc_title="d", body="짧은 본문", llm_client=mock,
+        )
+
+
+@pytest.mark.asyncio
+async def test_doc_call_generic_error_degraded_not_raised() -> None:
+    """컨텍스트와 무관한 일반 예외는 승격하지 않고 degraded 처리."""
+    mock = AsyncMock()
+    mock.complete = AsyncMock(side_effect=Exception("network boom"))
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=mock,
+    )
+    assert g.entities == [] and g.relations == []
+    assert stats.units_failed == 1
+    assert stats.units_called == 0
+
+
+@pytest.mark.asyncio
+async def test_doc_call_json_parse_failure_still_degraded() -> None:
+    """정상 200 응답이나 비-JSON 이면 승격 없이 degraded (파싱 실패 오분류 방지)."""
+    mock = AsyncMock()
+    mock.complete = AsyncMock(return_value="이건 JSON 이 아닙니다")
+    # InputTooLargeError 로 승격되지 않아야 한다 (raise 하지 않음).
+    g, stats = await extract_llm_body_graph_for_document(
+        doc_title="d", body="본문", llm_client=mock,
+    )
+    assert g.entities == [] and g.relations == []
+    assert stats.units_failed == 1
+    assert stats.units_called == 0

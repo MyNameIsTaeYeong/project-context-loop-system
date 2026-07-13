@@ -4,7 +4,20 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from context_loop.processor.llm_client import EndpointLLMClient
+import httpx
+import openai
+
+from context_loop.processor.llm_client import (
+    EndpointLLMClient,
+    is_context_length_error,
+)
+
+
+def _bad_request(message: str, *, body: object = None) -> openai.BadRequestError:
+    """context/token 관련 400 을 흉내내는 openai.BadRequestError 를 만든다."""
+    request = httpx.Request("POST", "http://test/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+    return openai.BadRequestError(message, response=response, body=body)
 
 
 # --- Mock helpers ---
@@ -206,3 +219,45 @@ class TestEndpointLLMClient:
         result = await client.complete("테스트")
 
         assert result == "ab"
+
+
+# ---------------------------------------------------------------------------
+# is_context_length_error (R-2 컨텍스트 초과 판별)
+# ---------------------------------------------------------------------------
+
+
+class TestIsContextLengthError:
+    def test_openai_code(self) -> None:
+        """구조화 code == 'context_length_exceeded' → True."""
+        err = _bad_request("bad", body={"code": "context_length_exceeded"})
+        assert is_context_length_error(err) is True
+
+    def test_openai_nested_error_code(self) -> None:
+        """body['error']['code'] 형태의 중첩 code 도 인정."""
+        err = _bad_request(
+            "some 400", body={"error": {"code": "context_length_exceeded"}},
+        )
+        assert is_context_length_error(err) is True
+
+    def test_vllm_message(self) -> None:
+        """vLLM/OpenAI 호환 서버의 컨텍스트 초과 메시지 → True."""
+        err = _bad_request(
+            "This model's maximum context length is 4096 tokens. However, "
+            "you requested 5000 tokens ... longer than the maximum model length",
+        )
+        assert is_context_length_error(err) is True
+
+    def test_generic_400_false(self) -> None:
+        """컨텍스트와 무관한 400 → False (폴백 남용 방지)."""
+        err = _bad_request("invalid value for parameter 'temperature'")
+        assert is_context_length_error(err) is False
+
+    def test_non_openai_exceptions_false(self) -> None:
+        """openai 예외가 아닌 일반 실패는 False."""
+        assert is_context_length_error(TimeoutError()) is False
+        assert is_context_length_error(ValueError("boom")) is False
+
+    def test_non_openai_but_context_message_true(self) -> None:
+        """호환 래퍼가 비-openai 예외로 감싸도 메시지 마커가 명확하면 True."""
+        exc = RuntimeError("prompt is longer than the maximum model length")
+        assert is_context_length_error(exc) is True

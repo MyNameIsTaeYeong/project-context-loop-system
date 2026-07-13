@@ -37,7 +37,7 @@
 | 1 수집 모듈 | `mcp_confluence.py` (MCP/JSON-RPC) | `git_repository.py` (git CLI subprocess) |
 | 2 전처리 모듈 | `confluence_extractor.py` (BeautifulSoup) | `ast_code_extractor.py` (ast/정규식) |
 | 3 청킹 함수 | `chunk_extracted_document_doclevel` | `to_chunks` (심볼 단위) |
-| LLM 사용 | 가상질문 + LLM 본문그래프 (2곳, 기본 ON) | **없음** (순수 정적) |
+| LLM 사용 | 가상질문 + LLM 본문그래프 (2곳, 기본 ON). 입력 한도는 `llm.max_input_tokens` 설정(기본 200K), 초과 시 배치/unit 폴백 (28e18d3, R-1~R-3) | **없음** (순수 정적) |
 | 그래프 추출 모듈 | `link_graph_builder` + `body_extractor`(+`extraction_unit`) + `llm_body_extractor` | `ast_code_extractor.to_graph_data` |
 | 엔티티 이름 규칙 | self=doc_title, 대상=표시명/정규화 | 심볼=FQN `<file>::<parent>.<name>`, 파일/import=단순명 |
 | SQLite embed_text | 비움(본문=임베딩입력) | 채움(meta_text, 본문≠임베딩입력) |
