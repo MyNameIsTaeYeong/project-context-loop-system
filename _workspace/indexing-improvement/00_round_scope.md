@@ -1,45 +1,70 @@
-# Round 2 Scope — Chunk → Document-level Indexing 전환 검토
+# 라운드 범위 — 128K 컨텍스트 모델 대응 (2026-07-13)
 
-## 사용자 요청 (원문 요지)
+## 배경
 
-> 현재 문서가 큰 경우 청크사이즈로 나눠서 인덱싱을 진행하고 있습니다. 이를 없애고 문서단위로 인덱싱을 진행하는 방안을 검토해주세요. 사용중인 LLM으로 문서단위 인덱싱이 가능할 것 같습니다.
+현재 인덱싱 LLM 호출 2곳(가상 질문 생성, LLM 본문 그래프)은 256K 컨텍스트 모델을
+가정하고 `max_input_tokens=200_000` 하드코딩 가드를 사용한다. 128K 모델 사용 시
+다음 문제가 발생한다 (상세: `_workspace/indexing-analysis/03_llm_usage_in_indexing.md`).
 
-특히 **confluence_mcp**와 **git_code** 두 소스타입 모두에 대해 검토.
+### 확인된 실패 모드 (코드 라인 기준)
 
-## 이번 라운드 핵심 질문
+1. **가드 사각지대**: 출력 예산 `max_tokens=32768` 을 빼면 128K 모델의 실질 입력
+   한도는 ~95K 토큰. 그러나 가드는 200K(tiktoken 추정)에서만 발동
+   (`question_generator.py:61` `QuestionGenConfig.max_input_tokens`,
+   `llm_body_extractor.py:87` `LLMBodyExtractionConfig.max_input_tokens`).
+   → **~95K~200K 구간 문서는 가드 통과 후 API 컨텍스트 초과 에러**.
 
-1. **현재 청킹 사용 위치/이유** — chunker, extraction_unit, ast_code_extractor 가 왜 분할을 하고 있는가? 무엇이 그 분할의 강제 요인인가?
-2. **LLM 컨텍스트 윈도우 충분성** — 현재 `qwen2.5:7b` (32K context) + Ollama 환경에서 평균/최대 문서를 한 번에 처리 가능한가? 임베딩 `nomic-embed-text` (2K~8K) 한도는?
-3. **문서단위 전환 시 영향** — 그래프 추출 품질 / 임베딩 품질 / 비용·속도 / 검색 정밀도 각각에서 +/- 정량 평가
-4. **회피 불가능한 잔여 청킹** — 임베딩 모델 한도, 거대 코드 파일 등 절대 청킹이 필요한 경계 식별
-5. **혼합 전략** — chunk를 완전 제거가 아니라 "기본 = 문서 단위, 한도 초과 = 자동 분할" 형태 가능성
+2. **본문 그래프 폴백 미발동 (역전 현상)**: `pipeline.py:475` 의 unit 폴백은
+   `InputTooLargeError`(사전 토큰 추정)에만 반응. 95K~200K 문서의 API 에러는
+   `extract_llm_body_graph_for_document` 내부 `except Exception`
+   (llm_body_extractor.py:344)이 삼켜 빈 GraphData 반환 → 폴백 없이 그래프 0건.
+   200K 초과 문서는 오히려 unit 폴백으로 그래프가 생성되는 역전.
 
-## 환경 정보 (분석가 전달 사항)
+3. **가상 질문 폴백 부재**: `generate_questions_for_document` 는 입력 초과 시
+   (사전 가드든 API 에러든) 질문 생성이 통째로 스킵됨. 섹션 단위 분할 호출 같은
+   폴백이 없다.
 
-- **LLM**: `qwen2.5:7b` via Ollama (`http://localhost:11434/v1`)
-  - 모델 컨텍스트 윈도우: 32K (Qwen2.5 공식 spec; 단, Ollama `num_ctx` 기본값은 2048이며 override 필요)
-  - 코드에서 사용되는 max_tokens: 32768 (이미 큰 값)
-- **임베딩**: `nomic-embed-text` via Ollama
-  - 컨텍스트 윈도우: 8192 토큰 (공식)
-- **청킹 설정**: `chunk_size=512`, `chunk_overlap=50`
+4. **설정 불가**: 두 `max_input_tokens` 모두 dataclass 기본값이며 pipeline.py 는
+   config 인자 없이 호출 (pipeline.py:281, 460). `config/default.yaml` `llm:`
+   블록에 컨텍스트 한도 항목 없음 → 모델 교체 시 코드 수정 필요.
 
-## 분석가별 추가 지시 사항
+## 이번 라운드 요구사항 (사용자 승인 완료 — 3건)
 
-기본 체크리스트 + 이번 라운드 추가 항목:
+### R-1. `max_input_tokens` 를 config 로 노출
+- `config/default.yaml` `llm:` 블록에 컨텍스트 한도(예: `max_input_tokens` 또는
+  `context_window` + 파생) 추가.
+- 설정값이 `QuestionGenConfig` / `LLMBodyExtractionConfig` 까지 주입되는 배선:
+  app.py(설정 로드) → coordinator / mcp_sync → `process_document` →
+  `generate_questions_for_document(config=...)` /
+  `extract_llm_body_graph_for_document(config=...)`.
+- 기본값은 기존 동작 보존 (미설정 시 200K).
 
-- **chunker 분석가**: "이 청킹을 완전히 제거하고 문서 한 덩이로 임베딩/그래프 추출에 넘기면 어떤 일이 발생하는가? 임베딩 한도, 검색 정밀도, 그래프 LLM 호출 비용 측면에서 분석"
-- **graph 분석가**: "그래프 추출 LLM 호출 시 입력이 청크가 아니라 문서 전체가 되면 cross-unit 엔티티 단절·중복 문제는? 토큰 한도 충돌은? extraction quality(상호 관계 포착) 개선폭은?"
+### R-2. 본문 그래프: API 컨텍스트 초과 에러 → unit 폴백 연결
+- `extract_llm_body_graph_for_document` 가 API 레벨 컨텍스트 초과를 삼키지 않고
+  호출자(pipeline)가 unit 폴백으로 전환할 수 있게 한다.
+- 컨텍스트 초과 판별: openai SDK BadRequestError(400) 중 context/token 관련
+  메시지 식별 (vLLM/OpenAI 호환 서버의 에러 메시지 패턴 고려). 판별 불가한
+  일반 실패는 기존대로 degraded 처리 (폴백 남용 금지).
+- unit 폴백은 기존 `extract_llm_body_graph(units, ...)` 재사용.
 
-## 분석가별 의사결정 권고 포맷
+### R-3. 가상 질문: 입력 초과 시 섹션 분할 호출 폴백
+- 문서 전체가 한도 초과일 때 (사전 가드 or API 에러), 섹션들을 한도 이하
+  배치(batch)로 묶어 여러 번 호출하고 결과 매핑을 병합.
+- 배치 간 중복 질문 제거는 기존 `seen_global` 방식과 일관되게.
+- `max_questions_per_doc` 총량 상한은 문서 전체 기준으로 유지.
+- stats 에 폴백 발생 여부/배치 수 기록.
 
-각 분석가는 보고서 말미에 다음을 명시:
+## 제약
 
-```markdown
-## 문서단위 전환 권고 (이번 라운드 핵심)
+- 기존 테스트 회귀 금지. 신규 동작은 테스트 추가.
+- `scripts/eval_*`, `src/context_loop/eval/*` 는 범위 밖 (별도 하네스 영역).
+- 미설정 시(256K 가정 유지) 기존 동작과 완전히 동일해야 함.
+- 결정성 유지: temperature=0.0, 배치 분할은 결정론적 (섹션 순서 기반).
 
-- **현재 청킹의 진짜 이유**: <코드 근거와 함께>
-- **문서단위 전환 가능성**: ✅ 가능 / ⚠️ 조건부 가능 / ❌ 불가
-- **전환 시 잔여 청킹 필요 케이스**: <리스트>
-- **권고 전환 방식**: chunk 완전 제거 / 하이브리드 / 미전환 — <근거>
-- **예상 영향 (정량 추정)**: 임베딩 호출 N% 감소 / LLM 호출 N건 감소 / 검색 정밀도 영향 ±N
-```
+## 진행 상태
+
+- [x] Phase 0: 범위 확정 (본 문서)
+- [x] Phase A: 분석 — 기존 `_workspace/indexing-analysis/03_llm_usage_in_indexing.md` 로 대체 (스킵)
+- [ ] Phase B: `05_improvement_plan.md`
+- [ ] Phase C: 구현 + `06_implementation_report.md`
+- [ ] Phase D: 검증 + `07_verification_report.md`
