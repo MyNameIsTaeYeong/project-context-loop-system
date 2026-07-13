@@ -262,7 +262,8 @@ LLM 분석 (문서 구조, 엔티티, 관계 존재 여부 판단)
 - 문서별 상태 표시 (원본, 처리 중, 처리 완료, 변경 감지됨)
 - 저장 방식 태그 (chunk / graph / hybrid)
 - 전체 통계 (문서 수, 청크 수, 그래프 노드/엣지 수)
-- Confluence 동기화 상태 및 "지금 동기화" 버튼
+- 동기화 제어(수동 싱크 버튼·자동 재싱크 토글)는 각 소스 페이지
+  (Confluence MCP / Git Sync)에 있음
 
 ### 문서 상세 뷰
 
@@ -442,7 +443,12 @@ sources:
     base_url: "https://yourcompany.atlassian.net"
     email: "user@company.com"
     token_storage: "keyring"              # 토큰은 OS 키체인에 저장
-    sync_interval_minutes: 30             # 증분 동기화 주기
+
+  confluence_mcp:
+    enabled: false
+    server_url: ""                        # MCP 서버 엔드포인트 URL
+    auto_sync_enabled: false              # 주기적 자동 재싱크 (대시보드 토글로도 제어)
+    sync_interval_minutes: 30             # 자동 재싱크 주기(분)
 
 processor:
   chunk_size: 512                         # 청크 토큰 수

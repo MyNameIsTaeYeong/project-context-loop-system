@@ -55,7 +55,7 @@ Context Loop System  ── MCP (stdio/SSE/HTTP) ──  Claude Code / 사내 LL
 1. **웹 API** — `POST /api/git-sync/start`, `POST /api/confluence-mcp/targets/{id}/sync` (`web/api/{git_sync.py, confluence_mcp.py}`)
 2. **CLI** — `scripts/run_git_code_store.py`
 3. **프로그래밍** — `ingestion/coordinator.py`의 `CoordinatorAgent.run_and_store()`
-4. **스케줄** — `sources.*.sync_interval_minutes` (confluence 30분, git 60분)
+4. **스케줄** — `sources.{confluence_mcp,git}.auto_sync_enabled` 토글 기반 자동 주기 싱크 (`sync/periodic.py::PeriodicSyncEngine`, 주기는 `sync_interval_minutes`. 대시보드 UI 토글 및 `POST /api/{confluence-mcp,git-sync}/auto-sync` 로도 제어)
 
 ### 2.3 빈틈
 

@@ -12,9 +12,6 @@
 넘겨, 수동 버튼 싱크와 **동일한 target 단위 락/진행 상태**를 공유한다.
 같은 대상이 이미 싱크 중이면 러너 쪽 락이 실행을 건너뛰므로 엔진은
 중복 실행을 걱정하지 않는다.
-
-기존 REST 기반 :class:`~context_loop.sync.engine.SyncEngine` 과 별개 클래스다
-(D-분리 결정: 세션 수명·도구 셋·에러 타입이 달라 공통화 비용이 분리 비용보다 큼).
 """
 
 from __future__ import annotations

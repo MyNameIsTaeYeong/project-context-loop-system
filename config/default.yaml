@@ -8,7 +8,6 @@ sources:
     base_url: ""
     email: ""
     token_storage: "keyring"
-    sync_interval_minutes: 30
 
   confluence_mcp:
     enabled: false
