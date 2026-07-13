@@ -249,6 +249,56 @@ def _build_git_sync_engine(
     )
 
 
+# request_stop 으로 중지 요청만 하고 떠나보낸 옛 엔진들. 진행 중이던 사이클이
+# 끝날 때까지 강한 참조를 유지해 태스크가 GC 로 사라지는 것을 막는다
+# (asyncio 는 pending task 의 강한 참조를 보장하지 않음).
+_draining_engines: set[Any] = set()
+
+_AUTO_SYNC_SOURCES = {
+    "confluence_mcp": ("mcp_sync_engine", _build_mcp_sync_engine),
+    "git": ("git_sync_engine", _build_git_sync_engine),
+}
+
+
+async def reconfigure_auto_sync(app: FastAPI, source: str):
+    """config 의 현재 auto_sync 설정에 맞춰 소스 엔진을 재기동/중지한다.
+
+    UI 토글 API 가 config 를 갱신한 뒤 호출한다. 기존 엔진에는 중지를
+    **요청만** 하고 기다리지 않는다 — 진행 중인 싱크 사이클이 길면 토글
+    응답이 그만큼 막히기 때문. 옛 루프가 사이클을 마무리하는 동안 새
+    엔진이 겹쳐 돌아도, 러너 쪽 가드(MCP: target 단위 락, git: 전역 싱크
+    상태)가 같은 작업의 중복 실행을 걸러낸다.
+
+    Args:
+        app: FastAPI 앱 (state 에 config/stores/clients 보유).
+        source: "confluence_mcp" 또는 "git".
+
+    Returns:
+        새로 기동된 엔진, 설정이 비활성이면 None.
+    """
+    attr, builder = _AUTO_SYNC_SOURCES[source]
+    state = app.state
+
+    old = getattr(state, attr, None)
+    if old is not None:
+        old.request_stop()
+        task = getattr(old, "_task", None)
+        if task is not None and not task.done():
+            _draining_engines.add(old)
+            task.add_done_callback(
+                lambda _t, engine=old: _draining_engines.discard(engine),
+            )
+
+    engine = builder(
+        state.config, state.meta_store, state.vector_store,
+        state.graph_store, state.embedding_client, state.llm_client,
+    )
+    setattr(state, attr, engine)
+    if engine is not None:
+        engine.start()
+    return engine
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """앱 시작/종료 시 스토어와 모델 클라이언트를 초기화/정리한다."""
@@ -303,10 +353,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("웹 대시보드 스토어 및 모델 클라이언트 초기화 완료.")
     yield
 
-    if git_sync_engine is not None:
-        await git_sync_engine.stop()
-    if mcp_sync_engine is not None:
-        await mcp_sync_engine.stop()
+    # 기동 시점 로컬 변수가 아니라 app.state 를 본다 — 런타임 UI 토글
+    # (reconfigure_auto_sync)로 엔진이 교체/중지됐을 수 있다.
+    for attr in ("git_sync_engine", "mcp_sync_engine"):
+        engine = getattr(app.state, attr, None)
+        if engine is not None:
+            await engine.stop()
     await meta_store.close()
     # 공유 임베딩 HTTP 커넥션 풀 정리 (aclose 미구현 클라이언트는 무시).
     aclose = getattr(embedding_client, "aclose", None)

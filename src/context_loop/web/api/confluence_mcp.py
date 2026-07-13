@@ -93,6 +93,44 @@ def _get_transport(config: Config) -> str:
     return config.get("sources.confluence_mcp.transport", "http")
 
 
+def parse_interval_minutes(raw: Any) -> int | None:
+    """요청 본문의 interval_minutes 값을 검증한다 (None 이면 변경 없음).
+
+    git_sync 라우터도 같은 검증을 쓴다.
+    """
+    if raw is None:
+        return None
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "interval_minutes 는 정수여야 합니다.")
+    if interval < 1:
+        raise HTTPException(400, "interval_minutes 는 1 이상이어야 합니다.")
+    return interval
+
+
+def _auto_sync_info(config: Config, engine: Any) -> dict[str, Any]:
+    """자동 주기 싱크 상태 dict — health 응답과 토글 API 가 공유한다.
+
+    ``enabled`` 는 config 의 영속 토글 값, ``running`` 은 엔진의 실제 실행
+    여부다. 엔진이 없으면 interval 은 config 값으로 폴백해 UI 프리필에 쓴다.
+    """
+    return {
+        "enabled": config.get("sources.confluence_mcp.auto_sync_enabled", False),
+        "running": engine.is_running if engine else False,
+        "interval_minutes": (
+            engine.interval_minutes
+            if engine
+            else config.get("sources.confluence_mcp.sync_interval_minutes", 30)
+        ),
+        "last_cycle_at": (
+            engine.last_cycle_at.isoformat()
+            if engine and engine.last_cycle_at
+            else None
+        ),
+    }
+
+
 @router.get("/confluence-mcp")
 async def confluence_mcp_page(
     request: Request,
@@ -153,16 +191,7 @@ async def health_check(request: Request, config: Config = Depends(get_config)):
         "transport": transport,
         "token_configured": token is not None,
         "enabled": config.get("sources.confluence_mcp.enabled", False),
-        "auto_sync": {
-            "enabled": config.get("sources.confluence_mcp.auto_sync_enabled", False),
-            "running": engine.is_running if engine else False,
-            "interval_minutes": engine.interval_minutes if engine else None,
-            "last_cycle_at": (
-                engine.last_cycle_at.isoformat()
-                if engine and engine.last_cycle_at
-                else None
-            ),
-        },
+        "auto_sync": _auto_sync_info(config, engine),
     }
 
     if not server_url:
@@ -184,6 +213,52 @@ async def health_check(request: Request, config: Config = Depends(get_config)):
         info["message"] = f"{type(exc).__name__}: {exc}"
 
     return info
+
+
+@router.get("/api/confluence-mcp/auto-sync")
+async def get_auto_sync(
+    request: Request,
+    config: Config = Depends(get_config),
+) -> dict[str, Any]:
+    """자동 주기 싱크 상태만 반환한다 (UI 토글용 경량 조회).
+
+    ``/health`` 와 달리 MCP 서버 연결 테스트를 하지 않는다.
+    """
+    engine = getattr(request.app.state, "mcp_sync_engine", None)
+    return {"auto_sync": _auto_sync_info(config, engine)}
+
+
+@router.post("/api/confluence-mcp/auto-sync")
+async def set_auto_sync(
+    request: Request,
+    config: Config = Depends(get_config),
+) -> dict[str, Any]:
+    """자동 주기 싱크를 켜거나 끄고 엔진을 즉시 재기동/중지한다.
+
+    본문: ``{"enabled": bool, "interval_minutes": int | null}``.
+    설정은 config 파일에 영속화되므로 서버 재시작 후에도 유지된다.
+    """
+    from context_loop.web.app import reconfigure_auto_sync
+
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    interval = parse_interval_minutes(body.get("interval_minutes"))
+
+    if enabled and (
+        not config.get("sources.confluence_mcp.enabled", False)
+        or not config.get("sources.confluence_mcp.server_url", "")
+    ):
+        raise HTTPException(
+            400, "Confluence MCP 서버가 설정되지 않았습니다. 먼저 서버에 연결하세요.",
+        )
+
+    config.set("sources.confluence_mcp.auto_sync_enabled", enabled)
+    if interval is not None:
+        config.set("sources.confluence_mcp.sync_interval_minutes", interval)
+    config.save()
+
+    engine = await reconfigure_auto_sync(request.app, "confluence_mcp")
+    return {"auto_sync": _auto_sync_info(config, engine)}
 
 
 @router.get("/api/confluence-mcp/tools")

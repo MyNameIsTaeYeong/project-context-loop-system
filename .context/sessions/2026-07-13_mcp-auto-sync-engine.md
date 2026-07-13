@@ -72,9 +72,43 @@ MCP 와 동일 패턴을 git_code 소스에 적용하면서 주기 루프를 공
 테스트 +10 (`test_periodic.py` 3, `test_git_auto_sync.py` 7).
 전체 1284 passed / 사전 실패 27 동일 — 회귀 없음.
 
+## 3차: UI 토글 (같은 세션 후속 요청)
+
+자동 주기 싱크를 대시보드에서 서버 재시작 없이 on/off + 주기 변경.
+
+1. **API**: `GET/POST /api/confluence-mcp/auto-sync`(GET 은 `/health` 와 달리
+   MCP 연결 테스트 없는 경량 조회), `POST /api/git-sync/auto-sync`.
+   본문 `{enabled, interval_minutes}` → 전제 조건 검증(MCP: 소스 enabled +
+   server_url / git: 소스 enabled + repositories, 아니면 400) → `config.set`
+   + `config.save()` 영속화 → 엔진 재구성 → `auto_sync` 상태 dict 반환.
+   interval 검증(`parse_interval_minutes`)은 confluence_mcp 에 정의하고
+   git_sync 가 임포트(기존 `documents._repo_label` 공유 패턴).
+2. **`web/app.py::reconfigure_auto_sync(app, source)`** — config 현재값에
+   맞춰 엔진 재기동/중지. 기존 엔진에는 `request_stop()`(신규, 비차단)으로
+   중지만 요청 — `stop()` 은 진행 중 사이클을 기다리므로 긴 싱크 중 토글
+   응답이 수 분~수 시간 막힐 수 있음. 옛 루프가 마무리되는 동안 새 엔진과
+   겹쳐 돌아도 러너 가드(MCP: target 락, git: 전역 상태)가 중복 실행을 차단.
+   떠나보낸 엔진은 `_draining_engines` 셋이 태스크 완료까지 강참조 유지
+   (asyncio 는 pending task 강참조를 보장하지 않음 — GC 가드).
+3. **lifespan 종료부 수정**: 기동 시점 로컬 변수 대신 `app.state` 의 엔진을
+   stop — 런타임 토글로 교체된 최신 엔진이 정확히 종료되도록.
+4. **`PeriodicSyncEngine.start()` 가 `_running=True` 즉시 마킹** — 토글
+   응답이 start() 직후 `is_running` 을 읽는데, 태스크 첫 스케줄링 전이라
+   False 로 보이던 문제 해소.
+5. **UI**: `confluence_mcp.html` — Alpine 상태
+   (`autoSync/autoSyncInterval/autoSyncBusy`) + 스위치/주기 입력/주기 적용
+   버튼/상태 텍스트, 실패 시 토스트 + `loadAutoSync()` 로 스위치 원복.
+   `formatRelative` 가 `+00:00` 오프셋 ISO 를 파싱 못 하던 버그 수정.
+   `git_sync.html` — vanilla JS (`loadGitAutoSync`/`setGitAutoSync`) 동일 UX.
+
+테스트 +10 (`tests/test_web/test_auto_sync_api.py` — 토글 왕복, 전제 조건
+400, interval 검증 400, interval 변경 시 엔진 교체, status 노출. 스텁
+Config 는 실제 Config 의 점 경로 get/set 시맨틱을 미러링 — git 경로는
+endpoint 가 점 경로로 set 한 값을 builder 가 중첩 dict 로 읽으므로 평면
+스텁으로는 재현 불가). 전체 1294 passed / 사전 실패 27 동일.
+
 ## 남은 것
 
-- UI 토글 — 현재 config 파일로만 on/off. 대시보드 토글은 후순위.
 - REST `SyncEngine`(`sync/engine.py`) 데드 코드 정리 여부 결정.
 - STATUS 9.9 체크박스 정합 확인 — `git_repository.py::get_changed_files`
   의 git diff 기반 증분 + 변경 없음 조기 종료(`sync_repository`)가 이미

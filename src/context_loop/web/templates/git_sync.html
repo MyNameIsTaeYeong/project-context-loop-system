@@ -123,6 +123,25 @@
 <!-- 2. 동기화 실행 -->
 <article>
     <header><strong>Sync Control</strong></header>
+
+    <!-- 자동 주기 싱크 토글 -->
+    <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
+        <label style="margin-bottom: 0; display: inline-flex; align-items: center; gap: 0.4rem;">
+            <input type="checkbox" role="switch" id="auto-sync-switch"
+                   onchange="setGitAutoSync(this.checked)">
+            <span>⏰ 자동 재싱크</span>
+        </label>
+        <label style="margin-bottom: 0; display: inline-flex; align-items: center; gap: 0.4rem;">
+            주기(분)
+            <input type="number" min="1" id="auto-sync-interval" value="60"
+                   style="width: 6rem; margin-bottom: 0; padding: 0.2rem 0.5rem; height: auto;">
+        </label>
+        <button type="button" class="outline" id="auto-sync-apply"
+                style="width: auto; margin: 0; padding: 0.3rem 0.7rem; font-size: 0.85rem; display: none;"
+                onclick="setGitAutoSync(true)">주기 적용</button>
+        <small id="auto-sync-state" style="color: var(--pico-muted-color);">상태 확인 중…</small>
+    </div>
+
     <div id="sync-status"
          hx-get="/partials/git-sync/status"
          hx-trigger="load"
@@ -130,6 +149,64 @@
         <p aria-busy="true">Loading status...</p>
     </div>
 </article>
+
+<script>
+function renderGitAutoSync(a) {
+    const sw = document.getElementById('auto-sync-switch');
+    const interval = document.getElementById('auto-sync-interval');
+    const apply = document.getElementById('auto-sync-apply');
+    const state = document.getElementById('auto-sync-state');
+    sw.checked = !!a.enabled;
+    if (a.interval_minutes) interval.value = Math.round(a.interval_minutes);
+    apply.style.display = a.enabled ? '' : 'none';
+    if (!a.enabled) {
+        state.textContent = '꺼짐 — 수동 싱크만 실행됩니다';
+    } else {
+        const last = a.last_cycle_at
+            ? '마지막 사이클 ' + new Date(a.last_cycle_at).toLocaleString()
+            : '첫 사이클 대기 중';
+        state.textContent = '주기 ' + Math.round(a.interval_minutes) + '분 · ' + last;
+    }
+}
+
+async function loadGitAutoSync() {
+    try {
+        const r = await fetch('/api/git-sync/status');
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d.auto_sync) renderGitAutoSync(d.auto_sync);
+    } catch (e) { /* 페이지 로드 시에는 조용히 무시 */ }
+}
+
+async function setGitAutoSync(enabled) {
+    const sw = document.getElementById('auto-sync-switch');
+    sw.disabled = true;
+    try {
+        const interval = parseInt(document.getElementById('auto-sync-interval').value, 10);
+        const r = await fetch('/api/git-sync/auto-sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                enabled: enabled,
+                interval_minutes: Number.isFinite(interval) ? interval : null,
+            }),
+        });
+        if (!r.ok) {
+            const d = await r.json().catch(() => ({}));
+            throw new Error(d.detail || ('HTTP ' + r.status));
+        }
+        const d = await r.json();
+        renderGitAutoSync(d.auto_sync);
+    } catch (e) {
+        alert('자동 싱크 설정 실패: ' + e.message);
+        await loadGitAutoSync();  // 스위치 상태 원복
+    } finally {
+        sw.disabled = false;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', loadGitAutoSync);
+</script>
 
 <!-- 3. 생성된 문서 -->
 <article>

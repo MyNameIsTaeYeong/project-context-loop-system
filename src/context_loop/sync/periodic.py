@@ -132,6 +132,9 @@ class PeriodicSyncEngine:
             logger.warning("[%s] 자동 싱크 엔진이 이미 실행 중입니다.", self._name)
             return
         self._stop_event.clear()
+        # 태스크가 첫 스케줄링을 받기 전에도 is_running 이 참이도록 여기서
+        # 미리 마킹한다 — UI 토글 응답이 start() 직후의 상태를 읽는다.
+        self._running = True
         self._task = asyncio.create_task(self._loop())
         logger.info(
             "[%s] 자동 싱크 시작 — 주기: %.0f분, 첫 실행까지: %.0f초",
@@ -140,13 +143,23 @@ class PeriodicSyncEngine:
             self._initial_delay_seconds,
         )
 
+    def request_stop(self) -> None:
+        """중지를 요청하고 즉시 반환한다 (태스크 종료를 기다리지 않음).
+
+        sleep 중이면 루프가 즉시 깨어나 종료하고, 사이클 진행 중이면
+        협조적으로 마무리한 뒤 종료한다. UI 토글처럼 긴 싱크가 끝나기를
+        기다릴 수 없는 호출자용 — 종료를 보장해야 하는 앱 셧다운 경로는
+        :meth:`stop` 을 쓴다.
+        """
+        self._stop_event.set()
+
     async def stop(self) -> None:
         """루프를 중지하고 태스크 종료를 기다린다.
 
         sleep 중이면 즉시 깨워 종료하고, 사이클 진행 중이면 협조적으로
         마무리될 때까지 기다린다 (cancel 하지 않음).
         """
-        self._stop_event.set()
+        self.request_stop()
         if self._task and not self._task.done():
             await self._task
         logger.info("[%s] 자동 싱크 중지됨.", self._name)

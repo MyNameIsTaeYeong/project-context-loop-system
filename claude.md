@@ -227,6 +227,13 @@ LLM 분석 (문서 구조, 엔티티, 관계 존재 여부 판단)
 `sync_interval_minutes` 주기로 재싱크한다. 주기 루프 공통 로직은
 `sync/periodic.py::PeriodicSyncEngine` (협조적 stop, 사이클 실패 격리).
 
+**대시보드 UI 토글**: 각 소스 페이지(Confluence MCP / Git Sync)의 스위치로
+서버 재시작 없이 on/off + 주기(분) 변경이 가능하다. 토글 API
+(`POST /api/confluence-mcp/auto-sync`, `POST /api/git-sync/auto-sync`)가
+설정을 config 파일에 영속화하고 `web/app.py::reconfigure_auto_sync` 로
+엔진을 즉시 재기동/중지한다 (기존 엔진에는 비차단 `request_stop()` —
+진행 중 싱크를 기다리지 않으며, 겹침은 러너 가드가 걸러냄).
+
 **Confluence MCP** — `MCPSyncEngine`(`sync/mcp_engine.py`):
 
 - 주기(기본 30분)마다 등록된 모든 싱크 대상을 순차 재싱크

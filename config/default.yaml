@@ -17,7 +17,7 @@ sources:
     token_storage: "keyring"                # 인증 토큰은 OS keyring에 저장 (x-auth 헤더로 전달)
     auto_sync_enabled: false                # 등록된 싱크 대상 전체를 주기적으로 자동 재싱크
                                             # (enabled + server_url 설정 시에만 동작. 끄면 기존처럼
-                                            # 대시보드 버튼 트리거만 가능)
+                                            # 대시보드 버튼 트리거만 가능. 대시보드 UI 토글로도 변경됨)
     sync_interval_minutes: 30               # 자동 재싱크 주기(분) — auto_sync_enabled 가 켜진 경우
     sync_watermark_margin_minutes: 1440     # 증분 fetch 변경 조회(lastModified CQL) 마진(분).
                                             # CQL 날짜는 인증 사용자 타임존으로 해석되므로 기본
@@ -30,7 +30,7 @@ sources:
     enabled: false
     auto_sync_enabled: false                # 설정된 레포 전체를 주기적으로 자동 재싱크
                                             # (enabled + repositories 설정 시에만 동작. 끄면 기존처럼
-                                            # 대시보드 버튼 트리거만 가능)
+                                            # 대시보드 버튼 트리거만 가능. 대시보드 UI 토글로도 변경됨)
     sync_interval_minutes: 60               # 자동 재싱크 주기(분) — auto_sync_enabled 가 켜진 경우
     file_size_limit_kb: 500                 # 이 크기 초과 파일 제외
     supported_extensions:                   # 처리할 파일 확장자
