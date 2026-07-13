@@ -453,6 +453,63 @@ class EndpointLLMClient(LLMClient):
         return body if isinstance(body, dict) else None
 
 
+# 컨텍스트 초과로 판별되는 에러 메시지 조각 (소문자 부분일치).
+# OpenAI 정식 code + vLLM/OpenAI 호환 서버(TGI 등)의 400 메시지 패턴을 함께 커버.
+_CONTEXT_OVERFLOW_MARKERS: tuple[str, ...] = (
+    "context_length_exceeded",          # OpenAI 정식 error code
+    "maximum context length",           # OpenAI/vLLM 공통 문구
+    "context length",                   # 일반
+    "context window",                   # 일부 호환 서버
+    "reduce the length",                # OpenAI: "Please reduce the length of the messages"
+    "longer than the maximum",          # vLLM: "... is longer than the maximum model length"
+    "maximum model length",             # vLLM 변형
+    "decrease the input",               # 일부 서버
+)
+
+
+def is_context_length_error(exc: BaseException) -> bool:
+    """예외가 LLM 컨텍스트(입력 토큰) 초과인지 판별한다.
+
+    True 조건 (둘 중 하나):
+      1) ``openai.BadRequestError`` (status 400) 이고 구조화 code ==
+         ``"context_length_exceeded"``
+      2) 예외 메시지(및 body message)에 ``_CONTEXT_OVERFLOW_MARKERS`` 중 하나가
+         포함
+
+    판별 불가한 일반 실패(다른 400, 타임아웃, 5xx, 파싱 오류 등)는 False.
+
+    Args:
+        exc: 판별 대상 예외.
+
+    Returns:
+        컨텍스트 초과로 판별되면 True.
+    """
+    try:
+        import openai  # noqa: PLC0415  (지연 import — llm_client 관례와 동일)
+    except Exception:  # pragma: no cover - openai 는 필수 의존성이나 방어적으로 처리
+        openai = None  # type: ignore[assignment]
+
+    # 1) 구조화 코드 (OpenAI 정식)
+    if openai is not None and isinstance(exc, openai.BadRequestError):
+        code = getattr(exc, "code", None)
+        if code == "context_length_exceeded":
+            return True
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error")
+            b_code = err.get("code") if isinstance(err, dict) else body.get("code")
+            if b_code == "context_length_exceeded":
+                return True
+        # 2) 400 이면서 메시지 패턴 매칭
+        msg = (getattr(exc, "message", "") or str(exc)).lower()
+        return any(m in msg for m in _CONTEXT_OVERFLOW_MARKERS)
+
+    # openai 미설치/비-openai 예외라도 메시지 패턴이 명확하면 인정 (호환 래퍼 대비).
+    # 단, BadRequest 컨텍스트가 없으므로 마커 매칭만으로 판단(보수적).
+    msg = str(exc).lower()
+    return any(m in msg for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
 def extract_json(text: str) -> Any:
     """LLM 응답에서 JSON을 추출한다.
 

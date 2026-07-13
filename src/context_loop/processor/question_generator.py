@@ -19,15 +19,28 @@ question-based / multi-vector retrieval 패턴).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from context_loop.ingestion.confluence_extractor import ExtractedDocument
-from context_loop.processor.chunker import count_tokens
-from context_loop.processor.llm_client import LLMClient, extract_json
+from context_loop.processor.chunker import _get_tokenizer, count_tokens
+from context_loop.processor.llm_client import (
+    LLMClient,
+    extract_json,
+    is_context_length_error,
+)
 
 logger = logging.getLogger(__name__)
+
+# 배치 분할 폴백(R-3) 예산 산정 상수 (설정 아님 — 모듈 내부).
+# TEMPLATE_SLACK: 유저 프롬프트 스캐폴딩(제목/지시문 마커) 토큰 여유.
+# SAFETY_MARGIN: 토큰 추정 오차·응답 예산 밖 여유 마진.
+# MIN_BUDGET: 오버헤드가 커도 배치 예산이 0/음수로 무너지지 않게 하한.
+_TEMPLATE_SLACK = 64
+_SAFETY_MARGIN = 1000
+_MIN_BUDGET = 512
 
 
 class InputTooLargeError(Exception):
@@ -76,6 +89,9 @@ class QuestionGenStats:
     llm_failed: bool = False
     input_tokens_estimate: int = 0
     questions_by_section: dict[int, int] = field(default_factory=dict)
+    fallback_used: bool = False   # 섹션 배치 분할 폴백이 사용됐는지 (R-3)
+    batch_count: int = 0          # 폴백 시 배치(LLM 호출) 수. 비폴백=0
+    sections_truncated: int = 0   # 단독 한도 초과로 토큰 절단된 섹션 수
 
 
 _SYSTEM_PROMPT = """\
@@ -156,8 +172,11 @@ async def generate_questions_for_document(
         섹션이 없거나 본문이 비면 빈 dict. ``section_index=-1`` 은 sections
         없는 plain 문서의 가상 질문을 가리킨다.
 
-    Raises:
-        InputTooLargeError: 문서 본문 토큰 수가 ``config.max_input_tokens`` 초과.
+    Note:
+        문서 본문이 ``config.max_input_tokens`` 를 초과하면(사전 가드 또는
+        단일 호출의 API 컨텍스트 초과) 통째 스킵 대신 섹션을 한도 이하 배치로
+        나눠 여러 번 호출하고 병합하는 폴백(R-3)으로 self-heal 한다. 이 경우
+        ``stats.fallback_used=True`` 와 ``stats.batch_count`` 가 채워진다.
     """
     cfg = config or QuestionGenConfig()
     stats = QuestionGenStats()
@@ -170,14 +189,21 @@ async def generate_questions_for_document(
         return {}, stats
 
     stats.sections_total = len(sections_payload)
+    valid_section_indices = {idx for idx, _ in sections_payload}
 
     sections_text = _render_sections_for_prompt(sections_payload)
     input_tokens = count_tokens(sections_text) + count_tokens(doc_title)
     stats.input_tokens_estimate = input_tokens
 
+    # (R-3) 사전 가드 초과 → 통째 스킵/raise 대신 섹션 배치 분할 폴백으로 self-heal.
     if input_tokens > cfg.max_input_tokens:
-        raise InputTooLargeError(
-            f"문서 본문 {input_tokens} 토큰 > 한도 {cfg.max_input_tokens}",
+        return await _run_batched(
+            sections_payload,
+            valid_section_indices,
+            doc_title=doc_title,
+            llm_client=llm_client,
+            cfg=cfg,
+            stats=stats,
         )
 
     user_prompt = _USER_PROMPT_TEMPLATE.format(
@@ -196,10 +222,28 @@ async def generate_questions_for_document(
             reasoning_mode="off",
             purpose="question_generation",
         )
+    except Exception as exc:
+        # (R-3) 단일 전체 호출의 API 레벨 컨텍스트 초과 → 배치 폴백으로 self-heal.
+        if is_context_length_error(exc):
+            return await _run_batched(
+                sections_payload,
+                valid_section_indices,
+                doc_title=doc_title,
+                llm_client=llm_client,
+                cfg=cfg,
+                stats=stats,
+            )
+        logger.warning(
+            "가상 질문 생성 실패 — doc_title=%s", doc_title, exc_info=True,
+        )
+        stats.llm_failed = True
+        return {}, stats
+
+    try:
         payload = extract_json(response)
     except Exception:
         logger.warning(
-            "가상 질문 생성 실패 — doc_title=%s", doc_title, exc_info=True,
+            "가상 질문 응답 파싱 실패 — doc_title=%s", doc_title, exc_info=True,
         )
         stats.llm_failed = True
         return {}, stats
@@ -211,14 +255,59 @@ async def generate_questions_for_document(
         stats.llm_failed = True
         return {}, stats
 
-    valid_section_indices = {idx for idx, _ in sections_payload}
     result: dict[int, list[str]] = {}
     seen_global: set[str] = set()  # 문서 전체 중복 제거 (서로 다른 섹션이 동일 질문)
-    total_emitted = 0
     raw_sections = payload.get("sections")
     if not isinstance(raw_sections, list):
         return {}, stats
 
+    total_emitted = _merge_sections_into(
+        raw_sections,
+        valid_section_indices,
+        result=result,
+        seen_global=seen_global,
+        stats=stats,
+        cfg=cfg,
+        total_emitted=0,
+    )
+
+    stats.final_questions = total_emitted
+    return result, stats
+
+
+# ---------------------------------------------------------------------------
+# 내부
+# ---------------------------------------------------------------------------
+
+
+def _merge_sections_into(
+    raw_sections: list[Any],
+    valid_indices: set[int],
+    *,
+    result: dict[int, list[str]],
+    seen_global: set[str],
+    stats: QuestionGenStats,
+    cfg: QuestionGenConfig,
+    total_emitted: int,
+) -> int:
+    """LLM 응답의 ``sections`` 를 검증·중복제거·상한 적용하여 ``result`` 에 병합.
+
+    단일 호출 경로와 배치 폴백 경로가 공유한다. ``seen_global`` 과
+    ``total_emitted`` 를 배치 간에 이어받아 문서 전체 기준의 중복 제거와
+    ``max_questions_per_doc`` 총량 상한을 유지한다.
+
+    Args:
+        raw_sections: LLM 응답 payload 의 ``sections`` 리스트.
+        valid_indices: 입력에 실제 존재하는 유효 ``section_index`` 집합.
+        result: 병합 대상 (in/out). ``{section_index: [questions]}``.
+        seen_global: 문서 전체 중복 제거용 소문자 키 집합 (in/out).
+        stats: 통계 (in/out).
+        cfg: 옵션.
+        total_emitted: 지금까지 방출된 총 질문 수.
+
+    Returns:
+        갱신된 ``total_emitted``.
+    """
     for sec in raw_sections:
         if not isinstance(sec, dict):
             continue
@@ -227,7 +316,7 @@ async def generate_questions_for_document(
         except (TypeError, ValueError):
             stats.dropped_questions += len(sec.get("questions", []) or [])
             continue
-        if section_index not in valid_section_indices:
+        if section_index not in valid_indices:
             stats.dropped_questions += len(sec.get("questions", []) or [])
             continue
         raw_questions = sec.get("questions") or []
@@ -267,14 +356,182 @@ async def generate_questions_for_document(
             and total_emitted >= cfg.max_questions_per_doc
         ):
             break
+    return total_emitted
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """``text`` 를 앞에서부터 ``max_tokens`` 토큰 이하로 절단한다 (결정론).
+
+    ``count_tokens`` 와 동일한 tiktoken 인코더를 사용해 round-trip 일관성을
+    유지한다. tiktoken 미가용 시 1 char = 1 token 폴백으로 문자 절단.
+    """
+    if max_tokens <= 0:
+        return ""
+    enc = _get_tokenizer()
+    if enc is None:
+        return text[:max_tokens]
+    tokens = enc.encode(text)  # type: ignore[union-attr]
+    if len(tokens) <= max_tokens:
+        return text
+    return enc.decode(tokens[:max_tokens])  # type: ignore[union-attr]
+
+
+def _plan_section_batches(
+    sections_payload: list[tuple[int, str]],
+    *,
+    doc_title: str,
+    cfg: QuestionGenConfig,
+    stats: QuestionGenStats,
+) -> list[list[tuple[int, str]]]:
+    """섹션들을 입력 한도 이하 배치로 나눈다 (결정론 — 문서 순서 유지).
+
+    예산 = ``max_input_tokens - overhead - SAFETY_MARGIN`` (하한 ``MIN_BUDGET``).
+    overhead 는 시스템 프롬프트 + 문서 제목 + 템플릿 스캐폴딩 여유.
+    탐욕적 패킹으로 문서 순서를 유지하며, 단일 섹션이 예산을 넘으면 해당
+    섹션만 단독 배치로 만들되 렌더 텍스트를 예산 이하로 head-절단한다
+    (스킵 대신 절단 — 최소 질문 확보 우선).
+
+    Args:
+        sections_payload: ``[(section_index, rendered_text), ...]`` (문서 순서).
+        doc_title: 문서 제목 (overhead 산정용).
+        cfg: 옵션.
+        stats: 통계 (in/out — ``sections_truncated`` 갱신).
+
+    Returns:
+        배치 리스트. 각 배치는 ``[(section_index, text), ...]``.
+    """
+    overhead = (
+        count_tokens(_SYSTEM_PROMPT) + count_tokens(doc_title) + _TEMPLATE_SLACK
+    )
+    budget = max(cfg.max_input_tokens - overhead - _SAFETY_MARGIN, _MIN_BUDGET)
+
+    batches: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    current_cost = 0
+
+    for idx, text in sections_payload:
+        marker = f"--- section_index={idx} ---\n"
+        cost = count_tokens(marker + text)
+
+        if cost > budget:
+            # 단일 섹션이 예산 초과 → 진행 중 배치 flush 후 단독 절단 배치.
+            if current:
+                batches.append(current)
+                current = []
+                current_cost = 0
+            marker_cost = count_tokens(marker)
+            allowed = max(budget - marker_cost, 0)
+            truncated = _truncate_to_tokens(text, allowed)
+            stats.sections_truncated += 1
+            batches.append([(idx, truncated)])
+            continue
+
+        if current and current_cost + cost > budget:
+            batches.append(current)
+            current = []
+            current_cost = 0
+        current.append((idx, text))
+        current_cost += cost
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def _run_batched(
+    sections_payload: list[tuple[int, str]],
+    valid_indices: set[int],
+    *,
+    doc_title: str,
+    llm_client: LLMClient,
+    cfg: QuestionGenConfig,
+    stats: QuestionGenStats,
+) -> tuple[dict[int, list[str]], QuestionGenStats]:
+    """섹션 배치 분할 폴백 (R-3): 배치별 LLM 호출 후 결과를 순서대로 병합.
+
+    배치는 ``asyncio.gather`` 로 병렬 호출하되, 결과는 입력(문서) 순서대로
+    병합하여 결정성을 유지한다. 배치 하나가 실패해도 다른 배치는 계속하며,
+    모든 배치가 실패하면 ``llm_failed=True`` 로 표시한다.
+    """
+    stats.fallback_used = True
+    stats.llm_called = True
+
+    batches = _plan_section_batches(
+        sections_payload, doc_title=doc_title, cfg=cfg, stats=stats,
+    )
+    stats.batch_count = len(batches)
+    if not batches:
+        stats.final_questions = 0
+        return {}, stats
+
+    async def _call(batch: list[tuple[int, str]]) -> Any:
+        sections_text = _render_sections_for_prompt(batch)
+        user_prompt = _USER_PROMPT_TEMPLATE.format(
+            doc_title=doc_title,
+            n_per_section=cfg.questions_per_section,
+            sections_text=sections_text,
+        )
+        return await llm_client.complete(
+            user_prompt,
+            system=_SYSTEM_PROMPT,
+            max_tokens=cfg.max_output_tokens,
+            temperature=cfg.temperature,
+            reasoning_mode="off",
+            purpose="question_generation",
+        )
+
+    responses = await asyncio.gather(
+        *[_call(b) for b in batches], return_exceptions=True,
+    )
+
+    result: dict[int, list[str]] = {}
+    seen_global: set[str] = set()
+    total_emitted = 0
+    batches_failed = 0
+
+    for response in responses:
+        if isinstance(response, BaseException):
+            batches_failed += 1
+            logger.warning(
+                "가상 질문 배치 호출 실패 — doc_title=%s", doc_title,
+                exc_info=response,
+            )
+            continue
+        try:
+            payload = extract_json(response)
+        except Exception:
+            batches_failed += 1
+            logger.warning(
+                "가상 질문 배치 응답 파싱 실패 — doc_title=%s", doc_title,
+                exc_info=True,
+            )
+            continue
+        if not isinstance(payload, dict):
+            batches_failed += 1
+            continue
+        raw_sections = payload.get("sections")
+        if not isinstance(raw_sections, list):
+            continue
+        total_emitted = _merge_sections_into(
+            raw_sections,
+            valid_indices,
+            result=result,
+            seen_global=seen_global,
+            stats=stats,
+            cfg=cfg,
+            total_emitted=total_emitted,
+        )
+        if (
+            cfg.max_questions_per_doc is not None
+            and total_emitted >= cfg.max_questions_per_doc
+        ):
+            break
+
+    if batches_failed == len(batches):
+        stats.llm_failed = True
 
     stats.final_questions = total_emitted
     return result, stats
-
-
-# ---------------------------------------------------------------------------
-# 내부
-# ---------------------------------------------------------------------------
 
 
 def _assemble_sections_payload(

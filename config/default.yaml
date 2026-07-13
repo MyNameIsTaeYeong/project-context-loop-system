@@ -146,6 +146,12 @@ llm:
   headers: {}                      # 엔드포인트 호출 시 추가 헤더 (예: {X-Org-Id: "abc"})
   api_key_storage: "keyring"       # provider: "openai" | "anthropic"일 때 keyring 사용
   classifier_prompt: "default"
+  # 인덱싱 LLM 호출(가상 질문 생성·LLM 본문 그래프)의 문서 입력 토큰 상한.
+  # 모델 컨텍스트 윈도우에서 출력 예산(약 32768)과 안전 마진을 뺀 값으로 설정한다.
+  #   예) 128K 모델 → 90000,  256K 모델 → 200000.
+  # 이 한도를 넘는 문서는 R-3(가상질문=섹션 배치 분할)·R-2(본문그래프=unit 폴백)로 전환된다.
+  # 미설정 시 200000 (기존 256K 가정 동작과 완전히 동일).
+  max_input_tokens: 200000
 
   # Reasoning(thinking) 프로파일.
   # 호출부는 reasoning_mode="off" 같은 의도만 전달하고, 모델별 실제 페이로드는

@@ -306,6 +306,9 @@ class CoordinatorAgent:
                 embedding_model=self._config.get(
                     "processor.embedding_model", "text-embedding-3-small",
                 ),
+                llm_max_input_tokens=self._config.get(
+                    "llm.max_input_tokens", 200_000,
+                ),
             )
 
             result = await process_document(

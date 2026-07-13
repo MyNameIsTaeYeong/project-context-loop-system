@@ -522,6 +522,7 @@ def _build_pipeline_config(config: Config) -> PipelineConfig:
         embedding_model=config.get(
             "processor.embedding_model", "text-embedding-3-small",
         ),
+        llm_max_input_tokens=config.get("llm.max_input_tokens", 200_000),
     )
 
 

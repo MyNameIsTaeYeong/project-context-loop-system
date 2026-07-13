@@ -1263,3 +1263,100 @@ async def test_git_code_never_degraded(store: MetadataStore) -> None:
     assert result["llm_degraded"] is False
     doc = await store.get_document(doc_id)
     assert doc["llm_degraded"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R-1 — PipelineConfig.llm_max_input_tokens 주입 배선
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pipeline_injects_llm_max_input_tokens_to_question_cfg(
+    store: MetadataStore,
+) -> None:
+    """PipelineConfig.llm_max_input_tokens 가 QuestionGenConfig 로 주입된다."""
+    from context_loop.processor.chunker import Chunk
+    from context_loop.processor.question_generator import QuestionGenStats
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    fake_chunks = [
+        Chunk(
+            id="chunk-1", index=0, content="본문", token_count=5,
+            section_path="", section_anchor="", section_index=None,
+        ),
+    ]
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=fake_chunks,
+    ), patch(
+        "context_loop.processor.pipeline.generate_questions_for_document",
+        new=AsyncMock(return_value=({}, QuestionGenStats())),
+    ) as mock_q:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(
+                llm_max_input_tokens=123,
+                enable_question_indexing=True,
+                enable_llm_body_extraction=False,
+            ),
+            llm_client=llm_client,
+        )
+
+    mock_q.assert_awaited_once()
+    passed_cfg = mock_q.await_args.kwargs["config"]
+    assert passed_cfg.max_input_tokens == 123
+
+
+@pytest.mark.asyncio
+async def test_pipeline_injects_llm_max_input_tokens_to_body_cfg(
+    store: MetadataStore,
+) -> None:
+    """llm_max_input_tokens 가 문서 단위 + unit 폴백 LLMBodyExtractionConfig 로 주입."""
+    from context_loop.processor.llm_body_extractor import (
+        InputTooLargeError,
+        LLMBodyExtractionStats,
+    )
+
+    doc_id = await _create_confluence_doc(store, raw_content=CONFLUENCE_HTML)
+    vector_store, graph_store, embedding_client = _make_stores()
+    llm_client = AsyncMock()
+
+    with patch(
+        "context_loop.processor.pipeline.chunk_extracted_document_doclevel",
+        return_value=[],
+    ), patch(
+        "context_loop.processor.pipeline.extract_body_graph",
+        return_value=GraphData(),
+    ), patch(
+        # 문서 단위 호출 → InputTooLargeError 로 unit 폴백을 유도
+        "context_loop.processor.pipeline.extract_llm_body_graph_for_document",
+        new=AsyncMock(side_effect=InputTooLargeError("too big")),
+    ) as mock_doc, patch(
+        "context_loop.processor.pipeline.extract_llm_body_graph",
+        new=AsyncMock(return_value=(GraphData(), LLMBodyExtractionStats())),
+    ) as mock_unit:
+        await process_document(
+            doc_id,
+            meta_store=store,
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_client=embedding_client,
+            config=PipelineConfig(
+                llm_max_input_tokens=123,
+                enable_question_indexing=False,
+                enable_llm_body_extraction=True,
+            ),
+            llm_client=llm_client,
+        )
+
+    # 문서 단위 호출과 unit 폴백 모두 동일 한도의 config 를 받는다
+    assert mock_doc.await_args.kwargs["config"].max_input_tokens == 123
+    assert mock_unit.await_args.kwargs["config"].max_input_tokens == 123

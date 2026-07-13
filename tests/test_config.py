@@ -27,6 +27,12 @@ def test_user_config_override(tmp_path: Path) -> None:
     assert config.get("app.data_dir") == "~/.context-loop/data"
 
 
+def test_default_llm_max_input_tokens(tmp_path: Path) -> None:
+    """인덱싱 LLM 입력 토큰 상한 기본값이 200000 (기존 동작 보존)."""
+    config = Config(config_path=tmp_path / "nonexistent.yaml")
+    assert config.get("llm.max_input_tokens") == 200000
+
+
 def test_get_missing_key_returns_default(tmp_path: Path) -> None:
     """존재하지 않는 키에 대해 기본값을 반환하는지 확인한다."""
     config = Config(config_path=tmp_path / "nonexistent.yaml")

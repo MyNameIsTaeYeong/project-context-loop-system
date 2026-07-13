@@ -489,6 +489,7 @@ async def _run_pipeline(
             chunk_size=config.get("processor.chunk_size", 512),
             chunk_overlap=config.get("processor.chunk_overlap", 50),
             embedding_model=config.get("processor.embedding_model", "text-embedding-3-small"),
+            llm_max_input_tokens=config.get("llm.max_input_tokens", 200_000),
         )
 
         await process_document(
