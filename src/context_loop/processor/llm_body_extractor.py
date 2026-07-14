@@ -27,6 +27,9 @@ from context_loop.processor.chunker import count_tokens
 from context_loop.processor.extraction_unit import ExtractionUnit
 from context_loop.processor.graph_extractor import Entity, GraphData, Relation
 from context_loop.processor.graph_vocabulary import (
+    canonical_entity_type,
+    canonical_relation,
+    canonical_relation_type,
     llm_body_entity_type_names,
     llm_body_entity_types_vocab,
     llm_body_relation_type_names,
@@ -201,8 +204,10 @@ async def extract_llm_body_graph(
     # 관계: (source_lower, target_lower, type) → Relation (link_graph_builder 패턴)
     relations: dict[tuple[str, str, str], Relation] = {}
 
-    allowed_etypes = set(cfg.allowed_entity_types)
-    allowed_rtypes = set(cfg.allowed_relation_types)
+    # allowed 집합도 canonical 로 정규화 — config 가 alias 이름(uses 등)으로
+    # override 되어 있어도 canonical 정규화된 출력과 일관되게 매칭된다.
+    allowed_etypes = {canonical_entity_type(t) for t in cfg.allowed_entity_types}
+    allowed_rtypes = {canonical_relation_type(t) for t in cfg.allowed_relation_types}
 
     for unit, payload in results:
         if payload is None:
@@ -222,7 +227,8 @@ async def extract_llm_body_graph(
                 stats.dropped_entities += 1
                 continue
             name = str(ent.get("name", "")).strip()
-            etype = str(ent.get("type", "")).strip()
+            # LLM 이 구 어휘(alias)로 답해도 canonical 로 수렴시켜 수용한다.
+            etype = canonical_entity_type(str(ent.get("type", "")).strip())
             if not name or etype not in allowed_etypes:
                 stats.dropped_entities += 1
                 continue
@@ -244,6 +250,8 @@ async def extract_llm_body_graph(
             src = str(rel.get("source", "")).strip()
             tgt = str(rel.get("target", "")).strip()
             rtype = str(rel.get("type", "")).strip()
+            # alias 정규화 — 역방향 alias(documented_in)는 src/tgt 교환.
+            rtype, src, tgt = canonical_relation(rtype, src, tgt)
             if (
                 not src or not tgt or rtype not in allowed_rtypes
                 or src.lower() not in unit_valid_entity_names
@@ -377,8 +385,9 @@ async def extract_llm_body_graph_for_document(
     stats.raw_entities = len(raw_entities)
     stats.raw_relations = len(raw_relations)
 
-    allowed_etypes = set(cfg.allowed_entity_types)
-    allowed_rtypes = set(cfg.allowed_relation_types)
+    # allowed 집합/LLM 출력 모두 canonical 로 정규화 (unit 단위 경로와 동일).
+    allowed_etypes = {canonical_entity_type(t) for t in cfg.allowed_entity_types}
+    allowed_rtypes = {canonical_relation_type(t) for t in cfg.allowed_relation_types}
 
     entities: dict[tuple[str, str], Entity] = {}
     valid_names: set[str] = set()
@@ -388,7 +397,7 @@ async def extract_llm_body_graph_for_document(
             stats.dropped_entities += 1
             continue
         name = str(ent.get("name", "")).strip()
-        etype = str(ent.get("type", "")).strip()
+        etype = canonical_entity_type(str(ent.get("type", "")).strip())
         if not name or etype not in allowed_etypes:
             stats.dropped_entities += 1
             continue
@@ -408,6 +417,8 @@ async def extract_llm_body_graph_for_document(
         src = str(rel.get("source", "")).strip()
         tgt = str(rel.get("target", "")).strip()
         rtype = str(rel.get("type", "")).strip()
+        # alias 정규화 — 역방향 alias(documented_in)는 src/tgt 교환.
+        rtype, src, tgt = canonical_relation(rtype, src, tgt)
         if (
             not src or not tgt or rtype not in allowed_rtypes
             or src.lower() not in valid_names

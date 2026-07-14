@@ -216,6 +216,7 @@ async def test_search_graph_description_fallback_relation_summary(
             Entity(name="Down", entity_type="component", description=""),
         ],
         relations=[
+            # uses 는 alias — 저장 시 depends_on 으로 정규화된다.
             Relation(source="Hub", target="Down", relation_type="uses"),
         ],
     ))
@@ -228,7 +229,7 @@ async def test_search_graph_description_fallback_relation_summary(
     by_name = {e.name: e for e in result.entities}
     hub_desc = by_name["Hub"].description
     assert "Down" in hub_desc
-    assert "uses" in hub_desc
+    assert "depends_on" in hub_desc
 
 
 @pytest.mark.asyncio

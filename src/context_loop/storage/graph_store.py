@@ -18,6 +18,10 @@ from typing import Any
 import networkx as nx
 
 from context_loop.processor.graph_extractor import GraphData
+from context_loop.processor.graph_vocabulary import (
+    canonical_entity_type,
+    canonical_relation,
+)
 from context_loop.storage.entity_normalizer import normalize_entity_name
 from context_loop.storage.metadata_store import MetadataStore
 
@@ -190,6 +194,10 @@ class GraphStore:
         for entity in graph_data.entities:
             props = {"description": entity.description} if entity.description else {}
 
+            # 어휘 alias 정규화 — 동의어 entity_type(struct→class 등)이
+            # (name, entity_type) 병합 키를 분열시키지 않도록 canonical 로 수렴.
+            entity_type = canonical_entity_type(entity.entity_type)
+
             # R3: 정규화 키 산출 — graph_store 측에서 정규화하여 metadata_store
             # 에 전달 (책임 분리: storage 레이어는 입력 키를 그대로 신뢰). 같은
             # 키를 신규 노드 INSERT 시에도 재사용해 머지/생성 양쪽이 일관된
@@ -199,7 +207,7 @@ class GraphStore:
             # 기존 정규 노드 검색 (정규화 키 기반)
             existing = await self._store.find_graph_node_by_entity(
                 entity.name,
-                entity.entity_type,
+                entity_type,
                 normalized_name=normalized,
             )
 
@@ -224,7 +232,7 @@ class GraphStore:
                     self._graph.add_node(
                         node_id,
                         entity_name=entity.name,
-                        entity_type=entity.entity_type,
+                        entity_type=entity_type,
                         document_ids={document_id},
                         properties=existing_props,
                     )
@@ -249,7 +257,7 @@ class GraphStore:
                 node_id = await self._store.create_graph_node_with_link(
                     document_id=document_id,
                     entity_name=entity.name,
-                    entity_type=entity.entity_type,
+                    entity_type=entity_type,
                     properties=json.dumps(props, ensure_ascii=False),
                     normalized_name=normalized,
                 )
@@ -257,7 +265,7 @@ class GraphStore:
                 self._graph.add_node(
                     node_id,
                     entity_name=entity.name,
-                    entity_type=entity.entity_type,
+                    entity_type=entity_type,
                     document_ids={document_id},
                     properties=props,
                 )
@@ -274,20 +282,25 @@ class GraphStore:
 
         edge_count = 0
         for relation in graph_data.relations:
-            src_id = name_to_node_id.get(relation.source)
-            tgt_id = name_to_node_id.get(relation.target)
+            # 어휘 alias 정규화 — 동의어 relation_type 을 canonical 로 수렴하고,
+            # 역방향 alias(documented_in)는 source/target 을 교환한다.
+            rel_type, rel_source, rel_target = canonical_relation(
+                relation.relation_type, relation.source, relation.target,
+            )
+            src_id = name_to_node_id.get(rel_source)
+            tgt_id = name_to_node_id.get(rel_target)
             if src_id is None or tgt_id is None:
                 logger.debug(
                     "관계 스킵 (엔티티 없음): %s → %s",
-                    relation.source,
-                    relation.target,
+                    rel_source,
+                    rel_target,
                 )
                 continue
             # 동일 엣지 중복 방지 (같은 src, tgt, relation_type, document_id)
             existing_edge = False
             if self._graph.has_edge(src_id, tgt_id):
                 edge_data = self._graph.edges[src_id, tgt_id]
-                if (edge_data.get("relation_type") == relation.relation_type
+                if (edge_data.get("relation_type") == rel_type
                         and edge_data.get("document_id") == document_id):
                     existing_edge = True
             if existing_edge:
@@ -298,14 +311,14 @@ class GraphStore:
                 document_id=document_id,
                 source_node_id=src_id,
                 target_node_id=tgt_id,
-                relation_type=relation.relation_type,
+                relation_type=rel_type,
                 properties=json.dumps(props, ensure_ascii=False),
             )
             self._graph.add_edge(
                 src_id,
                 tgt_id,
                 id=edge_id,
-                relation_type=relation.relation_type,
+                relation_type=rel_type,
                 document_id=document_id,
                 properties=props,
             )

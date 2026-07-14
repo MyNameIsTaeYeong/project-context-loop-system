@@ -11,11 +11,18 @@ from context_loop.processor.body_extractor import (
     BodyExtractionConfig,  # noqa: F401  (어휘 검증용 import 유지)
 )
 from context_loop.processor.graph_vocabulary import (
+    ENTITY_TYPE_ALIASES,
     ENTITY_TYPES,
     INTENT_TO_RELATIONS,
+    RELATION_TYPE_ALIASES,
     RELATION_TYPES,
     all_entity_type_names,
+    all_known_entity_type_names,
+    all_known_relation_type_names,
     all_relation_type_names,
+    canonical_entity_type,
+    canonical_relation,
+    canonical_relation_type,
     format_entity_types_for_prompt,
     format_intent_mapping_for_prompt,
     format_relation_types_for_prompt,
@@ -31,9 +38,13 @@ from context_loop.processor.llm_body_extractor import (
 
 
 def test_link_graph_vocab_subset_of_vocabulary() -> None:
-    """link_graph_builder 의 어휘는 모두 graph_vocabulary 에 정의되어 있어야 한다."""
-    entity_names = all_entity_type_names()
-    relation_names = all_relation_type_names()
+    """link_graph_builder 의 어휘는 canonical 또는 alias 로 정의되어 있어야 한다.
+
+    결정론 추출기는 자체 상수(mentions_user 등)를 그대로 emit 하고 GraphStore
+    저장 시점에 alias 정규화되므로, canonical ∪ alias 포함이면 충분하다.
+    """
+    entity_names = all_known_entity_type_names()
+    relation_names = all_known_relation_type_names()
     assert set(_KIND_TO_ENTITY_TYPE.values()) <= entity_names
     assert set(_KIND_TO_RELATION_TYPE.values()) <= relation_names
     # link_graph_builder 의 self entity 도 포함
@@ -58,8 +69,9 @@ def test_ast_code_vocab_subset_of_vocabulary() -> None:
         "module", "function", "class", "method", "struct", "interface",
     }
     expected_rtypes = {"imports", "contains"}
-    missing_e = expected_etypes - all_entity_type_names()
-    missing_r = expected_rtypes - all_relation_type_names()
+    # struct 는 alias(→class) — canonical ∪ alias 포함이면 저장 시 정규화된다.
+    missing_e = expected_etypes - all_known_entity_type_names()
+    missing_r = expected_rtypes - all_known_relation_type_names()
     assert not missing_e, f"ast_code entity_type 누락: {missing_e}"
     assert not missing_r, f"ast_code relation_type 누락: {missing_r}"
 
@@ -68,10 +80,11 @@ def test_body_extractor_vocab_subset_of_vocabulary() -> None:
     """body_extractor 가 emit 하는 entity_type / relation_type 도 포함."""
     # body_extractor 는 mentions, documents, has_attribute, mentions_ticket 4종.
     # entity 측은 concept, api, ticket, document.
+    # has_attribute(→contains) / mentions_ticket(→mentions) 은 alias.
     expected_etypes = {"concept", "api", "ticket", "document"}
     expected_rtypes = {"mentions", "documents", "has_attribute", "mentions_ticket"}
-    assert expected_etypes <= all_entity_type_names()
-    assert expected_rtypes <= all_relation_type_names()
+    assert expected_etypes <= all_known_entity_type_names()
+    assert expected_rtypes <= all_known_relation_type_names()
 
 
 def test_no_duplicate_vocab_entries() -> None:
@@ -154,3 +167,63 @@ def test_format_vocab_entries_for_prompt_includes_descriptions() -> None:
     for entry in vocab:
         assert f"**{entry.name}**" in text
         assert entry.description in text
+
+
+# --- alias 정규화 테스트 ---
+
+
+def test_alias_targets_exist_and_keys_are_not_canonical() -> None:
+    """alias 의 canonical 대상은 어휘에 존재하고, alias 키는 canonical 어휘와
+    겹치면 안 된다 (겹치면 정규화가 무한 순환하거나 의미가 모호해진다)."""
+    entity_names = all_entity_type_names()
+    relation_names = all_relation_type_names()
+
+    for alias, canonical in ENTITY_TYPE_ALIASES.items():
+        assert canonical in entity_names, f"entity alias 대상 누락: {canonical}"
+        assert alias not in entity_names, f"entity alias 키가 canonical 과 겹침: {alias}"
+
+    for alias, entry in RELATION_TYPE_ALIASES.items():
+        assert entry.canonical in relation_names, (
+            f"relation alias 대상 누락: {entry.canonical}"
+        )
+        assert alias not in relation_names, (
+            f"relation alias 키가 canonical 과 겹침: {alias}"
+        )
+
+
+def test_canonical_entity_type_normalizes_and_passes_through() -> None:
+    assert canonical_entity_type("struct") == "class"
+    assert canonical_entity_type("policy") == "concept"
+    # canonical / 미지 타입은 그대로
+    assert canonical_entity_type("system") == "system"
+    assert canonical_entity_type("custom_kind") == "custom_kind"
+
+
+def test_canonical_relation_normalizes_synonyms() -> None:
+    assert canonical_relation("has_part", "A", "B") == ("contains", "A", "B")
+    assert canonical_relation("has_attribute", "A", "B") == ("contains", "A", "B")
+    assert canonical_relation("uses", "A", "B") == ("depends_on", "A", "B")
+    assert canonical_relation("mentions_user", "Doc", "Kim") == (
+        "mentions", "Doc", "Kim",
+    )
+    # canonical / 미지 타입은 그대로
+    assert canonical_relation("calls", "A", "B") == ("calls", "A", "B")
+    assert canonical_relation("owns", "A", "B") == ("owns", "A", "B")
+
+
+def test_canonical_relation_swaps_inverse_direction() -> None:
+    """documented_in(A, B) ≡ documents(B, A) — 방향이 canonical 로 통일된다."""
+    assert canonical_relation("documented_in", "PaymentAPI", "설계문서") == (
+        "documents", "설계문서", "PaymentAPI",
+    )
+    assert canonical_relation_type("documented_in") == "documents"
+
+
+def test_intent_mapping_covers_only_canonical_relations() -> None:
+    """의도 매핑에 alias 이름이 남아 있으면 안 된다 — 검색 가이드는 저장된
+    canonical 어휘만 참조해야 한다."""
+    for _intent, rels in INTENT_TO_RELATIONS:
+        for r in rels:
+            assert r not in RELATION_TYPE_ALIASES, (
+                f"의도 매핑에 alias '{r}' 가 남아 있음"
+            )
