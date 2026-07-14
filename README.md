@@ -17,6 +17,7 @@
   <a href="#-시스템-아키텍처">아키텍처</a> •
   <a href="#-빠른-시작">빠른 시작</a> •
   <a href="#-mcp-server">MCP Server</a> •
+  <a href="#-성능-평가--골드셋--검색-채점">성능 평가</a> •
   <a href="#-기술-스택">기술 스택</a>
 </p>
 
@@ -236,6 +237,92 @@ flowchart TB
 | 🗂 **텍스트 청크**<br>(벡터 DB) | 서술형 문서, 가이드, 매뉴얼 | 온보딩 가이드, API 문서, 회의록 |
 | 🕸 **그래프 DB** | 엔티티 간 관계가 중요한 문서 | 아키텍처 문서, 팀 구성, 의존성 맵 |
 | 🔀 **혼합 (hybrid)** | 서술 + 관계 정보 공존 | 프로젝트 기획서 (설명 + 마일스톤 관계) |
+
+<br>
+
+## 📏 성능 평가 — 골드셋 · 검색 채점
+
+검색 품질을 감(感)이 아닌 **정량 지표**로 관리합니다. LLM으로 합성 골드셋을 생성하고, 검색 시스템을 채점한 뒤, 코드 변경 전후를 통계 검정으로 비교하는 **생성(build) → 평가(eval) → 비교(compare)** 3단계 파이프라인을 제공합니다.
+
+```mermaid
+flowchart TB
+    B["🏗 build_synthetic_gold_set.py<br>Generator LLM 질문 역방향 생성<br>+ Judge LLM 4단계 게이트"]
+    B -->|"eval/gold_set.yaml<br>(질문 · 정답 문서/엔티티 페어)"| E["📐 eval_search.py<br>Recall · Precision · Hit · nDCG@k · MRR<br>+ Judge 응답 품질 채점 (0~5)"]
+    E -->|"eval/runs/*.summary.json + *.csv"| C["⚖️ compare_runs.py<br>baseline ↔ treatment paired 비교<br>Wilcoxon + bootstrap CI + Cohen's d"]
+    K["🎛 calibrate_graph_match.py<br>그래프 매칭 임계값 τ 를<br>본 환경 데이터로 F1 최적 튜닝"] -.->|"그래프 모드 사용 시 사전 1회"| E
+```
+
+### 1️⃣ 골드셋 생성 — `scripts/build_synthetic_gold_set.py`
+
+인덱싱된 청크/그래프에서 stratified sampling 후, **Generator LLM**이 청크당 N개의 질문을 역방향 생성하고 **Judge LLM**의 4단계 게이트가 사기성·일반성 질문을 탈락시켜 (질문, 정답) 페어 YAML을 만듭니다.
+
+평가 신뢰성을 위한 안전장치가 코드로 강제됩니다:
+
+- **자기-평가 편향 차단** — Generator/Judge가 시스템 LLM과 같으면 `--allow-self-eval` 없이는 종료
+- **정답 누설 게이트** — ASCII 식별자·한국어 고유명사·지시대명사 정규식 + LLM 답변가능성/유일성/distractor 검증
+- **재현성** — 샘플링 시드(`--seed`) + LLM 호출 시드(`--generator-seed-base`) 지원
+- **변동성 측정** — `--n-gold-sets N`으로 다중 골드셋 빌드, 그래프 질문(`--include-graph-questions`)·관계 채점도 지원
+
+### 2️⃣ 검색 채점 — `scripts/eval_search.py`
+
+골드셋의 각 질의로 실제 컨텍스트 조립 파이프라인을 호출하고 정답과 비교합니다.
+
+| 메트릭 | 설명 |
+|--------|------|
+| `Recall@k` / `Precision@k` / `Hit@k` | 정답 문서가 top-k 검색 결과에 포함/차지하는 비율 |
+| `nDCG@k` / `MRR` | 정답의 랭킹 품질 (상위에 있을수록 높음) |
+| `graph_*` | 그래프 엔티티/관계 매칭 메트릭 (그래프 모드) |
+| `judge_score` (0~5) | Judge LLM의 응답 품질 채점 — `reference-free` 모드 권장, `--judge-n-samples`로 분산 측정 |
+
+tie-breaker 명시로 결정성을 보장하고, 실패 질의는 `failure_rate`로 분리 집계하며, `--gold-set-glob`으로 다중 골드셋 mean/std/min/max를 산출합니다.
+
+### 3️⃣ 통계 비교 — `scripts/compare_runs.py`
+
+코드 변경(baseline → treatment)의 효과를 per-question **paired 비교**로 검정합니다. 두 run의 골드셋 SHA256·핵심 설정 동치성을 자동 검증한 뒤, **Wilcoxon signed-rank + bootstrap 95% CI + Cohen's d**를 산출합니다.
+
+> [!TIP]
+> **머지 의사결정 기준**: `p_imp ≥ 0.95` + `CI95 하한 > 0` + `Cohen's d ≥ 0.5` → 유의미한 개선. 표본 N < 10이면 별표로 경고됩니다.
+
+<details>
+<summary><b>🧪 A/B 비교 전체 워크플로우 예시</b></summary>
+
+```bash
+# 1. (그래프 모드) 매칭 임계값 τ 캘리브레이션 — 신규 환경 1회
+python scripts/calibrate_graph_match.py --apply
+
+# 2. 골드셋 빌드 — Generator/Judge 분리 + 다중(N=5) 빌드로 변동성 측정
+python scripts/build_synthetic_gold_set.py \
+    --generator-endpoint http://strong-model:8080/v1 --generator-model gpt-4o \
+    --judge-endpoint http://other:8080/v1 --judge-model claude-haiku \
+    --seed 42 --generator-seed-base 1000 \
+    --n-gold-sets 5 --concurrency 4 \
+    --include-graph-questions --score-relations \
+    --output eval/gold_sets/run.yaml
+
+# 3. baseline 평가
+python scripts/eval_search.py \
+    --gold-set-glob "eval/gold_sets/run_*.yaml" --label baseline \
+    --judge --judge-endpoint http://other:8080/v1 --judge-model claude-haiku \
+    --judge-mode reference-free --judge-n-samples 3 --concurrency 4
+
+# 4. (코드 변경 후) treatment 평가 — 같은 골드셋 · 같은 옵션
+python scripts/eval_search.py \
+    --gold-set-glob "eval/gold_sets/run_*.yaml" --label treatment \
+    --judge --judge-endpoint http://other:8080/v1 --judge-model claude-haiku \
+    --judge-mode reference-free --judge-n-samples 3 --concurrency 4
+
+# 5. paired 통계 비교 → 머지 여부 의사결정
+python scripts/compare_runs.py \
+    --baseline  eval/runs/baseline.aggregate.summary.json \
+    --treatment eval/runs/treatment.aggregate.summary.json \
+    --baseline-csv  eval/runs/baseline_run_001.csv \
+    --treatment-csv eval/runs/treatment_run_001.csv \
+    --min-effect-size 0.02 --out eval/runs/compare.json
+```
+
+</details>
+
+> 📄 스크립트별 전체 파라미터와 트러블슈팅은 **[docs/eval-scripts.md](docs/eval-scripts.md)** 를 참조하세요.
 
 <br>
 
