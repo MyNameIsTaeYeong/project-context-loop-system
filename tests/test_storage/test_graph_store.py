@@ -99,6 +99,78 @@ async def test_save_graph_data_skips_missing_entity_in_relation(
 
 
 @pytest.mark.asyncio
+async def test_save_graph_data_normalizes_vocab_aliases(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """저장 시 어휘 alias 가 canonical 로 정규화된다.
+
+    - entity_type: struct → class (다른 문서의 class 노드와 병합 가능)
+    - relation_type: has_part → contains, uses → depends_on
+    - documented_in 은 방향까지 뒤집어 documents 로 저장
+    """
+    doc_id = await _create_doc(meta_store)
+    data = GraphData(
+        entities=[
+            Entity(name="Server", entity_type="struct"),
+            Entity(name="Handler", entity_type="class"),
+            Entity(name="설계문서", entity_type="document"),
+        ],
+        relations=[
+            Relation(source="Server", target="Handler", relation_type="has_part"),
+            Relation(source="Handler", target="설계문서",
+                     relation_type="documented_in"),
+        ],
+    )
+    await graph_store.save_graph_data(doc_id, data)
+
+    types = {
+        d["entity_name"]: d["entity_type"]
+        for _, d in graph_store.graph.nodes(data=True)
+    }
+    assert types["Server"] == "class"  # struct → class
+
+    edges = {
+        (
+            graph_store.graph.nodes[u]["entity_name"],
+            graph_store.graph.nodes[v]["entity_name"],
+        ): d["relation_type"]
+        for u, v, d in graph_store.graph.edges(data=True)
+    }
+    assert edges[("Server", "Handler")] == "contains"  # has_part → contains
+    # documented_in(Handler, 설계문서) → documents(설계문서, Handler)
+    assert edges[("설계문서", "Handler")] == "documents"
+    assert ("Handler", "설계문서") not in edges
+
+    # SQLite 영속본도 canonical 로 저장된다.
+    db_nodes = await meta_store.get_graph_nodes_by_document(doc_id)
+    db_types = {n["entity_name"]: n["entity_type"] for n in db_nodes}
+    assert db_types["Server"] == "class"
+    db_edges = await meta_store.get_graph_edges_by_document(doc_id)
+    assert {e["relation_type"] for e in db_edges} == {"contains", "documents"}
+
+
+@pytest.mark.asyncio
+async def test_alias_entity_type_merges_with_canonical_node(
+    graph_store: GraphStore, meta_store: MetadataStore,
+) -> None:
+    """struct 로 추출된 엔티티가 기존 class 노드와 같은 정규 노드로 병합된다."""
+    doc1 = await _create_doc(meta_store)
+    doc2 = await meta_store.create_document(
+        source_type="manual", title="Doc2",
+        original_content="content", content_hash="abc2",
+    )
+    await graph_store.save_graph_data(doc1, GraphData(
+        entities=[Entity(name="Server", entity_type="class")],
+    ))
+    result = await graph_store.save_graph_data(doc2, GraphData(
+        entities=[Entity(name="Server", entity_type="struct")],
+    ))
+    assert result["merged"] == 1
+    assert result["nodes"] == 0
+    assert graph_store.stats()["nodes"] == 1
+
+
+@pytest.mark.asyncio
 async def test_delete_document_graph(graph_store: GraphStore, meta_store: MetadataStore) -> None:
     """문서 그래프 삭제 후 노드/엣지가 사라진다."""
     doc_id = await _create_doc(meta_store)
@@ -829,8 +901,9 @@ async def test_get_schema_summary_with_data(graph_store: GraphStore, meta_store:
     assert summary["total_edges"] == 2
     assert "component" in summary["entity_types"]
     assert "service" in summary["entity_types"]
+    # uses 는 alias — 저장 시 depends_on 으로 정규화된다.
     assert "depends_on" in summary["relation_types"]
-    assert "uses" in summary["relation_types"]
+    assert "uses" not in summary["relation_types"]
     assert "Gateway" in summary["entities_by_type"]["component"]
     assert len(summary["sample_relations"]) == 2
 

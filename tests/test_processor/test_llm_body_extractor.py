@@ -293,9 +293,11 @@ async def test_cross_unit_entity_dedup_keeps_first_casing() -> None:
     auths = [e for e in g.entities if e.entity_type == "system"]
     assert len(auths) == 1
     assert auths[0].name == "Auth Service"  # 첫 등장 표기 보존
-    # 관계 정규화: source 가 첫 표기로 통일
-    rels_by_type = {r.relation_type: r for r in g.relations}
-    assert rels_by_type["uses"].source == "Auth Service"
+    # 관계 정규화: source 가 첫 표기로 통일. LLM 이 구 어휘 "uses" 로 답해도
+    # alias 정규화로 depends_on 으로 수렴한다.
+    cache_rel = next(r for r in g.relations if r.target == "Cache")
+    assert cache_rel.relation_type == "depends_on"
+    assert cache_rel.source == "Auth Service"
 
 
 @pytest.mark.asyncio
