@@ -26,7 +26,6 @@ async def stats_partial(
     """통계 카드 HTML 파셜."""
     templates = get_templates(request)
     stats = await meta_store.get_stats()
-    return templates.TemplateResponse("partials/document_stats.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/document_stats.html", {
         "stats": stats,
     })

@@ -43,8 +43,7 @@ async def confluence_page(
         config.get("sources.confluence.base_url")
         and config.get("sources.confluence.email")
     )
-    return templates.TemplateResponse("confluence.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "confluence.html", {
         "connected": connected,
         "base_url": config.get("sources.confluence.base_url", ""),
         "email": config.get("sources.confluence.email", ""),

@@ -43,7 +43,7 @@ async def dashboard(
 ):
     """메인 대시보드 페이지."""
     templates = get_templates(request)
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html")
 
 
 @router.get("/documents/{document_id}")
@@ -57,8 +57,7 @@ async def document_detail(
     if not doc:
         raise HTTPException(404, "문서를 찾을 수 없습니다.")
     templates = get_templates(request)
-    return templates.TemplateResponse("document_detail.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "document_detail.html", {
         "doc": doc,
     })
 
@@ -67,8 +66,7 @@ async def document_detail(
 async def editor_new(request: Request):
     """새 문서 에디터 페이지."""
     templates = get_templates(request)
-    return templates.TemplateResponse("editor.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "editor.html", {
         "doc": None,
     })
 
@@ -77,7 +75,7 @@ async def editor_new(request: Request):
 async def about_page(request: Request):
     """프로젝트 소개 페이지."""
     templates = get_templates(request)
-    return templates.TemplateResponse("about.html", {"request": request})
+    return templates.TemplateResponse(request, "about.html")
 
 
 @router.get("/editor/{document_id}")
@@ -91,8 +89,7 @@ async def editor_edit(
     if not doc:
         raise HTTPException(404, "문서를 찾을 수 없습니다.")
     templates = get_templates(request)
-    return templates.TemplateResponse("editor.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "editor.html", {
         "doc": doc,
     })
 
@@ -180,8 +177,7 @@ async def document_list_partial(
         })
 
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/document_list.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/document_list.html", {
         "groups": groups,
         "total": len(docs),
     })
@@ -209,8 +205,7 @@ async def tab_original(
     if not doc.get("original_content") and doc.get("raw_content"):
         raw_html_view = confluence_storage_to_html(doc["raw_content"])
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/tab_original.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/tab_original.html", {
         "doc": doc,
         "lang_hint": lang_hint,
         "raw_html_view": raw_html_view,
@@ -283,8 +278,7 @@ async def tab_chunks(
             })
 
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/tab_chunks.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/tab_chunks.html", {
         "chunks": enriched,
         "source_type": source_type,
     })
@@ -314,8 +308,7 @@ async def tab_graph(
         ],
     }
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/tab_graph.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/tab_graph.html", {
         "graph_data": json.dumps(graph_data, ensure_ascii=False),
         "has_graph": bool(nodes),
     })
@@ -334,8 +327,7 @@ async def tab_sources(
     sources = await meta_store.get_document_sources(document_id)
     reverse_refs = await meta_store.get_documents_by_source(document_id)
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/tab_sources.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/tab_sources.html", {
         "doc": doc,
         "sources": sources,
         "reverse_refs": reverse_refs,
@@ -354,8 +346,7 @@ async def tab_metadata(
         raise HTTPException(404)
     history = await meta_store.get_processing_history(document_id)
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/tab_metadata.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/tab_metadata.html", {
         "doc": doc,
         "history": history,
     })

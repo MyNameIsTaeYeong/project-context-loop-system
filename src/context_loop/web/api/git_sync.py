@@ -92,8 +92,7 @@ async def git_sync_page(
     # Git 관련 문서 수 조회
     stats = await meta_store.get_stats()
 
-    return templates.TemplateResponse("git_sync.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "git_sync.html", {
         "git_config": git_config,
         "issues": issues,
         "stats": stats,
@@ -112,8 +111,7 @@ async def sync_status_partial(
 ):
     """동기화 상태 HTML 파셜 (폴링용)."""
     templates = get_templates(request)
-    return templates.TemplateResponse("partials/git_sync_status.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/git_sync_status.html", {
         "sync_status": _get_sync_status(),
     })
 
@@ -153,8 +151,7 @@ async def sync_documents_partial(
             "subgroups": subgroups,
         })
 
-    return templates.TemplateResponse("partials/document_list.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "partials/document_list.html", {
         "groups": groups,
         "total": len(docs),
     })

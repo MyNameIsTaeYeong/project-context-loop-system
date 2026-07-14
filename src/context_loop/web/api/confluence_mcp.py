@@ -139,8 +139,7 @@ async def confluence_mcp_page(
     """Confluence MCP 임포트 페이지."""
     templates = get_templates(request)
     connected = bool(config.get("sources.confluence_mcp.server_url"))
-    return templates.TemplateResponse("confluence_mcp.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "confluence_mcp.html", {
         "connected": connected,
         "server_url": config.get("sources.confluence_mcp.server_url", ""),
     })

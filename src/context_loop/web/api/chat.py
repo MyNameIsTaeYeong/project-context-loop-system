@@ -58,7 +58,7 @@ class ChatRequest(BaseModel):
 async def chat_page(request: Request):
     """채팅 페이지."""
     templates = get_templates(request)
-    return templates.TemplateResponse("chat.html", {"request": request})
+    return templates.TemplateResponse(request, "chat.html")
 
 
 @router.post("/api/chat")

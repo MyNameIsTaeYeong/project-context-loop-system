@@ -37,7 +37,7 @@ _FULL_GRAPH_MAX_NODES = 300
 async def graph_page(request: Request):
     """그래프 탐색 페이지."""
     templates = get_templates(request)
-    return templates.TemplateResponse("graph.html", {"request": request})
+    return templates.TemplateResponse(request, "graph.html")
 
 
 def _node_payload(node_id: int, data: dict[str, Any]) -> dict[str, Any]:
