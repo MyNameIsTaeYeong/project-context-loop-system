@@ -39,8 +39,7 @@
     <td width="50%" valign="top">
       <h3>📥 다중 입력 소스</h3>
       <ul>
-        <li>Confluence REST API 임포트 (증분 동기화)</li>
-        <li>Confluence MCP Client 임포트 — REST 차단 환경 대안</li>
+        <li>Confluence MCP Client 임포트 (증분 동기화)</li>
         <li>파일 업로드 (<code>.md</code> / <code>.txt</code> / <code>.html</code>)</li>
         <li>대시보드 내장 마크다운 에디터</li>
         <li>Git 레포지토리 코드 수집 (AST 정적 분석)</li>
@@ -104,7 +103,6 @@
 flowchart TB
     subgraph INPUT["📥 Input Layer"]
         direction LR
-        A1["Confluence<br>API 임포트"]
         A2["Confluence<br>MCP Client"]
         A3["파일 업로드<br>(.md 등)"]
         A4["직접 MD 작성<br>(에디터)"]
