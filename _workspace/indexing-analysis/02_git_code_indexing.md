@@ -1,6 +1,9 @@
 # Git Code 인덱싱 파이프라인 분석
 
-> 기준: 현재 HEAD (origin/main 머지 완료). 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+> 기준: 현재 HEAD `cdf291e`. 분석 전용 — 코드 동작 서술이며 개선점 제안이 아니다.
+> 갱신: 2026-07-13 산출물을 커밋 `79cdcde`(그래프 어휘 alias 정규화) 이후 코드와 대조하여 보완. 변경 요약은 문서 맨 끝 "2026-07-13 대비 달라진 부분" 참조.
+
+> **문서-코드 대조 결과 (핵심):** 과제 지시문은 `79cdcde`가 "processor/ingestion 코드를 변경"했다고 했으나, 실제 그 커밋이 건드린 소스는 `processor/graph_vocabulary.py`, `storage/graph_store.py`, `processor/llm_body_extractor.py`(confluence 전용) 3개뿐이다 (`git show 79cdcde --stat` 확인). **ingestion(1단계)과 `ast_code_extractor`(2·3·5단계 추출부)는 이 커밋으로 바뀌지 않았다.** git_code에 실제로 영향을 준 지점은 **6단계 저장 시점의 어휘 정규화**이며, 5단계 서술의 entity_type도 "저장 시점 정규화"를 반영해 보정한다. (07-13 이후 src를 건드린 커밋은 `79cdcde`와 `389ed59`(confluence 워터마크 수정, git_code 무관) 둘뿐 — `git log --since=2026-07-13 -- src/` 확인.)
 
 ## 0. 진입점 & 전체 흐름
 
@@ -168,11 +171,13 @@ process_document(document_id)
 - **엔티티** (라인 224-273):
   - 파일 엔티티 1개: `Entity(name=file_title, entity_type="module")` (단순 이름, 전역 고유).
   - import 모듈: 단순 이름 `module` 엔티티 (파일 간 canonical 병합 의도 — 여러 파일이 `logging` import 시 1노드로 수렴).
-  - 코드 심볼: **FQN 이름** `<file>::<parent>.<name>` 또는 `<file>::<name>` (`_symbol_fqn`, 라인 195). entity_type = 실제 symbol_type(function/method/class/struct/interface).
-  - 부모 클래스: `<file>::<name>` (`_class_fqn`, 라인 205), entity_type="class".
+  - 코드 심볼: **FQN 이름** `<file>::<parent>.<name>` 또는 `<file>::<name>` (`_symbol_fqn`). entity_type = **추출기가 emit하는 실제 symbol_type** `sym.symbol_type` (ast_code_extractor.py:257) — function/method/class/**struct**/interface. Go `type X struct`는 `struct`로, `type X interface`는 `interface`로 감지된다 (라인 564-565).
+  - 부모 클래스: `<file>::<name>` (`_class_fqn`), entity_type="class" (라인 271).
+  - **[79cdcde 반영] 저장 시점 entity_type 정규화:** 추출기는 여전히 `struct`를 그대로 emit하지만, 6단계 `save_graph_data`가 `canonical_entity_type()`로 **`struct→class`**로 수렴시킨다 (graph_vocabulary.py `ENTITY_TYPE_ALIASES`, graph_store.py:199). `interface`는 alias가 아니라 그대로 유지된다. 즉 그래프 노드에 최종 저장되는 git_code entity_type은 function/method/class/interface/module 5종이며, Go struct는 class 노드로 병합된다.
 - **관계** (라인 275-312):
-  - **imports**: `Relation(source=file_title, target=module, relation_type="imports", label=import된 심볼 이름들)` (라인 298). `from x import a,b`의 심볼 이름을 label에 join(최대 20, 라인 293).
+  - **imports**: `Relation(source=file_title, target=module, relation_type="imports", label=import된 심볼 이름들)` (라인 298-303). `from x import a,b`의 심볼 이름을 label에 join(최대 20, 라인 293). Python 외 언어처럼 `import_symbols`가 비면 `imports`로 폴백(라인 287-288).
   - **contains**: 메서드→클래스 `Relation(source=<file>::<class>, target=<file>::<class>.<method>, relation_type="contains")` (라인 306-312).
+  - **[79cdcde 대조] git_code 관계는 저장 정규화의 영향을 받지 않는다:** `RELATION_TYPE_ALIASES`의 키는 `has_part/has_attribute/uses/mentions_user/mentions_ticket/documented_in` 6종인데, git_code가 emit하는 `imports`·`contains`는 이미 canonical relation_type이라 alias에 없다 (graph_vocabulary.py:180-186). 따라서 이름 변경·방향 교환 없이 그대로 저장된다. (참고: `contains`는 이 커밋에서 confluence body/llm_body의 `has_part`/`has_attribute`까지 흡수하는 공용 canonical이 되었다 — git_code가 원래 쓰던 `contains`가 canonical로 채택된 형태.)
   - **호출 그래프(call graph)는 추출하지 않음** — 함수 호출 `foo()`는 엣지가 되지 않는다. 상속/구현(extends/implements)도 관계로 추출되지 않는다 (graph_extractor의 vocab에는 있으나 AST 추출기가 emit하지 않음).
 
 **산출 데이터 형태:** `GraphData(entities: list[Entity], relations: list[Relation])` (graph_extractor.py:48). `Entity(name, entity_type)`, `Relation(source, target, relation_type, label)`.
@@ -195,9 +200,13 @@ process_document(document_id)
 - git_code는 `embed_text=meta_text`를 채운다 (라인 219) — 임베딩 입력이 본문과 다르므로 감사용 영속화 (create_chunk docstring, metadata_store.py:327). `section_index`는 None.
 
 **그래프 저장 (`storage/graph_store.py`):**
-- `graph_store.save_graph_data(document_id, graph_data)` (라인 137). SQLite `graph_nodes`/`graph_edges` + NetworkX 인메모리 그래프 동시 갱신.
-- **정규 병합** (라인 160-214): `find_graph_node_by_entity(name, type)` (metadata_store.py:447, SQL `WHERE LOWER(entity_name)=LOWER(?) AND entity_type=?`). 기존 노드 있으면 재사용+document_id 링크 추가(병합), 없으면 `create_graph_node_with_link()`로 신규(노드+문서링크 단일 트랜잭션, race 방지).
-- 엣지: `(src, tgt, relation_type, document_id)` 중복 방지(라인 227-235) 후 `create_graph_edge`.
+- `graph_store.save_graph_data(document_id, graph_data)` (라인 171). SQLite `graph_nodes`/`graph_edges` + NetworkX 인메모리 그래프 동시 갱신.
+- **[79cdcde 신규] 어휘 alias 정규화 — 저장 시점 1회 적용:** 결정론 추출기(ast_code_extractor)는 자체 어휘를 그대로 emit하고, 저장 직전 여기서 canonical로 수렴시킨다.
+  - **entity_type**: `entity_type = canonical_entity_type(entity.entity_type)` (라인 199). 이 정규화된 타입으로 병합 키 검색·신규 생성이 이뤄진다. git_code에서는 `struct→class` 수렴이 발생 → 같은 파일의 Go struct와 여타 class-타입 노드가 동일 병합 네임스페이스를 공유.
+  - **relation**: `rel_type, rel_source, rel_target = canonical_relation(relation.relation_type, source, target)` (라인 287-289). 이름 정규화 + 역방향 alias 시 source/target 교환. **git_code의 `imports`/`contains`는 alias가 아니므로 무변화** (위 5단계 참조).
+  - **주의(감사 로그):** 병합 로그 `_record_merge_safely`에는 정규화 **이전** 원본 타입 `raw_entity_type=entity.entity_type`가 기록된다 (라인 247·276). 실제 노드에 저장되는 타입(canonical)과 감사 로그의 raw 타입이 다를 수 있다.
+- **정규 병합** (라인 194-281): `find_graph_node_by_entity(entity.name, entity_type=canonical, normalized_name=...)` (metadata_store.py:638). 현재 병합 키는 SQL `WHERE normalized_name = ? AND entity_type = ?` (metadata_store.py:663) — 대소문자/공백/하이픈/언더스코어 표기 변형을 흡수하는 `normalize_entity_name` 정규화 이름 + canonical entity_type. 기존 노드 있으면 재사용+document_id 링크 추가(병합), 없으면 `create_graph_node_with_link()`로 신규(노드+문서링크 단일 트랜잭션, race 방지).
+- 엣지: `name_to_node_id`는 **원본 `entity.name`** 으로 키잉되고(라인 281), 관계는 정규화된 `rel_source`/`rel_target`로 조회(라인 290-291). `(src, tgt, relation_type, document_id)` 중복 방지(라인 300-307) 후 `create_graph_edge`.
 - 반환 `{"nodes": 신규수, "edges": 엣지수, "merged": 병합수}`.
 
 **문서 상태 마무리:** `_derive_storage_method(has_chunks, has_graph)` (pipeline.py:542) → `complete_reprocessing(meta_store, document_id, history_id, storage_method)` (라인 503). 예외 시 `storage_method="chunk"` + error_message 기록 (라인 531-538).
