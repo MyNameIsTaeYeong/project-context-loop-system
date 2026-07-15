@@ -771,11 +771,13 @@ async def test_sync_subtree_incremental_always_fetches_root(
     assert await meta.list_membership_page_ids(t["id"]) == {"100", "200"}
 
 
-async def test_sync_space_watermark_not_advanced_on_import_error(
+async def test_sync_space_watermark_advances_on_import_error_with_retry(
     stores, monkeypatch,
 ) -> None:
-    """임포트 오류가 있으면 워터마크가 전진하지 않는다 — 실패한 변경은
-    다음 싱크의 변경 조회 범위에 남아야 한다."""
+    """임포트 오류가 있어도 실패 페이지를 재시도 대기 목록에 기록하고
+    워터마크는 전진한다 — 영구 실패 페이지 소수가 워터마크를 멈춰 매 사이클
+    전량 fetch 를 유발하지 않도록. 실패한 변경은 재시도 목록의 강제 fetch
+    로 커버된다."""
     meta, vec, graph = stores
     monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
     monkeypatch.setattr(
@@ -809,16 +811,131 @@ async def test_sync_space_watermark_not_advanced_on_import_error(
     assert len(result.errors) == 1
 
     refreshed = await meta.get_sync_target(t["id"])
+    assert refreshed["last_watermark"] != old_wm  # 오류에도 전진
+    assert await meta.list_fetch_retry_page_ids(t["id"]) == {"2"}
+
+
+async def test_sync_space_retry_pending_page_force_fetched_and_cleared(
+    stores, monkeypatch,
+) -> None:
+    """재시도 대기 페이지는 변경 후보가 아니어도 강제 fetch 되고, 성공하면
+    대기 목록에서 빠진다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}, {"id": "3"}],
+            changed_pages=[],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    # 2 가 재시도 대기 상태라고 가정
+    await meta.replace_fetch_retries(
+        t["id"], [{"page_id": "2", "error": "simulated"}],
+    )
+
+    # 변경 후보 없음 — 그래도 2 는 강제 fetch 되어야 한다
+    calls, importer = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer)
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert set(calls) == {"2"}
+    assert result.skipped == 2  # 1, 3 은 여전히 생략
+    # 성공했으므로 대기 목록에서 제거
+    assert await meta.list_fetch_retry_page_ids(t["id"]) == set()
+
+
+async def test_sync_space_watermark_held_when_retry_persist_fails(
+    stores, monkeypatch,
+) -> None:
+    """재시도 목록 저장이 실패하면 워터마크를 전진시키지 않는다 — 실패분
+    기록 없이 전진하면 그 변경이 유실된다."""
+    meta, vec, graph = stores
+    monkeypatch.setattr(
+        mcp_sync, "import_page_via_mcp",
+        _make_fake_importer(fail_pages={"2"}),
+    )
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}],
+            changed_pages=[{"id": "2"}],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    old_wm = "2020-01-01 00:00"
+    await meta.update_sync_watermark(t["id"], old_wm)
+
+    async def failing_replace(target_id: int, entries) -> None:  # noqa: ANN001
+        raise RuntimeError("db write failed")
+
+    monkeypatch.setattr(meta, "replace_fetch_retries", failing_replace)
+
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert len(result.errors) == 1
+
+    refreshed = await meta.get_sync_target(t["id"])
     assert refreshed["last_watermark"] == old_wm  # 전진 안 함
 
-    # 오류 없이 재싱크하면 전진한다
+
+async def test_sync_space_retry_carried_over_when_enumeration_truncated(
+    stores, monkeypatch,
+) -> None:
+    """열거가 잘려 재시도 대기 페이지를 이번에 시도하지 못했으면, 대기
+    목록에서 지우지 않고 이월한다."""
+    meta, vec, graph = stores
     monkeypatch.setattr(mcp_sync, "import_page_via_mcp", _make_fake_importer())
-    result = await execute_sync_target(
-        None, refreshed, meta_store=meta, vector_store=vec, graph_store=graph,
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}, {"id": "3"}],
+            changed_pages=[],
+        ),
     )
-    assert result.errors == []
-    refreshed = await meta.get_sync_target(t["id"])
-    assert refreshed["last_watermark"] != old_wm
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    # 3 이 재시도 대기 상태인데, 다음 열거가 상한 2 로 잘려 3 이 빠진다
+    await meta.replace_fetch_retries(
+        t["id"], [{"page_id": "3", "error": "simulated"}],
+    )
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}],
+            changed_pages=[],
+        ),
+    )
+    t = await meta.get_sync_target(t["id"])
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+        enumeration_max_pages=2,
+    )
+
+    # 3 은 시도되지 못했으므로 대기 목록에 남는다
+    assert await meta.list_fetch_retry_page_ids(t["id"]) == {"3"}
 
 
 async def test_sync_space_corrupt_watermark_falls_back_to_full_fetch(

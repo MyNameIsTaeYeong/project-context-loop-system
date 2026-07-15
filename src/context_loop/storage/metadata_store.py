@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS confluence_sync_targets (
     last_sync_at      TIMESTAMP,
     last_result_json  TEXT,
     -- 증분 fetch 워터마크. CQL ``lastModified >= "..."`` 에 쓰는
-    -- "YYYY-MM-DD HH:MM" 문자열. 싱크가 오류 없이 완주했을 때만 전진한다.
+    -- "YYYY-MM-DD HH:MM" 문자열. 임포트 실패 페이지가
+    -- confluence_sync_fetch_retries 에 기록된 경우에만 전진한다.
     -- NULL 이면 전체 fetch (첫 싱크 또는 워터마크 리셋).
     last_watermark    TEXT
 );
@@ -151,6 +152,19 @@ CREATE TABLE IF NOT EXISTS confluence_sync_membership (
     parent_page_id  TEXT,
     depth           INTEGER,
     last_seen_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (target_id, page_id)
+);
+
+-- Phase 1 임포트가 실패한 페이지의 강제 재fetch 대기 목록. 이 목록이 있어야
+-- 임포트 오류가 있어도 워터마크를 전진시킬 수 있다 — 실패 페이지는 다음
+-- 싱크에서 변경 후보 조회와 무관하게 항상 fetch 되므로, 워터마크 전진으로
+-- 변경 조회 범위에서 벗어나도 변경이 유실되지 않는다.
+CREATE TABLE IF NOT EXISTS confluence_sync_fetch_retries (
+    target_id   INTEGER NOT NULL
+                REFERENCES confluence_sync_targets(id) ON DELETE CASCADE,
+    page_id     TEXT NOT NULL,
+    error       TEXT,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (target_id, page_id)
 );
 
@@ -1153,13 +1167,63 @@ class MetadataStore:
     ) -> None:
         """증분 fetch 워터마크를 갱신한다.
 
-        싱크가 오류 없이 완주한 경우에만 호출되어야 한다 — 실패한 싱크에서
-        전진시키면 그 사이의 변경이 다음 싱크의 변경 조회에서 누락된다.
+        임포트 실패 페이지가 :meth:`replace_fetch_retries` 로 기록된 뒤에만
+        호출되어야 한다 — 실패분을 재시도 목록에 남기지 않고 전진시키면
+        그 사이의 변경이 다음 싱크의 변경 조회에서 누락된다.
         """
         await self.db.execute(
             "UPDATE confluence_sync_targets SET last_watermark = ? WHERE id = ?",
             (watermark, target_id),
         )
+        await self.db.commit()
+
+    async def list_fetch_retry_page_ids(self, target_id: int) -> set[str]:
+        """Target 의 강제 재fetch 대기 page_id 집합을 반환한다.
+
+        Phase 1 임포트가 실패해 기록된 페이지들 — 다음 싱크에서 변경 후보
+        조회 결과와 무관하게 항상 fetch 대상에 포함되어야 한다.
+        """
+        cursor = await self.db.execute(
+            "SELECT page_id FROM confluence_sync_fetch_retries "
+            "WHERE target_id = ?",
+            (target_id,),
+        )
+        rows = await cursor.fetchall()
+        return {row["page_id"] for row in rows}
+
+    async def replace_fetch_retries(
+        self, target_id: int, entries: Iterable[dict[str, Any]],
+    ) -> None:
+        """Target 의 강제 재fetch 대기 목록을 통째로 교체한다.
+
+        싱크 1회가 끝날 때마다 그 실행의 실패분으로 갱신된다 — 이전 목록의
+        페이지는 이번 실행에서 강제 fetch 됐으므로, 성공했으면 목록에서
+        빠지고 또 실패했으면 ``entries`` 로 다시 들어온다.
+
+        Args:
+            target_id: 대상 싱크 target ID.
+            entries: ``{"page_id": str, "error": str}`` 목록. 빈 목록이면
+                대기 목록이 비워진다 (전부 성공).
+        """
+        await self.db.execute(
+            "DELETE FROM confluence_sync_fetch_retries WHERE target_id = ?",
+            (target_id,),
+        )
+        rows = [
+            (target_id, str(e["page_id"]), str(e.get("error", "")))
+            for e in entries
+            if e.get("page_id")
+        ]
+        if rows:
+            await self.db.executemany(
+                """INSERT INTO confluence_sync_fetch_retries
+                   (target_id, page_id, error, updated_at)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(target_id, page_id) DO UPDATE SET
+                     error = excluded.error,
+                     updated_at = CURRENT_TIMESTAMP""",
+                rows,
+            )
         await self.db.commit()
 
     async def delete_sync_target(
