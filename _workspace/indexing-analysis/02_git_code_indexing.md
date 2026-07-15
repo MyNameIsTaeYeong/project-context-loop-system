@@ -228,7 +228,9 @@ process_document(document_id)
 | FQN 규칙 | `<file>::<parent>.<name>` | ast_code_extractor.py:195 | 5 그래프 |
 | import label 상한 | 20 | ast_code_extractor.py:293 | 5 그래프 |
 | ChromaDB 거리 | cosine | vector_store.py:37 | 6 저장 |
-| 노드 병합 키 | LOWER(name)+type | metadata_store.py:455 | 6 저장 |
+| 노드 병합 키 | normalized_name + canonical(entity_type) | metadata_store.py:663 | 6 저장 |
+| ENTITY_TYPE_ALIASES | `struct→class`, `policy→concept` | graph_vocabulary.py `ENTITY_TYPE_ALIASES` | 6 저장 (79cdcde) |
+| RELATION_TYPE_ALIASES | `has_part/has_attribute→contains`, `uses→depends_on`, `mentions_*→mentions`, `documented_in→documents(방향교환)` | graph_vocabulary.py `RELATION_TYPE_ALIASES` | 6 저장 (79cdcde) — **git_code의 imports/contains는 해당 없음** |
 
 ## 부록 B: 데이터 모델
 
@@ -237,6 +239,21 @@ process_document(document_id)
 - `CodeExtraction` (ast_code_extractor.py:58): file_path, language, symbols, imports, import_symbols
 - `Chunk` (chunker.py:43): id, index, content, token_count, section_path, section_anchor, section_index
 - `Entity`/`Relation`/`GraphData` (graph_extractor.py:15/30/48)
+
+## 2026-07-13 대비 달라진 부분 (커밋 79cdcde 반영)
+
+`79cdcde refactor: 그래프 어휘 alias 정규화`가 git_code 파이프라인에 준 영향은 **6단계 저장 시점의 어휘 정규화 한 곳**으로 국한된다. 수집·전처리·청킹·임베딩·그래프 추출 로직 자체는 코드 변경이 없다.
+
+| 구분 | 07-13 산출물 서술 | 현재 코드 (79cdcde 이후) |
+|------|------------------|------------------------|
+| 5단계 entity_type | "실제 symbol_type (function/method/class/struct/interface)" — 추출 시점만 기술 | 추출기는 여전히 struct emit. **저장 시점에 `struct→class` 정규화**되어 최종 노드 타입은 struct가 사라짐 (graph_store.py:199). interface는 유지. |
+| 6단계 노드 병합 | "LOWER(name)+type (metadata_store.py:455)" | `normalized_name + canonical(entity_type)` (metadata_store.py:663). type가 저장 전 canonical화되어 Go struct/class 노드 분열 방지. |
+| 6단계 relation 저장 | 언급 없음 | `save_graph_data`가 `canonical_relation()`로 relation 이름 정규화 + 역방향 교환(graph_store.py:287). **git_code의 imports/contains는 alias 아님 → 무변화**. |
+| graph_vocabulary 어휘 수 | 기술 안 함 | relation 17→12, entity 15→13으로 축소. `contains`가 confluence의 `has_part/has_attribute`까지 흡수하는 공용 canonical이 됨(원래 git_code 어휘가 채택). |
+
+**재인덱싱 주의:** 커밋 메시지대로 기존 인덱스는 재처리해야 canonical 어휘로 수렴한다 — 이미 저장된 Go `struct` 노드는 재인덱싱 전까지 그대로 남는다.
+
+**과제 지시문과의 불일치:** 지시문은 79cdcde가 "processor/ingestion 코드를 변경"했다고 명시했으나 실제 변경 파일에 ingestion은 없다 (graph_vocabulary/graph_store/llm_body_extractor 3개). llm_body_extractor 변경분은 confluence LLM 그래프 전용이라 git_code 경로와 무관하다. 코드 사실을 우선하여 위와 같이 반영했다.
 
 ## 검토하지 못한 영역
 
