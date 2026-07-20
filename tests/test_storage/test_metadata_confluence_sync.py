@@ -690,3 +690,66 @@ async def test_delete_sync_target_skips_orphans_shared_with_other_target(
     # (caller의 책임). 존재 여부 확인:
     assert await store.get_document(shared_doc) is not None
     assert await store.get_document(private_doc) is not None
+
+
+# --- update_document_title / list_fallback_title_page_ids ---
+
+
+async def test_update_document_title(store: MetadataStore) -> None:
+    doc_id = await store.create_document(
+        source_type="confluence_mcp",
+        source_id="p1",
+        title="Old",
+        original_content="body",
+        content_hash="h1",
+    )
+    await store.update_document_title(doc_id, "New Title")
+    doc = await store.get_document(doc_id)
+    assert doc is not None
+    assert doc["title"] == "New Title"
+    assert doc["original_content"] == "body"  # 본문은 불변
+
+
+async def test_list_fallback_title_page_ids(store: MetadataStore) -> None:
+    """폴백 제목("Confluence Page {id}") 문서만 membership 기준으로 골라낸다."""
+    t = await store.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Eng",
+    )
+    # 오염 문서 (폴백 제목)
+    await store.create_document(
+        source_type="confluence_mcp",
+        source_id="111",
+        title="Confluence Page 111",
+        original_content="body",
+        content_hash="h-111",
+    )
+    # 정상 제목 문서
+    await store.create_document(
+        source_type="confluence_mcp",
+        source_id="222",
+        title="정상 제목",
+        original_content="body",
+        content_hash="h-222",
+    )
+    # membership 밖의 오염 문서 — 다른 target 소속이므로 제외되어야 함
+    await store.create_document(
+        source_type="confluence_mcp",
+        source_id="333",
+        title="Confluence Page 333",
+        original_content="body",
+        content_hash="h-333",
+    )
+    await store.upsert_membership(
+        target_id=t["id"], page_id="111", space_key="ENG",
+    )
+    await store.upsert_membership(
+        target_id=t["id"], page_id="222", space_key="ENG",
+    )
+
+    assert await store.list_fallback_title_page_ids(t["id"]) == {"111"}
+
+    # 치유되면 자연히 집합에서 빠진다
+    doc = await store.get_document_by_source("confluence_mcp", "111")
+    assert doc is not None
+    await store.update_document_title(doc["id"], "치유된 제목")
+    assert await store.list_fallback_title_page_ids(t["id"]) == set()

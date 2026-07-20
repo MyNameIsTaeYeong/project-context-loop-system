@@ -456,6 +456,19 @@ class MetadataStore:
         )
         await self.db.commit()
 
+    async def update_document_title(self, document_id: int, title: str) -> None:
+        """문서 제목만 갱신한다.
+
+        Confluence 페이지 rename 반영 및 "Confluence Page {id}" 폴백 제목
+        오염 문서의 치유용. 본문/해시는 건드리지 않는다.
+        """
+        await self.db.execute(
+            "UPDATE documents SET title = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (title, document_id),
+        )
+        await self.db.commit()
+
     async def update_document_source_version(
         self, document_id: int, source_version: int,
     ) -> None:
@@ -1338,6 +1351,27 @@ class MetadataStore:
         )
         rows = await cursor.fetchall()
         return [row["id"] for row in rows]
+
+    async def list_fallback_title_page_ids(self, target_id: int) -> set[str]:
+        """Target membership 중 폴백 제목("Confluence Page {id}")으로 저장된
+        문서의 page_id 집합을 반환한다.
+
+        과거 임포트에서 getPageByID 응답 파싱 실패로 제목이 오염된 문서를
+        증분 fetch 대상에 강제 포함시키기 위한 헬퍼. 워터마크 이후 소스측
+        변경이 없는 페이지는 증분 선정에서 제외되어 오염이 영구 잔존하는
+        문제를 막는다 — 제목이 치유되면 자연히 이 집합에서 빠진다.
+        """
+        cursor = await self.db.execute(
+            """SELECT m.page_id FROM confluence_sync_membership m
+               INNER JOIN documents d
+                 ON d.source_id = m.page_id
+                 AND d.source_type = 'confluence_mcp'
+               WHERE m.target_id = ?
+                 AND d.title = 'Confluence Page ' || d.source_id""",
+            (target_id,),
+        )
+        rows = await cursor.fetchall()
+        return {row["page_id"] for row in rows}
 
     async def list_degraded_member_doc_ids(self, target_id: int) -> list[int]:
         """Target 의 membership 에 속한 문서 중 LLM 결손(``llm_degraded=1``) 목록.

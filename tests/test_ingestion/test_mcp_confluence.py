@@ -10,10 +10,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from context_loop.ingestion.mcp_confluence import (
+    MCPToolError,
     SearchEnvelope,
     _extract_page_content,
     _extract_page_title,
+    _extract_page_title_raw,
     _extract_text,
+    fallback_page_title,
     _is_cql,
     _parse_json_result,
     _space_cql,
@@ -52,10 +55,17 @@ class FakeTextContent:
 @dataclass
 class FakeCallToolResult:
     content: list[FakeTextContent]
+    isError: bool = False  # noqa: N815 — MCP CallToolResult 속성명 그대로
 
 
 def _make_result(text: str) -> FakeCallToolResult:
     return FakeCallToolResult(content=[FakeTextContent(text=text)])
+
+
+def _make_error_result(text: str) -> FakeCallToolResult:
+    return FakeCallToolResult(
+        content=[FakeTextContent(text=text)], isError=True,
+    )
 
 
 # --- _extract_text 테스트 ---
@@ -158,6 +168,25 @@ def test_extract_page_title_name() -> None:
 
 def test_extract_page_title_fallback() -> None:
     assert _extract_page_title({}, "789") == "Confluence Page 789"
+
+
+def test_extract_page_title_uses_enumerated_fallback() -> None:
+    """응답에 제목이 없으면 열거 단계 제목(fallback 인자)을 쓴다."""
+    assert _extract_page_title({}, "789", fallback="열거 제목") == "열거 제목"
+    assert _extract_page_title(
+        {"title": "실제 제목"}, "789", fallback="열거 제목",
+    ) == "실제 제목"
+
+
+def test_extract_page_title_raw_returns_none_when_absent() -> None:
+    assert _extract_page_title_raw({}) is None
+    assert _extract_page_title_raw({"title": "  "}) is None
+    assert _extract_page_title_raw({"title": " My Page "}) == "My Page"
+    assert _extract_page_title_raw({"name": "Named"}) == "Named"
+
+
+def test_fallback_page_title_format() -> None:
+    assert fallback_page_title("2222222") == "Confluence Page 2222222"
 
 
 # --- MCP 도구 호출 테스트 ---
@@ -404,6 +433,41 @@ async def test_get_page_text_result() -> None:
     page = await get_page(session, "456")
     assert page["content"] == "Just plain text content"
     assert page["id"] == "456"
+
+
+@pytest.mark.asyncio
+async def test_get_page_raises_on_tool_error() -> None:
+    """isError=True 응답은 본문/제목으로 오인 임포트하지 않고 예외로 승격한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_error_result("permission denied")
+
+    with pytest.raises(MCPToolError, match="permission denied"):
+        await get_page(session, "123")
+
+
+@pytest.mark.asyncio
+async def test_get_page_unwraps_result_envelope() -> None:
+    """{"result": {...페이지...}} 처럼 한 겹 감싼 서버 변종 응답을 풀어낸다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"result": {"id": "123", "title": "Wrapped", "content": "Body"}}'
+    )
+
+    page = await get_page(session, "123")
+    assert page["title"] == "Wrapped"
+    assert page["content"] == "Body"
+
+
+@pytest.mark.asyncio
+async def test_get_page_does_not_unwrap_page_like_payload() -> None:
+    """최상위에 페이지 필드가 있으면 래핑 해제를 시도하지 않는다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "123", "title": "Top", "page": {"id": "999", "title": "Inner"}}'
+    )
+
+    page = await get_page(session, "123")
+    assert page["title"] == "Top"
 
 
 # --- get_page_with_ancestors 테스트 ---
@@ -1373,6 +1437,104 @@ async def test_import_page_via_mcp_changed(meta_store: MetadataStore) -> None:
     assert result2["created"] is False
     assert result2["changed"] is True
     assert result2["status"] == "changed"
+
+
+@pytest.mark.asyncio
+async def test_import_page_title_only_change_reindexes(
+    meta_store: MetadataStore,
+) -> None:
+    """본문 해시가 동일해도 제목이 바뀌면 changed=True + 제목 갱신."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "t1", "title": "Old Title", "content": "Same Body"}'
+    )
+    result1 = await import_page_via_mcp(session, meta_store, "t1")
+    assert result1["created"] is True
+
+    # 제목만 변경 (본문 동일)
+    session.call_tool.return_value = _make_result(
+        '{"id": "t1", "title": "New Title", "content": "Same Body"}'
+    )
+    result2 = await import_page_via_mcp(session, meta_store, "t1")
+    assert result2["created"] is False
+    assert result2["changed"] is True  # Phase 2 재인덱싱 대상으로 분류
+    assert result2["title"] == "New Title"
+    assert result2["status"] == "changed"
+
+    # 제목·본문 모두 그대로면 unchanged 유지
+    result3 = await import_page_via_mcp(session, meta_store, "t1")
+    assert result3["changed"] is False
+
+
+@pytest.mark.asyncio
+async def test_import_page_heals_fallback_title(
+    meta_store: MetadataStore,
+) -> None:
+    """폴백 제목으로 오염된 문서가 실제 제목 확보 시 치유된다."""
+    session = AsyncMock()
+    # 1차: 제목 없는 응답 → 폴백 제목으로 저장
+    session.call_tool.return_value = _make_result(
+        '{"id": "t2", "content": "Body"}'
+    )
+    result1 = await import_page_via_mcp(session, meta_store, "t2")
+    assert result1["title"] == "Confluence Page t2"
+
+    # 2차: 정상 응답 (본문 동일) → 제목 치유 + 재인덱싱 분류
+    session.call_tool.return_value = _make_result(
+        '{"id": "t2", "title": "Real Title", "content": "Body"}'
+    )
+    result2 = await import_page_via_mcp(session, meta_store, "t2")
+    assert result2["changed"] is True
+    assert result2["title"] == "Real Title"
+
+
+@pytest.mark.asyncio
+async def test_import_page_never_overwrites_title_with_fallback(
+    meta_store: MetadataStore,
+) -> None:
+    """제목 추출 실패 시 기존의 정상 제목을 폴백으로 덮어쓰지 않는다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "t3", "title": "Good Title", "content": "V1"}'
+    )
+    await import_page_via_mcp(session, meta_store, "t3")
+
+    # 본문은 변경됐지만 제목이 누락된 응답
+    session.call_tool.return_value = _make_result(
+        '{"id": "t3", "content": "V2"}'
+    )
+    result2 = await import_page_via_mcp(session, meta_store, "t3")
+    assert result2["changed"] is True
+    assert result2["title"] == "Good Title"  # 폴백으로 덮어쓰지 않음
+
+
+@pytest.mark.asyncio
+async def test_import_page_uses_enumerated_title_fallback(
+    meta_store: MetadataStore,
+) -> None:
+    """getPageByID 응답에 제목이 없으면 열거 단계 제목을 사용한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "t4", "content": "Body"}'
+    )
+    result = await import_page_via_mcp(
+        session, meta_store, "t4", enumerated_title="열거된 제목",
+    )
+    assert result["title"] == "열거된 제목"
+
+
+@pytest.mark.asyncio
+async def test_import_page_raises_on_tool_error(
+    meta_store: MetadataStore,
+) -> None:
+    """isError 응답은 문서를 생성하지 않고 예외로 전파된다 (재시도 목록행)."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_error_result("server exploded")
+
+    with pytest.raises(MCPToolError):
+        await import_page_via_mcp(session, meta_store, "t5")
+
+    assert await meta_store.get_document_by_source("confluence_mcp", "t5") is None
 
 
 @pytest.mark.asyncio

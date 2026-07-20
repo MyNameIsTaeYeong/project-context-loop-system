@@ -405,6 +405,23 @@ async def _sync_page(
     return result
 
 
+def _titles_by_id(pages: list[dict[str, Any]]) -> dict[str, str]:
+    """열거 결과에서 ``{page_id: title}`` 맵을 만든다.
+
+    searchContent 열거 결과에는 실제 제목이 포함되어 있다 — 이후
+    ``getPageByID`` 응답에서 제목 추출이 실패할 때의 폴백으로 쓰인다.
+    빈 제목은 제외한다. 같은 id 가 중복되면 첫 항목을 유지한다.
+    """
+    titles: dict[str, str] = {}
+    for page in pages:
+        pid = page.get("id")
+        title = page.get("title")
+        if not pid or not isinstance(title, str) or not title.strip():
+            continue
+        titles.setdefault(str(pid), title.strip())
+    return titles
+
+
 def _dedupe_ids(pages: list[dict[str, Any]]) -> list[str]:
     """열거 결과에서 순서를 보존하며 중복 없는 page_id 문자열 목록을 만든다."""
     ids: list[str] = []
@@ -517,6 +534,7 @@ async def _sync_subtree(
         target_id=target_id,
         space_key=space_key,
         all_ids=all_ids,
+        titles_by_id=_titles_by_id(descendants),
         # ancestor CQL 은 루트를 포함하지 않아 루트의 변경이 변경 후보 조회에
         # 잡히지 않는다 — 루트는 항상 fetch (싱크당 getPageByID 1회 추가).
         always_fetch_ids={root_id},
@@ -609,6 +627,7 @@ async def _sync_space(
         target_id=target_id,
         space_key=space_key,
         all_ids=all_ids,
+        titles_by_id=_titles_by_id(enumerated),
         always_fetch_ids=set(),
         changed_enumerator=_changed_pages,
         enumeration_complete=enumeration_complete,
@@ -629,6 +648,7 @@ async def _import_incremental_and_prune(
     target_id: int,
     space_key: str,
     all_ids: list[str],
+    titles_by_id: dict[str, str] | None = None,
     always_fetch_ids: set[str],
     changed_enumerator: Callable[[str], Awaitable[set[str]]],
     enumeration_complete: bool,
@@ -643,8 +663,12 @@ async def _import_incremental_and_prune(
 
     fetch 대상 = ``always_fetch_ids`` ∪ 신규(이전 membership 에 없음) ∪
     변경 후보(``changed_enumerator``) ∪ 재시도 대기(직전 싱크의 임포트 실패
-    페이지). 워터마크가 없거나 변경 후보/재시도 목록 조회가 실패하면 전체
-    fetch 로 폴백한다.
+    페이지) ∪ 폴백 제목 오염 문서(제목이 ``"Confluence Page {id}"`` 로 저장된
+    문서 — 소스측 변경이 없어도 강제 fetch 해 제목을 치유한다). 워터마크가
+    없거나 변경 후보/재시도 목록 조회가 실패하면 전체 fetch 로 폴백한다.
+
+    ``titles_by_id`` 는 열거 단계가 확보한 ``{page_id: title}`` — 임포트 시
+    ``getPageByID`` 응답에서 제목 추출이 실패할 때의 폴백으로 전달된다.
 
     fetch 를 생략한 페이지도 membership ``last_seen_at`` 은 배치로 갱신해
     "이번 열거에서 존재 확인됨" 상태를 유지한다.
@@ -689,6 +713,19 @@ async def _import_incremental_and_prune(
             )
             changed_ids = None
 
+    # 폴백 제목 오염 문서 — 소스측 변경이 없으면 증분 선정에서 영구 제외되어
+    # 제목이 치유될 기회가 없으므로 강제 fetch 대상에 포함한다. 조회 실패는
+    # 임포트 자체를 막을 이유가 아니므로 빈 집합으로 폴백.
+    try:
+        fallback_title_ids = await meta_store.list_fallback_title_page_ids(
+            target_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "폴백 제목 문서 조회 실패 target_id=%s", target_id, exc_info=True,
+        )
+        fallback_title_ids = set()
+
     if changed_ids is None or retry_ids is None:
         fetch_ids = list(all_ids)
     else:
@@ -698,7 +735,13 @@ async def _import_incremental_and_prune(
             or pid not in previous_ids
             or pid in changed_ids
             or pid in retry_ids
+            or pid in fallback_title_ids
         ]
+        if fallback_title_ids:
+            logger.info(
+                "폴백 제목 문서 %d건 강제 fetch 포함 target_id=%s",
+                len(fallback_title_ids & set(fetch_ids)), target_id,
+            )
 
     fetch_set = set(fetch_ids)
     skipped_ids = [pid for pid in all_ids if pid not in fetch_set]
@@ -709,8 +752,11 @@ async def _import_incremental_and_prune(
             target_id, len(skipped_ids), len(all_ids), watermark,
         )
 
+    titles = titles_by_id or {}
     await _import_nodes_and_upsert(
-        session, [{"id": pid} for pid in fetch_ids], space_key, target_id,
+        session,
+        [{"id": pid, "title": titles.get(pid)} for pid in fetch_ids],
+        space_key, target_id,
         result, current_ids,
         meta_store=meta_store, with_hierarchy=False,
     )
@@ -816,7 +862,10 @@ async def _import_nodes_and_upsert(
         # 열거 확인된 페이지는 임포트 성공과 무관하게 "현재 존재"로 간주.
         current_ids.add(page_id)
         try:
-            r = await import_page_via_mcp(session, meta_store, page_id)
+            r = await import_page_via_mcp(
+                session, meta_store, page_id,
+                enumerated_title=node.get("title"),
+            )
             _classify_import_result(result, r)
             await meta_store.upsert_membership(
                 target_id=target_id,
