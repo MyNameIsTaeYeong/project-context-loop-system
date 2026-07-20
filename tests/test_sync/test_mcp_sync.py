@@ -43,6 +43,7 @@ def _make_fake_importer(fail_pages: set[str] | None = None):
         session: Any,
         store: MetadataStore,
         page_id: str,
+        **_: Any,
     ) -> dict[str, Any]:
         pid = str(page_id)
         if pid in fail:
@@ -126,6 +127,7 @@ def _make_recording_importer(fail_pages: set[str] | None = None):
         session: Any,
         store: MetadataStore,
         page_id: str,
+        **_: Any,
     ) -> dict[str, Any]:
         pid = str(page_id)
         calls.append(pid)
@@ -734,6 +736,88 @@ async def test_sync_space_incremental_fetches_only_changed_and_new(
     assert await meta.list_membership_page_ids(t["id"]) == {"1", "2", "3", "4"}
     # 생략분은 unchanged (fetch 후 해시판정) 목록엔 없다
     assert len(result.unchanged) == 1  # "2" 는 fetch 됐지만 해시 동일
+
+
+async def test_sync_space_incremental_force_fetches_fallback_titled_docs(
+    stores, monkeypatch,
+) -> None:
+    """폴백 제목("Confluence Page {id}") 오염 문서는 소스측 변경이 없어도
+    증분 싱크에서 강제 fetch 되어 제목 치유 기회를 얻는다."""
+    meta, vec, graph = stores
+    calls1, importer1 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer1)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_incremental_enumerate(
+            all_pages=[{"id": "1"}, {"id": "2"}, {"id": "3"}],
+            changed_pages=[],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+    assert set(calls1) == {"1", "2", "3"}
+
+    # 페이지 1 의 문서를 폴백 제목으로 오염시킨다 (과거 파싱 실패 상황 재현).
+    doc1 = await meta.get_document_by_source("confluence_mcp", "1")
+    assert doc1 is not None
+    await meta.update_document_title(doc1["id"], "Confluence Page 1")
+
+    # 두 번째 싱크 — 소스측 변경 없음. 오염된 1 만 강제 fetch 된다.
+    calls2, importer2 = _make_recording_importer()
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", importer2)
+    t = await meta.get_sync_target(t["id"])
+    result = await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert set(calls2) == {"1"}
+    assert result.skipped == 2
+
+
+async def test_sync_space_passes_enumerated_title_to_importer(
+    stores, monkeypatch,
+) -> None:
+    """열거 결과의 title 이 importer 의 enumerated_title 폴백으로 전달된다."""
+    meta, vec, graph = stores
+    received: dict[str, Any] = {}
+
+    async def capturing_importer(
+        session: Any, store: MetadataStore, page_id: str, **kwargs: Any,
+    ) -> dict[str, Any]:
+        received[str(page_id)] = kwargs.get("enumerated_title")
+        doc_id = await store.create_document(
+            source_type="confluence_mcp",
+            source_id=str(page_id),
+            title=f"Page {page_id}",
+            original_content="content",
+            content_hash=f"hash-{page_id}",
+        )
+        doc = await store.get_document(doc_id)
+        assert doc is not None
+        return {**doc, "created": True, "changed": True}
+
+    monkeypatch.setattr(mcp_sync, "import_page_via_mcp", capturing_importer)
+    monkeypatch.setattr(
+        mcp_sync, "enumerate_space_pages",
+        _make_fake_enumerate(
+            [{"id": "1", "title": "첫 페이지"}, {"id": "2"}],
+        ),
+    )
+
+    t = await meta.upsert_sync_target(
+        scope="space", space_key="ENG", page_id=None, name="Engineering",
+    )
+    await execute_sync_target(
+        None, t, meta_store=meta, vector_store=vec, graph_store=graph,
+    )
+
+    assert received["1"] == "첫 페이지"
+    assert received["2"] is None  # 열거 결과에 title 없음 → None 전달
 
 
 async def test_sync_subtree_incremental_always_fetches_root(

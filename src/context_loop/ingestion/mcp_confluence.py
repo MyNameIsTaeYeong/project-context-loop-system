@@ -53,6 +53,22 @@ def _extract_text(result: Any) -> str:
     return str(result)
 
 
+def _raise_on_tool_error(result: Any, tool_name: str) -> None:
+    """``CallToolResult.isError`` 가 True 면 :class:`MCPToolError` 를 던진다.
+
+    MCP SDK 의 ``call_tool`` 은 도구 실행 실패(권한 제한, 서버측 오류 등)를
+    예외가 아니라 ``isError=True`` + 에러 텍스트로 돌려준다. 이를 검사하지
+    않으면 에러 메시지가 그대로 본문/제목 파싱에 흘러들어 "Confluence Page
+    {id}" 폴백 제목의 오염 문서가 조용히 생성된다.
+
+    ``is True`` 비교는 의도적 — 테스트 더블(MagicMock)의 임의 속성 같은
+    "truthy 이지만 bool 이 아닌" 값을 에러로 오인하지 않기 위함이다.
+    """
+    if getattr(result, "isError", False) is True:
+        detail = _extract_text(result).strip()
+        raise MCPToolError(f"{tool_name} 도구 오류: {detail[:500] or '(no detail)'}")
+
+
 def _parse_json_result(result: Any) -> Any:
     """CallToolResult에서 JSON을 파싱한다.
 
@@ -268,6 +284,7 @@ async def search_content(
     result = await session.call_tool(
         "searchContent", {"cql": cql, "limit": limit, "start": start},
     )
+    _raise_on_tool_error(result, "searchContent")
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
@@ -330,6 +347,7 @@ async def search_content_envelope(
     result = await session.call_tool(
         "searchContent", {"cql": cql, "limit": limit, "start": start},
     )
+    _raise_on_tool_error(result, "searchContent")
     parsed = _parse_json_result(result)
 
     if isinstance(parsed, dict) and "results" in parsed:
@@ -365,6 +383,32 @@ async def search_content_envelope(
     )
 
 
+_PAGE_PAYLOAD_KEYS = ("id", "title", "name", "body", "content", "markdown")
+"""페이지 payload 로 판정하는 최상위 키 후보."""
+
+_PAGE_WRAPPER_KEYS = ("page", "result", "data")
+"""서버 변종이 페이지를 한 겹 감싸는 envelope 키 후보."""
+
+
+def _unwrap_page_payload(parsed: dict[str, Any]) -> dict[str, Any]:
+    """``getPageByID`` 응답의 한 겹 래핑(envelope)을 풀어낸다.
+
+    MCP 스펙의 structured output 관행이나 서버 구현체에 따라 페이지가
+    ``{"result": {...}}`` / ``{"page": {...}}`` 처럼 감싸져 올 수 있다.
+    최상위에 페이지 필드(:data:`_PAGE_PAYLOAD_KEYS`)가 하나도 없고 래퍼 키
+    아래에 페이지 필드를 가진 dict 가 있으면 그 내부 dict 를 반환한다.
+    """
+    if any(key in parsed for key in _PAGE_PAYLOAD_KEYS):
+        return parsed
+    for wrapper in _PAGE_WRAPPER_KEYS:
+        inner = parsed.get(wrapper)
+        if isinstance(inner, dict) and any(
+            key in inner for key in _PAGE_PAYLOAD_KEYS
+        ):
+            return inner
+    return parsed
+
+
 async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     """MCP 서버의 getPageByID 도구로 페이지를 가져온다.
 
@@ -374,6 +418,11 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
 
     Returns:
         페이지 정보 dict. title, content 등이 포함된다.
+
+    Raises:
+        MCPToolError: 서버가 ``isError=True`` 응답을 준 경우 (권한 제한,
+            서버측 오류 등). 에러 텍스트를 본문으로 오인 임포트하지 않도록
+            예외로 승격한다.
     """
     result = await session.call_tool(
         "getPageByID",
@@ -382,9 +431,10 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
             "expand": "history,space,version,body.storage",
         },
     )
+    _raise_on_tool_error(result, "getPageByID")
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
-        return parsed
+        return _unwrap_page_payload(parsed)
     return {"content": _extract_text(result), "id": page_id}
 
 
@@ -413,9 +463,10 @@ async def get_page_with_ancestors(
             "expand": "ancestors,space,version",
         },
     )
+    _raise_on_tool_error(result, "getPageByID")
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
-        return parsed
+        return _unwrap_page_payload(parsed)
     return {"id": page_id}
 
 
@@ -511,6 +562,7 @@ async def get_child_pages(
                 "expand": expand,
             },
         )
+        _raise_on_tool_error(result, "getChild")
         parsed = _parse_json_result(result)
         items, envelope = _unwrap_envelope(parsed)
 
@@ -876,6 +928,7 @@ async def get_space_info(
         MCP 서버가 dict가 아닌 응답을 주면 ``{"key": space_key}`` 를 반환한다.
     """
     result = await session.call_tool("getSpaceInfo", {"spaceKey": space_key})
+    _raise_on_tool_error(result, "getSpaceInfo")
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
         return parsed
@@ -907,6 +960,7 @@ async def get_all_spaces(
         result = await session.call_tool(
             "getSpaceInfoAll", {"start": start, "limit": page_size},
         )
+        _raise_on_tool_error(result, "getSpaceInfoAll")
         parsed = _parse_json_result(result)
         items, envelope = _unwrap_envelope(parsed)
 
@@ -944,6 +998,7 @@ async def get_user_contributed_pages(
 ) -> list[dict[str, Any]]:
     """MCP 서버의 getUserContributedPages 도구로 사용자 기여 페이지를 가져온다."""
     result = await session.call_tool("getUserContributedPages", {"userId": user_id})
+    _raise_on_tool_error(result, "getUserContributedPages")
     parsed = _parse_json_result(result)
     if isinstance(parsed, list):
         return parsed
@@ -974,9 +1029,38 @@ def _extract_page_content(page_data: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_page_title(page_data: dict[str, Any], page_id: str) -> str:
-    """페이지 데이터에서 제목을 추출한다."""
-    return page_data.get("title") or page_data.get("name") or f"Confluence Page {page_id}"
+def _extract_page_title_raw(page_data: dict[str, Any]) -> str | None:
+    """페이지 데이터에서 실제 제목을 추출한다. 못 찾으면 ``None``.
+
+    폴백 문자열을 만들지 않는 것이 :func:`_extract_page_title` 과의 차이 —
+    호출측이 "진짜 제목을 얻었는가" 를 구분해야 할 때(기존 문서의 제목을
+    폴백으로 덮어쓰지 않기 위해) 사용한다.
+    """
+    for key in ("title", "name"):
+        val = page_data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def fallback_page_title(page_id: str) -> str:
+    """제목을 어디서도 얻지 못했을 때 쓰는 폴백 제목."""
+    return f"Confluence Page {page_id}"
+
+
+def _extract_page_title(
+    page_data: dict[str, Any], page_id: str, fallback: str | None = None,
+) -> str:
+    """페이지 데이터에서 제목을 추출한다.
+
+    응답에 제목이 없으면 ``fallback`` (예: 열거 단계 searchContent 가 준
+    제목), 그마저 없으면 :func:`fallback_page_title` 을 사용한다.
+    """
+    return (
+        _extract_page_title_raw(page_data)
+        or (fallback.strip() if isinstance(fallback, str) else None)
+        or fallback_page_title(page_id)
+    )
 
 
 def _extract_page_version(page_data: dict[str, Any]) -> int | None:
@@ -1023,25 +1107,45 @@ async def import_page_via_mcp(
     session: ClientSession,
     store: MetadataStore,
     page_id: str,
+    *,
+    enumerated_title: str | None = None,
 ) -> dict[str, Any]:
     """MCP를 통해 Confluence 페이지를 가져와 메타데이터 저장소에 등록한다.
 
     기존 import_page()와 동일한 패턴을 따른다.
 
+    제목 처리 규칙:
+      - ``getPageByID`` 응답의 ``title``/``name`` → 열거 단계(searchContent)가
+        준 ``enumerated_title`` → 폴백 ``"Confluence Page {id}"`` 순으로 결정.
+      - 기존 문서의 제목과 다르면 본문 해시가 동일하더라도 제목을 갱신하고
+        ``changed=True`` 로 반환한다 — 제목은 메타뷰 임베딩·청크 메타데이터·
+        그래프 ``doc_title`` 에도 들어가므로 재인덱싱(Phase 2)까지 태워야
+        검색 인덱스의 제목이 따라온다.
+      - 단, **실제 제목을 얻지 못한 경우**(둘 다 부재)에는 기존 문서의
+        제목을 폴백 문자열로 덮어쓰지 않는다.
+
     Args:
         session: 초기화된 MCP ClientSession.
         store: 초기화된 MetadataStore 인스턴스.
         page_id: 임포트할 Confluence 페이지 ID.
+        enumerated_title: 열거 단계에서 확보한 제목 (있으면). ``getPageByID``
+            응답에서 제목 추출이 실패했을 때의 폴백으로 쓰인다.
 
     Returns:
         생성 또는 업데이트된 문서 dict.
         추가 키:
           - "created" (bool): True면 새로 생성됨.
-          - "changed" (bool): True면 내용이 변경됨.
+          - "changed" (bool): True면 내용 또는 제목이 변경됨.
     """
     page_data = await get_page(session, page_id)
     html_body = _extract_page_content(page_data)
-    title = _extract_page_title(page_data, page_id)
+    # resolved_title 은 "실제로 확인된 제목" — 없으면 None (폴백 문자열 아님).
+    resolved_title = _extract_page_title_raw(page_data) or (
+        enumerated_title.strip()
+        if isinstance(enumerated_title, str) and enumerated_title.strip()
+        else None
+    )
+    title = resolved_title or fallback_page_title(page_id)
     source_version = _extract_page_version(page_data)
 
     # HTML → 마크다운 변환
@@ -1073,6 +1177,13 @@ async def import_page_via_mcp(
         assert doc is not None
         return {**doc, "created": True, "changed": True}
 
+    # 실제 제목을 확보했고 기존 제목과 다르면 갱신 대상 — 제목 변경(rename)
+    # 반영 및 과거 폴백 제목("Confluence Page {id}") 오염 문서의 자가 치유.
+    # resolved_title 이 None 이면(제목 확인 실패) 기존 제목을 유지한다.
+    title_changed = (
+        resolved_title is not None and resolved_title != existing["title"]
+    )
+
     if existing["content_hash"] == content_hash:
         # 본문은 그대로인데 소스 리비전만 오른 경우(라벨/제한 등 메타데이터성
         # 편집) — 진단 데이터가 뒤처지지 않도록 리비전만 따라간다.
@@ -1083,9 +1194,26 @@ async def import_page_via_mcp(
             await store.update_document_source_version(
                 existing["id"], source_version,
             )
-        return {**existing, "created": False, "changed": False}
+        if not title_changed:
+            return {**existing, "created": False, "changed": False}
 
-    # 내용 변경
+        # 제목만 변경 — 제목은 메타뷰 임베딩/청크 메타/그래프 doc_title 에도
+        # 들어가므로 changed 로 분류해 Phase 2 재인덱싱까지 태운다.
+        await store.update_document_title(existing["id"], resolved_title)
+        await store.update_document_status(existing["id"], status="changed")
+        await store.add_processing_history(
+            document_id=existing["id"],
+            action="updated",
+            prev_storage_method=existing.get("storage_method"),
+            status="started",
+        )
+        doc = await store.get_document(existing["id"])
+        assert doc is not None
+        return {**doc, "created": False, "changed": True}
+
+    # 내용 변경 (제목이 함께 변경됐으면 제목도 갱신)
+    if title_changed:
+        await store.update_document_title(existing["id"], resolved_title)
     await store.update_document_content(
         existing["id"],
         original_content=content,
