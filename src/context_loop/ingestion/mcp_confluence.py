@@ -421,8 +421,9 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
 
     Raises:
         MCPToolError: 서버가 ``isError=True`` 응답을 준 경우 (권한 제한,
-            서버측 오류 등). 에러 텍스트를 본문으로 오인 임포트하지 않도록
-            예외로 승격한다.
+            서버측 오류 등), 또는 응답 텍스트가 잘린 JSON 으로 판정된 경우
+            (서버측 길이 cap). 어느 쪽이든 그 텍스트를 본문으로 오인
+            임포트하지 않도록 예외로 승격한다.
     """
     result = await session.call_tool(
         "getPageByID",
@@ -435,7 +436,13 @@ async def get_page(session: ClientSession, page_id: str) -> dict[str, Any]:
     parsed = _parse_json_result(result)
     if isinstance(parsed, dict):
         return _unwrap_page_payload(parsed)
-    return {"content": _extract_text(result), "id": page_id}
+    text = _extract_text(result)
+    if _looks_like_truncated_json(text):
+        raise MCPToolError(
+            f"getPageByID 응답 JSON 파싱 실패(잘림 의심) page_id={page_id}: "
+            f"{text[:200]}",
+        )
+    return {"content": text, "id": page_id}
 
 
 async def get_page_with_ancestors(
@@ -1029,6 +1036,70 @@ def _extract_page_content(page_data: dict[str, Any]) -> str:
     return ""
 
 
+def _looks_like_truncated_json(text: str) -> bool:
+    """JSON 으로 시작하지만 파싱에 실패하는 텍스트인지 판별한다.
+
+    서버측 응답 길이 cap 으로 JSON 이 중간에서 잘린 케이스를 식별한다 —
+    이런 텍스트를 본문으로 임포트하면 쓰레기 데이터가 인덱싱된다.
+    순수 평문 응답(일부 서버는 본문을 평문으로 반환)은 해당하지 않는다.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    return False
+
+
+def _page_declares_body(page_data: dict[str, Any]) -> bool:
+    """응답이 본문 필드를 포함하는지 판별한다 (값이 비어 있어도 True).
+
+    :func:`_extract_page_content` 가 빈 문자열을 돌려줬을 때 "진짜 빈
+    페이지" (본문 필드는 있으나 값이 빔 — 자식 묶음용 부모 페이지 등) 와
+    "본문 추출 실패" (``expand=body.storage`` 를 요청했는데 body 계열 필드
+    자체가 없는 메타데이터성 응답) 를 구분하기 위한 헬퍼.
+
+    구조화 body dict 는 하위 키(storage/view/export_view)만 있으면 값이
+    비어도 선언으로 인정한다. 문자열 키는 비어 있지 않을 때만 인정한다 —
+    ``{"content": ""}`` 같은 퇴화 응답을 빈 페이지로 오인하지 않기 위함.
+    """
+    body = page_data.get("body")
+    if isinstance(body, str):
+        return True
+    if isinstance(body, dict) and any(
+        key in body for key in ("storage", "view", "export_view")
+    ):
+        return True
+    return any(
+        isinstance(page_data.get(key), str) and page_data[key].strip()
+        for key in ("markdown", "content", "value", "text")
+    )
+
+
+def _page_has_explicit_empty_body(page_data: dict[str, Any]) -> bool:
+    """body 구조에 명시적 값(빈 값 포함)이 있는지 판별한다.
+
+    기존의 비어 있지 않은 본문을 빈 본문으로 **덮어쓸** 때 요구하는 더
+    강한 증거 — 정상 Confluence 응답이라면 비워진 페이지도
+    ``body.storage.value == ""`` 처럼 value 키를 명시한다.
+    ``body == {"storage": {}}`` 같은 결손 변종은 선언(:func:`_page_declares_body`)
+    으로는 인정되지만 이 판정은 통과하지 못한다.
+    """
+    body = page_data.get("body")
+    if isinstance(body, str):
+        return True
+    if isinstance(body, dict):
+        for key in ("storage", "view", "export_view"):
+            sub = body.get(key)
+            if isinstance(sub, str):
+                return True
+            if isinstance(sub, dict) and "value" in sub:
+                return True
+    return False
+
+
 def _extract_page_title_raw(page_data: dict[str, Any]) -> str | None:
     """페이지 데이터에서 실제 제목을 추출한다. 못 찾으면 ``None``.
 
@@ -1136,9 +1207,25 @@ async def import_page_via_mcp(
         추가 키:
           - "created" (bool): True면 새로 생성됨.
           - "changed" (bool): True면 내용 또는 제목이 변경됨.
+
+    Raises:
+        MCPToolError: 서버 도구 오류(isError)/잘린 JSON 응답, 응답에 body
+            계열 필드가 아예 없는 본문 추출 실패, 또는 명시적 빈 body 근거
+            없이 기존 본문을 빈 값으로 덮어쓰게 되는 경우. 호출측(sync)이
+            에러로 집계해 재시도 목록 → 다음 싱크 강제 fetch 경로를 탄다.
     """
     page_data = await get_page(session, page_id)
     html_body = _extract_page_content(page_data)
+
+    # 본문 추출 실패 판정 — expand=body.storage 를 요청했는데 body 계열
+    # 필드 자체가 없으면 메타데이터성/결손 응답이다. 빈 본문으로 문서를
+    # 만들거나 덮어쓰지 않도록 예외로 승격한다. 본문 필드가 있으나 값이
+    # 빈 "진짜 빈 페이지" 는 정상 임포트된다.
+    if not html_body and not _page_declares_body(page_data):
+        raise MCPToolError(
+            f"getPageByID 응답에서 본문 추출 실패 page_id={page_id}: "
+            f"body 계열 필드 부재 keys={sorted(page_data.keys())[:10]}",
+        )
     # resolved_title 은 "실제로 확인된 제목" — 없으면 None (폴백 문자열 아님).
     resolved_title = _extract_page_title_raw(page_data) or (
         enumerated_title.strip()
@@ -1210,6 +1297,20 @@ async def import_page_via_mcp(
         doc = await store.get_document(existing["id"])
         assert doc is not None
         return {**doc, "created": False, "changed": True}
+
+    # 빈 본문 덮어쓰기 가드 (심층 방어) — 비어 있지 않은 기존 본문을 빈
+    # 값으로 교체하려면 응답에 명시적 빈 body 값(예: body.storage.value=="")
+    # 이 있어야 한다. ``body={"storage": {}}`` 같은 결손 변종이 정상 본문을
+    # 지우고 파생 인덱스(청크/그래프)까지 삭제시키는 것을 차단한다.
+    if (
+        not content
+        and existing.get("original_content")
+        and not _page_has_explicit_empty_body(page_data)
+    ):
+        raise MCPToolError(
+            f"빈 본문 응답으로 기존 본문 덮어쓰기 거부 page_id={page_id}: "
+            "명시적 빈 body 값 없음 (결손 응답 의심)",
+        )
 
     # 내용 변경 (제목이 함께 변경됐으면 제목도 갱신)
     if title_changed:

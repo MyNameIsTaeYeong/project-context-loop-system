@@ -16,6 +16,9 @@ from context_loop.ingestion.mcp_confluence import (
     _extract_page_title,
     _extract_page_title_raw,
     _extract_text,
+    _looks_like_truncated_json,
+    _page_declares_body,
+    _page_has_explicit_empty_body,
     fallback_page_title,
     _is_cql,
     _parse_json_result,
@@ -187,6 +190,39 @@ def test_extract_page_title_raw_returns_none_when_absent() -> None:
 
 def test_fallback_page_title_format() -> None:
     assert fallback_page_title("2222222") == "Confluence Page 2222222"
+
+
+# --- 본문 결손 판정 헬퍼 테스트 ---
+
+
+def test_looks_like_truncated_json() -> None:
+    assert _looks_like_truncated_json('{"id": "1", "body": "잘린') is True
+    assert _looks_like_truncated_json('[{"id": "1"') is True
+    assert _looks_like_truncated_json('{"id": "1"}') is False  # 유효 JSON
+    assert _looks_like_truncated_json("그냥 평문 본문") is False
+    assert _looks_like_truncated_json("") is False
+
+
+def test_page_declares_body() -> None:
+    # 구조화 body — 값이 비어도 선언으로 인정
+    assert _page_declares_body({"body": {"storage": {"value": ""}}}) is True
+    assert _page_declares_body({"body": {"storage": {}}}) is True
+    assert _page_declares_body({"body": "text"}) is True
+    assert _page_declares_body({"content": "본문"}) is True
+    # 부재/퇴화 케이스
+    assert _page_declares_body({"id": "1", "title": "T"}) is False
+    assert _page_declares_body({"content": ""}) is False
+    assert _page_declares_body({"body": {}}) is False
+
+
+def test_page_has_explicit_empty_body() -> None:
+    # 명시적 value 키가 있어야 빈 본문 덮어쓰기 근거로 인정
+    assert _page_has_explicit_empty_body(
+        {"body": {"storage": {"value": ""}}},
+    ) is True
+    assert _page_has_explicit_empty_body({"body": ""}) is True
+    assert _page_has_explicit_empty_body({"body": {"storage": {}}}) is False
+    assert _page_has_explicit_empty_body({"id": "1"}) is False
 
 
 # --- MCP 도구 호출 테스트 ---
@@ -442,6 +478,18 @@ async def test_get_page_raises_on_tool_error() -> None:
     session.call_tool.return_value = _make_error_result("permission denied")
 
     with pytest.raises(MCPToolError, match="permission denied"):
+        await get_page(session, "123")
+
+
+@pytest.mark.asyncio
+async def test_get_page_raises_on_truncated_json() -> None:
+    """길이 cap 으로 잘린 JSON 응답은 본문으로 임포트하지 않고 예외 처리."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "123", "title": "Big Page", "body": {"storage": {"value": "잘린'
+    )
+
+    with pytest.raises(MCPToolError, match="잘림 의심"):
         await get_page(session, "123")
 
 
@@ -1535,6 +1583,84 @@ async def test_import_page_raises_on_tool_error(
         await import_page_via_mcp(session, meta_store, "t5")
 
     assert await meta_store.get_document_by_source("confluence_mcp", "t5") is None
+
+
+@pytest.mark.asyncio
+async def test_import_page_raises_when_body_fields_absent(
+    meta_store: MetadataStore,
+) -> None:
+    """body 계열 필드가 아예 없는 응답은 본문 추출 실패로 예외 처리한다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "b1", "title": "Meta Only"}'
+    )
+
+    with pytest.raises(MCPToolError, match="본문 추출 실패"):
+        await import_page_via_mcp(session, meta_store, "b1")
+
+    assert await meta_store.get_document_by_source("confluence_mcp", "b1") is None
+
+
+@pytest.mark.asyncio
+async def test_import_page_allows_genuinely_empty_page(
+    meta_store: MetadataStore,
+) -> None:
+    """body 필드가 있고 값만 빈 진짜 빈 페이지는 정상 임포트된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "b2", "title": "Container", '
+        '"body": {"storage": {"value": ""}}}'
+    )
+
+    result = await import_page_via_mcp(session, meta_store, "b2")
+    assert result["created"] is True
+    assert result["title"] == "Container"
+    assert result["original_content"] == ""
+
+
+@pytest.mark.asyncio
+async def test_import_page_refuses_empty_overwrite_without_explicit_body(
+    meta_store: MetadataStore,
+) -> None:
+    """명시적 빈 body 값 없이 기존 본문을 빈 값으로 덮어쓰지 않는다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "b3", "title": "T", "content": "정상 본문"}'
+    )
+    result1 = await import_page_via_mcp(session, meta_store, "b3")
+
+    # 결손 변종 — body 선언은 있으나 명시적 value 없음
+    session.call_tool.return_value = _make_result(
+        '{"id": "b3", "title": "T", "body": {"storage": {}}}'
+    )
+    with pytest.raises(MCPToolError, match="덮어쓰기 거부"):
+        await import_page_via_mcp(session, meta_store, "b3")
+
+    doc = await meta_store.get_document(result1["id"])
+    assert doc is not None
+    assert doc["original_content"] == "정상 본문"  # 본문 보존
+
+
+@pytest.mark.asyncio
+async def test_import_page_allows_explicit_empty_body_overwrite(
+    meta_store: MetadataStore,
+) -> None:
+    """Confluence 에서 실제로 비워진 페이지(body.storage.value=="")는 반영된다."""
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result(
+        '{"id": "b4", "title": "T", "content": "지워질 본문"}'
+    )
+    result1 = await import_page_via_mcp(session, meta_store, "b4")
+
+    session.call_tool.return_value = _make_result(
+        '{"id": "b4", "title": "T", "body": {"storage": {"value": ""}}}'
+    )
+    result2 = await import_page_via_mcp(session, meta_store, "b4")
+    assert result2["changed"] is True
+
+    doc = await meta_store.get_document(result1["id"])
+    assert doc is not None
+    assert doc["original_content"] == ""
 
 
 @pytest.mark.asyncio
